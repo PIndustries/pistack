@@ -1,0 +1,112 @@
+[workspace]
+resolver = "2"
+members = [
+    "bin/pistack",
+    "crates/pistack-types",
+    "crates/pistack-store",
+    "crates/pistack-policy",
+    "crates/pistack-config",
+    "crates/pistack-rpc",
+    "crates/gate",
+    "crates/forge",
+    "crates/loom",
+    "crates/anvil",
+    "crates/fabric",
+    "crates/slab",
+    "crates/mold",
+    "crates/silo",
+    "crates/shelf",
+    "crates/beacon",
+    "crates/relay",
+    "crates/keep",
+    "crates/blueprint",
+    "crates/gauge",
+    "crates/bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/pindustries/pistack"
+authors = ["P. Industries LLC"]
+
+[workspace.dependencies]
+# runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+# http
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "util"] }
+hyper = "1"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+jsonschema = "0.52"
+# ids, time, errors
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+# storage
+redb = "2"
+bincode = "1"
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+# crypto / auth
+jsonwebtoken = "9"
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rustls = "0.23"
+rcgen = "0.13"
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+# misc
+ipnet = { version = "2", features = ["serde"] }
+regex = "1"
+once_cell = "1"
+dashmap = "6"
+parking_lot = "0.12"
+bytes = "1"
+tempfile = "3"
+
+# internal crates
+pistack-types = { path = "crates/pistack-types" }
+pistack-store = { path = "crates/pistack-store" }
+pistack-policy = { path = "crates/pistack-policy" }
+pistack-config = { path = "crates/pistack-config" }
+pistack-rpc = { path = "crates/pistack-rpc" }
+gate = { path = "crates/gate" }
+forge = { path = "crates/forge" }
+loom = { path = "crates/loom" }
+anvil = { path = "crates/anvil" }
+fabric = { path = "crates/fabric" }
+slab = { path = "crates/slab" }
+mold = { path = "crates/mold" }
+silo = { path = "crates/silo" }
+shelf = { path = "crates/shelf" }
+beacon = { path = "crates/beacon" }
+relay = { path = "crates/relay" }
+keep = { path = "crates/keep" }
+blueprint = { path = "crates/blueprint" }
+gauge = { path = "crates/gauge" }
+bench = { path = "crates/bench" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,30 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: dco
+        if: github.event_name == 'pull_request'
+        run: |
+          set -e
+          for c in $(git rev-list origin/${{ github.base_ref }}..HEAD); do
+            git log -1 --format=%B "$c" | grep -q '^Signed-off-by: ' || { echo "missing Signed-off-by on $c"; exit 1; }
+          done

@@ -1,0 +1,19 @@
+[package]
+name = "pistack-store"
+description = "Embedded state store (redb) behind a trait so Raft replication can slot in later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pistack-types.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
