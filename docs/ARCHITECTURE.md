@@ -7,7 +7,11 @@ One binary, two roles.
 - `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. Three of these for HA (Raft replication is the next step for `pistack-store`; today it is one node).
 - `pistack agent` — a host. Runs `anvil`: VMs (libvirt/KVM or Cloud Hypervisor), pods (youki), bare metal (same binary as the provisioning ramdisk), OVN chassis, volume attach, metrics.
 
-Everything a user touches enters the gateway (`bin/pistack/src/gateway.rs`) and is routed to a module by prefix. Modules talk to each other in-process and to hosts over gRPC (`pistack-rpc`). State changes publish `Event`s on a broadcast bus that reconcilers subscribe to.
+Everything a user touches enters the gateway (`bin/pistack/src/gateway.rs`) and is routed to a module by prefix. Modules talk to each other in-process and to hosts through `pistack-rpc`, a typed command queue with JSON-over-HTTP long-poll today (agents call in; no inbound ports on hosts). State changes publish `Event`s on an in-process broadcast bus that reconcilers subscribe to.
+
+### Why not NATS or gRPC everywhere
+
+The NATS server is Go and there is no production embeddable NATS server in Rust (every Rust crate is a client), so "NATS embedded" would mean shipping a Go binary inside PiStack. gRPC (tonic) is pure Rust but point-to-point, not a bus. So the transport sits behind a trait: the embedded default is pure Rust (command queue + event bus, persisted by the store), `async-nats` is a planned pluggable transport for sites that already run NATS, and a small Rust server speaking the core NATS wire protocol is a Phase 3 option if we want those semantics embedded.
 
 ## The resource model
 

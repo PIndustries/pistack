@@ -20,7 +20,7 @@ forge.workspace = true
 loom.workspace = true
 anvil.workspace = true
 fabric.workspace = true
-slab.workspace = true
+slab = { workspace = true }
 mold.workspace = true
 silo.workspace = true
 shelf.workspace = true

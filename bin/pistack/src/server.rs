@@ -6,6 +6,7 @@
 
 use crate::gateway;
 use anyhow::Context;
+use pistack_rpc::{CommandQueue, QueueConfig};
 use pistack_store::Store;
 use pistack_types::{Module, ModuleContext};
 use std::path::PathBuf;
@@ -20,31 +21,61 @@ pub struct ServerOpts {
     pub listen: String,
     pub public_url: Option<String>,
     pub insecure_http: bool,
+    /// Dev mode: a local mock host so machines "run" with no agent, and
+    /// unauthenticated requests act as admin. Never on in production.
+    pub dev: bool,
+}
+
+/// Everything the binary assembles before serving.
+pub struct Assembly {
+    pub modules: Vec<Arc<dyn Module>>,
+    pub gate: Arc<gate::Gate>,
+    pub forge: Arc<forge::Forge>,
+    pub queue: CommandQueue,
 }
 
 /// Every module in the binary, in mount order. Adding a module = one line.
-pub fn all_modules() -> Vec<Arc<dyn Module>> {
-    vec![
-        Arc::new(gate::Gate::default()),
-        Arc::new(forge::Forge::default()),
-        Arc::new(loom::Loom::default()),
+pub fn assemble(dev: bool) -> Assembly {
+    let gate_m = Arc::new(gate::Gate::default());
+    let registry = Arc::new(forge::DriverRegistry::new());
+    let forge_m = Arc::new(if dev {
+        forge::Forge::default()
+    } else {
+        forge::Forge::with_registry(registry)
+    });
+    let queue = CommandQueue::new(QueueConfig::default());
+
+    let modules: Vec<Arc<dyn Module>> = vec![
+        gate_m.clone(),
+        forge_m.clone(),
+        Arc::new(loom::Loom),
         Arc::new(fabric::Fabric::default()),
         Arc::new(slab::Slab::default()),
         Arc::new(mold::Mold::default()),
-        Arc::new(silo::Silo::default()),
-        Arc::new(shelf::Shelf::default()),
-        Arc::new(beacon::Beacon::default()),
-        Arc::new(relay::Relay::default()),
-        Arc::new(keep::Keep::default()),
-        Arc::new(blueprint::Blueprint::default()),
-        Arc::new(gauge::Gauge::default()),
-        Arc::new(bench::Bench::default()),
-    ]
+        Arc::new(silo::Silo),
+        Arc::new(shelf::Shelf),
+        Arc::new(beacon::Beacon),
+        Arc::new(relay::Relay),
+        Arc::new(keep::Keep),
+        Arc::new(blueprint::Blueprint),
+        Arc::new(gauge::Gauge),
+        Arc::new(bench::Bench),
+    ];
+    Assembly {
+        modules,
+        gate: gate_m,
+        forge: forge_m,
+        queue,
+    }
 }
 
 pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     std::fs::create_dir_all(&opts.data_dir)
         .with_context(|| format!("creating data dir {}", opts.data_dir.display()))?;
+    // Modules that keep files default under PISTACK_DATA_DIR.
+    if std::env::var_os("PISTACK_DATA_DIR").is_none() {
+        std::env::set_var("PISTACK_DATA_DIR", &opts.data_dir);
+    }
     let store_path = opts.data_dir.join("state.redb");
     let fresh = !store_path.exists();
     if fresh && !opts.init && opts.join.is_none() {
@@ -79,20 +110,31 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         store.put_meta("cluster_id", &uuid::Uuid::now_v7().to_string())?;
         store.put_meta("created_at", &chrono::Utc::now())?;
     }
+    if opts.dev {
+        tracing::warn!(
+            "DEV MODE: unauthenticated requests act as admin; a mock local host runs machines"
+        );
+    }
 
-    let modules = all_modules();
-    let app = gateway::build(&modules, ctx.clone());
+    let asm = assemble(opts.dev);
 
-    for m in &modules {
+    // Start modules first so gate has generated its signing key before the
+    // gateway asks for the verifier.
+    for m in &asm.modules {
         let name = m.info().name;
-        m.start(ctx.clone()).await.with_context(|| format!("starting module {name}"))?;
+        m.start(ctx.clone())
+            .await
+            .with_context(|| format!("starting module {name}"))?;
         tracing::debug!(module = name, "started");
     }
 
-    tracing::info!(listen = %opts.listen, public_url = %public_url, modules = modules.len(), "pistack server up");
+    let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
+    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev);
+
+    tracing::info!(listen = %opts.listen, public_url = %public_url, modules = asm.modules.len(), "pistack server up");
     let listener = tokio::net::TcpListener::bind(&opts.listen).await?;
     if !opts.insecure_http {
-        tracing::warn!("TLS not wired yet; serving plain HTTP. Pass --insecure-http to silence this.");
+        tracing::warn!("TLS not wired yet (keep is next); serving plain HTTP. Pass --insecure-http to silence this.");
     }
     let sd = shutdown.clone();
     axum::serve(listener, app)

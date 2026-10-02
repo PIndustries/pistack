@@ -27,7 +27,10 @@ pub struct Id {
 
 impl Id {
     pub fn new(kind: &'static str) -> Self {
-        Self { kind, uuid: Uuid::now_v7() }
+        Self {
+            kind,
+            uuid: Uuid::now_v7(),
+        }
     }
     pub fn parse(kind: &'static str, s: &str) -> Option<Self> {
         let rest = s.strip_prefix(kind)?.strip_prefix('-')?;
@@ -144,13 +147,53 @@ pub struct Resource<S, T> {
     pub status: T,
 }
 
-/// Marker trait a module implements for each of its resource kinds so the
-/// store can key it. Keep it tiny; behaviour lives in the module.
+/// Marker trait the store keys resources by. Modules normally do not
+/// implement this directly: implement [`Spec`] on the spec type and the
+/// blanket impl below makes `Resource<S, T>` a `Kind`. (A direct
+/// `impl Kind for Resource<MySpec, MyStatus>` from a module crate is rejected
+/// by the orphan rule, since both the trait and `Resource` live here.)
 pub trait Kind: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
     /// Table name in the store and id prefix, e.g. "mach".
     const KIND: &'static str;
     fn meta(&self) -> &Meta;
     fn meta_mut(&mut self) -> &mut Meta;
+}
+
+/// Implement this on a spec type to make `Resource<ThisSpec, AnyStatus>` a
+/// storable [`Kind`].
+///
+/// ```ignore
+/// #[derive(Serialize, Deserialize, Clone)] struct MachineSpec { .. }
+/// impl Spec for MachineSpec { const KIND: &'static str = "mach"; }
+/// type Machine = Resource<MachineSpec, MachineStatus>; // now a Kind
+/// ```
+pub trait Spec: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
+    const KIND: &'static str;
+}
+
+impl<S, T> Kind for Resource<S, T>
+where
+    S: Spec,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    const KIND: &'static str = S::KIND;
+    fn meta(&self) -> &Meta {
+        &self.meta
+    }
+    fn meta_mut(&mut self) -> &mut Meta {
+        &mut self.meta
+    }
+}
+
+impl<S: Spec, T: Default> Resource<S, T> {
+    /// Convenience constructor: fresh `Meta` of the spec's kind, default status.
+    pub fn new(name: impl Into<String>, project: Option<Id>, spec: S) -> Self {
+        Self {
+            meta: Meta::new(S::KIND, name, project),
+            spec,
+            status: T::default(),
+        }
+    }
 }
 
 /// Lifecycle phase shared by workloads, volumes, balancers and anything
@@ -309,8 +352,18 @@ mod tests {
 
     #[test]
     fn resources_fit() {
-        let want = Resources { vcpus: 2, memory_mib: 2048, disk_gib: 20, gpus: 0 };
-        let free = Resources { vcpus: 8, memory_mib: 32768, disk_gib: 500, gpus: 0 };
+        let want = Resources {
+            vcpus: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            gpus: 0,
+        };
+        let free = Resources {
+            vcpus: 8,
+            memory_mib: 32768,
+            disk_gib: 500,
+            gpus: 0,
+        };
         assert!(want.fits_in(&free));
         assert!(!free.fits_in(&want));
         assert_eq!(free.saturating_sub(&want).vcpus, 6);
@@ -318,7 +371,10 @@ mod tests {
 
     #[test]
     fn label_selector_parses() {
-        let q = ListQuery { labels: Some("env=prod, tier=web".into()), ..Default::default() };
+        let q = ListQuery {
+            labels: Some("env=prod, tier=web".into()),
+            ..Default::default()
+        };
         let sel = q.label_selector();
         assert_eq!(sel.get("env").unwrap(), "prod");
         assert_eq!(sel.get("tier").unwrap(), "web");

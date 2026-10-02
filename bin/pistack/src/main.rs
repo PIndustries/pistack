@@ -48,6 +48,9 @@ enum Cmd {
         /// Serve plain HTTP (dev only).
         #[arg(long)]
         insecure_http: bool,
+        /// Dev mode: mock local host, unauthenticated requests act as admin.
+        #[arg(long)]
+        dev: bool,
     },
     /// Run a host agent (anvil).
     Agent {
@@ -78,7 +81,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.cmd {
-        Cmd::Server { init, join, listen, public_url, insecure_http } => {
+        Cmd::Server {
+            init,
+            join,
+            listen,
+            public_url,
+            insecure_http,
+            dev,
+        } => {
             server::run(server::ServerOpts {
                 data_dir: cli.data_dir,
                 init,
@@ -86,10 +96,20 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 public_url,
                 insecure_http,
+                dev,
             })
             .await
         }
-        Cmd::Agent { join, token } => anvil::run_agent(anvil::AgentOpts { join, token, data_dir: cli.data_dir }).await,
-        Cmd::Store { cmd: StoreCmd::Dump } => server::dump(cli.data_dir),
+        Cmd::Agent { join, token } => {
+            anvil::run_agent(anvil::AgentOpts {
+                join,
+                token,
+                data_dir: cli.data_dir,
+            })
+            .await
+        }
+        Cmd::Store {
+            cmd: StoreCmd::Dump,
+        } => server::dump(cli.data_dir),
     }
 }

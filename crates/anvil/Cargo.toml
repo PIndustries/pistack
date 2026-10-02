@@ -18,3 +18,4 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+libc = "0.2"

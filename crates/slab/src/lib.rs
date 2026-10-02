@@ -1,28 +1,104 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Block volumes, snapshots, backups
+//! Block volumes, snapshots, backups (replaces Cinder).
 //!
-//! Status: scaffold. See docs/ARCHITECTURE.md for what this module owns.
+//! * [`types`] — `VolumeType`, `Volume`, `Snapshot`, `Backup`.
+//! * [`backend`] — the `BlockBackend` seam and the `local`, `lvm`, `rbd`
+//!   reference backends.
+//! * [`Client`] — the module core; the only writer of `status`. `forge`
+//!   uses [`Client::attach_info`], [`Client::mark_attached`] and
+//!   [`Client::mark_detached`].
+//! * [`quota`] — the `QuotaCheck` hook `gate` will implement.
+//! * HTTP under `/volume`: `/volumes`, `/snapshots`, `/backups`,
+//!   `/volume-types`.
 
 use async_trait::async_trait;
-use axum::{routing::get, Router};
+use axum::Router;
+use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-#[derive(Default)]
-pub struct Slab;
+pub mod backend;
+pub mod client;
+pub mod http;
+pub mod quota;
+pub mod reconcile;
+pub mod types;
+
+pub use backend::{AttachInfo, AttachTarget, BackendRef, BlockBackend, LocalFileBackend, Protocol};
+pub use client::{Client, Create, UpdateMeta};
+pub use quota::{AllowAll, QuotaCheck, QuotaRequest};
+pub use types::*;
+
+/// The slab module. `Default` runs the local file backend under
+/// `$PISTACK_SLAB_DIR`, else `$PISTACK_DATA_DIR/volumes`, else
+/// `./data/volumes`.
+pub struct Slab {
+    backend: Arc<dyn BlockBackend>,
+    quota: Arc<dyn QuotaCheck>,
+}
+
+impl Default for Slab {
+    fn default() -> Self {
+        let dir = std::env::var_os("PISTACK_SLAB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("PISTACK_DATA_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("./data"))
+                    .join("volumes")
+            });
+        Self::new(Arc::new(LocalFileBackend::new(dir)), Arc::new(AllowAll))
+    }
+}
+
+impl Slab {
+    pub fn new(backend: Arc<dyn BlockBackend>, quota: Arc<dyn QuotaCheck>) -> Self {
+        Self { backend, quota }
+    }
+
+    pub fn with_quota(mut self, quota: Arc<dyn QuotaCheck>) -> Self {
+        self.quota = quota;
+        self
+    }
+
+    /// A `Client` over `store` using this module's backend and quota hook.
+    /// Other modules get theirs from here.
+    pub fn client(&self, store: Store) -> Client {
+        Client::new(store, self.backend.clone(), self.quota.clone())
+    }
+
+    fn client_from(&self, ctx: &ModuleContext) -> Client {
+        let store: Arc<Store> = ctx.store::<Store>();
+        self.client((*store).clone())
+    }
+}
 
 #[async_trait]
 impl Module for Slab {
     fn info(&self) -> ModuleInfo {
         ModuleInfo {
             name: "slab",
-            prefix: "slab",
+            prefix: "volume",
             summary: "Block volumes, snapshots, backups",
             version: env!("CARGO_PKG_VERSION"),
         }
     }
-    fn router(&self, _ctx: ModuleContext) -> Router {
-        Router::new().route("/", get(|| async { "slab: scaffold" }))
+
+    fn router(&self, ctx: ModuleContext) -> Router {
+        http::router(self.client_from(&ctx))
+    }
+
+    async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
+        let client = self.client_from(&ctx);
+        client.seed_defaults()?;
+        tokio::spawn(reconcile::run(
+            client,
+            ctx.events.subscribe(),
+            ctx.shutdown.clone(),
+        ));
+        Ok(())
     }
 }

@@ -67,23 +67,49 @@ impl ErrorCode {
 
 impl ApiError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), details: Default::default() }
+        Self {
+            code,
+            message: message.into(),
+            details: Default::default(),
+        }
     }
     pub fn with_detail(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
         self.details.insert(key.to_owned(), value.into());
         self
     }
-    pub fn bad_request(m: impl Into<String>) -> Self { Self::new(ErrorCode::BadRequest, m) }
-    pub fn unauthorized(m: impl Into<String>) -> Self { Self::new(ErrorCode::Unauthorized, m) }
-    pub fn forbidden(m: impl Into<String>) -> Self { Self::new(ErrorCode::Forbidden, m) }
-    pub fn not_found(m: impl Into<String>) -> Self { Self::new(ErrorCode::NotFound, m) }
-    pub fn conflict(m: impl Into<String>) -> Self { Self::new(ErrorCode::Conflict, m) }
-    pub fn quota(m: impl Into<String>) -> Self { Self::new(ErrorCode::QuotaExceeded, m) }
-    pub fn unprocessable(m: impl Into<String>) -> Self { Self::new(ErrorCode::Unprocessable, m) }
-    pub fn internal(m: impl Into<String>) -> Self { Self::new(ErrorCode::Internal, m) }
-    pub fn unavailable(m: impl Into<String>) -> Self { Self::new(ErrorCode::Unavailable, m) }
-    pub fn not_implemented(m: impl Into<String>) -> Self { Self::new(ErrorCode::NotImplemented, m) }
-    pub fn status(&self) -> StatusCode { self.code.status() }
+    pub fn bad_request(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::BadRequest, m)
+    }
+    pub fn unauthorized(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unauthorized, m)
+    }
+    pub fn forbidden(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Forbidden, m)
+    }
+    pub fn not_found(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NotFound, m)
+    }
+    pub fn conflict(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Conflict, m)
+    }
+    pub fn quota(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::QuotaExceeded, m)
+    }
+    pub fn unprocessable(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unprocessable, m)
+    }
+    pub fn internal(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Internal, m)
+    }
+    pub fn unavailable(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unavailable, m)
+    }
+    pub fn not_implemented(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NotImplemented, m)
+    }
+    pub fn status(&self) -> StatusCode {
+        self.code.status()
+    }
 }
 
 #[derive(Serialize)]

@@ -16,4 +16,5 @@ pub mod resource;
 
 pub use error::{ApiError, ApiResult};
 pub use module::{Module, ModuleContext, ModuleInfo};
+pub use resource::Spec;
 pub use resource::*;

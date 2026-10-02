@@ -7,14 +7,15 @@ Each phase ends at a gate an outside tool decides.
 - [x] Cargo workspace, `pistack` binary, gateway, discovery document
 - [x] `pistack-types`: resource model, errors, Module contract
 - [x] `pistack-store`: redb-backed typed collections with name index, revisions, events
-- [ ] `pistack-policy`: rule language + evaluator
-- [ ] `pistack-config`: TOML + env + flags
-- [ ] `pistack-rpc`: host RPC (gRPC) and event bus
-- [ ] `gate`: projects, principals, roles, tokens, quotas; auth layer on the gateway
+- [x] `pistack-policy`: rule language + evaluator
+- [x] `pistack-config`: TOML + env + flags
+- [x] `pistack-rpc`: host command queue (HTTP long-poll) and event bus
+- [x] `gate`: projects, principals, roles, tokens, API keys, quotas; auth layer on the gateway; `--dev` mode
 - [ ] `keep`: cloud CA, TLS for the gateway and agents, secrets CRUD
-- [ ] `forge` + `anvil`: Host registration, Machine CRUD, scheduler, a `mock` driver that "runs" machines
-- [ ] `fabric`: Network/Subnet/Port/SecurityGroup model with a mock backend
-- [ ] `slab` + `mold`: Volume and Image model with local-file backends
+- [x] `forge`: Host/Size/Machine, scheduler, reconciler, mock driver (agent bridge pending)
+- [x] `anvil`: host facts, runtime trait with mock (agent loop pending)
+- [x] `fabric`: Network/Subnet/Port/Router/SecurityGroup/FloatingIp, IPAM, mock backend, OVN mapping documented
+- [x] `slab` + `mold`: Volume/Snapshot/Backup and Image with real local-file backends, qcow2 safety checks
 - [ ] `bench`: `pi` CLI covering the above
 - Gate: `pistack server --init` + `pistack agent --join` on one box; `pi machine create` reaches Ready on the mock driver; integration test in CI.
 

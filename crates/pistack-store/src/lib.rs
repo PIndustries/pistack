@@ -91,8 +91,15 @@ pub trait Backend: Send + Sync + 'static {
 
 #[derive(Debug, Clone)]
 pub enum Op {
-    Put { table: String, key: String, value: Vec<u8> },
-    Delete { table: String, key: String },
+    Put {
+        table: String,
+        key: String,
+        value: Vec<u8>,
+    },
+    Delete {
+        table: String,
+        key: String,
+    },
 }
 
 /// redb-backed `Backend`.
@@ -115,8 +122,7 @@ impl RedbBackend {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let db = Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())?;
+        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
         let tx = db.begin_write()?;
         {
             tx.open_table(RESOURCES)?;
@@ -148,12 +154,19 @@ impl Backend for RedbBackend {
     }
 
     fn put(&self, table: &str, key: &str, value: &[u8]) -> Result<()> {
-        self.batch(vec![Op::Put { table: table.into(), key: key.into(), value: value.to_vec() }])
+        self.batch(vec![Op::Put {
+            table: table.into(),
+            key: key.into(),
+            value: value.to_vec(),
+        }])
     }
 
     fn delete(&self, table: &str, key: &str) -> Result<bool> {
         let existed = self.get(table, key)?.is_some();
-        self.batch(vec![Op::Delete { table: table.into(), key: key.into() }])?;
+        self.batch(vec![Op::Delete {
+            table: table.into(),
+            key: key.into(),
+        }])?;
         Ok(existed)
     }
 
@@ -238,7 +251,11 @@ pub struct Store {
 
 impl Store {
     pub fn new(backend: Arc<dyn Backend>, events: broadcast::Sender<Event>) -> Self {
-        Self { backend, events, write_lock: Arc::new(RwLock::new(())) }
+        Self {
+            backend,
+            events,
+            write_lock: Arc::new(RwLock::new(())),
+        }
     }
 
     pub fn open(path: impl AsRef<Path>, events: broadcast::Sender<Event>) -> Result<Self> {
@@ -260,7 +277,10 @@ impl Store {
     }
 
     pub fn collection<K: Kind>(&self) -> Collection<K> {
-        Collection { store: self.clone(), _k: std::marker::PhantomData }
+        Collection {
+            store: self.clone(),
+            _k: std::marker::PhantomData,
+        }
     }
 
     // ---- small typed values -------------------------------------------------
@@ -295,7 +315,10 @@ pub struct Collection<K: Kind> {
 
 impl<K: Kind> Clone for Collection<K> {
     fn clone(&self) -> Self {
-        Self { store: self.store.clone(), _k: std::marker::PhantomData }
+        Self {
+            store: self.store.clone(),
+            _k: std::marker::PhantomData,
+        }
     }
 }
 
@@ -361,7 +384,11 @@ impl<K: Kind> Collection<K> {
         Ok(self
             .list(project)?
             .into_iter()
-            .filter(|k| labels.iter().all(|(lk, lv)| k.meta().labels.get(lk) == Some(lv)))
+            .filter(|k| {
+                labels
+                    .iter()
+                    .all(|(lk, lv)| k.meta().labels.get(lk) == Some(lv))
+            })
             .collect())
     }
 
@@ -381,8 +408,16 @@ impl<K: Kind> Collection<K> {
         }
         let rk = Store::res_key(K::KIND, &meta.id);
         self.store.backend.batch(vec![
-            Op::Put { table: "resources".into(), key: rk, value: serde_json::to_vec(&item)? },
-            Op::Put { table: "names".into(), key: nk, value: meta.id.to_string().into_bytes() },
+            Op::Put {
+                table: "resources".into(),
+                key: rk,
+                value: serde_json::to_vec(&item)?,
+            },
+            Op::Put {
+                table: "names".into(),
+                key: nk,
+                value: meta.id.to_string().into_bytes(),
+            },
         ])?;
         self.emit(&meta, EventAction::Created);
         Ok(item)
@@ -395,13 +430,20 @@ impl<K: Kind> Collection<K> {
         let cur_rev = current.meta().revision;
         if let Some(exp) = expected_revision {
             if exp != cur_rev {
-                return Err(StoreError::Revision { expected: exp, found: cur_rev });
+                return Err(StoreError::Revision {
+                    expected: exp,
+                    found: cur_rev,
+                });
             }
         }
         let mut ops = Vec::new();
         // Rename support: move the name index entry.
         if current.meta().name != item.meta().name {
-            let old = Store::name_key(K::KIND, current.meta().project.as_ref(), &current.meta().name);
+            let old = Store::name_key(
+                K::KIND,
+                current.meta().project.as_ref(),
+                &current.meta().name,
+            );
             let new = Store::name_key(K::KIND, item.meta().project.as_ref(), &item.meta().name);
             if self.store.backend.get("names", &new)?.is_some() {
                 return Err(StoreError::Conflict(format!(
@@ -410,7 +452,10 @@ impl<K: Kind> Collection<K> {
                     item.meta().name
                 )));
             }
-            ops.push(Op::Delete { table: "names".into(), key: old });
+            ops.push(Op::Delete {
+                table: "names".into(),
+                key: old,
+            });
             ops.push(Op::Put {
                 table: "names".into(),
                 key: new,
@@ -445,7 +490,10 @@ impl<K: Kind> Collection<K> {
                 Err(e) => return Err(e),
             }
         }
-        Err(StoreError::Conflict(format!("{} {id}: too many concurrent writers", K::KIND)))
+        Err(StoreError::Conflict(format!(
+            "{} {id}: too many concurrent writers",
+            K::KIND
+        )))
     }
 
     pub fn delete(&self, id: &Id) -> Result<K> {
@@ -453,7 +501,10 @@ impl<K: Kind> Collection<K> {
         let cur = self.get(id)?;
         let meta = cur.meta().clone();
         self.store.backend.batch(vec![
-            Op::Delete { table: "resources".into(), key: Store::res_key(K::KIND, id) },
+            Op::Delete {
+                table: "resources".into(),
+                key: Store::res_key(K::KIND, id),
+            },
             Op::Delete {
                 table: "names".into(),
                 key: Store::name_key(K::KIND, meta.project.as_ref(), &meta.name),
@@ -502,14 +553,8 @@ mod tests {
         ready: bool,
     }
     type Widget = Resource<WidgetSpec, WidgetStatus>;
-    impl Kind for Widget {
+    impl pistack_types::Spec for WidgetSpec {
         const KIND: &'static str = "widget";
-        fn meta(&self) -> &Meta {
-            &self.meta
-        }
-        fn meta_mut(&mut self) -> &mut Meta {
-            &mut self.meta
-        }
     }
 
     fn widget(name: &str, project: Option<Id>) -> Widget {
@@ -527,7 +572,10 @@ mod tests {
         let proj = Id::new(kind::PROJECT);
         let w = col.create(widget("a", Some(proj.clone()))).unwrap();
         assert_eq!(col.get(&w.meta.id).unwrap().spec.size, 1);
-        assert_eq!(col.get_by_name(Some(&proj), "a").unwrap().meta.id, w.meta.id);
+        assert_eq!(
+            col.get_by_name(Some(&proj), "a").unwrap().meta.id,
+            w.meta.id
+        );
         assert!(matches!(
             col.create(widget("a", Some(proj.clone()))),
             Err(StoreError::Conflict(_))
@@ -538,13 +586,24 @@ mod tests {
         assert_eq!(col.list(Some(&proj)).unwrap().len(), 1);
         assert_eq!(col.list(None).unwrap().len(), 2);
 
-        let updated = col.modify(&w.meta.id, |x| { x.spec.size = 5; Ok(()) }).unwrap();
+        let updated = col
+            .modify(&w.meta.id, |x| {
+                x.spec.size = 5;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(updated.meta.revision, 2);
-        assert!(matches!(col.update(w.clone(), Some(1)), Err(StoreError::Revision { .. })));
+        assert!(matches!(
+            col.update(w.clone(), Some(1)),
+            Err(StoreError::Revision { .. })
+        ));
 
         col.delete(&w.meta.id).unwrap();
         assert!(matches!(col.get(&w.meta.id), Err(StoreError::NotFound(_))));
-        assert!(matches!(col.get_by_name(Some(&proj), "a"), Err(StoreError::NotFound(_))));
+        assert!(matches!(
+            col.get_by_name(Some(&proj), "a"),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -565,7 +624,9 @@ mod tests {
         let (tx, _) = broadcast::channel(8);
         {
             let s = Store::open(&path, tx.clone()).unwrap();
-            s.collection::<Widget>().create(widget("disk", None)).unwrap();
+            s.collection::<Widget>()
+                .create(widget("disk", None))
+                .unwrap();
             s.put_meta("cluster_id", &"abc").unwrap();
         }
         let s = Store::open(&path, tx).unwrap();
