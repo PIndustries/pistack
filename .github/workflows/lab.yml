@@ -1,0 +1,41 @@
+# Runs on the bare-metal lab nodes (self-hosted runners registered with
+# scripts/lab-bootstrap.sh --runner). Hosted CI (ci.yml) covers unit tests;
+# this covers what only real hardware can: KVM, libvirt, OVN, LVM.
+name: lab
+on:
+  push:
+    branches: [main, "lab/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [pistack-lab]
+    runs-on: [self-hosted, pistack-lab]
+    steps:
+      - uses: actions/checkout@v4
+      - name: hardware report
+        run: sudo ./scripts/lab-bootstrap.sh --report
+      - name: build
+        run: |
+          source ~/.cargo/env
+          cargo build --release -p pistack -p bench
+      - name: unit + integration tests
+        run: |
+          source ~/.cargo/env
+          cargo test --workspace --release
+      - name: smoke (server + agent on this node)
+        run: |
+          source ~/.cargo/env
+          ./scripts/lab-smoke.sh target/release
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-logs-${{ runner.name }}
+          path: /tmp/pistack-lab/*.log
