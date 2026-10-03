@@ -1,0 +1,503 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 P. Industries LLC and PiStack contributors
+
+//! Drive `bench::cli::run` against a tiny in-process axum server that
+//! speaks just enough of the PiStack API: `/identity/tokens`, `/compute/
+//! machines` and `/identity/tokens/self`.
+
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use bench::cli::{self, Io};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+
+const TOKEN: &str = "tok-secret-123";
+
+#[derive(Clone, Default)]
+struct Mock {
+    machines: Arc<Mutex<BTreeMap<String, Value>>>,
+    polls: Arc<Mutex<u32>>,
+}
+
+fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
+    (
+        status,
+        Json(json!({"error": {"code": code, "message": msg, "details": {}}})),
+    )
+        .into_response()
+}
+
+fn authed(h: &HeaderMap) -> bool {
+    h.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == format!("Bearer {TOKEN}"))
+}
+
+async fn login(Json(body): Json<Value>) -> axum::response::Response {
+    if body["name"] == "admin" && body["password"] == "x" {
+        Json(json!({
+            "token": TOKEN,
+            "token_type": "Bearer",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "caller": {
+                "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+                "principal_name": "admin",
+                "project": "proj-0199a5e0-2222-7000-8000-000000000002",
+                "roles": ["admin"],
+                "system": true
+            }
+        }))
+        .into_response()
+    } else {
+        err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid credentials",
+        )
+    }
+}
+
+async fn whoami(h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    Json(json!({
+        "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+        "principal_name": "admin",
+        "project": null,
+        "roles": ["admin"],
+        "system": true
+    }))
+    .into_response()
+}
+
+async fn list(State(m): State<Mock>, h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let items: Vec<Value> = m.machines.lock().unwrap().values().cloned().collect();
+    let total = items.len();
+    Json(json!({"items": items, "total": total})).into_response()
+}
+
+async fn create(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let name = body["name"].as_str().unwrap_or("").to_owned();
+    if body["spec"]["size"].as_str().unwrap_or("").is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "spec.size is required",
+        );
+    }
+    if body["spec"]["size"] == "huge" {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "size 'huge' not found",
+        );
+    }
+    let mut machines = m.machines.lock().unwrap();
+    if machines.contains_key(&name) {
+        return err(StatusCode::CONFLICT, "conflict", "machine already exists");
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let v = json!({
+        "id": format!("mach-0199a5e0-aaaa-7000-8000-{:012}", machines.len() + 1),
+        "name": name,
+        "project": "proj-0199a5e0-2222-7000-8000-000000000002",
+        "created_at": now, "updated_at": now, "revision": 1,
+        "spec": body["spec"],
+        "status": {"phase": "pending", "power": "unknown", "addresses": []}
+    });
+    machines.insert(name, v.clone());
+    (StatusCode::CREATED, Json(v)).into_response()
+}
+
+fn find(machines: &BTreeMap<String, Value>, id: &str) -> Option<Value> {
+    machines
+        .get(id)
+        .cloned()
+        .or_else(|| machines.values().find(|v| v["id"] == id).cloned())
+}
+
+/// Each GET moves the machine one phase along: pending -> creating -> ready.
+async fn show(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let mut machines = m.machines.lock().unwrap();
+    let Some(mut v) = find(&machines, &id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("mach '{id}' not found"),
+        );
+    };
+    *m.polls.lock().unwrap() += 1;
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    let next = match v["status"]["phase"].as_str() {
+        Some("pending") => "creating".to_owned(),
+        Some("creating") => "ready".to_owned(),
+        other => other.unwrap_or("ready").to_owned(),
+    };
+    v["status"]["phase"] = json!(next);
+    if next == "ready" {
+        v["status"]["power"] = json!("on");
+        v["status"]["addresses"] = json!(["10.1.0.7"]);
+    }
+    machines.insert(name, v.clone());
+    Json(v).into_response()
+}
+
+async fn delete(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let mut machines = m.machines.lock().unwrap();
+    let Some(v) = find(&machines, &id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("mach '{id}' not found"),
+        );
+    };
+    machines.remove(v["name"].as_str().unwrap_or(""));
+    (StatusCode::ACCEPTED, Json(v)).into_response()
+}
+
+async fn start(State(m): State<Mock>, Path(id): Path<String>) -> axum::response::Response {
+    let machines = m.machines.lock().unwrap();
+    match find(&machines, &id) {
+        Some(v) => Json(v).into_response(),
+        None => err(StatusCode::NOT_FOUND, "not_found", "no such machine"),
+    }
+}
+
+async fn discovery() -> Json<Value> {
+    Json(json!({
+        "name": "pistack", "version": "0.1.0-test", "public_url": "http://mock", "dev_mode": false,
+        "modules": [
+            {"name": "gate", "prefix": "identity", "summary": "Identity", "version": "0.1.0", "url": "http://mock/identity"},
+            {"name": "forge", "prefix": "compute", "summary": "Machines", "version": "0.1.0", "url": "http://mock/compute"}
+        ]
+    }))
+}
+
+async fn serve() -> (String, Mock) {
+    let mock = Mock::default();
+    let app = Router::new()
+        .route("/", get(discovery))
+        .route("/identity/tokens", post(login))
+        .route("/identity/tokens/self", get(whoami))
+        .route("/compute/machines", get(list).post(create))
+        .route("/compute/machines/{id}", get(show).delete(delete))
+        .route("/compute/machines/{id}/start", post(start))
+        .with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), mock)
+}
+
+#[derive(Debug)]
+struct Run {
+    code: i32,
+    out: String,
+    err: String,
+}
+
+async fn pi(config: &std::path::Path, stdin: &str, args: &[&str]) -> Run {
+    let mut argv = vec![
+        "pi".to_owned(),
+        "--config".to_owned(),
+        config.display().to_string(),
+    ];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    let mut input = Cursor::new(stdin.as_bytes().to_vec());
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = {
+        let mut io = Io {
+            stdin: &mut input,
+            stdout: &mut out,
+            stderr: &mut err,
+            tty: false,
+        };
+        cli::run(argv, &mut io).await.expect("run")
+    };
+    Run {
+        code,
+        out: String::from_utf8(out).unwrap(),
+        err: String::from_utf8(err).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn login_then_machines_end_to_end() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+
+    // Unauthenticated use is a usage error with a login hint.
+    let r = pi(&cfg, "", &["machine", "list"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(
+        r.err.starts_with("error: no server configured"),
+        "{}",
+        r.err
+    );
+
+    // Wrong password: the error envelope is parsed and printed.
+    let r = pi(
+        &cfg,
+        "wrong\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 1);
+    assert_eq!(r.err.lines().next().unwrap(), "error: invalid credentials");
+    assert!(
+        r.err.contains("hint: your token is missing or expired"),
+        "{}",
+        r.err
+    );
+
+    // Login stores the token under the default profile.
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.contains("logged in to") && r.out.contains("as admin"),
+        "{}",
+        r.out
+    );
+    let saved = cli::Config::load(&cfg).unwrap();
+    assert_eq!(saved.current().unwrap().token.as_deref(), Some(TOKEN));
+    assert_eq!(saved.current().unwrap().url, url);
+
+    let r = pi(&cfg, "", &["profile", "list"]).await;
+    assert_eq!(r.code, 0);
+    assert!(
+        r.out.contains("default") && r.out.contains(&url),
+        "{}",
+        r.out
+    );
+
+    let r = pi(&cfg, "", &["whoami"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("principal  admin"), "{}", r.out);
+
+    let r = pi(&cfg, "", &["modules"]).await;
+    assert_eq!(r.code, 0);
+    assert!(
+        r.out.contains("forge") && r.out.contains("/compute"),
+        "{}",
+        r.out
+    );
+
+    // Empty list: only the header.
+    let r = pi(&cfg, "", &["machine", "list"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out.lines().count(), 1);
+    assert!(r.out.starts_with("NAME  ID  PHASE"), "{}", r.out);
+
+    // Create with --wait prints one line per phase change.
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine",
+            "create",
+            "web",
+            "--size",
+            "m.2x4",
+            "--image",
+            "ubuntu",
+            "--network",
+            "lan",
+            "--kind",
+            "container",
+            "--label",
+            "tier=web",
+            "--wait",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert!(
+        lines[0].starts_with("machine \"web\" created (mach-00000001)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(lines[1], "machine \"web\": creating");
+    assert_eq!(lines[2], "machine \"web\": ready");
+    assert_eq!(lines.len(), 3);
+    let stored = mock.machines.lock().unwrap()["web"].clone();
+    assert_eq!(stored["spec"]["kind"], "container");
+    assert_eq!(stored["spec"]["networks"], json!(["lan"]));
+    assert!(
+        stored["spec"].get("user_data").is_none(),
+        "nulls must be dropped"
+    );
+
+    // Table and name output.
+    let r = pi(&cfg, "", &["machine", "list"]).await;
+    assert_eq!(r.code, 0);
+    assert!(
+        r.out
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("web   mach-00000001  ready"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("10.1.0.7"));
+    let r = pi(&cfg, "", &["machine", "list", "-o", "name"]).await;
+    assert_eq!(r.out, "web\n");
+    let r = pi(&cfg, "", &["-o", "json", "machine", "show", "web"]).await;
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v["name"], "web");
+
+    // Server-side validation error -> exit 1, message on stderr, nothing on stdout.
+    let r = pi(
+        &cfg,
+        "",
+        &["machine", "create", "big", "--size", "huge", "--image", "u"],
+    )
+    .await;
+    assert_eq!(r.code, 1);
+    assert_eq!(r.err.trim(), "error: size 'huge' not found");
+    assert!(r.out.is_empty());
+
+    // Action endpoint.
+    let r = pi(&cfg, "", &["machine", "start", "web"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.starts_with("machine \"web\" start requested"),
+        "{}",
+        r.out
+    );
+
+    // Delete without --yes and no tty refuses; with --yes it goes.
+    let r = pi(&cfg, "", &["machine", "delete", "web"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("--yes"), "{}", r.err);
+    let r = pi(&cfg, "", &["machine", "delete", "web", "--yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out.trim(), "machine \"web\" deletion requested");
+    let r = pi(&cfg, "", &["machine", "show", "web"]).await;
+    assert_eq!(r.code, 1);
+    assert_eq!(r.err.trim(), "error: mach 'web' not found");
+
+    // A bad token is a 401 with the login hint.
+    let r = pi(&cfg, "", &["--token", "nope", "machine", "list"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("error: no credentials"), "{}", r.err);
+    assert!(r.err.contains(&format!("pi login {url}")), "{}", r.err);
+
+    // Raw API access.
+    let r = pi(&cfg, "", &["api", "GET", "/"]).await;
+    assert_eq!(r.code, 0);
+    assert!(r.out.contains("\"name\": \"pistack\""));
+    let r = pi(&cfg, "", &["version"]).await;
+    assert_eq!(r.code, 0);
+    assert!(r.out.contains("pistack 0.1.0-test"), "{}", r.out);
+}
+
+#[tokio::test]
+async fn apply_creates_then_updates() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let manifest = dir.path().join("m.yaml");
+    std::fs::write(
+        &manifest,
+        "kind: Machine\nname: app\nlabels: {a: b}\nspec:\n  size: s.1x1\n  image: alpine\n",
+    )
+    .unwrap();
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let r = pi(&cfg, "", &["apply", "-f", manifest.to_str().unwrap()]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.starts_with("machine \"app\" created"), "{}", r.out);
+    assert_eq!(
+        mock.machines.lock().unwrap()["app"]["spec"]["image"],
+        "alpine"
+    );
+    // Manifest from stdin, unknown kind is rejected cleanly.
+    let r = pi(&cfg, "kind: widget\nname: w\n", &["apply", "-f", "-"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("unknown kind 'widget'"), "{}", r.err);
+}
+
+#[tokio::test]
+async fn env_and_flags_override_profile() {
+    let (url, _mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    // No profile at all: --url and --token are enough.
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "machine",
+            "list",
+            "--no-headers",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.is_empty(), "{}", r.out);
+}
+
+#[tokio::test]
+async fn usage_errors_and_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let r = pi(&cfg, "", &["machine", "create"]).await;
+    assert_eq!(r.code, 2);
+    assert!(r.err.contains("--size"), "{}", r.err);
+    let r = pi(&cfg, "", &["--help"]).await;
+    assert_eq!(r.code, 0);
+    assert!(r.out.contains("pi login"), "{}", r.out);
+    let r = pi(&cfg, "", &["completion", "bash"]).await;
+    assert_eq!(r.code, 0);
+    assert!(r.out.contains("_pi"), "{}", r.out);
+}

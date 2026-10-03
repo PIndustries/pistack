@@ -1,6 +1,6 @@
 [package]
 name = "relay"
-description = "Load balancers and ingress"
+description = "Load balancers: L4 via OVN, L7 via Pingora (planned)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 pistack-types.workspace = true
 pistack-store.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +19,8 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+tokio-util.workspace = true

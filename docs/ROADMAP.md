@@ -11,13 +11,17 @@ Each phase ends at a gate an outside tool decides.
 - [x] `pistack-config`: TOML + env + flags
 - [x] `pistack-rpc`: host command queue (HTTP long-poll) and event bus
 - [x] `gate`: projects, principals, roles, tokens, API keys, quotas; auth layer on the gateway; `--dev` mode
-- [ ] `keep`: cloud CA, TLS for the gateway and agents, secrets CRUD
-- [x] `forge`: Host/Size/Machine, scheduler, reconciler, mock driver (agent bridge pending)
-- [x] `anvil`: host facts, runtime trait with mock (agent loop pending)
+- [x] `keep`: cloud CA (root + issuing), encrypted secrets, certificates, join tokens, rustls server/client configs (gateway TLS wiring pending)
+- [x] `forge`: Host/Size/Machine, scheduler, reconciler, mock driver, RpcDriver + agent registrar
+- [x] `anvil`: host facts, runtime trait with mock, real `pistack agent --join` loop
+- [x] `loom`: Pod/ReplicaSet/Deployment/Service/ConfigMap/Job/CronJob/Ingress with six controllers on top of forge
+- [x] `beacon`: zones, recordsets, authoritative DNS server (hickory), auto-records for machines
+- [x] `relay`: balancers, listeners, pools, members, health checker, mock provider, OVN/Pingora mapping documented
 - [x] `fabric`: Network/Subnet/Port/Router/SecurityGroup/FloatingIp, IPAM, mock backend, OVN mapping documented
 - [x] `slab` + `mold`: Volume/Snapshot/Backup and Image with real local-file backends, qcow2 safety checks
-- [ ] `bench`: `pi` CLI covering the above
-- Gate: `pistack server --init` + `pistack agent --join` on one box; `pi machine create` reaches Ready on the mock driver; integration test in CI.
+- [x] `bench`: `pi` CLI covering 18 nouns, login/profiles, apply, completions
+- [x] Gate reached 2026-10-02: `pistack server --init` + `pistack agent --join` in separate processes; `pi machine create --wait` reaches Ready on the agent's mock runtime; volumes attach; secrets and certs issue; a Deployment produces Running pods. 233 tests in CI.
+- [ ] Remaining Phase 0 polish: TLS on the gateway via keep, mTLS/join-token auth on `/rpc`, `silo`, `shelf`, `gauge`, `blueprint` beyond scaffold, k8s-API decision for loom
 
 ## Phase 1 — Bootable cloud
 

@@ -84,6 +84,13 @@ dashmap = "6"
 parking_lot = "0.12"
 bytes = "1"
 tempfile = "3"
+comfy-table = "7"
+dirs = "6"
+rpassword = "7"
+clap_complete = "4"
+# dns (beacon)
+hickory-server = "0.26"
+hickory-proto = "0.26"
 
 # internal crates
 pistack-types = { path = "crates/pistack-types" }
@@ -106,6 +113,11 @@ keep = { path = "crates/keep" }
 blueprint = { path = "crates/blueprint" }
 gauge = { path = "crates/gauge" }
 bench = { path = "crates/bench" }
+# keep: certificate parsing, PEM, at-rest encryption, TLS plumbing
+x509-parser = "0.18"
+pem = "3"
+aes-gcm = "0.10"
+tokio-rustls = "0.26"
 
 [profile.release]
 lto = "thin"

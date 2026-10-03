@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+pistack-rpc.workspace = true
+tokio-util.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true

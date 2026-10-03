@@ -23,15 +23,19 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use pistack_types::Resources;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::error::RpcError;
 use crate::proto::{
-    AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat, HeartbeatAck, HelloAck,
-    MachineReport, MAX_LONG_POLL_SECS,
+    AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat,
+    HeartbeatAck, HelloAck, MachineReport, MAX_LONG_POLL_SECS,
 };
+
+/// Capacity of the [`AgentEvent`] broadcast; a subscriber this far behind
+/// sees `Lagged` and should resync from [`CommandQueue::nodes`].
+pub const AGENT_EVENT_CAPACITY: usize = 1024;
 
 /// Tunables for [`CommandQueue`].
 #[derive(Clone, Debug)]
@@ -126,6 +130,7 @@ struct State {
 struct Inner {
     cfg: QueueConfig,
     state: Mutex<State>,
+    agent_events: broadcast::Sender<AgentEvent>,
 }
 
 /// Per-node command queues with pending/ack tracking. Clone freely; all
@@ -189,14 +194,27 @@ impl Ticket {
 
 impl CommandQueue {
     pub fn new(cfg: QueueConfig) -> Self {
+        let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
         Self(Arc::new(Inner {
             cfg,
             state: Mutex::new(State::default()),
+            agent_events,
         }))
     }
 
     pub fn config(&self) -> &QueueConfig {
         &self.0.cfg
+    }
+
+    /// Every hello and heartbeat the queue records, as it records it.
+    /// `forge` uses this to register hosts and refresh `last_seen`.
+    pub fn subscribe_agent_events(&self) -> broadcast::Receiver<AgentEvent> {
+        self.0.agent_events.subscribe()
+    }
+
+    fn emit(&self, ev: AgentEvent) {
+        // No subscribers is normal (tests, a bare queue); not an error.
+        let _ = self.0.agent_events.send(ev);
     }
 
     fn entry<'a>(&self, st: &'a mut State, node: &str) -> &'a mut NodeEntry {
@@ -224,6 +242,7 @@ impl CommandQueue {
             e.info.last_hello = Some(now);
         }
         tracing::info!(node = %hello.node_name, version = %hello.version, "agent hello");
+        self.emit(AgentEvent::Hello(hello.clone()));
         HelloAck {
             node_name: hello.node_name.clone(),
             server_time: now,
@@ -243,6 +262,8 @@ impl CommandQueue {
         e.info.last_heartbeat = Some(now);
         let known = e.info.last_hello.is_some();
         let commands_waiting = self.0.cfg.capacity - e.tx.capacity();
+        drop(st);
+        self.emit(AgentEvent::Heartbeat(hb.clone()));
         HeartbeatAck {
             server_time: now,
             commands_waiting,
@@ -778,5 +799,30 @@ mod tests {
         assert_eq!(info.resources_free.vcpus, 6);
         assert!(info.last_hello.is_some() && info.last_heartbeat.is_some());
         assert_eq!(info.queued, 1);
+    }
+
+    #[tokio::test]
+    async fn hello_and_heartbeat_are_broadcast() {
+        let q = CommandQueue::new(cfg(60));
+        let mut rx = q.subscribe_agent_events();
+        let hello = AgentHello {
+            node_name: "n1".into(),
+            capabilities: vec!["mock".into()],
+            resources: Resources::default(),
+            version: String::new(),
+            labels: Default::default(),
+        };
+        q.hello(&hello);
+        let hb = Heartbeat {
+            node_name: "n1".into(),
+            resources_free: Resources::default(),
+            machines: vec![],
+            at: Utc::now(),
+        };
+        q.heartbeat(&hb);
+        assert_eq!(rx.recv().await.unwrap(), AgentEvent::Hello(hello));
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.node_name(), "n1");
+        assert_eq!(got, AgentEvent::Heartbeat(hb));
     }
 }

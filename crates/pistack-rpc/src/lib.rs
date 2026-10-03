@@ -26,8 +26,9 @@ pub use client::AgentClient;
 pub use error::RpcError;
 pub use events::{EventBus, EventStream};
 pub use proto::{
-    AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat, HeartbeatAck, HelloAck,
-    MachineReport, ReportAck,
+    AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat,
+    HeartbeatAck, HelloAck, MachineKind, MachineRef, MachineReport, MachineRequest, PowerState,
+    ReportAck, RunningMachine,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
 pub use server::router;
@@ -128,6 +129,7 @@ mod loopback {
                     message: String::new(),
                     resources: None,
                     addresses: vec!["10.0.0.5".into()],
+                    power: None,
                 }],
                 at: Utc::now(),
             })

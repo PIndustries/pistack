@@ -38,12 +38,14 @@ pub struct Assembly {
 pub fn assemble(dev: bool) -> Assembly {
     let gate_m = Arc::new(gate::Gate::default());
     let registry = Arc::new(forge::DriverRegistry::new());
-    let forge_m = Arc::new(if dev {
-        forge::Forge::default()
-    } else {
-        forge::Forge::with_registry(registry)
-    });
     let queue = CommandQueue::new(QueueConfig::default());
+    // Agents that join through `/rpc` become forge hosts via its registrar;
+    // dev mode additionally keeps the in-process mock `local` host.
+    let forge_m = Arc::new(
+        forge::Forge::with_queue(registry, queue.clone())
+            .local_host(dev)
+            .dev_admin(dev),
+    );
 
     let modules: Vec<Arc<dyn Module>> = vec![
         gate_m.clone(),
@@ -54,9 +56,9 @@ pub fn assemble(dev: bool) -> Assembly {
         Arc::new(mold::Mold::default()),
         Arc::new(silo::Silo),
         Arc::new(shelf::Shelf),
-        Arc::new(beacon::Beacon),
-        Arc::new(relay::Relay),
-        Arc::new(keep::Keep),
+        Arc::new(beacon::Beacon::default()),
+        Arc::new(relay::Relay::default()),
+        Arc::new(keep::Keep::default()),
         Arc::new(blueprint::Blueprint),
         Arc::new(gauge::Gauge),
         Arc::new(bench::Bench),
@@ -131,7 +133,14 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
     let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev);
 
-    tracing::info!(listen = %opts.listen, public_url = %public_url, modules = asm.modules.len(), "pistack server up");
+    tracing::info!(
+        listen = %opts.listen,
+        public_url = %public_url,
+        modules = asm.modules.len(),
+        identity = asm.gate.info().version,
+        agent_rpc = asm.forge.queue().is_some(),
+        "pistack server up"
+    );
     let listener = tokio::net::TcpListener::bind(&opts.listen).await?;
     if !opts.insecure_http {
         tracing::warn!("TLS not wired yet (keep is next); serving plain HTTP. Pass --insecure-http to silence this.");

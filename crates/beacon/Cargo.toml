@@ -1,6 +1,6 @@
 [package]
 name = "beacon"
-description = "DNS zones and records"
+description = "DNS zones and records, served by an embedded authoritative server (hickory)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 pistack-types.workspace = true
 pistack-store.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +19,10 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true
+hickory-server.workspace = true
+hickory-proto.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+tokio-util.workspace = true

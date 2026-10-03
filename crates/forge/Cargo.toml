@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+pistack-rpc.workspace = true
+tokio-util.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -23,4 +25,5 @@ parking_lot.workspace = true
 [dev-dependencies]
 tower.workspace = true
 http-body-util = "0.1"
-tokio-util.workspace = true
+anvil.workspace = true
+reqwest.workspace = true

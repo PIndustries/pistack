@@ -16,7 +16,7 @@
 //! for gRPC later without touching the queue or the modules.
 
 use chrono::{DateTime, Utc};
-use pistack_types::{Id, Phase, Resources};
+use pistack_types::{ApiError, Id, Phase, Resources};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -76,6 +76,92 @@ pub struct MachineReport {
     pub resources: Option<Resources>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+    /// Observed power state, when the runtime knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerState>,
+}
+
+// ---- machine command payloads ---------------------------------------------
+//
+// `forge` builds these from its `Machine` resource and `anvil` executes them
+// with a `MachineRuntime`; neither crate depends on the other, so the shape
+// they agree on lives here.
+
+/// What kind of machine a request is for. Mirrors `forge::MachineKind`.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineKind {
+    #[default]
+    Vm,
+    Container,
+    Metal,
+}
+
+/// Observed power state of a machine. Mirrors `forge::PowerState`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerState {
+    On,
+    Off,
+    #[default]
+    Unknown,
+}
+
+/// Payload of [`CommandKind::StartMachine`]: everything a runtime needs to
+/// bring a machine up.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineRequest {
+    pub id: Id,
+    pub name: String,
+    #[serde(default)]
+    pub kind: MachineKind,
+    pub image: String,
+    #[serde(default)]
+    pub resources: Resources,
+    #[serde(default)]
+    pub networks: Vec<String>,
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_data: Option<String>,
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
+}
+
+/// Payload of [`CommandKind::StopMachine`] and [`CommandKind::DeleteMachine`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineRef {
+    pub id: Id,
+}
+
+/// Result payload of a successful [`CommandKind::StartMachine`]: what the
+/// runtime reports about the machine it now holds.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningMachine {
+    pub id: Id,
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    #[serde(default)]
+    pub power: PowerState,
+}
+
+/// Something an agent said, re-broadcast by the control plane so modules
+/// can react (register a host, refresh `last_seen`, reconcile reports).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentEvent {
+    Hello(AgentHello),
+    Heartbeat(Heartbeat),
+}
+
+impl AgentEvent {
+    pub fn node_name(&self) -> &str {
+        match self {
+            AgentEvent::Hello(h) => &h.node_name,
+            AgentEvent::Heartbeat(h) => &h.node_name,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,6 +246,34 @@ impl CommandResult {
     pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
         self.payload = payload;
         self
+    }
+
+    /// A failure carrying the full [`ApiError`] in the payload so the
+    /// issuing module can keep its code (`not_found` vs `unavailable`).
+    pub fn from_api_error(id: CommandId, e: &ApiError) -> Self {
+        Self {
+            id,
+            ok: false,
+            message: e.message.clone(),
+            payload: serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    /// `Ok(())` for a successful result; otherwise the [`ApiError`] the
+    /// agent sent (see [`CommandResult::from_api_error`]), or an
+    /// `internal` error built from `message` when it sent none.
+    pub fn into_api_result(self) -> Result<serde_json::Value, ApiError> {
+        if self.ok {
+            return Ok(self.payload);
+        }
+        match serde_json::from_value::<ApiError>(self.payload.clone()) {
+            Ok(e) => Err(e),
+            Err(_) => Err(ApiError::internal(if self.message.is_empty() {
+                "command failed on host".to_owned()
+            } else {
+                self.message
+            })),
+        }
     }
 }
 

@@ -7,21 +7,25 @@
 //! * [`scheduler`] — pure placement function.
 //! * [`driver`] — `HostDriver` trait, `MockDriver`, `ChannelDriver`,
 //!   `DriverRegistry`: the seam to `anvil` (in-process or over RPC).
+//! * [`agent_driver`] — `RpcDriver` (a `HostDriver` over `pistack-rpc`) and
+//!   the `Registrar` that turns agent hellos into `Host`s.
 //! * [`reconcile`] — the loop that turns `spec` into `status`.
 //! * [`http`] — the `compute` API.
 //!
 //! `Forge::default()` is dev mode: a single `local` host backed by a
 //! `MockDriver` is registered at start so `pi machine create` works on one
-//! box with no agent. Production wiring builds a `DriverRegistry`, hands it
-//! to [`Forge::with_registry`], and registers a driver per host as agents
-//! say hello.
+//! box with no agent. Production wiring builds a `DriverRegistry` and a
+//! `pistack_rpc::CommandQueue`, hands both to [`Forge::with_queue`], and the
+//! registrar registers an `RpcDriver` per host as agents say hello.
 
+pub mod agent_driver;
 pub mod driver;
 pub mod http;
 pub mod reconcile;
 pub mod scheduler;
 pub mod types;
 
+pub use agent_driver::{Registrar, RpcDriver};
 pub use driver::{
     ChannelDriver, DriverCommand, DriverRegistry, DriverReply, DriverRequest, HostDriver,
     MachineRuntime, MockDriver,
@@ -32,6 +36,7 @@ pub use types::*;
 
 use async_trait::async_trait;
 use axum::Router;
+use pistack_rpc::CommandQueue;
 use pistack_store::{Store, StoreError};
 use pistack_types::{Module, ModuleContext, ModuleInfo, Phase, Resources};
 use std::collections::BTreeMap;
@@ -42,6 +47,8 @@ pub const LOCAL_HOST_NAME: &str = "local";
 
 pub struct Forge {
     drivers: Arc<DriverRegistry>,
+    /// Agent transport; when set, a `Registrar` runs from `start`.
+    queue: Option<CommandQueue>,
     /// Register a `local` host with a `MockDriver` at start.
     local_host: bool,
     /// Treat unauthenticated requests as cloud admin.
@@ -54,6 +61,7 @@ impl Default for Forge {
     fn default() -> Self {
         Self {
             drivers: Arc::new(DriverRegistry::new()),
+            queue: None,
             local_host: true,
             dev_admin: true,
             strategy: Strategy::Spread,
@@ -67,10 +75,24 @@ impl Forge {
     pub fn with_registry(registry: Arc<DriverRegistry>) -> Self {
         Self {
             drivers: registry,
+            queue: None,
             local_host: false,
             dev_admin: false,
             strategy: Strategy::Spread,
         }
+    }
+
+    /// Production shape with the agent transport: hosts appear as agents
+    /// say hello on `queue` and are driven through [`RpcDriver`]s.
+    pub fn with_queue(registry: Arc<DriverRegistry>, queue: CommandQueue) -> Self {
+        let mut f = Self::with_registry(registry);
+        f.queue = Some(queue);
+        f
+    }
+
+    /// The command queue the registrar listens on, if any.
+    pub fn queue(&self) -> Option<&CommandQueue> {
+        self.queue.as_ref()
     }
 
     pub fn local_host(mut self, on: bool) -> Self {
@@ -193,6 +215,11 @@ impl Module for Forge {
         if self.local_host {
             let h = self.ensure_local_host(&store, &ctx.node_name)?;
             tracing::info!(host = %h.meta.id, capacity = ?h.spec.capacity, "forge: dev mode, local mock host registered");
+        }
+        if let Some(queue) = &self.queue {
+            let registrar = Registrar::new(store.clone(), self.drivers.clone(), queue.clone());
+            tokio::spawn(registrar.run(ctx.shutdown.clone()));
+            tracing::info!("forge: agent registrar listening");
         }
         let reconciler = Reconciler::new(store, self.drivers.clone(), self.strategy);
         tokio::spawn(reconciler.run(ctx));

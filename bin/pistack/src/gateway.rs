@@ -58,7 +58,11 @@ pub fn build(asm: &Assembly, ctx: ModuleContext, verifier: gate::Verifier, dev: 
         });
         app = app.nest(&format!("/{}", info.prefix), m.router(ctx.clone()));
     }
-    // Agent transport (anvil <-> control plane).
+    // Agent transport (anvil <-> control plane). `pistack agent --join URL`
+    // talks to URL/rpc/agents/...
+    // TODO(keep): authenticate agents with mTLS / a join token. Today any
+    // request without an Authorization header reaches the queue; a bearer
+    // token that is not a gate token is rejected by `attach_caller` below.
     app = app.nest("/rpc", pistack_rpc::router(asm.queue.clone()));
 
     let discovery = Discovery {
