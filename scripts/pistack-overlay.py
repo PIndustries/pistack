@@ -23,14 +23,19 @@ is kept on the plan and never passed to ip.
 A router interface may list DHCP leases. dnsmasq for those leases runs
 inside that router namespace only. Port, gateway, floating, fixed, DNS,
 and route addresses may be IPv4 or IPv6. Underlay and VXLAN endpoints
-stay IPv4. IPv6 packet rules use ip6tables.
+stay private unicast IPv4. IPv6 packet rules use ip6tables. A router
+external address may be IPv4 or a unique-local IPv6 address; SNAT
+rewrites each tenant prefix of that same family.
 
 State in $PISTACK_OVERLAY_STATE (default /var/lib/pistack/overlay) lists
 the devices, FDB entries, routes, veths, floating addresses, and rules
-this tool created. A later apply deletes only FDB entries, rules,
-routes, floating addresses, and veths that this tool created and that
-the new plan dropped. Bridges, VXLAN devices, VLAN links, and namespaces
-stay. Chain PISTACK-SG is never modified.
+this tool created. A later apply deletes only the bridge, VXLAN, network
+namespace, and veth this tool created for a record the new plan dropped,
+plus the FDB entries, rules, routes, and floating addresses that went
+with them. A VLAN link and the physical port stay. A second apply
+succeeds when those devices are already gone. Chain PISTACK-SG is never
+modified. pistack0, wg-fleet, simbr0, an empty name, and any name that
+starts with pi are refused.
 
 PISTACK_OVERLAY_IP, PISTACK_OVERLAY_BRIDGE, PISTACK_OVERLAY_IPTABLES,
 PISTACK_OVERLAY_IP6TABLES, PISTACK_OVERLAY_SYSCTL, and
@@ -156,9 +161,30 @@ def _check_addr(value: object, what: str, versions: tuple[int, ...]) -> str:
     return text
 
 
+def _private_underlay(ip: ipaddress.IPv4Address) -> bool:
+    """10/8, 172.16/12, 192.168/16, or 100.64/10. Not public, not loopback."""
+    if (
+        ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_loopback
+        or ip == ipaddress.IPv4Address("255.255.255.255")
+    ):
+        return False
+    a, b, _, _ = ip.packed
+    return (
+        a == 10
+        or (a == 172 and 16 <= b <= 31)
+        or (a == 192 and b == 168)
+        or (a == 100 and 64 <= b <= 127)
+    )
+
+
 def check_ip(value: object, what: str) -> str:
-    """Underlay and VXLAN endpoints stay IPv4."""
-    return _check_addr(value, what, (4,))
+    """Underlay and VXLAN endpoints stay private unicast IPv4."""
+    text = _check_addr(value, what, (4,))
+    if not _private_underlay(ipaddress.IPv4Address(text)):
+        die(f"{what} {text} is not a private underlay")
+    return text
 
 
 def check_addr(value: object, what: str) -> str:
@@ -176,7 +202,11 @@ def check_mac(value: object, what: str) -> str:
 
 def check_name(value: object, pattern: re.Pattern[str], what: str) -> str:
     text = expect_str(value, what)
-    if text == "pistack0" or text.startswith("pi") or not pattern.fullmatch(text):
+    if (
+        text in ("pistack0", "wg-fleet", "simbr0")
+        or text.startswith("pi")
+        or not pattern.fullmatch(text)
+    ):
         die(f"{what} {text} is not allowed")
     return text
 
@@ -192,6 +222,12 @@ def check_cidr(value: object, what: str) -> str:
 
 def addr_version(addr: str) -> int:
     return ipaddress.ip_address(addr.split("/")[0]).version
+
+
+def _is_ula(addr: str) -> bool:
+    """Unique-local IPv6, fc00::/7."""
+    ip = ipaddress.ip_address(addr.split("/")[0])
+    return isinstance(ip, ipaddress.IPv6Address) and (ip.packed[0] & 0xFE) == 0xFC
 
 
 def family_opt(version: int) -> str:
@@ -218,7 +254,7 @@ def same_version(left: str, right: str, what: str) -> None:
 def check_physnet(value: object) -> str:
     text = expect_str(value, "physnet")
     if (
-        text in ("pistack0", "wg-fleet")
+        text in ("pistack0", "wg-fleet", "simbr0")
         or text.startswith("pi")
         or any(ch.isspace() for ch in text)
         or "/" in text
@@ -540,6 +576,12 @@ def parse_router(item: object) -> Router:
     )
     if router.external_ip is None and (router.snat or router.dnat):
         die(f"router {router.id} snat or dnat needs external_ip")
+    if (
+        router.external_ip is not None
+        and addr_version(router.external_ip) == 6
+        and not _is_ula(router.external_ip)
+    ):
+        die(f"router {router.id} external_ip is not a private ipv6 address")
     if router.external_ip is not None:
         external_fam = addr_version(router.external_ip)
         for rule in router.dnat:
@@ -785,7 +827,9 @@ def _load_rules(raw: object) -> list[tuple[str, str, str, tuple[str, ...]]]:
         for tok in spec_raw:
             if not isinstance(tok, str) or not tok or any(ch in tok for ch in "\n\r\x00"):
                 die("state rule spec is corrupt")
-            if tok in ("pistack0", "wg-fleet", "PISTACK-SG") or PI_DEV_RE.fullmatch(tok):
+            if tok in ("pistack0", "wg-fleet", "simbr0", "PISTACK-SG") or (
+                tok.startswith("pi") and not tok.startswith(COMMENT_PREFIX)
+            ):
                 die(f"state rule names {tok}")
             if tok == "0.0.0.0" or tok.startswith("0.0.0.0/"):
                 die("state rule uses 0.0.0.0")
@@ -892,10 +936,12 @@ class Runner:
 
     def guard(self, argv: list[str]) -> None:
         for tok in argv[1:]:
-            if tok in ("pistack0", "wg-fleet", "PISTACK-SG"):
-                die(f"refusing to touch {tok}")
-            if PI_DEV_RE.fullmatch(tok):
-                die(f"refusing to touch device {tok}")
+            if (
+                tok == ""
+                or tok in ("pistack0", "wg-fleet", "simbr0", "PISTACK-SG")
+                or (tok.startswith("pi") and not tok.startswith(COMMENT_PREFIX))
+            ):
+                die(f"refusing to touch {tok or 'empty name'}")
             if "all.route_localnet" in tok:
                 die("refusing global route_localnet")
             if tok == "0.0.0.0" or tok.startswith("0.0.0.0/"):
@@ -1635,13 +1681,23 @@ def sync_rules(
                 runner.mutate(runner.rule_argv(netns, table, "-A", chain, spec))
         return
     # Rebuild when the set changes so a new ACCEPT cannot land behind DROP.
+    # A missing rule or a missing namespace is already the desired delete.
     for netns, table, chain, spec in previous:
         if runner.rule_present(netns, table, chain, spec):
-            runner.mutate(runner.rule_argv(netns, table, "-D", chain, spec))
+            _delete_rule(runner, netns, table, chain, spec)
     for netns, table, chain, spec in desired:
         if runner.rule_present(netns, table, chain, spec):
-            runner.mutate(runner.rule_argv(netns, table, "-D", chain, spec))
+            _delete_rule(runner, netns, table, chain, spec)
         runner.mutate(runner.rule_argv(netns, table, "-A", chain, spec))
+
+
+def _delete_rule(
+    runner: Runner, netns: str, table: str, chain: str, spec: tuple[str, ...]
+) -> None:
+    runner.mutate_missing(
+        runner.rule_argv(netns, table, "-D", chain, spec),
+        extra_ok=("bad rule", "does a matching rule exist", "cannot open"),
+    )
 
 
 def retire_routes(
@@ -1707,6 +1763,81 @@ def retire_veths(
         runner.mutate_missing([runner.ip, "link", "del", root])
         created.discard(root)
         created.discard(peer)
+
+
+_OWNED_RANK = {"veth": 0, "vxlan": 1, "bridge": 2, "netns": 3}
+
+
+def _refuse_delete(name: str) -> None:
+    if (
+        not name
+        or name in ("pistack0", "wg-fleet", "simbr0")
+        or name.startswith("pi")
+    ):
+        die(f"refusing to delete {name or 'empty name'}")
+
+
+def _owned_kind(name: str) -> Optional[str]:
+    if VETH_ROOT_RE.fullmatch(name):
+        return "veth"
+    if VXLAN_RE.fullmatch(name):
+        return "vxlan"
+    if BRIDGE_RE.fullmatch(name):
+        return "bridge"
+    if ANY_NS_RE.fullmatch(name):
+        return "netns"
+    return None
+
+
+def planned_owned(plan: Plan) -> set[str]:
+    """Bridge, VXLAN, netns, and veth names the plan still wants."""
+    wanted: set[str] = set()
+    for net in plan.networks:
+        wanted.add(net.bridge)
+        if net.vxlan:
+            wanted.add(net.vxlan)
+        for router in net.routers:
+            wanted.add(router.netns)
+            if router.external_veth_root:
+                wanted.add(router.external_veth_root)
+            if router.external_veth_ns:
+                wanted.add(router.external_veth_ns)
+            for iface in router.interfaces:
+                wanted.add(iface.veth_bridge)
+                wanted.add(iface.veth_ns)
+        for entry in net.floating:
+            wanted.add(entry.netns)
+            wanted.add(entry.veth_bridge)
+            wanted.add(entry.veth_ns)
+    return wanted
+
+
+def retire_owned(runner: Runner, created: set[str], plan: Plan) -> None:
+    """Delete bridge, vxlan, netns, and leftover veth this tool created.
+
+    retire_veths already removed pairs listed in the previous state. This
+    pass removes recorded devices the new plan dropped, and a device that
+    is already gone. VLAN links and physical ports are not in this set.
+    """
+    desired = planned_owned(plan)
+    stale = [name for name in created if name not in desired]
+    for name in stale:
+        _refuse_delete(name)
+    ranked = sorted(
+        (name for name in stale if _owned_kind(name) is not None),
+        key=lambda name: (_OWNED_RANK[_owned_kind(name) or ""], name),
+    )
+    for name in ranked:
+        kind = _owned_kind(name)
+        if kind == "netns":
+            runner.mutate_missing([runner.ip, "netns", "del", name])
+        else:
+            runner.mutate_missing([runner.ip, "link", "del", name])
+        created.discard(name)
+        if kind == "veth":
+            peer = {"a": "b", "c": "d", "e": "f"}.get(name[0])
+            if peer is not None:
+                created.discard(peer + name[1:])
 
 
 def retire_fdb(
@@ -1993,6 +2124,7 @@ def converge(plan: Plan, dry: bool) -> None:
     desired_roots = {root for root, _peer, _netns in desired.veths}
     retire_veths(runner, state.veths, desired_roots, created)
     retire_fdb(runner, state.fdb, set(desired.fdb))
+    retire_owned(runner, created, plan)
     if dry:
         return
     save_state(
@@ -2259,6 +2391,38 @@ def _check_refusals() -> None:
     bare_v6 = json.loads(json.dumps(base))
     bare_v6["networks"][0]["peers"] = ["2001:db8::2"]
     _refuses(lambda: parse_plan(bare_v6), "ipv6 peer")
+    public_host = {"version": 1, "host": "8.8.8.8", "networks": []}
+    _refuses(lambda: parse_plan(public_host), "public underlay")
+    loop_host = {"version": 1, "host": "127.0.0.1", "networks": []}
+    _refuses(lambda: parse_plan(loop_host), "loopback underlay")
+    for bad_host in ("100.63.255.255", "100.128.0.1", "172.32.0.1", "192.169.0.1", "11.0.0.1"):
+        _refuses(
+            lambda host=bad_host: parse_plan({"version": 1, "host": host, "networks": []}),
+            f"underlay {bad_host}",
+        )
+    _refuses(lambda: parse_plan({"version": 1, "host": "", "networks": []}), "empty underlay")
+    for good_host in ("10.0.0.1", "172.16.0.1", "172.31.255.254", "192.168.1.1", "100.64.0.1", "100.127.255.254"):
+        parse_plan({"version": 1, "host": good_host, "networks": []})
+    bad_peer = json.loads(json.dumps(base))
+    bad_peer["networks"][0]["peers"] = ["8.8.8.8"]
+    _refuses(lambda: parse_plan(bad_peer), "public peer")
+    bad_port_ul = json.loads(json.dumps(base))
+    bad_port_ul["networks"][0]["ports"][0]["underlay"] = "1.2.3.4"
+    _refuses(lambda: parse_plan(bad_port_ul), "public port underlay")
+    bad_sim = json.loads(json.dumps(base))
+    bad_sim["networks"][0]["provider"] = {"physnet": "simbr0", "vlan": None}
+    _refuses(lambda: parse_plan(bad_sim), "physnet simbr0")
+    bad_empty_phys = json.loads(json.dumps(base))
+    bad_empty_phys["networks"][0]["provider"] = {"physnet": "", "vlan": None}
+    _refuses(lambda: parse_plan(bad_empty_phys), "empty physnet")
+    runner = Runner(True)
+    for bad in ("pistack0", "wg-fleet", "simbr0", "", "pi0123456789ab", "pibr0"):
+        _refuses(lambda tok=bad: runner.guard(["ip", "link", "del", tok]), f"guard {bad or 'empty'}")
+    runner.guard(["iptables", "-m", "comment", "--comment", f"{COMMENT_PREFIX}port-1"])
+    public_v6 = json.loads(json.dumps(v6_snat_plan()))
+    public_v6["networks"][0]["routers"][0]["external_ip"] = "2001:db8::9"
+    _refuses(lambda: parse_plan(public_v6), "public ipv6 external")
+    parse_plan(v6_snat_plan())
     parse_plan(base)
 
 
@@ -2411,6 +2575,49 @@ def _tool(argv: list[str], name: str) -> bool:
     return any(tok == name or tok.endswith("/" + name) for tok in argv)
 
 
+def v6_snat_plan() -> dict:
+    """One IPv6 tenant prefix SNATed to a unique-local external address."""
+    return {
+        "version": 1,
+        "host": "10.0.0.1",
+        "networks": [
+            {
+                "id": "net-v6",
+                "vni": 11,
+                "mtu": 1450,
+                "bridge": "po0123456789aa",
+                "vxlan": "vx0123456789aa",
+                "local": "10.0.0.1",
+                "peers": [],
+                "ports": [],
+                "routers": [
+                    {
+                        "id": "rtr-v6",
+                        "netns": "ns0123456789ac",
+                        "interfaces": [
+                            {
+                                "network_id": "net-v6",
+                                "veth_bridge": "a0123456789ac",
+                                "veth_ns": "b0123456789ac",
+                                "gateway": "fd00:90::1",
+                                "prefix": 64,
+                                "cidr": "fd00:90::/64",
+                            }
+                        ],
+                        "external_veth_root": "c0123456789ac",
+                        "external_veth_ns": "d0123456789ac",
+                        "external_ip": "fd00:66::9",
+                        "external_dev": "external",
+                        "snat": True,
+                        "dnat": [],
+                        "metadata": False,
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def floating_plan(with_fip: bool) -> dict:
     floating: list[dict] = []
     if with_fip:
@@ -2489,6 +2696,202 @@ def _check_floating(first: list[list[str]], second: list[list[str]]) -> None:
         not any(_has(argv, "link", "del", "poaaaaaaaaaaaa") for argv in second),
         "dropping floating keeps the bridge",
     )
+    _assert(
+        any(_has(argv, "netns", "del", "nf0123456789ab") for argv in second),
+        "dropping floating deletes its netns",
+    )
+    _assert(
+        not any(_has(argv, "link", "del", "vxaaaaaaaaaaaa") for argv in second),
+        "dropping floating keeps the vxlan",
+    )
+
+
+def _check_delete_and_v6(td: str, log_path: str) -> None:
+    """Dropping a record removes only its bridge, vxlan, netns, and veth.
+
+    A second delete, and a delete of devices that are already gone, succeed.
+    Private IPv6 external SNAT is an ip6tables rule in the router namespace.
+    """
+    os.environ["PISTACK_OVERLAY_STATE"] = os.path.join(td, "state-drop")
+    with open(log_path, "w", encoding="utf-8"):
+        pass
+    apply_text(json.dumps(sample_plan(False)), False)
+    created_log = _load_log(log_path)
+    kept = sample_plan(False)
+    kept["networks"][0]["routers"] = []
+    apply_text(json.dumps(kept), False)
+    dropped_router = _load_log(log_path)[len(created_log) :]
+    _assert(
+        any(_has(argv, "netns", "del", "ns0123456789ab") for argv in dropped_router),
+        "dropping a router deletes its netns",
+    )
+    _assert(
+        any(_has(argv, "link", "del", "a01a103012345") for argv in dropped_router),
+        "dropping a router deletes its veth",
+    )
+    _assert(
+        any(_has(argv, "link", "del", "c0123456789ab") for argv in dropped_router),
+        "dropping a router deletes its external veth",
+    )
+    _assert(
+        not any(_has(argv, "link", "del", "po01a10318a507") for argv in dropped_router),
+        "dropping a router keeps the bridge",
+    )
+    _assert(
+        not any(_has(argv, "link", "del", "vx01a10318a507") for argv in dropped_router),
+        "dropping a router keeps the vxlan",
+    )
+    _assert(
+        not any(_has(argv, "netns", "del", "nsfedcba987654") for argv in dropped_router),
+        "the other router netns stays",
+    )
+    after_router = _load_log(log_path)
+    empty = {"version": 1, "host": "10.0.0.1", "networks": []}
+    apply_text(json.dumps(empty), False)
+    dropped_nets = _load_log(log_path)[len(after_router) :]
+    for name in (
+        "po01a10318a507",
+        "po01b20318b607",
+        "po000000000009",
+        "vx01a10318a507",
+        "vx01b20318b607",
+    ):
+        _assert(any(_has(argv, "link", "del", name) for argv in dropped_nets), f"delete {name}")
+    _assert(
+        any(_has(argv, "netns", "del", "nsfedcba987654") for argv in dropped_nets),
+        "dropping the network deletes the remaining netns",
+    )
+    for forbidden in ("pistack0", "wg-fleet", "simbr0", "eno1", "pv0123456789ab"):
+        _assert(
+            not any(forbidden in argv and "del" in argv for argv in dropped_nets),
+            f"delete does not remove {forbidden}",
+        )
+    _assert(
+        all(not any(tok.startswith("pi") and not tok.startswith(COMMENT_PREFIX) for tok in argv) for argv in dropped_nets),
+        "delete commands do not name a pi device",
+    )
+    marked = _load_log(log_path)
+    apply_text(json.dumps(empty), False)
+    second = _load_log(log_path)[len(marked) :]
+    _assert(not any("del" in argv for argv in second), "second delete is a no-op")
+
+    os.environ["PISTACK_OVERLAY_STATE"] = os.path.join(td, "state-v6")
+    with open(log_path, "w", encoding="utf-8"):
+        pass
+    apply_text(json.dumps(v6_snat_plan()), False)
+    v6_log = _load_log(log_path)
+    snat = [argv for argv in v6_log if "SNAT" in argv and "fd00:66::9" in argv]
+    _assert(snat, "private ipv6 external snat")
+    _assert(all(_tool(argv, "ip6tables") for argv in snat), "ipv6 snat uses ip6tables")
+    _assert(any("fd00:90::/64" in argv for argv in snat), "ipv6 snat matches the tenant prefix")
+    _assert(all("ns0123456789ac" in argv for argv in snat), "ipv6 snat stays in the router netns")
+    _assert(
+        any("net.ipv6.conf.all.forwarding=1" in argv for argv in v6_log),
+        "ipv6 forwarding in the router netns",
+    )
+
+    gone = os.path.join(td, "bin-gone")
+    os.makedirs(gone, mode=0o755)
+    for name in ("ip", "bridge", "iptables", "sysctl", "dnsmasq", "ip6tables"):
+        path = os.path.join(gone, name)
+        lines = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            f"with open({log_path!r}, 'a', encoding='utf-8') as fh:",
+            '    fh.write(json.dumps(sys.argv) + "\\n")',
+            "argv = sys.argv[1:]",
+            'if "link" in argv and "show" in argv:',
+            '    sys.stderr.write("Device does not exist\\n")',
+            "    sys.exit(1)",
+            'if ("link" in argv and "del" in argv) or ("netns" in argv and "del" in argv):',
+            '    sys.stderr.write("Cannot find device\\n")',
+            "    sys.exit(1)",
+            'if "fdb" in argv and "del" in argv:',
+            '    sys.stderr.write("No such file or directory\\n")',
+            "    sys.exit(1)",
+            'if "-D" in argv:',
+            '    sys.stderr.write("Bad rule (does a matching rule exist in that chain?)\\n")',
+            "    sys.exit(1)",
+            "sys.exit(0)",
+            "",
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        os.chmod(path, 0o755)
+    os.environ["PISTACK_OVERLAY_IP"] = os.path.join(gone, "ip")
+    os.environ["PISTACK_OVERLAY_BRIDGE"] = os.path.join(gone, "bridge")
+    os.environ["PISTACK_OVERLAY_IPTABLES"] = os.path.join(gone, "iptables")
+    os.environ["PISTACK_OVERLAY_IP6TABLES"] = os.path.join(gone, "ip6tables")
+    os.environ["PISTACK_OVERLAY_SYSCTL"] = os.path.join(gone, "sysctl")
+    state = os.path.join(td, "state-gone")
+    os.environ["PISTACK_OVERLAY_STATE"] = state
+    os.makedirs(state, mode=0o755)
+    with open(os.path.join(state, "state.json"), "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": 1,
+                "created": [
+                    "po01a10318a507",
+                    "vx01a10318a507",
+                    "ns0123456789ab",
+                    "nf0123456789ab",
+                    "a01a103012345",
+                    "b01a103012345",
+                    "e0123456789ab",
+                    "f0123456789ab",
+                ],
+                "fdb": [
+                    {"dev": "vx01a10318a507", "mac": "00:00:00:00:00:00", "dst": "10.0.0.2"}
+                ],
+                "routes": [],
+                "veths": [
+                    {
+                        "root": "a01a103012345",
+                        "peer": "b01a103012345",
+                        "netns": "ns0123456789ab",
+                    },
+                    {
+                        "root": "e0123456789ab",
+                        "peer": "f0123456789ab",
+                        "netns": "nf0123456789ab",
+                    },
+                ],
+                "rules": [
+                    {
+                        "netns": "ns0123456789ab",
+                        "table": "nat",
+                        "chain": "POSTROUTING",
+                        "spec": [
+                            "-s",
+                            "10.90.0.0/24",
+                            "-o",
+                            "d0123456789ab",
+                            "-j",
+                            "SNAT",
+                            "--to-source",
+                            "10.66.66.84",
+                        ],
+                    }
+                ],
+                "addrs": [],
+            },
+            fh,
+        )
+    apply_text(json.dumps(empty), False)
+    apply_text(json.dumps(empty), False)
+    with open(os.path.join(state, "state.json"), encoding="utf-8") as fh:
+        left = json.load(fh)
+    _assert(left["created"] == [], "gone devices are dropped from state")
+    _assert(left["veths"] == [], "gone veths are dropped from state")
+    _assert(left["fdb"] == [], "gone fdb is dropped from state")
+    _assert(left["rules"] == [], "gone rules are dropped from state")
+    bindir = os.path.join(td, "bin")
+    os.environ["PISTACK_OVERLAY_IP"] = os.path.join(bindir, "ip")
+    os.environ["PISTACK_OVERLAY_BRIDGE"] = os.path.join(bindir, "bridge")
+    os.environ["PISTACK_OVERLAY_IPTABLES"] = os.path.join(bindir, "iptables")
+    os.environ["PISTACK_OVERLAY_IP6TABLES"] = os.path.join(bindir, "ip6tables")
+    os.environ["PISTACK_OVERLAY_SYSCTL"] = os.path.join(bindir, "sysctl")
+    os.environ["PISTACK_OVERLAY_DNSMASQ"] = os.path.join(bindir, "dnsmasq")
 
 
 def self_test() -> None:
@@ -2535,6 +2938,7 @@ def self_test() -> None:
             fail(f"self-test: apply exited {exc.code}")
         _check_log(mark, full[len(mark) :])
         _check_floating(mid[before:], end[len(mid) :])
+        _check_delete_and_v6(td, log_path)
         confs = [
             name
             for name in os.listdir(os.path.join(td, "state"))
