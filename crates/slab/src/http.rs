@@ -423,5 +423,5 @@ async fn restore_backup(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Volume>> {
     let b = load_backup(&c, &caller(ext)?, &id)?;
-    Ok(Json(c.restore_backup(&b.meta.id)?))
+    Ok(Json(c.restore_backup(&b.meta.id).await?))
 }

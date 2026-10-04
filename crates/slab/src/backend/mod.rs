@@ -4,11 +4,13 @@
 //! Storage backends. `slab` decides *what* exists; a `BlockBackend` makes it
 //! exist on real storage and tells `anvil` how to reach it.
 //!
-//! Three reference backends: `local` (sparse raw files, real), `lvm` and
-//! `rbd` (stubs documenting the exact commands they will run).
+//! The volume type selects the backend. Empty or `local` is the sparse file
+//! backend and stays the default. `lvm` runs only when the volume group, thin
+//! pool, and LVM tools exist. `rbd` runs only when the pool, monitors, and
+//! `rbd` binary exist. A missing binary or pool is unavailable.
 
 use async_trait::async_trait;
-use pistack_types::ApiResult;
+use pistack_types::{ApiError, ApiResult};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Snapshot, Volume};
@@ -150,8 +152,55 @@ pub trait BlockBackend: Send + Sync + 'static {
 
     /// How `host` should attach `vol`.
     async fn attach_info(&self, vol: &Volume, host: &str) -> ApiResult<AttachInfo>;
+
+    /// File that holds the volume bytes for a backup. Backends without a
+    /// file in the slab directory are unavailable.
+    async fn bytes_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf>;
 }
 
 pub(crate) fn gib_to_bytes(gib: u64) -> u64 {
     gib.saturating_mul(1024 * 1024 * 1024)
+}
+
+/// `$PISTACK_*_BIN` when set and non-empty, otherwise `default`.
+pub(crate) fn configured_bin(env_key: &str, default: &str) -> String {
+    match std::env::var(env_key) {
+        Ok(v) => {
+            let v = v.trim();
+            if v.is_empty() {
+                default.to_owned()
+            } else {
+                v.to_owned()
+            }
+        }
+        Err(_) => default.to_owned(),
+    }
+}
+
+/// The configured binary, or unavailable when it is not executable.
+pub(crate) fn configured_bin_ready(env_key: &str, default: &str) -> ApiResult<String> {
+    let bin = configured_bin(env_key, default);
+    if command_exists(&bin) {
+        Ok(bin)
+    } else {
+        Err(ApiError::unavailable(format!("{default} is not available")))
+    }
+}
+
+fn command_exists(bin: &str) -> bool {
+    let path = std::path::Path::new(bin);
+    if path.is_absolute() || bin.contains('/') || bin.contains('\\') {
+        return is_executable(path);
+    }
+    match std::env::var_os("PATH") {
+        Some(paths) => std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(bin))),
+        None => false,
+    }
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
