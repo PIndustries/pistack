@@ -59,10 +59,13 @@ pub fn assemble(dev: bool) -> Assembly {
         Arc::new(silo::Silo),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),
-        Arc::new(match std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref() {
-            Some("forward") => relay::Relay::forward(),
-            _ => relay::Relay::default(),
-        }),
+        Arc::new(
+            match std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref() {
+                Some("forward") => relay::Relay::forward(),
+                _ => relay::Relay::default(),
+            }
+            .with_queue(queue.clone()),
+        ),
         Arc::new(keep::Keep::default()),
         Arc::new(blueprint::Blueprint),
         Arc::new(gauge::Gauge),

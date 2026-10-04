@@ -167,7 +167,8 @@ pub struct ListenerSpec {
     #[serde(default = "default_true")]
     pub admin_up: bool,
     /// Publish this listener off the host. Absent means the listener is
-    /// only the local forwarder. WireGuard and edge start no process.
+    /// only the local forwarder. WireGuard may create only a `pw` interface.
+    /// Edge queues a publish and starts no process on this server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub door: Option<DoorKind>,
 }

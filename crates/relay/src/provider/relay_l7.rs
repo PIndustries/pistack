@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! In-process HTTP reverse proxy. One socket per balancer.
+//! In-process HTTP reverse proxy. One TCP socket per balancer, and a UDP
+//! socket when the listener is UDP.
 //!
 //! `ensure_balancer` binds `127.0.0.1:0` unless `spec.vip_address` is
-//! loopback or private. `0.0.0.0`, public addresses, and multicast are
-//! refused. An `Http` listener rewrites the request onto the next member
-//! and copies the response back. `Tcp` and `Https` are byte copies.
-//! `Terminated` stays unavailable until a certificate is configured on
-//! this process. `Udp` is refused.
+//! loopback or private. Unspecified, public, multicast, broadcast,
+//! link-local, and 100.64/10 addresses are refused. An `Http` listener
+//! rewrites the request onto the next member and copies the response back.
+//! `Tcp` and `Https` are byte copies. `Terminated` presents the certificate
+//! `keep` already stored for that listener and stays unavailable when it
+//! has none. This proxy does not generate a certificate. UDP copies
+//! datagrams to an up member and is not ready when that list is empty.
 
 use super::{LbProvider, ListenerView, Realized};
 use crate::types::{Balancer, ListenerProtocol, Provider};
@@ -22,6 +25,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+#[derive(Clone)]
+enum Serve {
+    Http,
+    Stream,
+    Tls(Arc<rustls::ServerConfig>),
+}
+
 struct Slot {
     bound: SocketAddr,
     listener: Option<TcpListener>,
@@ -31,6 +41,8 @@ struct Slot {
     cursor: Arc<AtomicUsize>,
     limit: Arc<AtomicUsize>,
     inflight: Arc<AtomicUsize>,
+    mode: Arc<parking_lot::Mutex<Serve>>,
+    udp: Option<crate::udp::UdpForward>,
 }
 
 /// HTTP reverse proxy. Serves [`Provider::Relay`].
@@ -53,12 +65,52 @@ impl RelayL7Provider {
 
     async fn stop(&self, id: &Id) {
         let slot = self.slots.lock().remove(id);
-        if let Some(slot) = slot {
+        if let Some(mut slot) = slot {
             slot.cancel.cancel();
+            if let Some(udp) = slot.udp.take() {
+                udp.shutdown().await;
+            }
             if let Some(task) = slot.task {
                 let _ = task.await;
             }
         }
+    }
+
+    async fn ensure_udp(&self, view: &ListenerView) -> ApiResult<String> {
+        let targets = crate::udp::targets(view);
+        let id = view.balancer.meta.id.clone();
+        if targets.is_empty() {
+            if let Some(slot) = self.slots.lock().get(&id) {
+                if let Some(udp) = &slot.udp {
+                    udp.set_members(Vec::new());
+                }
+            }
+            return Err(ApiError::unavailable("udp pool has no up member"));
+        }
+        let ip = {
+            let slots = self.slots.lock();
+            let slot = slots.get(&id).ok_or_else(|| {
+                ApiError::bad_request("http balancer is not bound")
+            })?;
+            if let Some(udp) = &slot.udp {
+                udp.set_members(targets);
+                return Ok(udp.bound().to_string());
+            }
+            slot.bound.ip()
+        };
+        let udp = crate::udp::UdpForward::bind(ip, targets).await?;
+        let bound = udp.bound().to_string();
+        let mut slots = self.slots.lock();
+        let slot = slots.get_mut(&id).ok_or_else(|| {
+            ApiError::bad_request("http balancer is not bound")
+        })?;
+        if let Some(existing) = &slot.udp {
+            existing.set_members(crate::udp::targets(view));
+            drop(udp);
+            return Ok(existing.bound().to_string());
+        }
+        slot.udp = Some(udp);
+        Ok(bound)
     }
 }
 
@@ -75,20 +127,7 @@ impl Drop for RelayL7Provider {
 }
 
 fn vip_allowed(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
-                return false;
-            }
-            v4.is_loopback() || v4.is_private()
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_unspecified() || v6.is_multicast() {
-                return false;
-            }
-            v6.is_loopback() || v6.is_unique_local()
-        }
-    }
+    crate::bind::allowed(ip)
 }
 
 fn bind_target(lb: &Balancer) -> ApiResult<SocketAddr> {
@@ -143,7 +182,7 @@ async fn accept_loop(
     cursor: Arc<AtomicUsize>,
     limit: Arc<AtomicUsize>,
     inflight: Arc<AtomicUsize>,
-    http: bool,
+    mode: Arc<parking_lot::Mutex<Serve>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     loop {
@@ -153,11 +192,13 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
                         let cap = limit.load(Ordering::Relaxed);
                         let now = inflight.fetch_add(1, Ordering::Relaxed);
+                        let serve = mode.lock().clone();
                         if cap > 0 && now >= cap {
                             inflight.fetch_sub(1, Ordering::Relaxed);
-                            if http {
+                            if matches!(serve, Serve::Http | Serve::Tls(_)) {
                                 tokio::spawn(async move {
                                     let _ = refuse(stream).await;
                                 });
@@ -168,10 +209,20 @@ async fn accept_loop(
                         let cursor = cursor.clone();
                         let inflight = inflight.clone();
                         tokio::spawn(async move {
-                            if http {
-                                proxy_http(stream, peer, members, cursor).await;
-                            } else {
-                                splice(stream, members, cursor).await;
+                            match serve {
+                                Serve::Http => proxy_http(stream, peer, members, cursor).await,
+                                Serve::Stream => splice(stream, members, cursor).await,
+                                Serve::Tls(cfg) => {
+                                    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                                    match acceptor.accept(stream).await {
+                                        Ok(tls) => {
+                                            proxy_http(tls, peer, members, cursor).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(error = %e, "tls handshake failed");
+                                        }
+                                    }
+                                }
                             }
                             inflight.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -186,7 +237,10 @@ async fn accept_loop(
     }
 }
 
-async fn refuse(mut stream: TcpStream) {
+async fn refuse<S>(mut stream: S)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     let body = b"unavailable";
     let msg = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -218,13 +272,14 @@ async fn splice(
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
 }
 
-async fn proxy_http(
-    mut inbound: TcpStream,
+async fn proxy_http<S>(
+    mut inbound: S,
     peer: SocketAddr,
     members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
     cursor: Arc<AtomicUsize>,
-) {
-    let _ = inbound.set_nodelay(true);
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let read = read_headers(&mut inbound).await;
     let Some((head, rest)) = read else {
         return;
@@ -297,9 +352,13 @@ async fn proxy_http(
         }
     }
     let _ = tokio::io::copy(&mut outbound, &mut inbound).await;
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut inbound).await;
 }
 
-async fn read_headers(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
+async fn read_headers<R>(stream: &mut R) -> Option<(Vec<u8>, Vec<u8>)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -444,6 +503,8 @@ impl LbProvider for RelayL7Provider {
                 cursor: Arc::new(AtomicUsize::new(0)),
                 limit: Arc::new(AtomicUsize::new(0)),
                 inflight: Arc::new(AtomicUsize::new(0)),
+                mode: Arc::new(parking_lot::Mutex::new(Serve::Http)),
+                udp: None,
             },
         );
         Ok(realized(bound))
@@ -455,18 +516,20 @@ impl LbProvider for RelayL7Provider {
     }
 
     async fn ensure_listener(&self, view: &ListenerView) -> ApiResult<String> {
-        match view.listener.spec.protocol {
-            ListenerProtocol::Udp => {
-                return Err(ApiError::bad_request("http provider does not serve udp"));
-            }
-            ListenerProtocol::Terminated { .. } => {
-                return Err(ApiError::unavailable(
-                    "tls termination is not configured",
-                ));
-            }
-            ListenerProtocol::Http | ListenerProtocol::Tcp | ListenerProtocol::Https => {}
+        if matches!(view.listener.spec.protocol, ListenerProtocol::Udp) {
+            return self.ensure_udp(view).await;
         }
-        let http = matches!(view.listener.spec.protocol, ListenerProtocol::Http);
+        let serve = match &view.listener.spec.protocol {
+            ListenerProtocol::Udp => unreachable!("udp returned above"),
+            ListenerProtocol::Terminated { .. } => {
+                let material = view.tls.as_ref().ok_or_else(|| {
+                    ApiError::unavailable("no certificate for this listener")
+                })?;
+                Serve::Tls(crate::tls::server_config(material)?)
+            }
+            ListenerProtocol::Http => Serve::Http,
+            ListenerProtocol::Tcp | ListenerProtocol::Https => Serve::Stream,
+        };
         let addrs = member_addrs(view);
         let limit = view.listener.spec.connection_limit as usize;
         let id = view.balancer.meta.id.clone();
@@ -476,6 +539,7 @@ impl LbProvider for RelayL7Provider {
         })?;
         *slot.members.lock() = addrs;
         slot.limit.store(limit, Ordering::Relaxed);
+        *slot.mode.lock() = serve;
         if slot.task.is_none() {
             let listener = slot
                 .listener
@@ -485,9 +549,10 @@ impl LbProvider for RelayL7Provider {
             let cursor = slot.cursor.clone();
             let limit = slot.limit.clone();
             let inflight = slot.inflight.clone();
+            let mode = slot.mode.clone();
             let cancel = slot.cancel.clone();
             slot.task = Some(tokio::spawn(async move {
-                accept_loop(listener, members, cursor, limit, inflight, http, cancel).await;
+                accept_loop(listener, members, cursor, limit, inflight, mode, cancel).await;
             }));
         }
         Ok(slot.bound.to_string())
@@ -566,6 +631,7 @@ mod tests {
                 status: ListenerStatus::default(),
             },
             pool: Some((pool, member_rows)),
+            tls: None,
         }
     }
 
@@ -591,7 +657,16 @@ mod tests {
             .ensure_listener(&view(&lb, ListenerProtocol::Udp, vec![]))
             .await
             .unwrap_err();
-        assert_eq!(udp.code, ErrorCode::BadRequest);
+        assert_eq!(udp.code, ErrorCode::Unavailable);
+        assert!(udp.message.contains("no up member"));
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+        ] {
+            let err = p.ensure_balancer(&balancer(Some(ip))).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "{ip}");
+        }
         let tls = p
             .ensure_listener(&view(
                 &lb,
@@ -603,7 +678,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(tls.code, ErrorCode::Unavailable);
-        assert!(tls.message.contains("tls termination"));
+        assert!(tls.message.contains("no certificate"));
         p.delete_balancer(&lb.meta.id).await.unwrap();
     }
 

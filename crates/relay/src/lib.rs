@@ -11,18 +11,23 @@
 //! * [`provider`] — the `LbProvider` trait, `MockProvider`, `ForwardProvider`,
 //!   and the HTTP reverse proxy.
 //! * [`door`] — publish a listener. Cloudflared and tailscale run when the
-//!   binary is present. WireGuard and edge start no process.
+//!   binary is present. WireGuard creates only a `pw` interface and is
+//!   unavailable when `wg` is missing. Edge queues a publish for a host
+//!   whose driver is `edge` and starts no process.
 //! * `reconcile` — turns spec into provider state and writes status.
 //! * [`health`] — active TCP/HTTP checks driving `Member.operating_status`.
 //! * `api` — HTTP, mounted at `/balancers`.
 
 pub mod api;
+mod bind;
 pub mod client;
 pub mod door;
 pub mod health;
 pub mod provider;
 mod reconcile;
+mod tls;
 pub mod types;
+mod udp;
 
 pub use client::Client;
 pub use door::{DoorKind, DoorPlan};
@@ -32,6 +37,7 @@ pub use provider::{
 pub use types::*;
 
 use async_trait::async_trait;
+use pistack_rpc::CommandQueue;
 use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::sync::Arc;
@@ -45,6 +51,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// and the HTTP reverse proxy (`PISTACK_RELAY_BACKEND=forward`).
 pub struct Relay {
     providers: Providers,
+    queue: Option<CommandQueue>,
 }
 
 impl Default for Relay {
@@ -57,7 +64,14 @@ impl Relay {
     pub fn with_providers(list: Vec<Arc<dyn LbProvider>>) -> Self {
         Self {
             providers: Providers::new(list),
+            queue: None,
         }
+    }
+
+    /// Edge publishes are queued on this agent command queue.
+    pub fn with_queue(mut self, queue: CommandQueue) -> Self {
+        self.queue = Some(queue);
+        self
     }
 
     /// In-process L4 TCP forwarder and HTTP reverse proxy.
@@ -72,7 +86,11 @@ impl Relay {
     /// A `Client` over the context's store and this module's providers.
     pub fn client(&self, ctx: &ModuleContext) -> Client {
         let store = ctx.store::<Store>();
-        Client::new((*store).clone(), self.providers.clone())
+        let mut client = Client::new((*store).clone(), self.providers.clone());
+        if let Some(queue) = &self.queue {
+            client = client.with_queue(queue.clone());
+        }
+        client
     }
 }
 

@@ -360,6 +360,9 @@ impl Agent {
                 serde_json::to_value(LogText { text })
                     .map_err(|e| ApiError::internal(e.to_string()))
             }
+            CommandKind::Publish => Err(ApiError::not_implemented(
+                "publish is handled by the edge host, not this agent",
+            )),
         }
     }
 }

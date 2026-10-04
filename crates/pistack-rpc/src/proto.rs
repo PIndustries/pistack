@@ -352,6 +352,9 @@ pub enum CommandKind {
     /// Read the youki bundle log or the libvirt console log. The payload is
     /// [`MachineRef`]. The result is [`LogText`].
     ReadLogs,
+    /// Ask an edge host to publish a listener. The payload is the listener
+    /// id, the listen port, and the upstream. It does not power a host.
+    Publish,
 }
 
 impl std::fmt::Display for CommandKind {
@@ -367,6 +370,7 @@ impl std::fmt::Display for CommandKind {
             CommandKind::SyncOverlay => "sync_overlay",
             CommandKind::MigrateMachine => "migrate_machine",
             CommandKind::ReadLogs => "read_logs",
+            CommandKind::Publish => "publish",
         };
         f.write_str(s)
     }

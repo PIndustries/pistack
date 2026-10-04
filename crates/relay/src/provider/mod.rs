@@ -11,8 +11,9 @@
 //! reconciler is the only caller.
 //!
 //! Implementations: [`MockProvider`] for tests and single-node development,
-//! [`ForwardProvider`] (in-process L4 TCP), [`RelayL7Provider`] (in-process
-//! HTTP), and [`OvnProvider`] (unimplemented).
+//! [`ForwardProvider`] (in-process L4 TCP and UDP), [`RelayL7Provider`]
+//! (in-process HTTP, and TLS when `keep` already holds the certificate),
+//! and [`OvnProvider`] (unimplemented).
 
 use crate::types::{Balancer, Listener, Member, Pool, Provider};
 use async_trait::async_trait;
@@ -47,6 +48,10 @@ pub struct ListenerView {
     /// that are administratively down or `Offline` are already filtered
     /// out; what remains is what should take traffic.
     pub pool: Option<(Pool, Vec<Member>)>,
+    /// Set for [`crate::types::ListenerProtocol::Terminated`] when `keep`
+    /// already has that listener's certificate. Absent means TLS stays
+    /// unavailable. The proxy does not generate one.
+    pub tls: Option<crate::tls::TlsMaterial>,
 }
 
 #[async_trait]
