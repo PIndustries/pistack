@@ -113,9 +113,9 @@
   th, td { text-align: left; padding: 0.45rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; font-size: 0.78rem; letter-spacing: 0.03em; }
   .phase { text-transform: lowercase; }
-  .phase.ready, .phase.on { color: var(--ok); }
-  .phase.error, .phase.off { color: var(--bad); }
-  .phase.pending, .phase.creating, .phase.deleting { color: var(--wait); }
+  .phase.ready, .phase.on, .phase.running, .phase.succeeded, .phase.ok, .phase.accepted { color: var(--ok); }
+  .phase.error, .phase.off, .phase.failed, .phase.firing { color: var(--bad); }
+  .phase.pending, .phase.creating, .phase.deleting, .phase.unknown { color: var(--wait); }
   .rules { margin: 0.25rem 0 0; padding-left: 1.1rem; }
   .detail { width: min(760px, 100%); }
   .detail p { margin: 0.22rem 0; }
@@ -170,6 +170,14 @@
     <button type="button" data-view="secrets">Secrets</button>
     <button type="button" data-view="dns">DNS</button>
     <button type="button" data-view="balancers">Load balancers</button>
+    <button type="button" data-view="pods">Pods</button>
+    <button type="button" data-view="deployments">Deployments</button>
+    <button type="button" data-view="services">Services</button>
+    <button type="button" data-view="jobs">Jobs</button>
+    <button type="button" data-view="ingresses">Ingresses</button>
+    <button type="button" data-view="stacks">Stacks</button>
+    <button type="button" data-view="shares">Shares</button>
+    <button type="button" data-view="alarms">Alarms</button>
   </nav>
   <div>
     <header>
@@ -214,7 +222,6 @@ const VIEWS = {
   networks: {
     title: "Networks",
     path: "/network/networks",
-    note: "These records are the API. The running guest network is the host bridge pistack0, not an OVN switch.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
@@ -236,7 +243,6 @@ const VIEWS = {
   ports: {
     title: "Ports",
     path: "/network/ports",
-    note: "Ports are API records. The guest NIC is still the host bridge pistack0.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
@@ -249,7 +255,6 @@ const VIEWS = {
   routers: {
     title: "Routers",
     path: "/network/routers",
-    note: "These records are stored. The guest uses the host bridge pistack0, not this router.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
@@ -365,6 +370,111 @@ const VIEWS = {
     note: "Stored by relay. Nothing is programmed on the host yet.",
     multi: "balancers",
   },
+  pods: {
+    title: "Pods",
+    path: "/loom/pods",
+    note: "Phase and address are the pod status. Images lists each container.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Address", i => i.status && i.status.pod_ip],
+      ["Images", i => containerImages(i.spec)],
+      ["Host", i => i.status && i.status.host],
+      ["Machine", i => i.status && i.status.machine],
+    ],
+  },
+  deployments: {
+    title: "Deployments",
+    path: "/loom/deployments",
+    note: "Ready, available, and updated are counts from the deployment status.",
+    cols: [
+      ["Name", i => i.name],
+      ["Replicas", i => num(i.spec, "replicas")],
+      ["Ready", i => num(i.status, "ready")],
+      ["Available", i => num(i.status, "available")],
+      ["Updated", i => num(i.status, "updated")],
+      ["Revision", i => num(i.status, "revision")],
+      ["Image", i => templateImages(i)],
+    ],
+  },
+  services: {
+    title: "Services",
+    path: "/loom/services",
+    note: "Kind, ports, and selector are the spec. The cluster address and endpoint count are status.",
+    cols: [
+      ["Name", i => i.name],
+      ["Kind", i => i.spec && i.spec.kind],
+      ["Cluster IP", i => i.status && i.status.cluster_ip],
+      ["Ports", i => ((i.spec && i.spec.ports) || []).map(p => p.port).join(", ")],
+      ["Selector", i => selectorText(i.spec && i.spec.selector)],
+      ["Endpoints", i => (i.status && i.status.endpoints) ? i.status.endpoints.length : 0],
+    ],
+  },
+  jobs: {
+    title: "Jobs",
+    path: "/loom/jobs",
+    note: "Active, succeeded, and failed are the job status.",
+    cols: [
+      ["Name", i => i.name],
+      ["Completions", i => num(i.spec, "completions")],
+      ["Parallelism", i => num(i.spec, "parallelism")],
+      ["Active", i => num(i.status, "active")],
+      ["Succeeded", i => num(i.status, "succeeded")],
+      ["Failed", i => num(i.status, "failed")],
+      ["Image", i => templateImages(i)],
+      ["Suspended", i => yesNo(i.spec && i.spec.suspend)],
+    ],
+  },
+  ingresses: {
+    title: "Ingresses",
+    path: "/loom/ingresses",
+    note: "Rules are stored as written. Addresses are status and stay empty until filled.",
+    cols: [
+      ["Name", i => i.name],
+      ["Hosts", i => ingressHosts(i)],
+      ["Paths", i => ingressPaths(i)],
+      ["Addresses", i => ((i.status && i.status.load_balancer) || []).join(", ")],
+    ],
+  },
+  stacks: {
+    title: "Stacks",
+    path: "/blueprint/stacks",
+    note: "Apply creates network, subnet, and machine rows from the document. Every other kind is skipped. The phase stays accepted.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Created", i => ((i.status && i.status.created) || []).join(", ")],
+      ["Message", i => i.status && i.status.message],
+    ],
+    apply: true,
+  },
+  shares: {
+    title: "Shares",
+    path: "/shelf/shares",
+    note: "NFS is ready after exportfs. CephFS is ready after the subvolume is created.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Protocol", i => i.spec && i.spec.protocol],
+      ["GiB", i => num(i.spec, "size_gib")],
+      ["Access", i => accessText(i)],
+      ["Message", i => i.status && i.status.message],
+    ],
+  },
+  alarms: {
+    title: "Alarms",
+    path: "/gauge/alarms",
+    note: "Pending means no sample for that metric yet. Ok and firing follow the latest sample against the threshold.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Metric", i => i.spec && i.spec.metric],
+      ["Comparison", i => i.spec && i.spec.comparison],
+      ["Threshold", i => num(i.spec, "threshold")],
+      ["Last", i => (i.status && i.status.last_value != null) ? i.status.last_value : ""],
+      ["For seconds", i => num(i.spec, "for_seconds")],
+    ],
+  },
 };
 
 let current = "machines";
@@ -472,6 +582,65 @@ function protoText(p) {
 }
 function itemsOf(page) {
   return (page && page.items) || [];
+}
+function num(obj, key) {
+  if (!obj || obj[key] == null || obj[key] === "") return "";
+  return obj[key];
+}
+function intField(value, label, min, max) {
+  const n = Number(String(value).trim());
+  if (!Number.isInteger(n) || n < min || (max != null && n > max)) {
+    throw new Error(max == null
+      ? label + " must be an integer >= " + min
+      : label + " must be an integer from " + min + " to " + max);
+  }
+  return n;
+}
+function containerImages(spec) {
+  return ((spec && spec.containers) || []).map(c => c.image).filter(Boolean).join(", ");
+}
+function templateImages(item) {
+  const template = item.spec && item.spec.template;
+  return containerImages(template && template.spec);
+}
+function selectorText(sel) {
+  if (!sel || typeof sel !== "object") return "";
+  return Object.keys(sel).map(k => k + "=" + sel[k]).join(", ");
+}
+function accessText(item) {
+  return ((item.spec && item.spec.access) || []).map(a => {
+    const who = a.cidr || a.principal || "";
+    const mode = a.mode || "";
+    return mode ? who + " " + mode : who;
+  }).filter(Boolean).join(", ");
+}
+function ingressHosts(item) {
+  return ((item.spec && item.spec.rules) || []).map(r => r.host).filter(Boolean).join(", ");
+}
+function ingressPaths(item) {
+  const out = [];
+  for (const rule of (item.spec && item.spec.rules) || []) {
+    for (const path of rule.paths || []) {
+      const backend = path.backend || {};
+      const dest = backend.service ? backend.service + ":" + backend.port : "";
+      out.push(dest ? (path.path || "/") + " · " + dest : (path.path || "/"));
+    }
+  }
+  return out.join(", ");
+}
+function onCreate(form, go, work) {
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    setErr("");
+    go.disabled = true;
+    try {
+      await work();
+      await render();
+    } catch (e) {
+      setErr(e.message);
+    }
+    go.disabled = false;
+  });
 }
 
 document.getElementById("login-form").addEventListener("submit", async (ev) => {
@@ -1002,6 +1171,212 @@ function createForm() {
     });
     return form;
   }
+  if (current === "pods") {
+    const name = el("input"); name.required = true; name.placeholder = "web";
+    const container = el("input"); container.required = true; container.placeholder = "web";
+    const image = el("input"); image.required = true; image.placeholder = "nginx:1.27";
+    const network = el("input"); network.placeholder = "default";
+    form.append(el("strong", "New pod"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Container", container), field("Image", image), field("Network", network));
+    form.append(row);
+    const go = el("button", "Create pod"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const spec = { containers: [{ name: container.value.trim(), image: image.value.trim() }] };
+      const net = network.value.trim();
+      if (net) spec.networks = [net];
+      await api("POST", "/loom/pods", { name: name.value.trim(), spec });
+      name.value = ""; container.value = ""; image.value = ""; network.value = "";
+    });
+    return form;
+  }
+  if (current === "deployments") {
+    const name = el("input"); name.required = true; name.placeholder = "web";
+    const replicas = el("input"); replicas.type = "number"; replicas.min = "0"; replicas.value = "1"; replicas.required = true;
+    const container = el("input"); container.placeholder = "same as name";
+    const image = el("input"); image.required = true; image.placeholder = "nginx:1.27";
+    form.append(el("strong", "New deployment"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Replicas", replicas), field("Container", container), field("Image", image));
+    form.append(row);
+    const go = el("button", "Create deployment"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const n = name.value.trim();
+      await api("POST", "/loom/deployments", {
+        name: n,
+        spec: {
+          replicas: intField(replicas.value, "replicas", 0),
+          template: {
+            labels: { app: n },
+            spec: { containers: [{ name: container.value.trim() || n, image: image.value.trim() }] },
+          },
+        },
+      });
+      name.value = ""; container.value = ""; image.value = ""; replicas.value = "1";
+    });
+    return form;
+  }
+  if (current === "services") {
+    const name = el("input"); name.required = true; name.placeholder = "web";
+    const key = el("input"); key.placeholder = "app";
+    const value = el("input"); value.placeholder = "web";
+    const port = el("input"); port.required = true; port.value = "80"; port.inputMode = "numeric";
+    const kind = el("select");
+    kind.append(option("ClusterIp", "cluster IP"), option("NodePort", "node port"), option("LoadBalancer", "load balancer"));
+    form.append(el("strong", "New service"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Selector key", key), field("Selector value", value), field("Port", port), field("Kind", kind));
+    form.append(row);
+    const go = el("button", "Create service"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const spec = { ports: [{ port: intField(port.value, "port", 1, 65535) }], kind: kind.value };
+      const k = key.value.trim();
+      const v = value.value.trim();
+      if (k || v) {
+        if (!k || !v) throw new Error("selector needs both a key and a value");
+        spec.selector = { [k]: v };
+      }
+      await api("POST", "/loom/services", { name: name.value.trim(), spec });
+      name.value = ""; key.value = ""; value.value = "";
+    });
+    return form;
+  }
+  if (current === "jobs") {
+    const name = el("input"); name.required = true; name.placeholder = "batch";
+    const container = el("input"); container.placeholder = "same as name";
+    const image = el("input"); image.required = true; image.placeholder = "busybox";
+    const completions = el("input"); completions.type = "number"; completions.min = "1"; completions.value = "1"; completions.required = true;
+    const parallelism = el("input"); parallelism.type = "number"; parallelism.min = "1"; parallelism.value = "1"; parallelism.required = true;
+    const policy = el("select");
+    policy.append(option("Never", "never"), option("OnFailure", "on failure"));
+    form.append(el("strong", "New job"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Container", container), field("Image", image), field("Completions", completions), field("Parallelism", parallelism), field("Restart", policy));
+    form.append(row);
+    const go = el("button", "Create job"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const n = name.value.trim();
+      await api("POST", "/loom/jobs", {
+        name: n,
+        spec: {
+          completions: intField(completions.value, "completions", 1),
+          parallelism: intField(parallelism.value, "parallelism", 1),
+          template: {
+            spec: {
+              restart_policy: policy.value,
+              containers: [{ name: container.value.trim() || n, image: image.value.trim() }],
+            },
+          },
+        },
+      });
+      name.value = ""; container.value = ""; image.value = "";
+    });
+    return form;
+  }
+  if (current === "ingresses") {
+    const name = el("input"); name.required = true; name.placeholder = "web";
+    const host = el("input"); host.placeholder = "web.example.com";
+    const path = el("input"); path.required = true; path.value = "/";
+    const service = el("input"); service.required = true; service.placeholder = "web";
+    const port = el("input"); port.required = true; port.value = "80"; port.inputMode = "numeric";
+    form.append(el("strong", "New ingress"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Host", host), field("Path", path), field("Service", service), field("Port", port));
+    form.append(row);
+    const go = el("button", "Create ingress"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const p = path.value.trim() || "/";
+      if (p.charAt(0) !== "/") throw new Error("path must start with /");
+      const rule = {
+        paths: [{
+          path: p,
+          backend: { service: service.value.trim(), port: intField(port.value, "port", 1, 65535) },
+        }],
+      };
+      const h = host.value.trim();
+      if (h) rule.host = h;
+      await api("POST", "/loom/ingresses", { name: name.value.trim(), spec: { rules: [rule] } });
+      name.value = ""; host.value = ""; service.value = ""; path.value = "/";
+    });
+    return form;
+  }
+  if (current === "stacks") {
+    const name = el("input"); name.required = true; name.placeholder = "web";
+    const document = el("textarea"); document.required = true;
+    document.placeholder = "kind: network\nname: app\nspec: {}";
+    form.append(el("strong", "New stack"));
+    form.append(field("Name", name), field("Document", document));
+    form.append(el("p", "Apply creates network, subnet, and machine rows from this document. Every other kind is skipped.", "sub"));
+    const go = el("button", "Create stack"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const n = name.value.trim();
+      const doc = document.value;
+      if (!doc.trim()) throw new Error("document must not be empty");
+      await api("POST", "/blueprint/stacks", { name: n, spec: { name: n, document: doc } });
+      name.value = ""; document.value = "";
+    });
+    return form;
+  }
+  if (current === "shares") {
+    const name = el("input"); name.required = true; name.placeholder = "home";
+    const protocol = el("select");
+    protocol.append(option("nfs"), option("cephfs"));
+    const size = el("input"); size.type = "number"; size.min = "1"; size.value = "10"; size.required = true;
+    const cidr = el("input"); cidr.placeholder = "10.0.0.0/24";
+    const mode = el("select");
+    mode.append(option("read"), option("write"));
+    form.append(el("strong", "New share"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Protocol", protocol), field("Size GiB", size), field("Client CIDR", cidr), field("Mode", mode));
+    form.append(row);
+    const go = el("button", "Create share"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const spec = { protocol: protocol.value, size_gib: intField(size.value, "size", 1) };
+      const client = cidr.value.trim();
+      if (client) spec.access = [{ cidr: client, mode: mode.value }];
+      await api("POST", "/shelf/shares", { name: name.value.trim(), spec });
+      name.value = ""; cidr.value = "";
+    });
+    return form;
+  }
+  if (current === "alarms") {
+    const name = el("input"); name.required = true; name.placeholder = "cpu-high";
+    const metric = el("input"); metric.required = true; metric.placeholder = "cpu.usage";
+    const comparison = el("select");
+    comparison.append(option("gt", "greater than"), option("lt", "less than"), option("eq", "equal"));
+    const threshold = el("input"); threshold.type = "number"; threshold.step = "any"; threshold.required = true; threshold.value = "0";
+    const seconds = el("input"); seconds.type = "number"; seconds.min = "0"; seconds.value = "0"; seconds.required = true;
+    form.append(el("strong", "New alarm"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Metric", metric), field("Comparison", comparison), field("Threshold", threshold), field("For seconds", seconds));
+    form.append(row);
+    const go = el("button", "Create alarm"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const n = name.value.trim();
+      const t = Number(String(threshold.value).trim());
+      if (!Number.isFinite(t)) throw new Error("threshold must be a finite number");
+      await api("POST", "/gauge/alarms", {
+        name: n,
+        spec: {
+          name: n,
+          metric: metric.value.trim(),
+          comparison: comparison.value,
+          threshold: t,
+          for_seconds: intField(seconds.value, "for seconds", 0),
+        },
+      });
+      name.value = ""; metric.value = "";
+    });
+    return form;
+  }
   return null;
 }
 
@@ -1018,7 +1393,7 @@ function simpleTable(cols, items) {
     for (const c of cols) {
       const value = c[1](item);
       const td = el("td", show(value));
-      if (c[0] === "Phase" || c[0] === "Power") td.className = "phase " + String(value || "");
+      if (c[0] === "Phase" || c[0] === "Power") td.className = "phase " + String(value || "").toLowerCase();
       tr.append(td);
     }
     body.append(tr);
@@ -1543,13 +1918,14 @@ async function render() {
   root.append(simpleTable(view.cols, items));
   const table = root.lastElementChild;
   const body = table.querySelector("tbody");
-  if (view.actions || view.rules) {
+  const rowAction = !!(view.actions || view.apply);
+  if (rowAction || view.rules) {
     const head = table.querySelector("tr");
-    if (view.actions) head.append(el("th", ""));
+    if (rowAction) head.append(el("th", ""));
     const rows = body.querySelectorAll("tr");
     if (!items.length) {
       const td = rows[0] && rows[0].firstChild;
-      if (td) td.colSpan = view.cols.length + (view.actions ? 1 : 0);
+      if (td) td.colSpan = view.cols.length + (rowAction ? 1 : 0);
     } else {
       items.forEach((item, idx) => {
         const tr = rows[idx];
@@ -1577,28 +1953,44 @@ async function render() {
             }
           }
         }
-        if (view.actions) {
+        if (rowAction) {
           const td = el("td");
-          const start = el("button", "Start"); start.type = "button";
-          const stop = el("button", "Stop"); stop.type = "button";
-          const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
-          start.addEventListener("click", async () => {
-            setErr("");
-            try { await api("POST", view.path + "/" + item.id + "/start"); await render(); }
-            catch (e) { setErr(e.message); }
-          });
-          stop.addEventListener("click", async () => {
-            setErr("");
-            try { await api("POST", view.path + "/" + item.id + "/stop"); await render(); }
-            catch (e) { setErr(e.message); }
-          });
-          del.addEventListener("click", async () => {
-            if (!confirm("Delete " + item.name + "?")) return;
-            setErr("");
-            try { await api("DELETE", view.path + "/" + item.id); await render(); }
-            catch (e) { setErr(e.message); }
-          });
-          td.append(start, document.createTextNode(" "), stop, document.createTextNode(" "), del);
+          if (view.actions) {
+            const start = el("button", "Start"); start.type = "button";
+            const stop = el("button", "Stop"); stop.type = "button";
+            const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
+            start.addEventListener("click", async () => {
+              setErr("");
+              try { await api("POST", view.path + "/" + item.id + "/start"); await render(); }
+              catch (e) { setErr(e.message); }
+            });
+            stop.addEventListener("click", async () => {
+              setErr("");
+              try { await api("POST", view.path + "/" + item.id + "/stop"); await render(); }
+              catch (e) { setErr(e.message); }
+            });
+            del.addEventListener("click", async () => {
+              if (!confirm("Delete " + item.name + "?")) return;
+              setErr("");
+              try { await api("DELETE", view.path + "/" + item.id); await render(); }
+              catch (e) { setErr(e.message); }
+            });
+            td.append(start, document.createTextNode(" "), stop, document.createTextNode(" "), del);
+          }
+          if (view.apply) {
+            const apply = el("button", "Apply"); apply.type = "button";
+            apply.addEventListener("click", async () => {
+              setErr("");
+              apply.disabled = true;
+              try {
+                await api("POST", view.path + "/" + item.id + "/apply");
+                await render();
+              } catch (e) { setErr(e.message); }
+              apply.disabled = false;
+            });
+            if (td.childNodes.length) td.append(document.createTextNode(" "));
+            td.append(apply);
+          }
           tr.append(td);
         }
       });

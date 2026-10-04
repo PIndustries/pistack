@@ -99,5 +99,34 @@ mod tests {
         assert!(text.contains("security_groups"));
         assert!(text.contains(">Reboot<") || text.contains("\"Reboot\""));
         assert!(!text.contains("innerHTML"));
+        assert!(text.contains("data-view=\"pods\""));
+        assert!(text.contains("data-view=\"deployments\""));
+        assert!(text.contains("data-view=\"services\""));
+        assert!(text.contains("data-view=\"jobs\""));
+        assert!(text.contains("data-view=\"ingresses\""));
+        assert!(text.contains("data-view=\"stacks\""));
+        assert!(text.contains("data-view=\"shares\""));
+        assert!(text.contains("data-view=\"alarms\""));
+        assert!(text.contains("/loom/pods"));
+        assert!(text.contains("/loom/deployments"));
+        assert!(text.contains("/loom/services"));
+        assert!(text.contains("/loom/jobs"));
+        assert!(text.contains("/loom/ingresses"));
+        assert!(text.contains("/blueprint/stacks"));
+        assert!(text.contains("/apply"));
+        assert!(text.contains("/shelf/shares"));
+        assert!(text.contains("/gauge/alarms"));
+        assert!(text.contains("Create pod"));
+        assert!(text.contains("Create deployment"));
+        assert!(text.contains("Create service"));
+        assert!(text.contains("Create job"));
+        assert!(text.contains("Create ingress"));
+        assert!(text.contains("Create stack"));
+        assert!(text.contains("Create share"));
+        assert!(text.contains("Create alarm"));
+        assert!(text.contains("\"Apply\""));
+        assert!(text.contains("#7e9b86"));
+        assert!(!text.contains("pistack0"));
+        assert!(!text.to_ascii_lowercase().contains("ovn"));
     }
 }
