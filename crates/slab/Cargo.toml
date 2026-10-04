@@ -13,6 +13,7 @@ pistack-types.workspace = true
 pistack-store.workspace = true
 pistack-rpc.workspace = true
 gate.workspace = true
+silo.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 axum.workspace = true

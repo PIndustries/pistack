@@ -1902,6 +1902,7 @@ dependencies = [
  "pistack-types",
  "serde",
  "serde_json",
+ "silo",
  "tempfile",
  "thiserror",
  "tokio",

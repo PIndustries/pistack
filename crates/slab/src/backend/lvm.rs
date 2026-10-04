@@ -21,9 +21,17 @@
 //!
 //! Parameters come from `VolumeTypeSpec::params`: `vg` (required),
 //! `pool` (thin pool, default `pistack-thin`).
+//!
+//! A mutating command runs only after `vgs` shows the volume group and
+//! `lvs` shows the thin pool, and only when `lvcreate`, `lvremove`,
+//! `lvchange`, `lvextend`, `vgs`, and `lvs` are executable. A missing
+//! binary, volume group, or thin pool is unavailable. This backend does
+//! not create the group or the pool.
 
 use async_trait::async_trait;
+use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
@@ -46,7 +54,56 @@ impl LvmBackend {
         }
     }
 
+    /// `vg` and `pool` from a volume type. An empty pool stays empty here
+    /// and defaults to `pistack-thin` when a command is built.
+    pub fn from_params(params: &BTreeMap<String, String>) -> Self {
+        Self {
+            vg: params.get("vg").cloned().unwrap_or_default(),
+            pool: params.get("pool").cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Tools, volume group, and thin pool must all exist. No LVM command
+    /// that creates or removes a logical volume runs before this returns.
+    pub async fn require_available(&self) -> ApiResult<()> {
+        let vg = self.vg()?.to_owned();
+        let pool = self.pool()?.to_owned();
+        for tool in ["vgs", "lvs", "lvcreate", "lvremove", "lvchange", "lvextend"] {
+            super::configured_bin_ready(ENV_BIN, tool)?;
+        }
+        let vgs = super::configured_bin(ENV_BIN, "vgs");
+        run(
+            &vgs,
+            &[
+                "--noheadings".into(),
+                "-o".into(),
+                "vg_name".into(),
+                vg.clone(),
+            ],
+            false,
+        )
+        .await
+        .map_err(|e| unavailable_probe(e, &format!("volume group {vg}")))?;
+        let lvs = super::configured_bin(ENV_BIN, "lvs");
+        run(
+            &lvs,
+            &[
+                "--noheadings".into(),
+                "-o".into(),
+                "lv_name".into(),
+                format!("{vg}/{pool}"),
+            ],
+            false,
+        )
+        .await
+        .map_err(|e| unavailable_probe(e, &format!("thin pool {vg}/{pool}")))?;
+        Ok(())
+    }
+
     fn vg(&self) -> ApiResult<&str> {
+        if self.vg.is_empty() {
+            return Err(ApiError::unavailable("volume group is not configured"));
+        }
         ident("vg", &self.vg)?;
         Ok(&self.vg)
     }
@@ -69,12 +126,13 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef> {
+        self.require_available().await?;
         let vg = self.vg()?;
         let pool = self.pool()?;
         let id = vol_id(vol)?;
         let size = format!("{}G", vol.spec.size_gib);
         run(
-            &program(ENV_BIN, "lvcreate"),
+            &super::configured_bin(ENV_BIN, "lvcreate"),
             &[
                 "--thin".into(),
                 "--virtualsize".into(),
@@ -90,10 +148,11 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
+        self.require_available().await?;
         let vg = self.vg()?;
         let id = vol_id(vol)?;
         run(
-            &program(ENV_BIN, "lvremove"),
+            &super::configured_bin(ENV_BIN, "lvremove"),
             &["--force".into(), format!("{vg}/{id}")],
             true,
         )
@@ -101,11 +160,12 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn snapshot(&self, vol: &Volume, snap: &Snapshot) -> ApiResult<BackendRef> {
+        self.require_available().await?;
         let vg = self.vg()?;
         let vol_id = vol_id(vol)?;
         let snap_id = snap_id(snap)?;
         run(
-            &program(ENV_BIN, "lvcreate"),
+            &super::configured_bin(ENV_BIN, "lvcreate"),
             &[
                 "--snapshot".into(),
                 "--name".into(),
@@ -119,10 +179,11 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn delete_snapshot(&self, snap: &Snapshot) -> ApiResult<()> {
+        self.require_available().await?;
         let vg = self.vg()?;
         let id = snap_id(snap)?;
         run(
-            &program(ENV_BIN, "lvremove"),
+            &super::configured_bin(ENV_BIN, "lvremove"),
             &["--force".into(), format!("{vg}/{id}")],
             true,
         )
@@ -130,11 +191,12 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef> {
+        self.require_available().await?;
         let vg = self.vg()?;
         let snap_id = snap_id(snap)?;
         let id = vol_id(into)?;
         run(
-            &program(ENV_BIN, "lvcreate"),
+            &super::configured_bin(ENV_BIN, "lvcreate"),
             &[
                 "--snapshot".into(),
                 "--name".into(),
@@ -145,7 +207,7 @@ impl BlockBackend for LvmBackend {
         )
         .await?;
         run(
-            &program(ENV_BIN, "lvchange"),
+            &super::configured_bin(ENV_BIN, "lvchange"),
             &["-ay".into(), "-K".into(), format!("{vg}/{id}")],
             false,
         )
@@ -157,10 +219,11 @@ impl BlockBackend for LvmBackend {
         if new_size_gib < vol.spec.size_gib {
             return Err(ApiError::unprocessable("volumes cannot shrink"));
         }
+        self.require_available().await?;
         let vg = self.vg()?;
         let id = vol_id(vol)?;
         run(
-            &program(ENV_BIN, "lvextend"),
+            &super::configured_bin(ENV_BIN, "lvextend"),
             &[
                 "--size".into(),
                 format!("{new_size_gib}G"),
@@ -172,6 +235,7 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn attach_info(&self, vol: &Volume, _host: &str) -> ApiResult<AttachInfo> {
+        self.require_available().await?;
         let vg = self.vg()?;
         let id = vol_id(vol)?;
         let mut info = AttachInfo::new(AttachTarget::Local {
@@ -179,6 +243,11 @@ impl BlockBackend for LvmBackend {
         });
         info.device = vol.status.device.clone();
         Ok(info)
+    }
+
+    async fn bytes_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf> {
+        let _ = vol;
+        Err(ApiError::unavailable("lvm backup is not available"))
     }
 }
 
@@ -208,17 +277,11 @@ fn ident(kind: &str, value: &str) -> ApiResult<()> {
     }
 }
 
-fn program(env_key: &str, default: &str) -> String {
-    match std::env::var(env_key) {
-        Ok(v) => {
-            let v = v.trim();
-            if v.is_empty() {
-                default.to_owned()
-            } else {
-                v.to_owned()
-            }
-        }
-        Err(_) => default.to_owned(),
+fn unavailable_probe(err: ApiError, what: &str) -> ApiError {
+    if err.code == ErrorCode::Unavailable {
+        err
+    } else {
+        ApiError::unavailable(format!("{what} is not available"))
     }
 }
 
@@ -332,5 +395,53 @@ mod tests {
         std::env::set_var(ENV_BIN, dir.path().join("missing-lvm"));
         let err = backend.create(&vol).await.unwrap_err();
         assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+    }
+
+    #[tokio::test]
+    async fn missing_thin_pool_does_not_create() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("lvm");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\n\
+                 if [ \"$1\" = \"--noheadings\" ]; then\n\
+                   last=\n\
+                   for a in \"$@\"; do last=$a; done\n\
+                   case \"$last\" in */*) exit 1 ;; esac\n\
+                 fi\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+
+        let err = LvmBackend::new("", "pistack-thin")
+            .create(&volume(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert!(!log.exists(), "empty vg must not run a command");
+
+        let err = LvmBackend::new("vg0", "pistack-thin")
+            .create(&volume(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("not available"), "{err}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.contains("--thin"), "{logged}");
+        assert!(!logged.contains("--virtualsize"), "{logged}");
     }
 }

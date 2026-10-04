@@ -19,9 +19,16 @@
 //!
 //! Parameters from `VolumeTypeSpec::params`: `pool` (default `volumes`),
 //! `user` (default `pistack`), `monitors` (comma separated).
+//!
+//! A mutating command runs only when monitors are configured, `rbd` is
+//! executable, and `rbd pool stats {pool}` succeeds. A missing binary,
+//! monitor list, or pool is unavailable. This backend does not create
+//! the pool.
 
 use async_trait::async_trait;
+use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
@@ -55,6 +62,47 @@ impl RbdBackend {
         }
     }
 
+    /// `pool`, `user`, and comma-separated `monitors` from a volume type.
+    pub fn from_params(params: &BTreeMap<String, String>) -> Self {
+        let monitors = params
+            .get("monitors")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            pool: params.get("pool").cloned().unwrap_or_default(),
+            user: params.get("user").cloned().unwrap_or_default(),
+            monitors,
+        }
+    }
+
+    /// Monitors, the `rbd` binary, and the pool must all exist. No `rbd`
+    /// create, remove, clone, or resize runs before this returns.
+    pub async fn require_available(&self) -> ApiResult<()> {
+        let pool = self.pool()?.to_owned();
+        if !self.monitors.iter().any(|m| !m.trim().is_empty()) {
+            return Err(ApiError::unavailable(
+                "rbd monitors are not configured",
+            ));
+        }
+        let bin = super::configured_bin_ready(ENV_BIN, "rbd")?;
+        run(&bin, &["pool".into(), "stats".into(), pool.clone()], false)
+            .await
+            .map_err(|e| {
+                if e.code == ErrorCode::Unavailable {
+                    e
+                } else {
+                    ApiError::unavailable(format!("rbd pool {pool} is not available"))
+                }
+            })?;
+        Ok(())
+    }
+
     fn pool(&self) -> ApiResult<&str> {
         let pool = if self.pool.is_empty() {
             "volumes"
@@ -81,12 +129,13 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef> {
+        self.require_available().await?;
         let pool = self.pool()?;
         let id = vol_id(vol)?;
         let size = format!("{}G", vol.spec.size_gib);
         let image = format!("{pool}/{id}");
         run(
-            &program(ENV_BIN, "rbd"),
+            &super::configured_bin(ENV_BIN, "rbd"),
             &[
                 "create".into(),
                 "--size".into(),
@@ -102,10 +151,11 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
+        self.require_available().await?;
         let pool = self.pool()?;
         let id = vol_id(vol)?;
         run(
-            &program(ENV_BIN, "rbd"),
+            &super::configured_bin(ENV_BIN, "rbd"),
             &["rm".into(), format!("{pool}/{id}")],
             true,
         )
@@ -113,23 +163,25 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn snapshot(&self, vol: &Volume, snap: &Snapshot) -> ApiResult<BackendRef> {
+        self.require_available().await?;
         let pool = self.pool()?;
         let vol_id = vol_id(vol)?;
         let snap_id = snap_id(snap)?;
         let spec = format!("{pool}/{vol_id}@{snap_id}");
-        let bin = program(ENV_BIN, "rbd");
+        let bin = super::configured_bin(ENV_BIN, "rbd");
         run(&bin, &["snap".into(), "create".into(), spec.clone()], false).await?;
         run(&bin, &["snap".into(), "protect".into(), spec.clone()], false).await?;
         Ok(BackendRef::new(spec))
     }
 
     async fn delete_snapshot(&self, snap: &Snapshot) -> ApiResult<()> {
+        self.require_available().await?;
         let pool = self.pool()?;
         let vol_id = snap.spec.volume.to_string();
         ident("volume id", &vol_id)?;
         let snap_id = snap_id(snap)?;
         let spec = format!("{pool}/{vol_id}@{snap_id}");
-        let bin = program(ENV_BIN, "rbd");
+        let bin = super::configured_bin(ENV_BIN, "rbd");
         run(
             &bin,
             &["snap".into(), "unprotect".into(), spec.clone()],
@@ -140,6 +192,7 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef> {
+        self.require_available().await?;
         let pool = self.pool()?;
         let src = snap.spec.volume.to_string();
         ident("volume id", &src)?;
@@ -147,7 +200,7 @@ impl BlockBackend for RbdBackend {
         let id = vol_id(into)?;
         let image = format!("{pool}/{id}");
         run(
-            &program(ENV_BIN, "rbd"),
+            &super::configured_bin(ENV_BIN, "rbd"),
             &[
                 "clone".into(),
                 format!("{pool}/{src}@{snap_id}"),
@@ -163,10 +216,11 @@ impl BlockBackend for RbdBackend {
         if new_size_gib < vol.spec.size_gib {
             return Err(ApiError::unprocessable("volumes cannot shrink"));
         }
+        self.require_available().await?;
         let pool = self.pool()?;
         let id = vol_id(vol)?;
         run(
-            &program(ENV_BIN, "rbd"),
+            &super::configured_bin(ENV_BIN, "rbd"),
             &[
                 "resize".into(),
                 "--size".into(),
@@ -179,6 +233,7 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn attach_info(&self, vol: &Volume, _host: &str) -> ApiResult<AttachInfo> {
+        self.require_available().await?;
         let pool = self.pool()?.to_owned();
         let id = vol_id(vol)?;
         let mut info = AttachInfo::new(AttachTarget::Rbd {
@@ -190,6 +245,11 @@ impl BlockBackend for RbdBackend {
         });
         info.device = vol.status.device.clone();
         Ok(info)
+    }
+
+    async fn bytes_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf> {
+        let _ = vol;
+        Err(ApiError::unavailable("rbd backup is not available"))
     }
 }
 
@@ -216,20 +276,6 @@ fn ident(kind: &str, value: &str) -> ApiResult<()> {
         Err(ApiError::bad_request(format!(
             "{kind} must match [A-Za-z0-9._-]{{1,64}}"
         )))
-    }
-}
-
-fn program(env_key: &str, default: &str) -> String {
-    match std::env::var(env_key) {
-        Ok(v) => {
-            let v = v.trim();
-            if v.is_empty() {
-                default.to_owned()
-            } else {
-                v.to_owned()
-            }
-        }
-        Err(_) => default.to_owned(),
     }
 }
 
@@ -342,5 +388,48 @@ mod tests {
         std::env::set_var(ENV_BIN, dir.path().join("missing-rbd"));
         let err = backend.create(&vol).await.unwrap_err();
         assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+    }
+
+    #[tokio::test]
+    async fn missing_monitors_or_pool_does_not_create() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vol = volume(4);
+        let err = RbdBackend::new("volumes", "pistack", Vec::new())
+            .create(&vol)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("monitor"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("rbd");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\nif [ \"$1\" = \"pool\" ]; then exit 1; fi\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+
+        let err = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()])
+            .create(&vol)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("not available"), "{err}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.lines().any(|line| line == "create"), "{logged}");
     }
 }

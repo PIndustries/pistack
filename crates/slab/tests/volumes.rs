@@ -383,8 +383,9 @@ async fn http_crud_with_stale_revision() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{bak}");
     let bid = bak["id"].as_str().expect("id");
-    let (st, _) = call(&app, "POST", &format!("/backups/{bid}/restore"), None).await;
-    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    let (st, body) = call(&app, "POST", &format!("/backups/{bid}/restore"), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert_ne!(bak["status"]["phase"], "ready");
     let (st, _) = call(&app, "DELETE", &format!("/backups/{bid}"), None).await;
     assert_eq!(st, StatusCode::ACCEPTED);
 
@@ -443,6 +444,396 @@ async fn reconciler_loop_drives_volume_to_ready() {
     }
     shutdown.cancel();
     task.await.expect("reconciler exits");
+}
+
+fn type_create(name: &str, backend: &str, params: serde_json::Value) -> Create<slab::VolumeTypeSpec> {
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(obj) = params.as_object() {
+        for (k, v) in obj {
+            map.insert(k.clone(), v.as_str().unwrap_or_default().to_owned());
+        }
+    }
+    Create {
+        name: name.into(),
+        description: String::new(),
+        labels: Default::default(),
+        annotations: Default::default(),
+        project: None,
+        spec: slab::VolumeTypeSpec {
+            backend: backend.into(),
+            params: map,
+        },
+    }
+}
+
+fn make_bucket(c: &Client, project: &Id, name: &str) {
+    silo::Client::new(c.store().clone(), c.silo_root())
+        .create_bucket(
+            pistack_types::Meta::new(kind::BUCKET, name, Some(project.clone())),
+            silo::BucketSpec::default(),
+        )
+        .expect("bucket");
+}
+
+#[tokio::test]
+async fn empty_backend_uses_local_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    c.create_volume_type(type_create("blank", "", json!({})))
+        .expect("type");
+    let vt = c.get_volume_type("blank").expect("type");
+    assert_eq!(vt.spec.backend, "local");
+    let vol = c
+        .create_volume(create(
+            "blank-vol",
+            VolumeSpec {
+                volume_type: "blank".into(),
+                ..spec(1)
+            },
+        ))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_eq!(vol.status.phase, Phase::Ready);
+    assert!(LocalFileBackend::new(dir.path()).volume_path(&vol).exists());
+}
+
+#[tokio::test]
+async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    let lvm_log = dir.path().join("lvm.log");
+    let lvm_bin = dir.path().join("lvm");
+    let quoted = lvm_log.display().to_string().replace('\'', "'\\''");
+    std::fs::write(
+        &lvm_bin,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\nexit 1\n"),
+    )
+    .unwrap();
+    let rbd_log = dir.path().join("rbd.log");
+    let rbd_bin = dir.path().join("rbd");
+    let rbd_quoted = rbd_log.display().to_string().replace('\'', "'\\''");
+    std::fs::write(
+        &rbd_bin,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{rbd_quoted}'\nif [ \"$1\" = \"pool\" ]; then exit 1; fi\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lvm_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&rbd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("PISTACK_LVM_BIN", &lvm_bin);
+    std::env::set_var("PISTACK_RBD_BIN", &rbd_bin);
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            std::env::remove_var("PISTACK_LVM_BIN");
+            std::env::remove_var("PISTACK_RBD_BIN");
+        }
+    }
+    let _reset = Reset;
+
+    c.create_volume_type(type_create(
+        "thin",
+        "lvm",
+        json!({"vg": "pistack-absent-vg", "pool": "pistack-absent-pool"}),
+    ))
+    .expect("lvm type");
+    let lvm = c
+        .create_volume(create(
+            "lvm-vol",
+            VolumeSpec {
+                volume_type: "thin".into(),
+                ..spec(1)
+            },
+        ))
+        .await
+        .expect("lvm volume");
+    let lvm = c
+        .reconcile_volume(&lvm.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_ne!(lvm.status.phase, Phase::Ready);
+    assert!(lvm.status.backend_ref.is_none());
+    assert!(!LocalFileBackend::new(dir.path()).volume_path(&lvm).exists());
+    let logged = std::fs::read_to_string(&lvm_log).unwrap_or_default();
+    assert!(!logged.contains("--thin"), "{logged}");
+    assert!(!logged.contains("--virtualsize"), "{logged}");
+
+    c.create_volume_type(type_create(
+        "ceph",
+        "rbd",
+        json!({"pool": "volumes", "monitors": "10.0.0.1:6789"}),
+    ))
+    .expect("rbd type");
+    let rbd = c
+        .create_volume(create(
+            "rbd-vol",
+            VolumeSpec {
+                volume_type: "ceph".into(),
+                ..spec(1)
+            },
+        ))
+        .await
+        .expect("rbd volume");
+    let rbd = c
+        .reconcile_volume(&rbd.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_ne!(rbd.status.phase, Phase::Ready);
+    assert!(rbd.status.backend_ref.is_none());
+    let logged = std::fs::read_to_string(&rbd_log).unwrap_or_default();
+    assert!(
+        !logged.lines().any(|line| line == "create"),
+        "{logged}"
+    );
+
+    c.create_volume_type(type_create("nomon", "rbd", json!({"pool": "volumes"})))
+        .expect("rbd type without monitors");
+    let quiet = dir.path().join("rbd-quiet.log");
+    let quiet_bin = dir.path().join("rbd-quiet");
+    let quiet_quoted = quiet.display().to_string().replace('\'', "'\\''");
+    std::fs::write(
+        &quiet_bin,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quiet_quoted}'\nexit 0\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&quiet_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("PISTACK_RBD_BIN", &quiet_bin);
+    let bare = c
+        .create_volume(create(
+            "rbd-bare",
+            VolumeSpec {
+                volume_type: "nomon".into(),
+                ..spec(1)
+            },
+        ))
+        .await
+        .expect("volume");
+    let bare = c
+        .reconcile_volume(&bare.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_ne!(bare.status.phase, Phase::Ready);
+    assert!(
+        !quiet.exists(),
+        "missing monitors must not run rbd"
+    );
+}
+
+#[tokio::test]
+async fn backup_round_trip_and_oversize_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    let vol = c
+        .create_volume(create("src", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let path = LocalFileBackend::new(dir.path()).volume_path(&vol);
+    let payload = b"pistack-backup-payload";
+    std::fs::write(&path, payload).expect("shrink source");
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+
+    let bak = c
+        .create_backup(Create {
+            name: "nightly".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: slab::BackupSpec {
+                volume: vol.meta.id.clone(),
+                target: "backups".into(),
+            },
+        })
+        .await
+        .expect("backup");
+    assert_eq!(bak.status.phase, Phase::Pending);
+    let bak = c
+        .reconcile_backup(&bak.meta.id)
+        .await
+        .expect("upload")
+        .expect("exists");
+    assert_eq!(bak.status.phase, Phase::Ready, "{bak:?}");
+    let key = bak.status.object_ref.clone().expect("object");
+    let bucket = silo::Client::new(c.store().clone(), c.silo_root())
+        .get_bucket(Some(&project), "backups")
+        .expect("bucket");
+    let (obj, bytes) = silo::Client::new(c.store().clone(), c.silo_root())
+        .get_object(&bucket.meta.id, &key)
+        .await
+        .expect("object bytes");
+    assert_eq!(bytes, payload);
+    assert_eq!(obj.status.size_bytes, payload.len() as u64);
+
+    let restored = c.restore_backup(&bak.meta.id).await.expect("restore");
+    assert_eq!(restored.status.phase, Phase::Ready);
+    assert_ne!(restored.meta.id, vol.meta.id);
+    let restored_path = LocalFileBackend::new(dir.path()).volume_path(&restored);
+    let mut got = vec![0u8; payload.len()];
+    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got)
+        .unwrap();
+    assert_eq!(got, payload);
+
+    let huge = silo::MAX_OBJECT_BYTES as u64 + 1;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(huge)
+        .unwrap();
+    let big = c
+        .create_backup(Create {
+            name: "too-big".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: slab::BackupSpec {
+                volume: vol.meta.id.clone(),
+                target: "backups".into(),
+            },
+        })
+        .await
+        .expect("big backup");
+    let err = c
+        .reconcile_backup(&big.meta.id)
+        .await
+        .expect_err("oversize");
+    assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+    assert!(err.message.contains(&huge.to_string()), "{err}");
+    let big = c.backups().get(&big.meta.id).expect("big");
+    assert_ne!(big.status.phase, Phase::Ready);
+    assert!(big.status.object_ref.is_none());
+    let objects = silo::Client::new(c.store().clone(), c.silo_root())
+        .list_objects(&bucket.meta.id)
+        .expect("list");
+    assert!(
+        objects.iter().all(|o| o.spec.key == key),
+        "oversize backup must not write an object: {objects:?}"
+    );
+
+    let blocked = dir.path().join("not-a-dir");
+    std::fs::write(&blocked, b"x").unwrap();
+    let c = Client::local(dir.path())
+        .expect("client")
+        .with_silo_root(&blocked);
+    c.seed_defaults().expect("seed");
+    let vol = c
+        .create_volume(create("src2", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let path = LocalFileBackend::new(dir.path()).volume_path(&vol);
+    std::fs::write(&path, b"nope").unwrap();
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+    let bak = c
+        .create_backup(Create {
+            name: "broken".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: slab::BackupSpec {
+                volume: vol.meta.id.clone(),
+                target: "backups".into(),
+            },
+        })
+        .await
+        .expect("backup");
+    let bak = c
+        .reconcile_backup(&bak.meta.id)
+        .await
+        .expect("failed write still returns the record")
+        .expect("exists");
+    assert_ne!(bak.status.phase, Phase::Ready);
+    assert!(bak.status.object_ref.is_none(), "{bak:?}");
+}
+
+#[tokio::test]
+async fn refs_outside_the_slab_dir_are_not_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("tempdir");
+    let sentinel = outside.path().join("sentinel");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    let c = client(&dir);
+
+    let vol = c
+        .create_volume(create("data", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let snap = c
+        .create_snapshot(Create {
+            name: "data-snap".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: SnapshotSpec {
+                volume: vol.meta.id.clone(),
+            },
+        })
+        .await
+        .expect("snapshot");
+    let snap = c
+        .reconcile_snapshot(&snap.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+
+    c.snapshots()
+        .modify(&snap.meta.id, |s| {
+            s.status.backend_ref = Some(sentinel.display().to_string());
+            s.status.phase = Phase::Deleting;
+            Ok(())
+        })
+        .expect("modify snapshot");
+    let snap = c
+        .reconcile_snapshot(&snap.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("snapshot record stays");
+    assert_eq!(snap.status.phase, Phase::Error);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+
+    c.volumes()
+        .modify(&vol.meta.id, |v| {
+            v.status.backend_ref = Some(sentinel.display().to_string());
+            v.status.phase = Phase::Deleting;
+            Ok(())
+        })
+        .expect("modify volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("volume record stays");
+    assert_eq!(vol.status.phase, Phase::Error);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
 }
 
 fn admin_caller() -> Caller {

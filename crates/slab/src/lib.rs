@@ -19,7 +19,7 @@ use axum::Router;
 use pistack_rpc::CommandQueue;
 use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod backend;
@@ -47,16 +47,27 @@ pub struct Slab {
 
 impl Default for Slab {
     fn default() -> Self {
-        let dir = std::env::var_os("PISTACK_SLAB_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::var_os("PISTACK_DATA_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("./data"))
-                    .join("volumes")
-            });
-        Self::new(Arc::new(LocalFileBackend::new(dir)), Arc::new(AllowAll))
+        Self::new(
+            Arc::new(LocalFileBackend::new(default_volume_dir())),
+            Arc::new(AllowAll),
+        )
     }
+}
+
+/// `$PISTACK_SLAB_DIR`, else `$PISTACK_DATA_DIR/volumes`, else `./data/volumes`.
+pub(crate) fn default_volume_dir() -> PathBuf {
+    std::env::var_os("PISTACK_SLAB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("PISTACK_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("./data"))
+                .join("volumes")
+        })
+}
+
+pub(crate) fn path_inside(root: &Path, path: &Path) -> bool {
+    path.starts_with(root)
 }
 
 impl Slab {

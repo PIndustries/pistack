@@ -7,6 +7,7 @@
 //! Layout: `<dir>/<vol-id>.raw`, `<dir>/snapshots/<snap-id>.raw`.
 
 use async_trait::async_trait;
+use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -149,7 +150,7 @@ impl BlockBackend for LocalFileBackend {
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
-        Self::remove_if_exists(&self.vol_ref_path(vol)).await
+        self.remove_owned(&self.vol_ref_path(vol)).await
     }
 
     async fn snapshot(&self, vol: &Volume, snap: &Snapshot) -> ApiResult<BackendRef> {
@@ -161,7 +162,7 @@ impl BlockBackend for LocalFileBackend {
     }
 
     async fn delete_snapshot(&self, snap: &Snapshot) -> ApiResult<()> {
-        Self::remove_if_exists(&self.snap_ref_path(snap)).await
+        self.remove_owned(&self.snap_ref_path(snap)).await
     }
 
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef> {
@@ -196,4 +197,96 @@ impl BlockBackend for LocalFileBackend {
         info.device = vol.status.device.clone();
         Ok(info)
     }
+
+    async fn bytes_path(&self, vol: &Volume) -> ApiResult<PathBuf> {
+        self.confine(&self.vol_ref_path(vol)).await
+    }
+}
+
+impl LocalFileBackend {
+    /// The volume file must stay inside this backend's directory.
+    async fn confine(&self, path: &Path) -> ApiResult<PathBuf> {
+        let dir = match fs::canonicalize(&self.dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ApiError::unavailable(
+                    "local volume directory is not available",
+                ));
+            }
+            Err(e) => return Err(io_err(e)),
+        };
+        match fs::canonicalize(path).await {
+            Ok(canon) => {
+                if !crate::path_inside(&dir, &canon) {
+                    return Err(ApiError::bad_request(
+                        "volume path escapes the slab directory",
+                    ));
+                }
+                Ok(canon)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let parent = path.parent().ok_or_else(|| {
+                    ApiError::bad_request("volume path escapes the slab directory")
+                })?;
+                let parent = fs::canonicalize(parent).await.map_err(io_err)?;
+                if !crate::path_inside(&dir, &parent) {
+                    return Err(ApiError::bad_request(
+                        "volume path escapes the slab directory",
+                    ));
+                }
+                let name = path.file_name().ok_or_else(|| {
+                    ApiError::bad_request("volume path escapes the slab directory")
+                })?;
+                Ok(parent.join(name))
+            }
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// Remove `path` only when it stays inside this backend's directory.
+    /// A missing directory or a missing file is success. An outside path
+    /// is refused and left in place.
+    async fn remove_owned(&self, path: &Path) -> ApiResult<()> {
+        match self.confine(path).await {
+            Ok(path) => Self::remove_if_exists(&path).await,
+            Err(e) if e.code == ErrorCode::Unavailable => Ok(()),
+            Err(e) if e.code == ErrorCode::BadRequest => Err(e),
+            Err(_) if self.lexical_inside(path) => Self::remove_if_exists(path).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Component-wise check used when the file is not there to canonicalize.
+    /// Both the configured directory and its canonical form count, so a
+    /// `/var` path and a `/private/var` path still agree.
+    fn lexical_inside(&self, path: &Path) -> bool {
+        let mut roots = vec![self.dir.clone()];
+        if let Ok(canon) = std::fs::canonicalize(&self.dir) {
+            roots.push(canon);
+        }
+        roots.into_iter().any(|root| path_under(&root, path))
+    }
+}
+
+fn path_under(root: &Path, path: &Path) -> bool {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    crate::path_inside(&normalize(root), &normalize(&abs))
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
