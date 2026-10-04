@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! LVM thin-pool backend. Stub: every method returns `not_implemented`.
+//! LVM thin-pool backend.
 //!
-//! When wired, the backend runs these on the storage host (via `anvil`
-//! over RPC, never locally on the control plane):
+//! `$PISTACK_LVM_BIN`, when set and non-empty, replaces the `lvcreate` /
+//! `lvs` family binary (`lvcreate`, `lvremove`, `lvchange`, `lvextend`).
+//! Otherwise those names are looked up on `PATH`. A missing binary is
+//! unavailable. `vg`, `pool`, volume ids and snapshot ids must match
+//! `[A-Za-z0-9._-]{1,64}`.
 //!
 //! | operation       | command |
 //! | --------------- | ------- |
@@ -14,16 +17,20 @@
 //! | delete_snapshot | `lvremove --force {vg}/{snap_id}` |
 //! | restore         | `lvcreate --snapshot --name {new_vol_id} {vg}/{snap_id}` then `lvchange -ay -K {vg}/{new_vol_id}` |
 //! | extend          | `lvextend --size {new_size_gib}G {vg}/{vol_id}` |
-//! | attach_info     | same host: `Local { path: /dev/{vg}/{vol_id} }`; remote host: export with `targetcli` and return `Iscsi { portal, iqn, lun }` |
+//! | attach_info     | same host: `Local { path: /dev/{vg}/{vol_id} }` |
 //!
 //! Parameters come from `VolumeTypeSpec::params`: `vg` (required),
-//! `pool` (thin pool, default `pistack-thin`), `iscsi_portal`.
+//! `pool` (thin pool, default `pistack-thin`).
 
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult};
+use std::time::Duration;
 
-use super::{AttachInfo, BackendRef, BlockBackend};
+use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
 use crate::types::{Snapshot, Volume};
+
+const TIMEOUT: Duration = Duration::from_secs(30);
+const ENV_BIN: &str = "PISTACK_LVM_BIN";
 
 #[derive(Default)]
 pub struct LvmBackend {
@@ -39,9 +46,19 @@ impl LvmBackend {
         }
     }
 
-    fn todo(op: &str, cmd: String) -> ApiError {
-        ApiError::not_implemented(format!("lvm backend: {op} not implemented"))
-            .with_detail("command", cmd)
+    fn vg(&self) -> ApiResult<&str> {
+        ident("vg", &self.vg)?;
+        Ok(&self.vg)
+    }
+
+    fn pool(&self) -> ApiResult<&str> {
+        let pool = if self.pool.is_empty() {
+            "pistack-thin"
+        } else {
+            self.pool.as_str()
+        };
+        ident("pool", pool)?;
+        Ok(pool)
     }
 }
 
@@ -52,66 +69,268 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef> {
-        Err(Self::todo(
-            "create",
-            format!(
-                "lvcreate --thin --virtualsize {}G --name {} {}/{}",
-                vol.spec.size_gib, vol.meta.id, self.vg, self.pool
-            ),
-        ))
+        let vg = self.vg()?;
+        let pool = self.pool()?;
+        let id = vol_id(vol)?;
+        let size = format!("{}G", vol.spec.size_gib);
+        run(
+            &program(ENV_BIN, "lvcreate"),
+            &[
+                "--thin".into(),
+                "--virtualsize".into(),
+                size,
+                "--name".into(),
+                id.clone(),
+                format!("{vg}/{pool}"),
+            ],
+            false,
+        )
+        .await?;
+        Ok(BackendRef::new(format!("/dev/{vg}/{id}")))
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
-        Err(Self::todo(
-            "delete",
-            format!("lvremove --force {}/{}", self.vg, vol.meta.id),
-        ))
+        let vg = self.vg()?;
+        let id = vol_id(vol)?;
+        run(
+            &program(ENV_BIN, "lvremove"),
+            &["--force".into(), format!("{vg}/{id}")],
+            true,
+        )
+        .await
     }
 
     async fn snapshot(&self, vol: &Volume, snap: &Snapshot) -> ApiResult<BackendRef> {
-        Err(Self::todo(
-            "snapshot",
-            format!(
-                "lvcreate --snapshot --name {} {}/{}",
-                snap.meta.id, self.vg, vol.meta.id
-            ),
-        ))
+        let vg = self.vg()?;
+        let vol_id = vol_id(vol)?;
+        let snap_id = snap_id(snap)?;
+        run(
+            &program(ENV_BIN, "lvcreate"),
+            &[
+                "--snapshot".into(),
+                "--name".into(),
+                snap_id.clone(),
+                format!("{vg}/{vol_id}"),
+            ],
+            false,
+        )
+        .await?;
+        Ok(BackendRef::new(format!("/dev/{vg}/{snap_id}")))
     }
 
     async fn delete_snapshot(&self, snap: &Snapshot) -> ApiResult<()> {
-        Err(Self::todo(
-            "delete_snapshot",
-            format!("lvremove --force {}/{}", self.vg, snap.meta.id),
-        ))
+        let vg = self.vg()?;
+        let id = snap_id(snap)?;
+        run(
+            &program(ENV_BIN, "lvremove"),
+            &["--force".into(), format!("{vg}/{id}")],
+            true,
+        )
+        .await
     }
 
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef> {
-        Err(Self::todo(
-            "restore",
-            format!(
-                "lvcreate --snapshot --name {} {}/{} && lvchange -ay -K {}/{}",
-                into.meta.id, self.vg, snap.meta.id, self.vg, into.meta.id
-            ),
-        ))
+        let vg = self.vg()?;
+        let snap_id = snap_id(snap)?;
+        let id = vol_id(into)?;
+        run(
+            &program(ENV_BIN, "lvcreate"),
+            &[
+                "--snapshot".into(),
+                "--name".into(),
+                id.clone(),
+                format!("{vg}/{snap_id}"),
+            ],
+            false,
+        )
+        .await?;
+        run(
+            &program(ENV_BIN, "lvchange"),
+            &["-ay".into(), "-K".into(), format!("{vg}/{id}")],
+            false,
+        )
+        .await?;
+        Ok(BackendRef::new(format!("/dev/{vg}/{id}")))
     }
 
     async fn extend(&self, vol: &Volume, new_size_gib: u64) -> ApiResult<()> {
-        Err(Self::todo(
-            "extend",
-            format!(
-                "lvextend --size {new_size_gib}G {}/{}",
-                self.vg, vol.meta.id
-            ),
-        ))
+        if new_size_gib < vol.spec.size_gib {
+            return Err(ApiError::unprocessable("volumes cannot shrink"));
+        }
+        let vg = self.vg()?;
+        let id = vol_id(vol)?;
+        run(
+            &program(ENV_BIN, "lvextend"),
+            &[
+                "--size".into(),
+                format!("{new_size_gib}G"),
+                format!("{vg}/{id}"),
+            ],
+            false,
+        )
+        .await
     }
 
-    async fn attach_info(&self, vol: &Volume, host: &str) -> ApiResult<AttachInfo> {
-        Err(Self::todo(
-            "attach_info",
-            format!(
-                "on {host}: Local {{ path: /dev/{}/{} }} or targetcli iSCSI export",
-                self.vg, vol.meta.id
-            ),
-        ))
+    async fn attach_info(&self, vol: &Volume, _host: &str) -> ApiResult<AttachInfo> {
+        let vg = self.vg()?;
+        let id = vol_id(vol)?;
+        let mut info = AttachInfo::new(AttachTarget::Local {
+            path: format!("/dev/{vg}/{id}"),
+        });
+        info.device = vol.status.device.clone();
+        Ok(info)
+    }
+}
+
+fn vol_id(vol: &Volume) -> ApiResult<String> {
+    let id = vol.meta.id.to_string();
+    ident("volume id", &id)?;
+    Ok(id)
+}
+
+fn snap_id(snap: &Snapshot) -> ApiResult<String> {
+    let id = snap.meta.id.to_string();
+    ident("snapshot id", &id)?;
+    Ok(id)
+}
+
+fn ident(kind: &str, value: &str) -> ApiResult<()> {
+    let ok = (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{kind} must match [A-Za-z0-9._-]{{1,64}}"
+        )))
+    }
+}
+
+fn program(env_key: &str, default: &str) -> String {
+    match std::env::var(env_key) {
+        Ok(v) => {
+            let v = v.trim();
+            if v.is_empty() {
+                default.to_owned()
+            } else {
+                v.to_owned()
+            }
+        }
+        Err(_) => default.to_owned(),
+    }
+}
+
+async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let finished = tokio::time::timeout(TIMEOUT, cmd.output()).await;
+    let output = match finished {
+        Err(_) => {
+            return Err(ApiError::unavailable(format!(
+                "{bin} timed out after 30s"
+            )))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::unavailable(format!("{bin} is not available")))
+        }
+        Ok(Err(e)) => return Err(ApiError::internal(format!("{bin}: {e}"))),
+        Ok(Ok(output)) => output,
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = format!("{}{}", clip(&output.stderr), clip(&output.stdout));
+    if missing_ok && object_absent(&detail) {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    Err(ApiError::internal(format!("{bin} exited {code}: {detail}")))
+}
+
+fn clip(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(400)
+        .collect()
+}
+
+fn object_absent(text: &str) -> bool {
+    let s = text.to_ascii_lowercase();
+    s.contains("failed to find logical volume")
+        || s.contains("failed to find device")
+        || s.contains("no such file or directory")
+        || (s.contains("not found") && (s.contains("image") || s.contains("snap")))
+        || s.contains("not protected")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{VolumeSpec, VolumeStatus};
+    use pistack_types::{kind, Meta};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn volume(size: u64) -> Volume {
+        Volume {
+            meta: Meta::new(kind::VOLUME, "data", None),
+            spec: VolumeSpec {
+                size_gib: size,
+                volume_type: "lvm".into(),
+                source: Default::default(),
+                bootable: false,
+                encrypted: false,
+            },
+            status: VolumeStatus::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_argv_contains_id_and_size() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("lvm");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\nexit 0\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+
+        let bad = LvmBackend::new("bad/vg", "pistack-thin");
+        let vol = volume(17);
+        let err = bad.create(&vol).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::BadRequest);
+        assert!(!log.exists());
+
+        let backend = LvmBackend::new("vg0", "pistack-thin");
+        let id = vol.meta.id.to_string();
+        backend.create(&vol).await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains(&id), "{logged}");
+        assert!(logged.contains("17G"), "{logged}");
+
+        std::env::set_var(ENV_BIN, dir.path().join("missing-lvm"));
+        let err = backend.create(&vol).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
     }
 }

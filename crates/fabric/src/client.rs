@@ -363,12 +363,21 @@ impl Client {
         }
         self.validate_security_groups(&meta, &spec.security_groups)?;
 
+        // Gateway and interface ports belong to the router, not the tenant quota.
+        let counted = !is_router_device(&spec.device);
+        if counted {
+            crate::usage::admit_port(&self.store, meta.project.as_ref())?;
+        }
         let port = Port {
             meta,
             spec,
             status: PortStatus::default(),
         };
-        self.ports().create(port).map_err(store_err)
+        let port = self.ports().create(port).map_err(store_err)?;
+        if counted {
+            crate::usage::note_port_create(&self.store, port.meta.project.as_ref());
+        }
+        Ok(port)
     }
 
     pub fn update_port(
@@ -442,7 +451,12 @@ impl Client {
                     .map_err(store_err)?;
             }
         }
-        self.ports().delete(&port.meta.id).map_err(store_err)
+        let counted = !port.is_router_port();
+        let port = self.ports().delete(&port.meta.id).map_err(store_err)?;
+        if counted {
+            crate::usage::note_port_delete(&self.store, port.meta.project.as_ref());
+        }
+        Ok(port)
     }
 
     fn validate_fixed_ips(
@@ -937,13 +951,93 @@ impl Client {
         if let Some(p) = &spec.port {
             self.validate_fip_target(&meta, &meta.id, p)?;
         }
-        self.floating_ips()
+        crate::usage::admit_floating_ip(&self.store, meta.project.as_ref())?;
+        let fip = self
+            .floating_ips()
             .create(FloatingIp {
                 meta,
                 spec,
                 status: FloatingIpStatus::default(),
             })
-            .map_err(store_err)
+            .map_err(store_err)?;
+        crate::usage::note_floating_ip_create(&self.store, fip.meta.project.as_ref());
+        Ok(fip)
+    }
+
+    /// Point the floating IP at a machine's current IPv4.
+    ///
+    /// A port is created on the longest-prefix subnet that contains that
+    /// address, in this floating IP's project. A later call reuses that port.
+    pub fn associate_to_machine(&self, id: &Id, machine: &Id) -> ApiResult<FloatingIp> {
+        let fip = self.floating_ips().get(id).map_err(store_err)?;
+        let guest = crate::machine::guest_ipv4(&self.store, machine)?;
+        check_same_project(&fip.meta, &guest.meta, "machine")?;
+        let port = self.ensure_machine_port(&fip.meta, machine, guest.ipv4, &guest.meta.name)?;
+        self.associate_floating_ip(id, Some(port))
+    }
+
+    fn ensure_machine_port(
+        &self,
+        fip: &Meta,
+        machine: &Id,
+        addr: IpAddr,
+        machine_name: &str,
+    ) -> ApiResult<Id> {
+        let ports = self.ports().list(None).map_err(store_err)?;
+        if let Some(existing) = ports
+            .iter()
+            .find(|p| p.meta.project == fip.project && p.spec.fixed_ips.contains(&addr))
+        {
+            if existing.is_router_port() {
+                return Err(ApiError::conflict(format!(
+                    "{addr} is held by router port {}",
+                    existing.meta.id
+                )));
+            }
+            if existing.spec.device.as_ref().is_some_and(|d| d != machine) {
+                return Err(ApiError::conflict(format!(
+                    "{addr} is held by port {} on another machine",
+                    existing.meta.id
+                )));
+            }
+            return Ok(existing.meta.id.clone());
+        }
+
+        let mut subnets: Vec<Subnet> = self
+            .subnets()
+            .list(None)
+            .map_err(store_err)?
+            .into_iter()
+            .filter(|s| {
+                s.spec.cidr.contains(&addr) && check_same_project(fip, &s.meta, "subnet").is_ok()
+            })
+            .collect();
+        subnets.sort_by(|a, b| {
+            prefix_len(b.spec.cidr)
+                .cmp(&prefix_len(a.spec.cidr))
+                .then(a.meta.id.cmp(&b.meta.id))
+        });
+        let Some(sub) = subnets.into_iter().next() else {
+            return Err(ApiError::unprocessable(format!(
+                "no subnet contains {addr}"
+            )));
+        };
+        let name = if machine_name.is_empty() {
+            machine.to_string()
+        } else {
+            format!("{machine_name}-{addr}")
+        };
+        let port = self.create_port(
+            Meta::new(kind::PORT, name, fip.project.clone()),
+            PortSpec {
+                network: sub.spec.network.clone(),
+                subnet: Some(sub.meta.id.clone()),
+                fixed_ips: vec![addr],
+                device: Some(machine.clone()),
+                ..PortSpec::default()
+            },
+        )?;
+        Ok(port.meta.id)
     }
 
     /// Point the floating IP at `port`, or detach it with `None`.
@@ -988,7 +1082,9 @@ impl Client {
     }
 
     pub fn delete_floating_ip(&self, id: &Id) -> ApiResult<FloatingIp> {
-        self.floating_ips().delete(id).map_err(store_err)
+        let fip = self.floating_ips().delete(id).map_err(store_err)?;
+        crate::usage::note_floating_ip_delete(&self.store, fip.meta.project.as_ref());
+        Ok(fip)
     }
 
     fn validate_fip_target(&self, meta: &Meta, fip: &Id, port: &Id) -> ApiResult<()> {
@@ -1027,6 +1123,18 @@ impl Client {
         network: &str,
         device: Id,
     ) -> ApiResult<Port> {
+        self.create_port_for_device_with(project, network, device, &[]).await
+    }
+
+    /// Like [`Self::create_port_for_device`]. `groups` replaces the default
+    /// security group when it is not empty.
+    pub async fn create_port_for_device_with(
+        &self,
+        project: &Id,
+        network: &str,
+        device: Id,
+        groups: &[Id],
+    ) -> ApiResult<Port> {
         let net = match self.networks().resolve(Some(project), network) {
             Ok(n) => n,
             Err(StoreError::NotFound(_)) => {
@@ -1042,11 +1150,14 @@ impl Client {
         );
         meta.labels
             .insert("pistack.io/device".into(), device.to_string());
-        let spec = PortSpec {
+        let mut spec = PortSpec {
             network: net.meta.id.clone(),
             device: Some(device),
             ..PortSpec::default()
         };
+        if !groups.is_empty() {
+            spec.security_groups = groups.to_vec();
+        }
         let port = self.create_port(meta, spec)?;
         self.reconcile_port(&port.meta.id).await;
         self.ports().get(&port.meta.id).map_err(store_err)
@@ -1113,6 +1224,13 @@ fn overlaps(a: IpNet, b: IpNet) -> bool {
 
 fn is_router_device(d: &Option<Id>) -> bool {
     d.as_ref().is_some_and(|d| d.kind == kind::ROUTER)
+}
+
+fn prefix_len(net: IpNet) -> u8 {
+    match net {
+        IpNet::V4(n) => n.prefix_len(),
+        IpNet::V6(n) => n.prefix_len(),
+    }
 }
 
 /// A project resource may only reference resources in its own project or

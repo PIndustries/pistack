@@ -6,7 +6,7 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use pistack_store::Store;
-use pistack_types::{kind, Id, Module, ModuleContext, Phase};
+use pistack_types::{kind, Caller, Id, Module, ModuleContext, Phase};
 use relay::health::Checker;
 use relay::*;
 use serde_json::{json, Value};
@@ -69,12 +69,9 @@ impl Harness {
             }
             None => Body::empty(),
         };
-        let res = self
-            .router
-            .clone()
-            .oneshot(req.body(body).unwrap())
-            .await
-            .unwrap();
+        let mut req = req.body(body).unwrap();
+        req.extensions_mut().insert(admin_caller());
+        let res = self.router.clone().oneshot(req).await.unwrap();
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
@@ -515,6 +512,7 @@ async fn health_checker_flips_online_then_offline() {
                 default_pool: Some(pool.meta.id.clone()),
                 connection_limit: 0,
                 admin_up: true,
+                door: None,
             },
         )
         .unwrap();
@@ -664,4 +662,43 @@ async fn every_kind_create_list_stale_update_delete() {
     let (_, lbs) = h.call("GET", "/balancers?all=true", None).await;
     assert_eq!(lbs["total"], 0);
     h.ctx.shutdown.cancel();
+}
+
+fn admin_caller() -> Caller {
+    Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "dev-admin".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    }
+}
+
+#[tokio::test]
+async fn missing_caller_is_unauthorized() {
+    let store = Store::in_memory().unwrap();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+    };
+    let app = Relay::default().router(ctx);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/balancers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "no credentials");
 }

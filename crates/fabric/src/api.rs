@@ -9,8 +9,8 @@
 //! rules, floating IP association). Handlers only validate the caller's
 //! scope and hand off to `Client`; they never write `status`.
 //!
-//! The `Caller` comes from request extensions (set by the gateway once
-//! `gate` is wired). Without one, requests run as a development admin.
+//! The `Caller` comes from request extensions (set by the gateway).
+//! Without one, the request is rejected.
 
 use crate::client::Client;
 use crate::types::{self, *};
@@ -70,26 +70,16 @@ pub fn router(client: Client) -> axum::Router {
         )
         .route("/floating-ips/{id}/associate", post(associate_fip))
         .route("/floating-ips/{id}/disassociate", post(disassociate_fip))
-        .layer(middleware::from_fn(default_caller))
+        .layer(middleware::from_fn(require_caller))
         .with_state(client)
 }
 
-/// Attach a development admin `Caller` when the gateway did not.
-async fn default_caller(mut req: Request, next: Next) -> Response {
+/// The gateway attaches a `Caller`. A request without one is refused.
+async fn require_caller(req: Request, next: Next) -> Response {
     if req.extensions().get::<Caller>().is_none() {
-        req.extensions_mut().insert(dev_admin());
+        return ApiError::unauthorized("no credentials").into_response();
     }
     next.run(req).await
-}
-
-pub fn dev_admin() -> Caller {
-    Caller {
-        principal: Id::new(kind::PRINCIPAL),
-        principal_name: "dev-admin".into(),
-        project: None,
-        roles: vec!["admin".into()],
-        system: true,
-    }
 }
 
 // ---- request / response shapes ---------------------------------------------
@@ -139,7 +129,12 @@ pub struct Interfaces {
 
 #[derive(Deserialize)]
 pub struct Associate {
-    pub port: Id,
+    /// Existing port. Exactly one of `port` or `machine` is set.
+    #[serde(default)]
+    pub port: Option<Id>,
+    /// Machine whose current IPv4 becomes the fixed address.
+    #[serde(default)]
+    pub machine: Option<Id>,
 }
 
 #[derive(Serialize)]
@@ -485,9 +480,16 @@ async fn associate_fip(
 ) -> ApiResult<Json<FloatingIp>> {
     let project = scope(&caller, &sq)?;
     let cur = visible(&caller, c.floating_ips().resolve(project.as_ref(), &id)?)?;
-    Ok(Json(
-        c.associate_floating_ip(&cur.meta.id, Some(body.port))?,
-    ))
+    let fip = match (body.port, body.machine) {
+        (Some(port), None) => c.associate_floating_ip(&cur.meta.id, Some(port))?,
+        (None, Some(machine)) => c.associate_to_machine(&cur.meta.id, &machine)?,
+        _ => {
+            return Err(ApiError::bad_request(
+                "associate needs exactly one of port or machine",
+            ))
+        }
+    };
+    Ok(Json(fip))
 }
 
 async fn disassociate_fip(

@@ -208,9 +208,9 @@ async fn machine_lifecycle_on_local_mock_host() {
     .await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
 
-    // Console is not implemented.
+    // Console returns a short-lived websocket ticket. The ticket is not logged.
     let (st, _) = raw(app, "GET", &format!("/machines/{id}/console"), None).await;
-    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(st, StatusCode::OK);
 
     // Delete: accepted, then gone.
     let (st, _) = raw(app, "DELETE", &format!("/machines/{id}"), None).await;

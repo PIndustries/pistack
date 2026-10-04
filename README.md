@@ -8,35 +8,35 @@ pistack agent  --join URL      # every host
 pi machine create web --image ubuntu-24.04 --size m.2x4
 ```
 
-PiStack treats OpenStack as the requirements list for what a private cloud must do, and Kubernetes as the requirements list for how containers should be orchestrated, then answers both with one system where a VM, a pod and a bare-metal box are peers: same scheduler, same network, same volumes, same identity, same DNS.
+A virtual machine, a container, and a bare-metal machine are peers. They share one scheduler, one network, one set of volumes, one identity, and one DNS. A name, an address, and a running workload stay on the same records, in one binary.
 
 ## Modules
 
-Every module is a crate in `crates/` and a prefix on the one API port. Names follow a workshop theme; CLI nouns stay plain.
+Every module is a crate in `crates/` and a prefix on the one API port. Names follow a workshop theme. CLI nouns stay plain.
 
-| Module | Owns | Replaces |
-| --- | --- | --- |
-| `gate` | identity, projects, roles, tokens, quotas, policy | Keystone, oslo.policy |
-| `forge` | machines: VMs, containers, bare metal | Nova, Zun, Ironic, Masakari, Watcher, Blazar |
-| `loom` | pods, deployments, services, ingress, controllers | Kubernetes control plane, Magnum |
-| `anvil` | the per-host agent | nova-compute, neutron agents, os-brick, kubelet |
-| `fabric` | networks, subnets, routers, security groups, floating IPs (OVN) | Neutron |
-| `slab` | block volumes, snapshots, backups | Cinder |
-| `mold` | images (VM and OCI) | Glance |
-| `silo` | object storage, S3 | Swift |
-| `shelf` | shared filesystems | Manila |
-| `beacon` | DNS | Designate, CoreDNS |
-| `relay` | load balancers, ingress | Octavia |
-| `keep` | secrets, certificates, the cloud CA | Barbican |
-| `blueprint` | declarative stacks, workflows, kits | Heat, Mistral, Helm |
-| `gauge` | metrics, alarms, metering | Telemetry, CloudKitty |
-| `bench` | the `pi` CLI and web console | Horizon, Skyline, openstackclient |
+| Module | Owns |
+| --- | --- |
+| `gate` | identity, projects, roles, tokens, quotas, policy |
+| `forge` | machines: virtual machines, containers, bare metal |
+| `loom` | pods, deployments, services, ingress, controllers |
+| `anvil` | the agent on each host |
+| `fabric` | networks, subnets, routers, security groups, floating IPs |
+| `slab` | block volumes, snapshots, backups |
+| `mold` | images for virtual machines and containers |
+| `silo` | object storage, S3 |
+| `shelf` | shared filesystems |
+| `beacon` | DNS |
+| `relay` | load balancers and ingress |
+| `keep` | secrets, certificates, the cloud CA |
+| `blueprint` | stacks, workflows, kits |
+| `gauge` | metrics, alarms, metering |
+| `bench` | the `pi` CLI and the web console |
 
 Shared crates: `pistack-types` (resource model, errors, the `Module` contract), `pistack-store` (embedded redb store behind a trait; Raft later), `pistack-policy`, `pistack-config`, `pistack-rpc`.
 
 ## Status
 
-Scaffold. The binary boots, mounts every module, serves a discovery document at `/`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+The binary mounts every module on one API. The shape of the system is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The phase list is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Building
 
@@ -48,4 +48,4 @@ curl localhost:8443/
 
 ## Licence
 
-Apache-2.0; see [LICENSE](LICENSE). The reasoning is in [LICENSE-DECISION.md](LICENSE-DECISION.md). Contributions require a DCO sign-off (`git commit -s`). "PiStack" and the PiStack logo are trademarks of P. Industries LLC; the code is free, the name is not.
+Apache-2.0; see [LICENSE](LICENSE). Contributions require a DCO sign-off (`git commit -s`). "PiStack" and the PiStack logo are trademarks of P. Industries LLC. The code is free. The name is not.

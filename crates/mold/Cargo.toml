@@ -10,6 +10,7 @@ pistack-types.workspace = true
 pistack-store.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
+reqwest.workspace = true
 futures.workspace = true
 bytes.workspace = true
 sha2.workspace = true

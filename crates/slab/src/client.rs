@@ -5,13 +5,16 @@
 //! HTTP handlers, the reconciler, and other modules (`forge` attaches
 //! volumes through it). It is the only writer of `status`.
 
+use pistack_rpc::{CommandKind, CommandQueue, VolumeAttach, VolumeAttached, VolumeDetach};
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{ApiError, ApiResult, Id, Meta, Phase};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::backend::{AttachInfo, BlockBackend, LocalFileBackend};
+use crate::backend::{AttachInfo, AttachTarget, BlockBackend, LocalFileBackend};
+use crate::place;
 use crate::quota::{AllowAll, QuotaCheck, QuotaRequest};
 use crate::types::*;
 
@@ -68,6 +71,18 @@ pub struct Client {
     store: Store,
     backend: Arc<dyn BlockBackend>,
     quota: Arc<dyn QuotaCheck>,
+    /// Set on the server so attach/detach hotplug through the agent.
+    /// Absent in unit tests, which only record the attachment.
+    queue: Option<CommandQueue>,
+}
+
+fn local_path(info: &AttachInfo) -> ApiResult<String> {
+    match &info.target {
+        AttachTarget::Local { path } if !path.is_empty() => Ok(path.clone()),
+        _ => Err(ApiError::unprocessable(
+            "only a local file volume can be attached to a KVM guest",
+        )),
+    }
 }
 
 fn validate_name(name: &str) -> ApiResult<()> {
@@ -91,7 +106,17 @@ impl Client {
             store,
             backend,
             quota,
+            queue: None,
         }
+    }
+
+    pub fn with_queue(mut self, queue: CommandQueue) -> Self {
+        self.queue = Some(queue);
+        self
+    }
+
+    pub fn has_queue(&self) -> bool {
+        self.queue.is_some()
     }
 
     /// In-memory store, local file backend under `dir`, no quotas. For tests
@@ -264,19 +289,22 @@ impl Client {
                 ],
             )
             .await?;
+        crate::usage::admit_create(self.store(), req.project.as_ref())?;
 
         let mut meta = Meta::new(KIND_VOLUME, req.name, req.project);
         meta.description = req.description;
         meta.labels = req.labels;
         meta.annotations = req.annotations;
-        Ok(self.volumes().create(Volume {
+        let vol = self.volumes().create(Volume {
             meta,
             spec,
             status: VolumeStatus {
                 phase: Phase::Pending,
                 ..Default::default()
             },
-        })?)
+        })?;
+        crate::usage::note_create(self.store(), vol.meta.project.as_ref());
+        Ok(vol)
     }
 
     pub fn get_volume(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Volume> {
@@ -313,7 +341,8 @@ impl Client {
                 "volume {id} has snapshots; delete them first"
             )));
         }
-        Ok(self.volumes().modify(id, |v| {
+        let mut release = false;
+        let vol = self.volumes().modify(id, |v| {
             if v.status.attached_to.is_some() {
                 return Err(StoreError::Conflict(format!(
                     "volume {id} is attached to {}",
@@ -324,9 +353,13 @@ impl Client {
                         .unwrap_or_default()
                 )));
             }
-            v.status.phase = Phase::Deleting;
+            release = crate::usage::claim_release(v);
             Ok(())
-        })?)
+        })?;
+        if release {
+            crate::usage::note_delete(self.store(), vol.meta.project.as_ref());
+        }
+        Ok(vol)
     }
 
     /// Record that `machine` holds the volume as `device`. `forge` calls this
@@ -378,6 +411,86 @@ impl Client {
             set_condition(&mut v.status.conditions, "Attached", false, "detached", "");
             Ok(())
         })?)
+    }
+
+    /// Ask the host that runs `machine` to hotplug this volume. Returns the
+    /// guest device name. The volume must be a local file.
+    pub async fn plug_volume(
+        &self,
+        id: &Id,
+        machine: &Id,
+        device: Option<String>,
+    ) -> ApiResult<String> {
+        let queue = self.queue.clone().ok_or_else(|| {
+            ApiError::not_implemented("volume attach has no host queue on this process")
+        })?;
+        let vol = self.ready_volume(id).await?;
+        let node = place::node_for_machine(&self.store, machine)?;
+        let info = self.backend.attach_info(&vol, &node).await?;
+        let path = local_path(&info)?;
+        let req = VolumeAttach {
+            machine: machine.clone(),
+            volume: id.clone(),
+            path,
+            device,
+            read_only: info.read_only,
+        };
+        let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
+        let ticket = queue.enqueue(&node, CommandKind::AttachVolume, payload)?;
+        let attached: VolumeAttached =
+            serde_json::from_value(ticket.wait().await?.into_api_result()?).map_err(|e| {
+                ApiError::internal(format!("host returned a bad attach result: {e}"))
+            })?;
+        Ok(attached.device)
+    }
+
+    /// Ask the host to unplug the volume. A disk that is already gone is success.
+    pub async fn unplug_volume(
+        &self,
+        id: &Id,
+        machine: &Id,
+        device: Option<String>,
+    ) -> ApiResult<()> {
+        let queue = self.queue.clone().ok_or_else(|| {
+            ApiError::not_implemented("volume detach has no host queue on this process")
+        })?;
+        let vol = self.volumes().get(id)?;
+        let node = place::node_for_machine(&self.store, machine)?;
+        let info = self.backend.attach_info(&vol, &node).await?;
+        let path = local_path(&info)?;
+        let req = VolumeDetach {
+            machine: machine.clone(),
+            volume: id.clone(),
+            path,
+            device,
+        };
+        let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
+        let ticket = queue.enqueue(&node, CommandKind::DetachVolume, payload)?;
+        ticket.wait().await?.into_api_result()?;
+        Ok(())
+    }
+
+    async fn ready_volume(&self, id: &Id) -> ApiResult<Volume> {
+        for _ in 0..40 {
+            let vol = self.volumes().get(id)?;
+            match vol.status.phase {
+                Phase::Ready => return Ok(vol),
+                Phase::Pending | Phase::Creating | Phase::Updating => {
+                    if let Err(e) = self.reconcile_volume(id).await {
+                        tracing::debug!(volume = %id, error = %e, "volume not ready yet");
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                other => {
+                    return Err(ApiError::conflict(format!(
+                        "volume {id} is {other:?}, not ready"
+                    )))
+                }
+            }
+        }
+        Err(ApiError::conflict(format!(
+            "volume {id} did not become ready"
+        )))
     }
 
     /// Grow a volume. Sets `spec.size_gib` and phase `Updating`; the

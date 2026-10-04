@@ -13,7 +13,7 @@ use hickory_server::net::udp::UdpClientStream;
 use hickory_server::proto::op::ResponseCode;
 use hickory_server::proto::rr::{DNSClass, Name, RData, RecordType as Rt};
 use pistack_store::Store;
-use pistack_types::{kind, Id, Module, ModuleContext};
+use pistack_types::{kind, Caller, Id, Module, ModuleContext};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -59,12 +59,9 @@ impl Harness {
             }
             None => Body::empty(),
         };
-        let res = self
-            .router
-            .clone()
-            .oneshot(req.body(body).unwrap())
-            .await
-            .unwrap();
+        let mut req = req.body(body).unwrap();
+        req.extensions_mut().insert(admin_caller());
+        let res = self.router.clone().oneshot(req).await.unwrap();
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
@@ -205,23 +202,18 @@ async fn zone_and_record_over_http_then_udp() {
         )
         .await;
     assert_eq!(st, StatusCode::OK);
-    let res = h
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/recordsets/{rec_id}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::IF_MATCH, "1")
-                .body(Body::from(
-                    json!({ "spec": { "zone": zone_id, "name": "web", "type": "A", "records": ["10.0.0.2"] } })
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
+    let mut stale = Request::builder()
+        .method("PUT")
+        .uri(format!("/recordsets/{rec_id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::IF_MATCH, "1")
+        .body(Body::from(
+            json!({ "spec": { "zone": zone_id, "name": "web", "type": "A", "records": ["10.0.0.2"] } })
+                .to_string(),
+        ))
         .unwrap();
+    stale.extensions_mut().insert(admin_caller());
+    let res = h.router.clone().oneshot(stale).await.unwrap();
     assert_eq!(res.status(), StatusCode::CONFLICT);
 
     // Export and list.
@@ -347,6 +339,45 @@ struct RawMachine {
     spec: Value,
     status: Value,
 }
+fn admin_caller() -> Caller {
+    Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "dev-admin".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    }
+}
+
+#[tokio::test]
+async fn missing_caller_is_unauthorized() {
+    let store = Store::in_memory().unwrap();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+    };
+    let app = Beacon::default().router(ctx);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/zones")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "no credentials");
+}
+
 impl pistack_types::Kind for RawMachine {
     const KIND: &'static str = kind::MACHINE;
     fn meta(&self) -> &pistack_types::Meta {

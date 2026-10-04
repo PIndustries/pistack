@@ -21,6 +21,8 @@ pub struct ServerOpts {
     pub listen: String,
     pub public_url: Option<String>,
     pub insecure_http: bool,
+    /// Optional HTTPS listener. `None` keeps today's single plain listener.
+    pub tls_listen: Option<String>,
     /// Dev mode: a local mock host so machines "run" with no agent, and
     /// unauthenticated requests act as admin. Never on in production.
     pub dev: bool,
@@ -51,13 +53,16 @@ pub fn assemble(dev: bool) -> Assembly {
         gate_m.clone(),
         forge_m.clone(),
         Arc::new(loom::Loom),
-        Arc::new(fabric::Fabric::default()),
-        Arc::new(slab::Slab::default()),
+        Arc::new(fabric_module()),
+        Arc::new(slab::Slab::default().with_queue(queue.clone())),
         Arc::new(mold::Mold::default()),
         Arc::new(silo::Silo),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),
-        Arc::new(relay::Relay::default()),
+        Arc::new(match std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref() {
+            Some("forward") => relay::Relay::forward(),
+            _ => relay::Relay::default(),
+        }),
         Arc::new(keep::Keep::default()),
         Arc::new(blueprint::Blueprint),
         Arc::new(gauge::Gauge),
@@ -71,6 +76,18 @@ pub fn assemble(dev: bool) -> Assembly {
     }
 }
 
+/// `PISTACK_FABRIC_BACKEND=hostnat` is the single-host NAT datapath.
+/// `PISTACK_FABRIC_BACKEND=overlay` is the VXLAN segment datapath. The agent
+/// applies that plan. Anything else, including an unset variable, keeps the
+/// mock backend so tests and a laptop server never touch interfaces.
+fn fabric_module() -> fabric::Fabric {
+    match std::env::var("PISTACK_FABRIC_BACKEND").ok().as_deref() {
+        Some("hostnat") => fabric::Fabric::hostnat(),
+        Some("overlay") => fabric::Fabric::overlay(),
+        _ => fabric::Fabric::default(),
+    }
+}
+
 pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     std::fs::create_dir_all(&opts.data_dir)
         .with_context(|| format!("creating data dir {}", opts.data_dir.display()))?;
@@ -79,24 +96,30 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         std::env::set_var("PISTACK_DATA_DIR", &opts.data_dir);
     }
     let store_path = opts.data_dir.join("state.redb");
-    let fresh = !store_path.exists();
-    if fresh && !opts.init && opts.join.is_none() {
-        anyhow::bail!(
-            "no state in {}: run `pistack server --init` for a new cloud or `--join URL`",
-            opts.data_dir.display()
-        );
-    }
-    if opts.join.is_some() {
-        anyhow::bail!("--join is not implemented yet (single control-plane node for now)");
-    }
-
-    let (events, _) = broadcast::channel(4096);
-    let store = Store::open(&store_path, events.clone()).context("opening state store")?;
-
     let public_url = opts.public_url.clone().unwrap_or_else(|| {
         let scheme = if opts.insecure_http { "http" } else { "https" };
         format!("{scheme}://{}", opts.listen.replace("0.0.0.0", "127.0.0.1"))
     });
+    let boot = crate::cluster::prepare_store(&crate::cluster::BootRequest {
+        data_dir: &opts.data_dir,
+        init: opts.init,
+        join: opts.join.as_deref(),
+        listen: &opts.listen,
+        public_url: &public_url,
+    })
+    .await?;
+    // Keep never sweeps. Joined has already downloaded a snapshot. Init has
+    // no file yet; opening the store creates it.
+    let (events, _) = broadcast::channel(4096);
+    let store = match Store::open(&store_path, events.clone()) {
+        Ok(store) => store,
+        Err(err) => {
+            if matches!(boot, crate::cluster::BootKind::Joined) {
+                let _ = std::fs::remove_file(&store_path);
+            }
+            return Err(err).context("opening state store");
+        }
+    };
 
     let shutdown = CancellationToken::new();
     let ctx = ModuleContext {
@@ -107,11 +130,68 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         node_name: hostname(),
     };
 
-    if fresh {
+    if store.get_meta::<String>("cluster_id")?.is_none() {
+        if matches!(boot, crate::cluster::BootKind::Joined) {
+            drop(store);
+            let _ = std::fs::remove_file(&store_path);
+            anyhow::bail!("joined store has no cluster id");
+        }
         tracing::info!(dir = %opts.data_dir.display(), "initialising new cloud");
         store.put_meta("cluster_id", &uuid::Uuid::now_v7().to_string())?;
         store.put_meta("created_at", &chrono::Utc::now())?;
     }
+    let node_id = crate::cluster::load_or_create_node_id(&opts.data_dir)?;
+    let allow_seed = !matches!(boot, crate::cluster::BootKind::Joined);
+    let established = match crate::cluster::establish_local(
+        &store,
+        &node_id,
+        &public_url,
+        allow_seed,
+    ) {
+        Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
+        Ok(crate::cluster::LocalRole::NeedJoin) => {
+            let hint = crate::cluster::leader_hint(&store, &node_id)?
+                .or_else(|| crate::cluster::remembered_leader(&opts.data_dir))
+                .context("store belongs to a cluster and no leader address is known; pass --join URL")?;
+            match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
+                Ok(ready) => ready,
+                Err(err) => {
+                    if matches!(boot, crate::cluster::BootKind::Joined) {
+                        drop(store);
+                        let _ = std::fs::remove_file(&store_path);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    crate::cluster::clear_remembered_leader(&opts.data_dir);
+    let cluster_id: String = store
+        .get_meta("cluster_id")?
+        .unwrap_or_else(|| "unknown".into());
+    tracing::info!(
+        %cluster_id,
+        %node_id,
+        leader = established.leader,
+        role = ?established.role,
+        members = established.members.len(),
+        "control plane membership"
+    );
+    let cluster = std::sync::Arc::new(crate::cluster::handle_from(
+        node_id,
+        public_url.clone(),
+        cluster_id,
+        store.clone(),
+        store_path.clone(),
+        &established,
+        crate::cluster::advertise_ip(&opts.listen),
+    ));
+    crate::cluster::spawn_background(
+        cluster.clone(),
+        crate::cluster::advertise_ip(&opts.listen),
+        shutdown.clone(),
+    );
     if opts.dev {
         tracing::warn!(
             "DEV MODE: unauthenticated requests act as admin; a mock local host runs machines"
@@ -131,28 +211,43 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
 
     let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
-    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev);
+    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster));
 
+    let tls = opts
+        .tls_listen
+        .clone()
+        .map(|addr| crate::listen::TlsListen {
+            addr,
+            data_dir: opts.data_dir.clone(),
+            store: store.clone(),
+        });
+    let bound = crate::listen::bind_listeners(app, &opts.listen, tls).await?;
     tracing::info!(
-        listen = %opts.listen,
+        listen = %bound.http,
         public_url = %public_url,
         modules = asm.modules.len(),
         identity = asm.gate.info().version,
         agent_rpc = asm.forge.queue().is_some(),
         "pistack server up"
     );
-    let listener = tokio::net::TcpListener::bind(&opts.listen).await?;
-    if !opts.insecure_http {
+    if bound.tls.is_none() && !opts.insecure_http {
         tracing::warn!("TLS not wired yet (keep is next); serving plain HTTP. Pass --insecure-http to silence this.");
     }
     let sd = shutdown.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-            sd.cancel();
-        })
-        .await?;
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+        sd.cancel();
+    });
+    bound.serve(shutdown).await?;
+    Ok(())
+}
+
+pub fn backup(data_dir: PathBuf, to: PathBuf) -> anyhow::Result<()> {
+    let src = data_dir.join("state.redb");
+    pistack_store::backup_file(&src, &to)
+        .with_context(|| format!("backing up {} to {}", src.display(), to.display()))?;
+    println!("{}", to.display());
     Ok(())
 }
 

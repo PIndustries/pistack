@@ -28,7 +28,7 @@ async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (St
         method,
         uri,
         body.map(|v| Body::from(v.to_string())),
-        None,
+        Some(admin()),
     )
     .await;
     let v = if bytes.is_empty() {
@@ -63,6 +63,16 @@ async fn raw(
     (status, bytes.to_vec())
 }
 
+fn admin() -> Caller {
+    Caller {
+        principal: Id::new("prin"),
+        principal_name: "dev-admin".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    }
+}
+
 fn member(project: &Id) -> Caller {
     Caller {
         principal: Id::new("prin"),
@@ -95,7 +105,14 @@ async fn upload_download_delete_roundtrip() {
     assert_eq!(img["spec"]["arch"], "x86_64");
 
     // no data yet -> 409
-    let (st, _) = raw(&app, "GET", &format!("/images/{id}/data"), None, None).await;
+    let (st, _) = raw(
+        &app,
+        "GET",
+        &format!("/images/{id}/data"),
+        None,
+        Some(admin()),
+    )
+    .await;
     assert_eq!(st, StatusCode::CONFLICT);
 
     // 1 MiB of random bytes
@@ -108,7 +125,7 @@ async fn upload_download_delete_roundtrip() {
         "PUT",
         &format!("/images/{id}/data"),
         Some(Body::from(payload.clone())),
-        None,
+        Some(admin()),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
@@ -141,13 +158,20 @@ async fn upload_download_delete_roundtrip() {
         "PUT",
         &format!("/images/{id}/data"),
         Some(Body::from(vec![1u8; 10])),
-        None,
+        Some(admin()),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
 
     // download equals upload
-    let (st, got) = raw(&app, "GET", &format!("/images/{id}/data"), None, None).await;
+    let (st, got) = raw(
+        &app,
+        "GET",
+        &format!("/images/{id}/data"),
+        None,
+        Some(admin()),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(got, payload);
 
@@ -161,7 +185,7 @@ async fn upload_download_delete_roundtrip() {
         .expect("read");
     assert_eq!(buf, payload);
 
-    // import is validated then 501
+    // a bad scheme is still rejected; a ready image is not fetched again
     let (st, _) = call(
         &app,
         "POST",
@@ -180,9 +204,16 @@ async fn upload_download_delete_roundtrip() {
     assert_eq!(st, StatusCode::CONFLICT, "already has data");
 
     // delete removes record and blob
-    let (st, _) = raw(&app, "DELETE", &format!("/images/{id}"), None, None).await;
+    let (st, _) = raw(
+        &app,
+        "DELETE",
+        &format!("/images/{id}"),
+        None,
+        Some(admin()),
+    )
+    .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
-    let (st, _) = raw(&app, "GET", &format!("/images/{id}"), None, None).await;
+    let (st, _) = raw(&app, "GET", &format!("/images/{id}"), None, Some(admin())).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     assert!(!path.exists(), "blob removed with its last image");
 }
@@ -218,7 +249,7 @@ async fn qcow2_with_backing_file_is_rejected() {
         "PUT",
         &format!("/images/{id}/data"),
         Some(Body::from(h)),
-        None,
+        Some(admin()),
     )
     .await;
     assert_eq!(
@@ -260,7 +291,7 @@ async fn qcow2_with_backing_file_is_rejected() {
         "PUT",
         &format!("/images/{id}/data"),
         Some(Body::from(h)),
-        None,
+        Some(admin()),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
@@ -284,10 +315,64 @@ async fn qcow2_with_backing_file_is_rejected() {
         "PUT",
         &format!("/images/{id2}/data"),
         Some(Body::from(h)),
-        None,
+        Some(admin()),
     )
     .await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn import_rejects_loopback_and_reader_becomes_ready() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = Client::local(dir.path()).expect("client");
+    let app = mold::http::router(c.clone());
+    let (st, img) = call(
+        &app,
+        "POST",
+        "/images",
+        Some(json!({ "name": "tiny-raw", "spec": { "format": "raw" } })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{img}");
+    let id = img["id"].as_str().expect("id").to_owned();
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        &format!("/images/{id}/import"),
+        Some(json!({ "url": "http://127.0.0.1/x.img" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    let (st, body) = call(
+        &app,
+        "POST",
+        &format!("/images/{id}/import"),
+        Some(json!({ "url": "http://169.254.169.254/latest" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    let (st, body) = call(
+        &app,
+        "POST",
+        &format!("/images/{id}/import"),
+        Some(json!({ "url": "http://[::1]/x.img" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    // The URL check forbids 127.0.0.1, so the bytes come from a reader.
+    // Same raw fixture shape upload uses: no qcow2 magic, declared raw.
+    let payload = b"pistack-raw-fixture".to_vec();
+    let parsed = Id::parse("img", &id).expect("id");
+    let got = c
+        .import_reader(&parsed, std::io::Cursor::new(payload.clone()))
+        .await
+        .expect("import");
+    assert_eq!(got.status.phase, pistack_types::Phase::Ready);
+    assert_eq!(got.status.size_bytes, Some(payload.len() as u64));
+    assert!(got.status.sha256.as_ref().is_some_and(|s| s.len() == 64));
+    assert!(got.status.backing_ref.is_some());
 }
 
 fn walk(dir: &std::path::Path) -> usize {
@@ -422,7 +507,7 @@ async fn visibility_members_and_stale_revision() {
         "DELETE",
         &format!("/images/{shared_id}/members/{other}"),
         None,
-        None,
+        Some(admin()),
     )
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
@@ -438,13 +523,15 @@ async fn visibility_members_and_stale_revision() {
 
     // update with If-Match, then stale -> 409
     let put = |rev: &str| {
-        Request::builder()
+        let mut req = Request::builder()
             .method("PUT")
             .uri(format!("/images/{shared_id}"))
             .header("content-type", "application/json")
             .header("if-match", rev)
             .body(Body::from(json!({ "min_ram_mib": 512 }).to_string()))
-            .expect("req")
+            .expect("req");
+        req.extensions_mut().insert(admin());
+        req
     };
     let resp = app.clone().oneshot(put("1")).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -459,4 +546,15 @@ async fn visibility_members_and_stale_revision() {
         .expect("resolve public");
     assert_eq!(resolved.spec.visibility, mold::Visibility::Public);
     assert!(c.resolve(Some(&other), "secret").is_err());
+}
+
+#[tokio::test]
+async fn missing_caller_is_unauthorized() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = mold::http::router(Client::local(dir.path()).expect("client"));
+    let (st, bytes) = raw(&app, "GET", "/images", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let body: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "no credentials");
 }

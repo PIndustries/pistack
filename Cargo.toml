@@ -7,6 +7,7 @@ members = [
     "crates/pistack-policy",
     "crates/pistack-config",
     "crates/pistack-rpc",
+    "crates/pistack-cluster",
     "crates/gate",
     "crates/forge",
     "crates/loom",
@@ -98,6 +99,7 @@ pistack-store = { path = "crates/pistack-store" }
 pistack-policy = { path = "crates/pistack-policy" }
 pistack-config = { path = "crates/pistack-config" }
 pistack-rpc = { path = "crates/pistack-rpc" }
+pistack-cluster = { path = "crates/pistack-cluster" }
 gate = { path = "crates/gate" }
 forge = { path = "crates/forge" }
 loom = { path = "crates/loom" }

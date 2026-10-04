@@ -44,7 +44,13 @@ struct ModuleEntry {
     url: String,
 }
 
-pub fn build(asm: &Assembly, ctx: ModuleContext, verifier: gate::Verifier, dev: bool) -> Router {
+pub fn build(
+    asm: &Assembly,
+    ctx: ModuleContext,
+    verifier: gate::Verifier,
+    dev: bool,
+    cluster: Option<std::sync::Arc<crate::cluster::ClusterHandle>>,
+) -> Router {
     let mut app = Router::new();
     let mut entries = Vec::new();
     for m in &asm.modules {
@@ -59,11 +65,15 @@ pub fn build(asm: &Assembly, ctx: ModuleContext, verifier: gate::Verifier, dev: 
         app = app.nest(&format!("/{}", info.prefix), m.router(ctx.clone()));
     }
     // Agent transport (anvil <-> control plane). `pistack agent --join URL`
-    // talks to URL/rpc/agents/...
-    // TODO(keep): authenticate agents with mTLS / a join token. Today any
-    // request without an Authorization header reaches the queue; a bearer
-    // token that is not a gate token is rejected by `attach_caller` below.
-    app = app.nest("/rpc", pistack_rpc::router(asm.queue.clone()));
+    // talks to URL/rpc/agents/... The join check lives in the rpc router and
+    // stays off unless PISTACK_REQUIRE_JOIN=1, so an agent with no token keeps
+    // working. The token is `x-pistack-join`, not Authorization: a bearer that
+    // is not a gate token is rejected by `attach_caller` below.
+    let store = (*ctx.store::<pistack_store::Store>()).clone();
+    app = app.nest(
+        "/rpc",
+        pistack_rpc::router_with_store(asm.queue.clone(), store.clone()),
+    );
 
     let discovery = Discovery {
         name: "pistack",
@@ -82,6 +92,17 @@ pub fn build(asm: &Assembly, ctx: ModuleContext, verifier: gate::Verifier, dev: 
         )
         .route("/healthz", get(|| async { "ok" }));
 
+    // Inner to authentication so the Caller, when present, is already attached.
+    app = app.layer(middleware::from_fn_with_state(store, audit_mutation));
+
+    if let Some(handle) = cluster {
+        app = app.merge(crate::cluster::router(handle.clone()));
+        app = app.layer(middleware::from_fn_with_state(
+            handle,
+            crate::cluster::reject_follower_writes,
+        ));
+    }
+
     if dev {
         app = app.layer(middleware::from_fn(dev_admin));
     }
@@ -91,8 +112,47 @@ pub fn build(asm: &Assembly, ctx: ModuleContext, verifier: gate::Verifier, dev: 
     ))
     .layer(PropagateRequestIdLayer::x_request_id())
     .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-    .layer(TraceLayer::new_for_http())
+    .layer(
+        TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
+            // Path only. The console ticket is a query parameter and must not be logged.
+            tracing::debug_span!(
+                "request",
+                method = %request.method(),
+                path = %request.uri().path(),
+                version = ?request.version(),
+            )
+        }),
+    )
     .layer(CorsLayer::permissive())
+}
+
+fn is_mutation(method: &str) -> bool {
+    !matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// After the response, record a mutation. The path has no query string.
+async fn audit_mutation(
+    axum::extract::State(store): axum::extract::State<pistack_store::Store>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    let principal = req
+        .extensions()
+        .get::<Caller>()
+        .map(|c| c.principal_name.clone());
+    let response = next.run(req).await;
+    if is_mutation(&method) {
+        gate::audit::record(
+            &store,
+            &method,
+            &path,
+            principal.as_deref(),
+            response.status().as_u16(),
+        );
+    }
+    response
 }
 
 /// Dev mode only: requests with no caller become the admin.

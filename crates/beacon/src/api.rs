@@ -9,8 +9,8 @@
 //! Handlers only validate the caller's scope and hand off to `Client`;
 //! they never write `status`.
 //!
-//! The `Caller` comes from request extensions (set by the gateway once
-//! `gate` is wired). Without one, requests run as a development admin.
+//! The `Caller` comes from request extensions (set by the gateway).
+//! Without one, the request is rejected.
 
 use crate::client::Client;
 use crate::types::*;
@@ -45,26 +45,16 @@ pub fn router(client: Client) -> axum::Router {
                 .put(update_recordset)
                 .delete(delete_recordset),
         )
-        .layer(middleware::from_fn(default_caller))
+        .layer(middleware::from_fn(require_caller))
         .with_state(client)
 }
 
-/// Attach a development admin `Caller` when the gateway did not.
-async fn default_caller(mut req: Request, next: Next) -> Response {
+/// The gateway attaches a `Caller`. A request without one is refused.
+async fn require_caller(req: Request, next: Next) -> Response {
     if req.extensions().get::<Caller>().is_none() {
-        req.extensions_mut().insert(dev_admin());
+        return ApiError::unauthorized("no credentials").into_response();
     }
     next.run(req).await
-}
-
-pub fn dev_admin() -> Caller {
-    Caller {
-        principal: Id::new(kind::PRINCIPAL),
-        principal_name: "dev-admin".into(),
-        project: None,
-        roles: vec!["admin".into()],
-        system: true,
-    }
 }
 
 // ---- request / response shapes ---------------------------------------------

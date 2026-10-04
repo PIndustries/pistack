@@ -4,7 +4,7 @@
 
 One binary, two roles.
 
-- `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. Three of these for HA (Raft replication is the next step for `pistack-store`; today it is one node).
+- `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. One process is already a one-voter cluster and announces itself on its private address. A new process with an empty data directory discovers that cluster and adopts it, or `--join URL` names it. `--init` founds a cluster even if peers answer. An existing store never joins away. The second server replicates as a learner. The third makes all three voters. Later servers stay learners until promoted. Writes are accepted by the leader. A learner does not become leader.
 - `pistack agent` — a host. Runs `anvil`: VMs (libvirt/KVM or Cloud Hypervisor), pods (youki), bare metal (same binary as the provisioning ramdisk), OVN chassis, volume attach, metrics.
 
 Everything a user touches enters the gateway (`bin/pistack/src/gateway.rs`) and is routed to a module by prefix. Modules talk to each other in-process and to hosts through `pistack-rpc`, a typed command queue with JSON-over-HTTP long-poll today (agents call in; no inbound ports on hosts). State changes publish `Event`s on an in-process broadcast bus that reconcilers subscribe to.
@@ -21,7 +21,7 @@ Every object is a `Resource<Spec, Status>` (`pistack-types::resource`):
 - `spec` — what the user asked for. Owned by the module.
 - `status` — what is true. Written only by reconcilers.
 
-This is deliberately the Kubernetes shape so `loom` can speak the k8s API later without translation, and so every module gets list/get/watch/revision-guarded update for free from `pistack-store::Collection<K>`.
+Every module uses that shape, so list, get, watch, and revision-guarded update come from `pistack-store::Collection<K>`. `loom` stores pods and deployments as the same kind of record.
 
 Names are unique per project per kind. `Collection::resolve` accepts a name or an id, which is what lets the CLI say `pi machine show web`.
 
@@ -60,11 +60,11 @@ pub trait Module {
 
 ## Scheduling
 
-One scheduler in `forge` places every workload kind. It reads `Host` inventory (reported by anvil), subtracts allocations, applies filters (resources, affinity, labels, reservations from Blazar-style leases) and weighs the rest. `loom` pods become `Machine{kind: Container}` and go through the same path, so VMs and pods share capacity math.
+One scheduler in `forge` places every workload. It reads `Host` inventory reported by anvil, subtracts allocations, applies filters (resources, affinity, labels, reservations) and weighs the rest. A `loom` pod becomes `Machine{kind: Container}` and takes the same path, so a virtual machine and a pod share capacity math.
 
 ## Networking
 
-OVN-native, no plugin layer. `fabric` writes logical switches, routers, ports and ACLs to the OVN northbound DB; `anvil` runs the chassis side. Pods get logical switch ports exactly like VMs. DHCP and metadata are OVN features; no dnsmasq.
+`fabric` owns networks, subnets, ports, routers, security groups, and floating IPs. A project network is an overlay segment: its own bridge, its own VXLAN id, and its own router namespace, so two projects can use the same CIDR without seeing each other. Hosts share an underlay they report when they join. Guests on one network reach each other through a static forwarding table on that segment. The project router connects the network to an external network. When that external network is a provider segment or an overlay segment, the floating address is installed on the host that owns the port. A provider network is a bridge on a named physical link, with a VLAN when one is set. DHCP from the project router hands the guest the address allocated for its port, plus the subnet DNS servers and host routes. Security groups are installed with that plan, and metadata is answered on the host that holds the tap. The port records the host that runs the guest. The scheduler places a machine that names a network only on a host that has reported an underlay address. `PISTACK_FABRIC_BACKEND=overlay` selects this datapath. `PISTACK_FABRIC_BACKEND=hostnat` remains the single-host datapath: the address on the port is the address inside the guest. Virtual machines and pods use the same network records.
 
 ## Storage
 
@@ -74,6 +74,6 @@ OVN-native, no plugin layer. `fabric` writes logical switches, routers, ports an
 
 `keep` is the cloud CA. Every server and agent gets a certificate at join; every API call is mTLS or bearer-token over TLS. `gate` issues signed tokens (verifiable without a store lookup) and evaluates one policy document for the whole cloud.
 
-## What is deliberately not here
+## One system
 
-RabbitMQ, a database per service, microversions, the Swift API, HOT templates, ML2, amphora VMs, Gnocchi, Django. See the design doc for why each was dropped.
+Modules run in the `pistack` process and share one store. Agents call in over `pistack-rpc`. Stacks are PiStack YAML applied with `pi apply`. `gate` evaluates one policy document for the whole cloud. `keep` is the cloud CA.

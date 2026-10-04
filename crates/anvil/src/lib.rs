@@ -5,8 +5,8 @@
 //!
 //! * [`facts`] — what this host is (cpus, memory, disk) and can run (kvm,
 //!   libvirt, youki, ovs).
-//! * [`runtime`] — the `MachineRuntime` trait with a working mock and
-//!   libvirt/youki stubs.
+//! * [`runtime`] — the `MachineRuntime` trait. The mock is in-process. libvirt
+//!   drives KVM through `virsh`. youki is still a stub.
 //! * [`Anvil`] — the module mounted at `/host` on a control-plane node,
 //!   serving this node's facts.
 //! * [`agent`] — [`run_agent`], the entry point for `pistack agent`: hello,
@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod facts;
+mod overlay;
 pub mod runtime;
 
 pub use agent::{run_agent, run_agent_with, run_agent_with_facts, AgentOpts};

@@ -19,24 +19,37 @@ Each phase ends at a gate an outside tool decides.
 - [x] `relay`: balancers, listeners, pools, members, health checker, mock provider, OVN/Pingora mapping documented
 - [x] `fabric`: Network/Subnet/Port/Router/SecurityGroup/FloatingIp, IPAM, mock backend, OVN mapping documented
 - [x] `slab` + `mold`: Volume/Snapshot/Backup and Image with real local-file backends, qcow2 safety checks
-- [x] `bench`: `pi` CLI covering 18 nouns, login/profiles, apply, completions
+- [x] `bench`: `pi` CLI covering 18 nouns, login/profiles, apply, completions. `/console` serves the web portal (login, machines, hosts, networks, volumes, images, buckets).
 - [x] Gate reached 2026-10-02: `pistack server --init` + `pistack agent --join` in separate processes; `pi machine create --wait` reaches Ready on the agent's mock runtime; volumes attach; secrets and certs issue; a Deployment produces Running pods. 233 tests in CI.
-- [ ] Remaining Phase 0 polish: TLS on the gateway via keep, mTLS/join-token auth on `/rpc`, `silo`, `shelf`, `gauge`, `blueprint` beyond scaffold, k8s-API decision for loom
+- [x] Decisions for the next phase are recorded in [DECISIONS.md](DECISIONS.md): libvirt/KVM first, PiStack YAML stacks, the PiStack API only in v1, loom on the same records as every other module, youki directly under anvil
+- [x] `silo`, `shelf`, `gauge`, `blueprint` are store-backed HTTP APIs. silo writes object bytes under the data dir (32 MiB cap). gauge keeps an in-memory sample ring and Prometheus text. shelf shares stay Pending. blueprint apply accepts a document and does not create machines.
+- [x] A request with no Caller is unauthorized (`no credentials`) on fabric, beacon, relay, blueprint, gauge, slab, mold, silo, and shelf. `--dev` still injects an admin only at the gateway. `/`, `/healthz`, `POST /identity/tokens`, and `/rpc` do not require a token.
+- [x] Gateway TLS: `pistack server --tls-listen ADDR` (env `PISTACK_TLS_LISTEN`) serves the same app with rustls beside plain HTTP. Certs are `data_dir/tls/cert.pem`, `key.pem`, and `ca.pem`, reused when present and otherwise issued by keep. The address must be specific (not `0.0.0.0` or `::`). `--insecure-http` still only silences the plain-HTTP warning when TLS is not configured.
+- [ ] mTLS or a join token on `/rpc`. The network ACL is the lock.
 
 ## Phase 1 — Bootable cloud
 
-- libvirt/KVM driver in anvil; cloud-init metadata
-- OVN backend in fabric; DHCP, metadata, floating IPs, security groups
-- LVM and Ceph RBD in slab; qemu-img in mold
+- [x] libvirt/KVM driver in anvil (virsh, one NAT network `pistack` on 10.88.0.0/24, cloud-init seed). `pi volume attach` hotplugs a local slab file into that guest as a virtio disk.
+- [x] Host NAT floating IPs when `PISTACK_FABRIC_BACKEND=hostnat`. `pi fip associate --machine` uses the guest address.
+- [x] Overlay datapath when `PISTACK_FABRIC_BACKEND=overlay`: one VXLAN segment per network, one router namespace per router, static forwarding to peer underlays, DHCP and subnet routes from that router, a provider bridge for a physical link, floating-IP translation on the host that owns the port, and placement only onto a host that reported an underlay address. Host NAT stays in place for networks already realised that way.
+- [ ] LVM and Ceph RBD in slab; qemu-img in mold. Attach uses the local file backend.
 - TLS everywhere via keep
 - Gate: a VM boots on three nodes and gets an IP, a volume and a floating IP from the CLI.
 
 ## Phase 2 — Containers and platform
 
-- loom: pods, deployments, services, ingress on youki; k8s API compatibility decision
-- relay (OVN L4 + Pingora L7), beacon (hickory), silo (S3), gauge (Prometheus)
-- Gate: a stack with a VM database and a pod web tier behind one relay, one DNS name.
+- [x] youki runtime: an OCI bundle and `youki create` / `youki start` when the binary is on the host. A missing binary is unavailable.
+- [x] Stack apply writes `network`, `subnet`, and `machine` rows from the stack document. `pi apply` already writes one resource at a time.
+- [x] L4 forwarder when `PISTACK_RELAY_BACKEND=forward`: a loopback or private listener copies bytes to a pool member.
+- [x] HTTP reverse proxy for the same setting. It answers `GET` from an up member. TLS termination stays unavailable until a certificate is configured. UDP is refused.
+- [x] A listener door runs cloudflared or tailscale when that binary is present and stays unavailable when it is missing. WireGuard and an edge host start no process.
+- [x] A failed live migration sets the machine to `Error` and leaves it on the source host.
+- [x] Host heartbeats write memory and vcpu capacity into one process-wide gauge ring.
+- [x] An NFS share is `Ready` only after `exportfs` accepts the client CIDR. CephFS is `Ready` only after `ceph fs subvolume create`. A missing tool stays `Pending`.
+- [x] A metal machine that names this host is the host and is not powered off. A different machine with a BMC address is powered with `ipmitool` when that binary and a password file are present.
+- [ ] A stack with a VM database and a pod web tier behind one relay and one DNS name, on real hosts.
+- beacon (hickory) and silo are already in the tree.
 
 ## Phase 3 — Everything else
 
-- shelf, blueprint kits, Cloud Hypervisor driver, bare-metal provisioning, openstack-compat shim, web console, Raft replication of the store.
+- shelf, blueprint kits, Cloud Hypervisor driver, bare-metal provisioning, web console. Control-plane discovery, adopt, and leader replication are part of `pistack server`. A compatibility door waits until a migration needs it.

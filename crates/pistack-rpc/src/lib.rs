@@ -6,7 +6,8 @@
 //! * [`proto`] – the wire types `anvil` and the control plane exchange.
 //! * [`queue`] – [`CommandQueue`], per-node FIFOs with pending/ack tracking
 //!   and timeouts; modules enqueue, the HTTP layer delivers.
-//! * [`server`] – [`router`], the axum routes agents call.
+//! * [`server`] – [`router`], the axum routes agents call. [`router_with_store`]
+//!   is that router plus an optional join-token check.
 //! * [`client`] – [`AgentClient`], the agent side over reqwest.
 //! * [`events`] – [`EventBus`], a typed `broadcast<Event>` with filtered
 //!   subscriptions.
@@ -28,10 +29,10 @@ pub use events::{EventBus, EventStream};
 pub use proto::{
     AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat,
     HeartbeatAck, HelloAck, MachineKind, MachineRef, MachineReport, MachineRequest, PowerState,
-    ReportAck, RunningMachine,
+    ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
-pub use server::router;
+pub use server::{router, router_with_store, REQUIRE_JOIN_ENV};
 
 #[cfg(test)]
 mod loopback {
@@ -81,6 +82,7 @@ mod loopback {
                 labels: [("rack".to_string(), "r1".to_string())]
                     .into_iter()
                     .collect(),
+                underlay_ip: None,
             })
             .await
             .unwrap();
@@ -198,6 +200,7 @@ mod loopback {
             resources: Resources::default(),
             version: String::new(),
             labels: Default::default(),
+            underlay_ip: None,
         }
     }
 

@@ -210,6 +210,7 @@ impl Client {
     }
 
     pub async fn delete_listener(&self, id: &Id) -> ApiResult<Listener> {
+        crate::door::stop(&id.to_string());
         let l = self.listeners().get(id).map_err(store_err)?;
         if l.status.provider_ref.is_some() {
             if let Ok(lb) = self.balancers().get(&l.spec.balancer) {
@@ -483,6 +484,7 @@ impl Client {
                         default_pool: Some(pool.meta.id.clone()),
                         connection_limit: 0,
                         admin_up: true,
+                        door: None,
                     },
                 )?;
             }

@@ -112,6 +112,10 @@ pub struct ImageStatus {
     /// `ImageStore` reference, e.g. `sha256:<hex>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backing_ref: Option<String>,
+    /// Absolute blob path on this server. Set only for a local store, so a
+    /// machine can boot the file without treating `backing_ref` as a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
     /// Size of the disk the image expands to (qcow2 virtual size). `None`
     /// when unknown (no `qemu-img` on the server).
     #[serde(default, skip_serializing_if = "Option::is_none")]

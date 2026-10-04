@@ -4,10 +4,8 @@ Real hardware for Phase 1 (KVM, libvirt, OVN, LVM). Nodes never accept inbound
 connections for this; they run a GitHub Actions self-hosted runner that pulls
 jobs from this private repo.
 
-| Node | Role |
-| --- | --- |
-| `spark-wg` | ARM64 GPU node (DGX Spark class), reached over WireGuard |
-| `fleet` | bare-metal Ubuntu, x86 KVM host |
+A lab node is a machine you control: an x86 KVM host, or an ARM64 host. The
+runner on that machine pulls jobs. The repo does not list private host names.
 
 ## One-time setup per node
 

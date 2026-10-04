@@ -7,9 +7,10 @@
 //! They never touch `status` themselves.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -44,21 +45,23 @@ pub fn router(client: Client) -> Router {
         .route("/backups", get(list_backups).post(create_backup))
         .route("/backups/{id}", get(get_backup).delete(delete_backup))
         .route("/backups/{id}/restore", post(restore_backup))
+        .layer(middleware::from_fn(require_caller))
         .with_state(client)
+}
+
+async fn require_caller(req: Request, next: Next) -> Response {
+    if req.extensions().get::<Caller>().is_none() {
+        return ApiError::unauthorized("no credentials").into_response();
+    }
+    next.run(req).await
 }
 
 // ---- caller scope ---------------------------------------------------------
 
-/// The gateway attaches a `Caller`; without one (dev mode, tests) the
-/// request is treated as a system admin with no project scope.
-fn caller(ext: Option<Extension<Caller>>) -> Caller {
-    ext.map(|Extension(c)| c).unwrap_or_else(|| Caller {
-        principal: Id::new("prin"),
-        principal_name: "dev-admin".into(),
-        project: None,
-        roles: vec!["admin".into()],
-        system: true,
-    })
+/// The gateway attaches a `Caller`. Without one the request is refused.
+fn caller(ext: Option<Extension<Caller>>) -> ApiResult<Caller> {
+    ext.map(|Extension(c)| c)
+        .ok_or_else(|| ApiError::unauthorized("no credentials"))
 }
 
 /// Project a list/get is scoped to: admins see everything unless they
@@ -147,7 +150,7 @@ async fn create_volume_type(
     ext: Option<Extension<Caller>>,
     Json(req): Json<Create<VolumeTypeSpec>>,
 ) -> ApiResult<impl IntoResponse> {
-    if !caller(ext).is_admin() {
+    if !caller(ext)?.is_admin() {
         return Err(ApiError::forbidden("only admins manage volume types"));
     }
     Ok(created(c.create_volume_type(req)?))
@@ -175,7 +178,7 @@ async fn update_volume_type(
     headers: HeaderMap,
     Json(req): Json<UpdateVolumeType>,
 ) -> ApiResult<Json<VolumeType>> {
-    if !caller(ext).is_admin() {
+    if !caller(ext)?.is_admin() {
         return Err(ApiError::forbidden("only admins manage volume types"));
     }
     let vt = c.get_volume_type(&id)?;
@@ -192,7 +195,7 @@ async fn delete_volume_type(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    if !caller(ext).is_admin() {
+    if !caller(ext)?.is_admin() {
         return Err(ApiError::forbidden("only admins manage volume types"));
     }
     let vt = c.get_volume_type(&id)?;
@@ -207,7 +210,7 @@ async fn list_volumes(
     ext: Option<Extension<Caller>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Page<Volume>>> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     Ok(Json(page(c.list_volumes(scope(&caller).as_ref())?, &q)))
 }
 
@@ -216,7 +219,7 @@ async fn create_volume(
     ext: Option<Extension<Caller>>,
     Json(mut req): Json<Create<VolumeSpec>>,
 ) -> ApiResult<impl IntoResponse> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     req.project = target_project(&caller, req.project.take())?;
     Ok(created(c.create_volume(req).await?))
 }
@@ -232,7 +235,7 @@ async fn get_volume(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Volume>> {
-    Ok(Json(load_volume(&c, &caller(ext), &id)?))
+    Ok(Json(load_volume(&c, &caller(ext)?, &id)?))
 }
 
 async fn update_volume(
@@ -242,7 +245,7 @@ async fn update_volume(
     headers: HeaderMap,
     Json(req): Json<UpdateMeta>,
 ) -> ApiResult<Json<Volume>> {
-    let v = load_volume(&c, &caller(ext), &id)?;
+    let v = load_volume(&c, &caller(ext)?, &id)?;
     Ok(Json(c.update_volume(
         &v.meta.id,
         req,
@@ -255,7 +258,7 @@ async fn delete_volume(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let v = load_volume(&c, &caller(ext), &id)?;
+    let v = load_volume(&c, &caller(ext)?, &id)?;
     c.request_delete_volume(&v.meta.id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -273,15 +276,19 @@ async fn attach_volume(
     Path(id): Path<String>,
     Json(body): Json<AttachBody>,
 ) -> ApiResult<Json<Volume>> {
-    let v = load_volume(&c, &caller(ext), &id)?;
+    let v = load_volume(&c, &caller(ext)?, &id)?;
     if body.machine.kind != "mach" {
         return Err(ApiError::bad_request("machine must be a mach-… id"));
     }
-    Ok(Json(c.mark_attached(
-        &v.meta.id,
-        &body.machine,
-        body.device,
-    )?))
+    let device = if c.has_queue() {
+        Some(
+            c.plug_volume(&v.meta.id, &body.machine, body.device)
+                .await?,
+        )
+    } else {
+        body.device
+    };
+    Ok(Json(c.mark_attached(&v.meta.id, &body.machine, device)?))
 }
 
 async fn detach_volume(
@@ -289,7 +296,13 @@ async fn detach_volume(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Volume>> {
-    let v = load_volume(&c, &caller(ext), &id)?;
+    let v = load_volume(&c, &caller(ext)?, &id)?;
+    if c.has_queue() {
+        if let Some(machine) = v.status.attached_to.clone() {
+            c.unplug_volume(&v.meta.id, &machine, v.status.device.clone())
+                .await?;
+        }
+    }
     Ok(Json(c.mark_detached(&v.meta.id)?))
 }
 
@@ -304,7 +317,7 @@ async fn extend_volume(
     Path(id): Path<String>,
     Json(body): Json<ExtendBody>,
 ) -> ApiResult<(StatusCode, Json<Volume>)> {
-    let v = load_volume(&c, &caller(ext), &id)?;
+    let v = load_volume(&c, &caller(ext)?, &id)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(c.extend_volume(&v.meta.id, body.size_gib).await?),
@@ -318,7 +331,7 @@ async fn list_snapshots(
     ext: Option<Extension<Caller>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Page<Snapshot>>> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     Ok(Json(page(c.list_snapshots(scope(&caller).as_ref())?, &q)))
 }
 
@@ -327,7 +340,7 @@ async fn create_snapshot(
     ext: Option<Extension<Caller>>,
     Json(req): Json<Create<SnapshotSpec>>,
 ) -> ApiResult<impl IntoResponse> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     // The snapshot inherits its volume's project; the volume must be visible.
     let vol = c.get_volume(None, &req.spec.volume.to_string())?;
     check_visible(&caller, &vol)?;
@@ -345,7 +358,7 @@ async fn get_snapshot(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Snapshot>> {
-    Ok(Json(load_snapshot(&c, &caller(ext), &id)?))
+    Ok(Json(load_snapshot(&c, &caller(ext)?, &id)?))
 }
 
 async fn delete_snapshot(
@@ -353,7 +366,7 @@ async fn delete_snapshot(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let s = load_snapshot(&c, &caller(ext), &id)?;
+    let s = load_snapshot(&c, &caller(ext)?, &id)?;
     c.request_delete_snapshot(&s.meta.id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -365,7 +378,7 @@ async fn list_backups(
     ext: Option<Extension<Caller>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Page<Backup>>> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     Ok(Json(page(c.list_backups(scope(&caller).as_ref())?, &q)))
 }
 
@@ -374,7 +387,7 @@ async fn create_backup(
     ext: Option<Extension<Caller>>,
     Json(req): Json<Create<BackupSpec>>,
 ) -> ApiResult<impl IntoResponse> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     let vol = c.get_volume(None, &req.spec.volume.to_string())?;
     check_visible(&caller, &vol)?;
     Ok(created(c.create_backup(req).await?))
@@ -391,7 +404,7 @@ async fn get_backup(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Backup>> {
-    Ok(Json(load_backup(&c, &caller(ext), &id)?))
+    Ok(Json(load_backup(&c, &caller(ext)?, &id)?))
 }
 
 async fn delete_backup(
@@ -399,7 +412,7 @@ async fn delete_backup(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let b = load_backup(&c, &caller(ext), &id)?;
+    let b = load_backup(&c, &caller(ext)?, &id)?;
     c.request_delete_backup(&b.meta.id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -409,6 +422,6 @@ async fn restore_backup(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Volume>> {
-    let b = load_backup(&c, &caller(ext), &id)?;
+    let b = load_backup(&c, &caller(ext)?, &id)?;
     Ok(Json(c.restore_backup(&b.meta.id)?))
 }

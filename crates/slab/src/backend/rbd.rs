@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Ceph RBD backend. Stub: every method returns `not_implemented`.
+//! Ceph RBD backend.
 //!
-//! When wired, the backend runs these (control plane or any host with a
-//! Ceph keyring; `anvil` does the `rbd map`/librbd attach side):
+//! `$PISTACK_RBD_BIN`, when set and non-empty, replaces the `rbd` binary.
+//! Otherwise `rbd` is looked up on `PATH`. A missing binary is unavailable.
+//! Pool, volume ids and snapshot ids must match `[A-Za-z0-9._-]{1,64}`.
 //!
 //! | operation       | command |
 //! | --------------- | ------- |
@@ -12,19 +13,22 @@
 //! | delete          | `rbd rm {pool}/{vol_id}` |
 //! | snapshot        | `rbd snap create {pool}/{vol_id}@{snap_id}` then `rbd snap protect {pool}/{vol_id}@{snap_id}` |
 //! | delete_snapshot | `rbd snap unprotect {pool}/{vol_id}@{snap_id}` then `rbd snap rm {pool}/{vol_id}@{snap_id}` |
-//! | restore         | `rbd clone {pool}/{vol_id}@{snap_id} {pool}/{new_vol_id}` (flatten later with `rbd flatten`) |
+//! | restore         | `rbd clone {pool}/{vol_id}@{snap_id} {pool}/{new_vol_id}` |
 //! | extend          | `rbd resize --size {new_size_gib}G {pool}/{vol_id}` |
-//! | attach_info     | `Rbd { pool, image: vol_id, monitors, user }`; anvil runs `rbd map {pool}/{vol_id}` for bare metal or hands librbd to libvirt for VMs |
+//! | attach_info     | `Rbd { pool, image: vol_id, monitors, user }` |
 //!
 //! Parameters from `VolumeTypeSpec::params`: `pool` (default `volumes`),
-//! `user` (default `pistack`), `monitors` (comma separated), `keyring_secret`
-//! (a `keep` secret id holding the cephx key).
+//! `user` (default `pistack`), `monitors` (comma separated).
 
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult};
+use std::time::Duration;
 
-use super::{AttachInfo, BackendRef, BlockBackend};
+use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
 use crate::types::{Snapshot, Volume};
+
+const TIMEOUT: Duration = Duration::from_secs(30);
+const ENV_BIN: &str = "PISTACK_RBD_BIN";
 
 pub struct RbdBackend {
     pub pool: String,
@@ -51,9 +55,22 @@ impl RbdBackend {
         }
     }
 
-    fn todo(op: &str, cmd: String) -> ApiError {
-        ApiError::not_implemented(format!("rbd backend: {op} not implemented"))
-            .with_detail("command", cmd)
+    fn pool(&self) -> ApiResult<&str> {
+        let pool = if self.pool.is_empty() {
+            "volumes"
+        } else {
+            self.pool.as_str()
+        };
+        ident("pool", pool)?;
+        Ok(pool)
+    }
+
+    fn user(&self) -> String {
+        if self.user.is_empty() {
+            "pistack".into()
+        } else {
+            self.user.clone()
+        }
     }
 }
 
@@ -64,73 +81,266 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef> {
-        Err(Self::todo(
-            "create",
-            format!(
-                "rbd create --size {}G --image-feature layering,exclusive-lock {}/{}",
-                vol.spec.size_gib, self.pool, vol.meta.id
-            ),
-        ))
+        let pool = self.pool()?;
+        let id = vol_id(vol)?;
+        let size = format!("{}G", vol.spec.size_gib);
+        let image = format!("{pool}/{id}");
+        run(
+            &program(ENV_BIN, "rbd"),
+            &[
+                "create".into(),
+                "--size".into(),
+                size,
+                "--image-feature".into(),
+                "layering,exclusive-lock".into(),
+                image.clone(),
+            ],
+            false,
+        )
+        .await?;
+        Ok(BackendRef::new(image))
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
-        Err(Self::todo(
-            "delete",
-            format!("rbd rm {}/{}", self.pool, vol.meta.id),
-        ))
+        let pool = self.pool()?;
+        let id = vol_id(vol)?;
+        run(
+            &program(ENV_BIN, "rbd"),
+            &["rm".into(), format!("{pool}/{id}")],
+            true,
+        )
+        .await
     }
 
     async fn snapshot(&self, vol: &Volume, snap: &Snapshot) -> ApiResult<BackendRef> {
-        Err(Self::todo(
-            "snapshot",
-            format!(
-                "rbd snap create {p}/{v}@{s} && rbd snap protect {p}/{v}@{s}",
-                p = self.pool,
-                v = vol.meta.id,
-                s = snap.meta.id
-            ),
-        ))
+        let pool = self.pool()?;
+        let vol_id = vol_id(vol)?;
+        let snap_id = snap_id(snap)?;
+        let spec = format!("{pool}/{vol_id}@{snap_id}");
+        let bin = program(ENV_BIN, "rbd");
+        run(&bin, &["snap".into(), "create".into(), spec.clone()], false).await?;
+        run(&bin, &["snap".into(), "protect".into(), spec.clone()], false).await?;
+        Ok(BackendRef::new(spec))
     }
 
     async fn delete_snapshot(&self, snap: &Snapshot) -> ApiResult<()> {
-        Err(Self::todo(
-            "delete_snapshot",
-            format!(
-                "rbd snap unprotect {p}/{v}@{s} && rbd snap rm {p}/{v}@{s}",
-                p = self.pool,
-                v = snap.spec.volume,
-                s = snap.meta.id
-            ),
-        ))
+        let pool = self.pool()?;
+        let vol_id = snap.spec.volume.to_string();
+        ident("volume id", &vol_id)?;
+        let snap_id = snap_id(snap)?;
+        let spec = format!("{pool}/{vol_id}@{snap_id}");
+        let bin = program(ENV_BIN, "rbd");
+        run(
+            &bin,
+            &["snap".into(), "unprotect".into(), spec.clone()],
+            true,
+        )
+        .await?;
+        run(&bin, &["snap".into(), "rm".into(), spec], true).await
     }
 
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef> {
-        Err(Self::todo(
-            "restore",
-            format!(
-                "rbd clone {p}/{v}@{s} {p}/{n}",
-                p = self.pool,
-                v = snap.spec.volume,
-                s = snap.meta.id,
-                n = into.meta.id
-            ),
-        ))
+        let pool = self.pool()?;
+        let src = snap.spec.volume.to_string();
+        ident("volume id", &src)?;
+        let snap_id = snap_id(snap)?;
+        let id = vol_id(into)?;
+        let image = format!("{pool}/{id}");
+        run(
+            &program(ENV_BIN, "rbd"),
+            &[
+                "clone".into(),
+                format!("{pool}/{src}@{snap_id}"),
+                image.clone(),
+            ],
+            false,
+        )
+        .await?;
+        Ok(BackendRef::new(image))
     }
 
     async fn extend(&self, vol: &Volume, new_size_gib: u64) -> ApiResult<()> {
-        Err(Self::todo(
-            "extend",
-            format!(
-                "rbd resize --size {new_size_gib}G {}/{}",
-                self.pool, vol.meta.id
-            ),
-        ))
+        if new_size_gib < vol.spec.size_gib {
+            return Err(ApiError::unprocessable("volumes cannot shrink"));
+        }
+        let pool = self.pool()?;
+        let id = vol_id(vol)?;
+        run(
+            &program(ENV_BIN, "rbd"),
+            &[
+                "resize".into(),
+                "--size".into(),
+                format!("{new_size_gib}G"),
+                format!("{pool}/{id}"),
+            ],
+            false,
+        )
+        .await
     }
 
     async fn attach_info(&self, vol: &Volume, _host: &str) -> ApiResult<AttachInfo> {
-        Err(Self::todo(
-            "attach_info",
-            format!("rbd map {}/{}", self.pool, vol.meta.id),
-        ))
+        let pool = self.pool()?.to_owned();
+        let id = vol_id(vol)?;
+        let mut info = AttachInfo::new(AttachTarget::Rbd {
+            pool,
+            image: id,
+            monitors: self.monitors.clone(),
+            user: self.user(),
+            key_secret: None,
+        });
+        info.device = vol.status.device.clone();
+        Ok(info)
+    }
+}
+
+fn vol_id(vol: &Volume) -> ApiResult<String> {
+    let id = vol.meta.id.to_string();
+    ident("volume id", &id)?;
+    Ok(id)
+}
+
+fn snap_id(snap: &Snapshot) -> ApiResult<String> {
+    let id = snap.meta.id.to_string();
+    ident("snapshot id", &id)?;
+    Ok(id)
+}
+
+fn ident(kind: &str, value: &str) -> ApiResult<()> {
+    let ok = (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{kind} must match [A-Za-z0-9._-]{{1,64}}"
+        )))
+    }
+}
+
+fn program(env_key: &str, default: &str) -> String {
+    match std::env::var(env_key) {
+        Ok(v) => {
+            let v = v.trim();
+            if v.is_empty() {
+                default.to_owned()
+            } else {
+                v.to_owned()
+            }
+        }
+        Err(_) => default.to_owned(),
+    }
+}
+
+async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let finished = tokio::time::timeout(TIMEOUT, cmd.output()).await;
+    let output = match finished {
+        Err(_) => {
+            return Err(ApiError::unavailable(format!(
+                "{bin} timed out after 30s"
+            )))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::unavailable(format!("{bin} is not available")))
+        }
+        Ok(Err(e)) => return Err(ApiError::internal(format!("{bin}: {e}"))),
+        Ok(Ok(output)) => output,
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = format!("{}{}", clip(&output.stderr), clip(&output.stdout));
+    if missing_ok && object_absent(&detail) {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    Err(ApiError::internal(format!("{bin} exited {code}: {detail}")))
+}
+
+fn clip(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(400)
+        .collect()
+}
+
+fn object_absent(text: &str) -> bool {
+    let s = text.to_ascii_lowercase();
+    s.contains("no such file or directory")
+        || s.contains("not protected")
+        || s.contains("already unprotected")
+        || (s.contains("not found") && (s.contains("image") || s.contains("snap")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{VolumeSpec, VolumeStatus};
+    use pistack_types::{kind, Meta};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn volume(size: u64) -> Volume {
+        Volume {
+            meta: Meta::new(kind::VOLUME, "data", None),
+            spec: VolumeSpec {
+                size_gib: size,
+                volume_type: "rbd".into(),
+                source: Default::default(),
+                bootable: false,
+                encrypted: false,
+            },
+            status: VolumeStatus::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_argv_contains_id_and_size() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("rbd");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\nexit 0\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+
+        let bad = RbdBackend::new("bad/pool", "pistack", Vec::new());
+        let vol = volume(17);
+        let err = bad.create(&vol).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::BadRequest);
+        assert!(!log.exists());
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let id = vol.meta.id.to_string();
+        backend.create(&vol).await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains(&id), "{logged}");
+        assert!(logged.contains("17G"), "{logged}");
+
+        std::env::set_var(ENV_BIN, dir.path().join("missing-rbd"));
+        let err = backend.create(&vol).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
     }
 }

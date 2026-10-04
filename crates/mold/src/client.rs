@@ -9,7 +9,10 @@ use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{ApiError, ApiResult, Caller, Id, Meta, Phase};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::io::StreamReader;
 
 use crate::inspect;
 use crate::store::{ImageData, ImageStore, LocalDirStore};
@@ -79,15 +82,29 @@ pub fn validate_source_url(url: &str) -> ApiResult<()> {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .ok_or_else(|| ApiError::bad_request("url must start with http:// or https://"))?;
-    let host = rest.split('/').next().unwrap_or("");
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    if host.is_empty() {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
         return Err(ApiError::bad_request("url has no host"));
     }
-    if host.contains('@') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if authority.contains('@') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(ApiError::bad_request(
             "url may not contain credentials or whitespace",
         ));
+    }
+    // Bracketed IPv6 (`[::1]`, `[::1]:443`) must not be split on ':'.
+    // A bare `::1` has more than one colon, so it is the host, not host:port.
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split_once(']').map(|(h, _)| h).unwrap_or(inner)
+    } else if authority.matches(':').count() > 1 {
+        authority
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
+    if host.is_empty() {
+        return Err(ApiError::bad_request("url has no host"));
     }
     if matches!(
         host,
@@ -383,11 +400,17 @@ impl Client {
             }
         }
 
+        let file_path = self
+            .blobs
+            .local_path(&stored.reference)
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned());
         Ok(col.modify(id, |i| {
             i.status.phase = Phase::Ready;
             i.status.size_bytes = Some(stored.size);
             i.status.sha256 = Some(stored.sha256.clone());
             i.status.backing_ref = Some(stored.reference.clone());
+            i.status.file_path = file_path.clone();
             i.status.virtual_size_bytes = inspection.as_ref().and_then(|x| x.virtual_size);
             set_condition(
                 &mut i.status.conditions,
@@ -432,18 +455,30 @@ impl Client {
         Err(e)
     }
 
-    /// `POST /images/{id}/import`: validated, then 501 until the fetcher
-    /// lands (it will stream `url` through [`Client::upload`]).
-    pub fn import(&self, id: &Id, url: &str) -> ApiResult<Image> {
+    /// `POST /images/{id}/import`. Fetches `url` and streams the body through
+    /// [`Client::upload`], so inspect, sha256, and the Ready phase stay the
+    /// same as a direct upload.
+    pub async fn import(&self, id: &Id, url: &str) -> ApiResult<Image> {
         let img = self.images().get(id)?;
         validate_source_url(url)?;
         if img.status.phase == Phase::Ready {
             return Err(ApiError::conflict(format!("image {id} already has data")));
         }
-        Err(
-            ApiError::not_implemented("image import from URL is not implemented yet")
-                .with_detail("url", url),
-        )
+        let data = fetch_source(url).await?;
+        self.upload(id, data).await
+    }
+
+    /// Stream `data` through [`Client::upload`] without fetching a URL.
+    /// Tests use this so the SSRF check stays on for [`Client::import`].
+    pub async fn import_reader<R>(&self, id: &Id, data: R) -> ApiResult<Image>
+    where
+        R: tokio::io::AsyncRead + Send + 'static,
+    {
+        let img = self.images().get(id)?;
+        if img.status.phase == Phase::Ready {
+            return Err(ApiError::conflict(format!("image {id} already has data")));
+        }
+        self.upload(id, Box::pin(data)).await
     }
 
     // ---- members ----------------------------------------------------------
@@ -503,10 +538,101 @@ impl Client {
     }
 }
 
+const MAX_IMPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+
+fn redirect_action(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    if attempt.previous().len() >= MAX_REDIRECTS {
+        return attempt.error(io::Error::other("image import: too many redirects"));
+    }
+    match validate_source_url(attempt.url().as_str()) {
+        Ok(()) => attempt.follow(),
+        Err(e) => attempt.error(io::Error::other(format!("image import: {e}"))),
+    }
+}
+
+fn fetch_err(e: reqwest::Error) -> ApiError {
+    if e.is_timeout() || e.is_connect() {
+        ApiError::unavailable(format!("image import: {e}"))
+    } else {
+        ApiError::bad_request(format!("image import: {e}"))
+    }
+}
+
+/// GET `url`, following at most five redirects when every hop passes
+/// [`validate_source_url`]. The body is capped at 8 GiB.
+async fn fetch_source(url: &str) -> ApiResult<ImageData> {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(redirect_action))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(2 * 60 * 60))
+        .build()
+        .map_err(|e| ApiError::internal(format!("image import: {e}")))?;
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(fetch_err)?
+        .error_for_status()
+        .map_err(fetch_err)?;
+    if resp.content_length().is_some_and(|n| n > MAX_IMPORT_BYTES) {
+        return Err(ApiError::bad_request("image import exceeds 8 GiB"));
+    }
+    let stream = futures::stream::unfold((resp, 0u64), |(mut resp, read)| async move {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let next = read.saturating_add(chunk.len() as u64);
+                if next > MAX_IMPORT_BYTES {
+                    Some((
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "image import exceeds 8 GiB",
+                        )),
+                        (resp, next),
+                    ))
+                } else {
+                    Some((Ok(chunk), (resp, next)))
+                }
+            }
+            Ok(None) => None,
+            Err(e) => Some((Err(io::Error::other(e)), (resp, read))),
+        }
+    });
+    Ok(Box::pin(StreamReader::new(stream)))
+}
+
 fn not_found_to_none<T>(r: pistack_store::Result<T>) -> ApiResult<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(StoreError::NotFound(_)) => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_source_url;
+
+    #[test]
+    fn source_url_allows_public_http_and_rejects_ssrf() {
+        assert!(validate_source_url("https://cloud-images.example/x.img").is_ok());
+        assert!(validate_source_url("http://example.com:8080/a").is_ok());
+        for bad in [
+            "ftp://x/y",
+            "http://localhost/x",
+            "http://127.0.0.1/x",
+            "http://127.0.0.1:9/latest",
+            "http://[::1]/x",
+            "http://[::1]:80/x",
+            "http://::1/",
+            "http://169.254.169.254/latest",
+            "http://user:pass@example.com/x",
+            "http://example.com/a b",
+            "/etc/passwd",
+            "https://",
+        ] {
+            assert!(validate_source_url(bad).is_err(), "{bad}");
+        }
     }
 }

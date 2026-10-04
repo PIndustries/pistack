@@ -103,9 +103,13 @@ mod tests {
                 gpus: 0,
             },
             networks: vec![],
+            nics: vec![],
             volumes: vec![],
             user_data: None,
             ssh_keys: vec![],
+            overlay: None,
+            bmc_address: None,
+            bmc_user: None,
         }
     }
 

@@ -9,18 +9,22 @@
 //! already looked up) and returns only what the model cannot know by
 //! itself (a port binding). The reconciler is the only caller.
 //!
-//! Two implementations ship: [`MockBackend`] for tests and single-node
-//! development, and [`OvnBackend`], today a stub that documents the OVN
-//! northbound mapping for every operation.
+//! [`MockBackend`] records calls for tests. [`HostNat`] is the single-host
+//! datapath. [`OverlayBackend`] accepts one VXLAN segment per network and
+//! does not configure the host. [`OvnBackend`] is a stub.
 
 use crate::types::{FloatingIp, Network, Port, PortBinding, Router, SecurityGroup, Subnet};
 use async_trait::async_trait;
 use pistack_types::{ApiResult, Id};
 
+pub mod hostnat;
 pub mod mock;
+pub mod overlay;
 pub mod ovn;
 
+pub use hostnat::HostNat;
 pub use mock::{Call, MockBackend};
+pub use overlay::OverlayBackend;
 pub use ovn::OvnBackend;
 
 /// A router with everything the backend needs to plumb it.

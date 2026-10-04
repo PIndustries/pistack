@@ -65,6 +65,9 @@ pub struct NodeInfo {
     pub capabilities: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub version: String,
+    /// Underlay IPv4 from the last hello. None when the agent left it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlay_ip: Option<String>,
     pub resources_total: Resources,
     pub resources_free: Resources,
     pub machines: Vec<MachineReport>,
@@ -83,6 +86,7 @@ impl NodeInfo {
             capabilities: Vec::new(),
             labels: BTreeMap::new(),
             version: String::new(),
+            underlay_ip: None,
             resources_total: Resources::default(),
             resources_free: Resources::default(),
             machines: Vec::new(),
@@ -238,6 +242,7 @@ impl CommandQueue {
             e.info.capabilities = hello.capabilities.clone();
             e.info.labels = hello.labels.clone();
             e.info.version = hello.version.clone();
+            e.info.underlay_ip = hello.underlay_ip.clone();
             e.info.resources_total = hello.resources;
             e.info.last_hello = Some(now);
         }
@@ -771,6 +776,7 @@ mod tests {
             },
             version: "0.1.0".into(),
             labels: Default::default(),
+            underlay_ip: Some("10.66.66.5".into()),
         });
         assert_eq!(ack.node_name, "n1");
         assert_eq!(ack.heartbeat_interval_secs, 5);
@@ -797,6 +803,7 @@ mod tests {
         assert_eq!(info.capabilities, vec!["kvm"]);
         assert_eq!(info.resources_total.vcpus, 8);
         assert_eq!(info.resources_free.vcpus, 6);
+        assert_eq!(info.underlay_ip.as_deref(), Some("10.66.66.5"));
         assert!(info.last_hello.is_some() && info.last_heartbeat.is_some());
         assert_eq!(info.queued, 1);
     }
@@ -811,6 +818,7 @@ mod tests {
             resources: Resources::default(),
             version: String::new(),
             labels: Default::default(),
+            underlay_ip: None,
         };
         q.hello(&hello);
         let hb = Heartbeat {

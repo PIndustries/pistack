@@ -1291,17 +1291,16 @@ async fn fip(ctx: &Ctx, cmd: FipCmd, io: &mut Io<'_>) -> CliResult<()> {
         }
         FipCmd::Associate(a) => {
             let c = ctx.client()?;
-            let port = resolve(&c, kind("port"), &a.port).await?;
-            do_action(
-                ctx,
-                io,
-                k,
-                &a.name,
-                "associate",
-                Some(json!({ "port": port })),
-            )
-            .await
-            .map(|_| ())
+            let body = if let Some(machine) = &a.machine {
+                json!({ "machine": resolve(&c, kind("machine"), machine).await? })
+            } else if let Some(port) = &a.port {
+                json!({ "port": resolve(&c, kind("port"), port).await? })
+            } else {
+                return Err(CliError::usage("associate needs --port or --machine"));
+            };
+            do_action(ctx, io, k, &a.name, "associate", Some(body))
+                .await
+                .map(|_| ())
         }
         FipCmd::Disassociate(a) => do_action(ctx, io, k, &a.name, "disassociate", None)
             .await

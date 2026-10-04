@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use pistack_types::{kind, Condition, Id, Kind, Meta, Phase, Resource, Resources};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::ops::{Deref, DerefMut};
 
 /// Declare a newtype over `Resource<Spec, Status>` that implements `Kind`.
@@ -80,6 +81,10 @@ pub struct HostSpec {
     /// "metal", "mock". The scheduler maps `MachineKind` onto these.
     #[serde(default)]
     pub drivers: Vec<String>,
+    /// Underlay IPv4 reported by the agent. None means this host is not on
+    /// any overlay segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlay_ip: Option<String>,
 }
 
 /// What is true about a host right now. Written by the reconciler.
@@ -121,6 +126,7 @@ pub fn new_host(
             node_name: node_name.into(),
             capacity,
             drivers,
+            underlay_ip: None,
         },
         status: HostStatus {
             free: capacity,
@@ -225,6 +231,9 @@ pub struct MachineSpec {
     pub image: String,
     #[serde(default)]
     pub networks: Vec<String>,
+    /// Security group names or ids. Empty uses the project's default group.
+    #[serde(default)]
+    pub security_groups: Vec<String>,
     #[serde(default)]
     pub volumes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +255,17 @@ pub struct MachineSpec {
     /// reconciler restarts the machine when it exceeds `status.restarts`.
     #[serde(default)]
     pub restarts: u64,
+    /// Secret names this guest may read. Payloads stay in keep.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// Baseboard address for a chassis that is not this host.
+    /// The agent does not power off the host it is running on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bmc_address: Option<String>,
+    /// IPMI username. The password is a file under `PISTACK_IPMI_DIR`,
+    /// named by the machine id, and is not stored on the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bmc_user: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -301,6 +321,28 @@ pub fn new_machine(name: impl Into<String>, project: Option<Id>, spec: MachineSp
         spec,
         status: MachineStatus::default(),
     })
+}
+
+/// Usable underlay address: IPv4 unicast in 10/8, 172.16/12, 192.168/16,
+/// or 100.64/10. A missing or rejected value is `None`.
+pub(crate) fn usable_underlay(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let ip: Ipv4Addr = raw.parse().ok()?;
+    underlay_ip_ok(ip).then(|| ip.to_string())
+}
+
+fn underlay_ip_ok(ip: Ipv4Addr) -> bool {
+    if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+        return false;
+    }
+    let [a, b, _, _] = ip.octets();
+    a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 100 && (64..=127).contains(&b))
 }
 
 /// Whether a delete has been requested (see `DELETE_ANNOTATION`).

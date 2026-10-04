@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
@@ -40,19 +41,21 @@ pub fn router(client: Client) -> Router {
             "/images/{id}/members/{project}",
             axum::routing::delete(remove_member),
         )
+        .layer(middleware::from_fn(require_caller))
         .with_state(client)
 }
 
-/// The gateway attaches a `Caller`; without one (dev mode, tests) the
-/// request is a system admin with no project scope.
-fn caller(ext: Option<Extension<Caller>>) -> Caller {
-    ext.map(|Extension(c)| c).unwrap_or_else(|| Caller {
-        principal: Id::new("prin"),
-        principal_name: "dev-admin".into(),
-        project: None,
-        roles: vec!["admin".into()],
-        system: true,
-    })
+async fn require_caller(req: Request, next: Next) -> Response {
+    if req.extensions().get::<Caller>().is_none() {
+        return ApiError::unauthorized("no credentials").into_response();
+    }
+    next.run(req).await
+}
+
+/// The gateway attaches a `Caller`. Without one the request is refused.
+fn caller(ext: Option<Extension<Caller>>) -> ApiResult<Caller> {
+    ext.map(|Extension(c)| c)
+        .ok_or_else(|| ApiError::unauthorized("no credentials"))
 }
 
 fn if_match(headers: &HeaderMap) -> ApiResult<Option<u64>> {
@@ -110,7 +113,7 @@ async fn list_images(
     ext: Option<Extension<Caller>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Page<Image>>> {
-    Ok(Json(page(c.list_visible(&caller(ext))?, &q)))
+    Ok(Json(page(c.list_visible(&caller(ext)?)?, &q)))
 }
 
 async fn create_image(
@@ -118,7 +121,7 @@ async fn create_image(
     ext: Option<Extension<Caller>>,
     Json(mut req): Json<CreateImage>,
 ) -> ApiResult<(StatusCode, Json<Image>)> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     match (&req.project, &caller.project) {
         (Some(p), Some(own)) if p != own && !caller.is_admin() => {
             return Err(ApiError::forbidden(
@@ -139,7 +142,7 @@ async fn get_image(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Image>> {
-    Ok(Json(c.get_visible(&caller(ext), &id)?))
+    Ok(Json(c.get_visible(&caller(ext)?, &id)?))
 }
 
 async fn update_image(
@@ -149,7 +152,7 @@ async fn update_image(
     headers: HeaderMap,
     Json(req): Json<UpdateImage>,
 ) -> ApiResult<Json<Image>> {
-    let caller = caller(ext);
+    let caller = caller(ext)?;
     let img = editable(&c, &caller, &id)?;
     if req.visibility == Some(Visibility::Public) && !caller.is_admin() {
         return Err(ApiError::forbidden("only admins publish public images"));
@@ -162,7 +165,7 @@ async fn delete_image(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let img = editable(&c, &caller(ext), &id)?;
+    let img = editable(&c, &caller(ext)?, &id)?;
     c.delete(&img.meta.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -175,7 +178,7 @@ async fn upload(
     Path(id): Path<String>,
     req: Request,
 ) -> ApiResult<Json<Image>> {
-    let img = editable(&c, &caller(ext), &id)?;
+    let img = editable(&c, &caller(ext)?, &id)?;
     let stream = req
         .into_body()
         .into_data_stream()
@@ -189,7 +192,7 @@ async fn download(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let img = c.get_visible(&caller(ext), &id)?;
+    let img = c.get_visible(&caller(ext)?, &id)?;
     let data = c.open_image(&img).await?;
     let mut resp = Body::from_stream(ReaderStream::with_capacity(data, 256 * 1024)).into_response();
     let h = resp.headers_mut();
@@ -233,8 +236,8 @@ async fn import_image(
     Path(id): Path<String>,
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<Image>> {
-    let img = editable(&c, &caller(ext), &id)?;
-    Ok(Json(c.import(&img.meta.id, &body.url)?))
+    let img = editable(&c, &caller(ext)?, &id)?;
+    Ok(Json(c.import(&img.meta.id, &body.url).await?))
 }
 
 // ---- members --------------------------------------------------------------
@@ -244,7 +247,7 @@ async fn list_members(
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Page<ImageMember>>> {
-    let img = c.get_visible(&caller(ext), &id)?;
+    let img = c.get_visible(&caller(ext)?, &id)?;
     let items = c.list_members(&img.meta.id)?;
     let total = items.len();
     Ok(Json(Page {
@@ -265,7 +268,7 @@ async fn add_member(
     Path(id): Path<String>,
     Json(body): Json<MemberBody>,
 ) -> ApiResult<(StatusCode, Json<ImageMember>)> {
-    let img = editable(&c, &caller(ext), &id)?;
+    let img = editable(&c, &caller(ext)?, &id)?;
     if body.project.kind != "proj" {
         return Err(ApiError::bad_request("project must be a proj-… id"));
     }
@@ -280,7 +283,7 @@ async fn remove_member(
     ext: Option<Extension<Caller>>,
     Path((id, project)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let img = editable(&c, &caller(ext), &id)?;
+    let img = editable(&c, &caller(ext)?, &id)?;
     let project = Id::parse("proj", &project)
         .ok_or_else(|| ApiError::bad_request(format!("'{project}' is not a project id")))?;
     c.remove_member(&img.meta.id, &project)?;

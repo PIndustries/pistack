@@ -4,11 +4,11 @@
 //! The load-balancer resource model: `Balancer`, `Listener`, `Pool`,
 //! `Member`.
 //!
-//! The shape follows Octavia so the concepts transfer: a balancer owns a
-//! VIP; listeners bind a protocol and port on it and point at a default
-//! pool; a pool holds members and a health monitor. `spec` is the user's,
-//! `status` is the reconciler's (provider results, operating status).
+//! A balancer owns a VIP. Listeners bind a protocol and port on it and
+//! point at a default pool. A pool holds members and a health monitor.
+//! `spec` is the request. `status` is what the provider reported.
 
+use crate::door::DoorKind;
 use pistack_types::{kind, Id, Kind, Meta, Phase, Resource};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -68,10 +68,10 @@ pub const MANAGED_LABEL: &str = "pistack.io/managed-by";
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
-    /// L4 (TCP/UDP) through the OVN `Load_Balancer` table. The default.
+    /// L4 TCP. The in-process forwarder serves this value. The default.
     #[default]
     Ovn,
-    /// L7 (HTTP/HTTPS) through relay's own Pingora proxy.
+    /// HTTP. The in-process reverse proxy serves this value.
     Relay,
 }
 
@@ -166,6 +166,10 @@ pub struct ListenerSpec {
     pub connection_limit: u32,
     #[serde(default = "default_true")]
     pub admin_up: bool,
+    /// Publish this listener off the host. Absent means the listener is
+    /// only the local forwarder. WireGuard and edge start no process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub door: Option<DoorKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]

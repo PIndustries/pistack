@@ -25,6 +25,11 @@ pub const MAX_LONG_POLL_SECS: u64 = 30;
 /// Default `max` for a command poll.
 pub const DEFAULT_POLL_BATCH: usize = 16;
 
+/// Clear-text join token on each agent request. Omitted when the agent has
+/// no token. Not an `Authorization` bearer: the gateway treats those as gate
+/// session tokens.
+pub const JOIN_HEADER: &str = "x-pistack-join";
+
 /// First message an agent sends after it starts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentHello {
@@ -41,6 +46,11 @@ pub struct AgentHello {
     /// Labels the operator set on the host (rack, zone, ...).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// IPv4 address of this host on the underlay. Empty when the agent could
+    /// not learn a usable address. The scheduler will not place a networked
+    /// machine on a host that leaves this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlay_ip: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,6 +119,28 @@ pub enum PowerState {
     Unknown,
 }
 
+/// One NIC whose address was allocated by fabric. Empty `nics` on a
+/// [`MachineRequest`] means the shared `pistack` network.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NicAttachment {
+    /// Fabric network id. The host turns this into a libvirt network name.
+    pub network_id: String,
+    pub mac: String,
+    /// IPv4 address with no prefix.
+    pub address: String,
+    pub prefix: u8,
+    /// Subnet gateway. The guest uses it as a default route only when `routed`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gateway: String,
+    /// A router on this subnet has an external network, so the host NATs it.
+    #[serde(default)]
+    pub routed: bool,
+    /// VXLAN VNI. Set only for the overlay datapath. Absent keeps the
+    /// host NAT bridge, including the shared `pistack` network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<u32>,
+}
+
 /// Payload of [`CommandKind::StartMachine`]: everything a runtime needs to
 /// bring a machine up.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,18 +154,71 @@ pub struct MachineRequest {
     pub resources: Resources,
     #[serde(default)]
     pub networks: Vec<String>,
+    /// Port addresses. Empty keeps the shared host network.
+    #[serde(default)]
+    pub nics: Vec<NicAttachment>,
     #[serde(default)]
     pub volumes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+    /// Overlay plan for this host. The agent applies it before plugging a
+    /// NIC that carries [`NicAttachment::segment_id`]. Absent on host NAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<serde_json::Value>,
+    /// Baseboard address when this machine is a remote chassis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bmc_address: Option<String>,
+    /// IPMI username. The password stays in a file on the agent host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bmc_user: Option<String>,
 }
 
 /// Payload of [`CommandKind::StopMachine`] and [`CommandKind::DeleteMachine`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineRef {
     pub id: Id,
+}
+
+/// Payload of [`CommandKind::MigrateMachine`]. `dest` is a libvirt URI,
+/// `qemu+ssh://HOST/system`. The source agent live-migrates the domain;
+/// the guest XML is not redefined.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrateRequest {
+    pub id: Id,
+    /// `qemu+ssh://DEST/system`.
+    pub dest: String,
+}
+
+/// Payload of [`CommandKind::AttachVolume`]. `path` is the host file `slab`
+/// created. The agent may stage a copy under its libvirt image directory
+/// when AppArmor will not let qemu open `path` in place.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeAttach {
+    pub machine: Id,
+    pub volume: Id,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// What the guest disk was named, so `slab` can record `status.device`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeAttached {
+    pub device: String,
+}
+
+/// Payload of [`CommandKind::DetachVolume`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeDetach {
+    pub machine: Id,
+    pub volume: Id,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// Result payload of a successful [`CommandKind::StartMachine`]: what the
@@ -185,6 +270,11 @@ pub enum CommandKind {
     DetachVolume,
     PlugPort,
     UnplugPort,
+    /// Install or refresh this host's overlay plan. The payload is the plan
+    /// document. It does not redefine a guest that is already running.
+    SyncOverlay,
+    /// Live-migrate a running domain. The payload is [`MigrateRequest`].
+    MigrateMachine,
 }
 
 impl std::fmt::Display for CommandKind {
@@ -197,6 +287,8 @@ impl std::fmt::Display for CommandKind {
             CommandKind::DetachVolume => "detach_volume",
             CommandKind::PlugPort => "plug_port",
             CommandKind::UnplugPort => "unplug_port",
+            CommandKind::SyncOverlay => "sync_overlay",
+            CommandKind::MigrateMachine => "migrate_machine",
         };
         f.write_str(s)
     }
@@ -298,6 +390,9 @@ mod tests {
         assert_eq!(CommandKind::AttachVolume.to_string(), "attach_volume");
         let back: CommandKind = serde_json::from_value(v).unwrap();
         assert_eq!(back, CommandKind::AttachVolume);
+        let v = serde_json::to_value(CommandKind::MigrateMachine).unwrap();
+        assert_eq!(v, serde_json::json!("migrate_machine"));
+        assert_eq!(CommandKind::MigrateMachine.to_string(), "migrate_machine");
     }
 
     #[test]
@@ -308,6 +403,7 @@ mod tests {
         assert_eq!(h.node_name, "n1");
         assert!(h.capabilities.is_empty());
         assert_eq!(h.resources.vcpus, 4);
+        assert!(h.underlay_ip.is_none());
     }
 
     #[test]

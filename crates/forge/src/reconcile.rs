@@ -20,7 +20,10 @@ use crate::types::{
     delete_requested, DesiredPower, Host, Machine, MachineStatus, PowerState, Size,
 };
 use chrono::Utc;
+use pistack_rpc::proto::CommandKind;
+use pistack_rpc::CommandQueue;
 use pistack_store::{Collection, Store, StoreError};
+use pistack_types::error::ErrorCode;
 use pistack_types::{kind, ApiError, Id, ModuleContext, Phase, Resources};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -36,6 +39,9 @@ pub struct Reconciler {
     store: Store,
     drivers: Arc<DriverRegistry>,
     strategy: Strategy,
+    queue: Option<CommandQueue>,
+    /// Last overlay document sent to each node. A changed plan is sent again.
+    overlay_sent: parking_lot::Mutex<BTreeMap<String, String>>,
 }
 
 impl Reconciler {
@@ -44,7 +50,15 @@ impl Reconciler {
             store,
             drivers,
             strategy,
+            queue: None,
+            overlay_sent: parking_lot::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// When set, a pass refreshes overlay plans on hosts that have joined.
+    pub fn with_queue(mut self, queue: CommandQueue) -> Self {
+        self.queue = Some(queue);
+        self
     }
 
     /// Run until `ctx.shutdown` fires.
@@ -124,7 +138,87 @@ impl Reconciler {
                 tracing::warn!(machine = %id, error = %e, "forge: machine reconcile failed");
             }
         }
+        // Binding record for fabric ports. Runs even when the overlay
+        // backend is off. A machine with no host does not clear one.
+        self.bind_port_hosts()?;
+        self.sync_overlay().await;
         Ok(())
+    }
+
+    /// Set `status.host` on each fabric port plugged into a placed machine.
+    /// A port that already names that host is not written again.
+    fn bind_port_hosts(&self) -> anyhow::Result<()> {
+        let machines = self.machines().list(None)?;
+        let ports = self.store.collection::<fabric::Port>();
+        let listed = ports.list(None)?;
+        for machine in machines {
+            let Some(host) = machine.status.host.as_ref() else {
+                continue;
+            };
+            let recorded = host.to_string();
+            for port in &listed {
+                if port.spec.device.as_ref() != Some(&machine.meta.id) {
+                    continue;
+                }
+                if port.status.host.as_deref() == Some(recorded.as_str()) {
+                    continue;
+                }
+                let next = recorded.clone();
+                match ports.modify(&port.meta.id, |p| {
+                    p.status.host = Some(next.clone());
+                    Ok(())
+                }) {
+                    Ok(_) => {}
+                    Err(pistack_store::StoreError::NotFound(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Push a changed overlay plan to each host that has already said hello.
+    /// The send is not awaited: the agent applies it on its next poll, and a
+    /// later plan change is sent again.
+    async fn sync_overlay(&self) {
+        if !crate::overlay::enabled() {
+            return;
+        }
+        let Some(queue) = &self.queue else {
+            return;
+        };
+        let plans = match crate::overlay::all_plans(&self.store) {
+            Ok(plans) => plans,
+            Err(e) => {
+                tracing::warn!(error = %e, "forge: overlay plan was not built");
+                return;
+            }
+        };
+        let known: BTreeMap<String, ()> = queue.nodes().into_iter().map(|n| (n.name, ())).collect();
+        for (node, plan) in plans {
+            if !known.contains_key(&node) {
+                continue;
+            }
+            let body = match serde_json::to_string(&plan) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(node, error = %e, "forge: overlay plan was not encoded");
+                    continue;
+                }
+            };
+            if self.overlay_sent.lock().get(&node) == Some(&body) {
+                continue;
+            }
+            let payload = serde_json::to_value(&plan).unwrap_or(serde_json::Value::Null);
+            match queue.enqueue(&node, CommandKind::SyncOverlay, payload) {
+                Ok(_) => {
+                    self.overlay_sent.lock().insert(node, body);
+                }
+                Err(e) => {
+                    tracing::warn!(node, error = %e, "forge: overlay plan was not queued");
+                }
+            }
+        }
     }
 
     /// Heartbeat local hosts, mark stale ones, recompute free. Returns the
@@ -223,7 +317,13 @@ impl Reconciler {
                     .await?;
                     return Ok(());
                 };
-                let host = match scheduler::place(&m.spec, &size, hosts, alloc, self.strategy) {
+                let named_network = m.spec.networks.iter().any(|n| !n.trim().is_empty());
+                let decided = if named_network {
+                    scheduler::place_on_segment(&m.spec, &size, hosts, alloc, self.strategy)
+                } else {
+                    scheduler::place(&m.spec, &size, hosts, alloc, self.strategy)
+                };
+                let host = match decided {
                     Ok(h) => h,
                     Err(e) => {
                         let msg = e.message.clone();
@@ -289,6 +389,17 @@ impl Reconciler {
                 return Ok(());
             }
         };
+        if let Err(e) = crate::nic::ensure_ports(&self.store, &m).await {
+            tracing::warn!(machine = %m.meta.id, error = %e, "forge: port was not allocated");
+            let msg = e.message.clone();
+            self.patch(&m.meta.id, |s| {
+                s.phase = Phase::Error;
+                s.message = msg.clone();
+                s.set_condition("Running", false, "StartFailed", &msg);
+            })
+            .await?;
+            return Ok(());
+        }
         match driver.start(&m).await {
             Ok(rt) => {
                 tracing::info!(machine = %m.meta.id, name = %m.meta.name, host = %hid, addrs = ?rt.addresses, "forge: machine ready");
@@ -298,6 +409,15 @@ impl Reconciler {
                     s.power = rt.power;
                     s.message.clear();
                     s.set_condition("Running", true, "Started", "");
+                })
+                .await?;
+            }
+            Err(e) if e.code == ErrorCode::Unavailable && e.message.contains("no segment") => {
+                tracing::info!(machine = %m.meta.id, error = %e, "forge: waiting for the network segment");
+                let msg = e.message.clone();
+                self.patch(&m.meta.id, |s| {
+                    s.message = msg.clone();
+                    s.set_condition("Scheduled", true, "Segment", &msg);
                 })
                 .await?;
             }
@@ -340,6 +460,7 @@ impl Reconciler {
                 st.power = PowerState::Off;
             }
             if !want_off {
+                crate::nic::ensure_ports(&self.store, &m).await?;
                 let rt = driver.start(&m).await?;
                 st.power = rt.power;
                 st.addresses = rt.addresses;
@@ -398,6 +519,9 @@ impl Reconciler {
                 self.patch(&m.meta.id, |s| s.message = msg.clone()).await?;
                 return Ok(());
             }
+        }
+        if let Err(e) = crate::nic::release_ports(&self.store, &m.meta.id) {
+            tracing::warn!(machine = %m.meta.id, error = %e, "forge: port release failed");
         }
         match self.machines().delete(&m.meta.id) {
             Ok(_) => {

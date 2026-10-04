@@ -1,6 +1,6 @@
 [package]
 name = "fabric"
-description = "Networks, subnets, routers, security groups, floating IPs (OVN)"
+description = "Networks, subnets, routers, security groups, floating IPs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+gate.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true

@@ -158,6 +158,27 @@ impl Client {
             Ok(p) => p.ensure_listener(&view).await,
             Err(e) => Err(e),
         };
+        let result = match result {
+            Ok(bound) => match view.listener.spec.door {
+                Some(kind) => {
+                    let upstream = format!("http://{bound}");
+                    let listen = view.listener.spec.port.to_string();
+                    match crate::door::apply(
+                        &view.listener.meta.id.to_string(),
+                        kind,
+                        &listen,
+                        &upstream,
+                    )
+                    .await
+                    {
+                        Ok(_) => Ok(bound),
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Ok(bound),
+            },
+            Err(e) => Err(e),
+        };
         let outcome = self.listeners().modify(&l.meta.id, |x| {
             match &result {
                 Ok(r) => {

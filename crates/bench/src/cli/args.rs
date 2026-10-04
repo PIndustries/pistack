@@ -669,14 +669,17 @@ pub struct FipCreate {
 pub struct FipAssociate {
     pub name: String,
     /// Port (name or id).
-    #[arg(long)]
-    pub port: String,
+    #[arg(long, required_unless_present = "machine", conflicts_with = "machine")]
+    pub port: Option<String>,
+    /// Machine (name or id). Uses that guest's current IPv4.
+    #[arg(long, required_unless_present = "port")]
+    pub machine: Option<String>,
 }
 
 crud!(
     FipCmd,
     FipCreate,
-    /// Associate with a port.
+    /// Associate with a machine or a port.
     Associate(FipAssociate),
     /// Disassociate.
     Disassociate(NameArg),

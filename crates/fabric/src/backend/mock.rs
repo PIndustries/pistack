@@ -269,6 +269,13 @@ impl NetBackend for MockBackend {
     }
 
     async fn associate_fip(&self, view: &FipView) -> ApiResult<()> {
+        // The mock stands in for OVN, which needs a router to carry the NAT.
+        // Host NAT does not: that backend accepts a missing router.
+        if view.target.is_some() && view.router.is_none() {
+            return Err(ApiError::unprocessable(
+                "no router on this subnet to the external network",
+            ));
+        }
         let id = view.fip.meta.id.clone();
         let port = view.target.as_ref().map(|(p, _)| p.meta.id.clone());
         self.record(

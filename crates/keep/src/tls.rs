@@ -77,6 +77,24 @@ pub fn server_config(pki: &Pki) -> Result<ServerConfig> {
     Ok(cfg)
 }
 
+/// Gateway HTTPS for browsers and bearer tokens.
+///
+/// Unlike [`server_config`], this does not ask for a client certificate, so
+/// a browser does not open a certificate picker. ALPN is HTTP/1.1 only: the
+/// axum listener is built without the `http2` feature, and advertising `h2`
+/// makes browsers speak a protocol the process cannot read.
+pub fn server_config_http(pki: &Pki) -> Result<ServerConfig> {
+    let mut chain = certs_from_pem(&pki.cert_pem)?;
+    chain.extend(certs_from_pem(&pki.ca_pem)?);
+    let key = key_from_pem(&pki.key_pem)?;
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
 /// Client side. Trusts `ca_pem`; with `client` set, presents that
 /// certificate for mTLS.
 pub fn client_config(ca_pem: &str, client: Option<&Pki>) -> Result<ClientConfig> {

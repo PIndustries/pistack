@@ -14,6 +14,7 @@
 //! HTTP lives under the `identity` prefix; see `api.rs`.
 
 pub mod api;
+pub mod audit;
 pub mod credentials;
 pub mod policy;
 pub mod quota;

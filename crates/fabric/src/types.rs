@@ -57,7 +57,7 @@ macro_rules! resource {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NetworkKind {
-    /// Geneve overlay; the default for tenant networks.
+    /// VXLAN overlay. The segment id is the VNI.
     #[default]
     Overlay,
     /// Mapped onto a physical network, optionally VLAN-tagged.
@@ -104,6 +104,10 @@ pub struct NetworkStatus {
     /// VNI for overlays, VLAN tag for provider networks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_id: Option<u32>,
+    /// `hostnat` or `overlay`. Set once. A network that already has a
+    /// host-NAT port stays `hostnat`, so later guests join that bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datapath: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
     #[serde(default)]

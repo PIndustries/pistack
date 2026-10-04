@@ -8,7 +8,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use pistack_types::{Id, Phase};
+use pistack_types::{kind, Caller, Id, Phase};
 use serde_json::{json, Value};
 use slab::{Client, Create, LocalFileBackend, Protocol, SnapshotSpec, VolumeSource, VolumeSpec};
 use tower::ServiceExt;
@@ -215,11 +215,9 @@ async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (St
         }
         None => Body::empty(),
     };
-    let resp = app
-        .clone()
-        .oneshot(req.body(body).expect("request"))
-        .await
-        .expect("response");
+    let mut req = req.body(body).expect("request");
+    req.extensions_mut().insert(admin_caller());
+    let resp = app.clone().oneshot(req).await.expect("response");
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
     let v = if bytes.is_empty() {
@@ -297,7 +295,7 @@ async fn http_crud_with_stale_revision() {
     // update with If-Match: correct, then stale -> 409
     let resp = app
         .clone()
-        .oneshot(
+        .oneshot(with_admin(
             Request::builder()
                 .method("PUT")
                 .uri(format!("/volumes/{id}"))
@@ -307,13 +305,13 @@ async fn http_crud_with_stale_revision() {
                     json!({ "description": "web node data" }).to_string(),
                 ))
                 .expect("req"),
-        )
+        ))
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
     let resp = app
         .clone()
-        .oneshot(
+        .oneshot(with_admin(
             Request::builder()
                 .method("PUT")
                 .uri(format!("/volumes/{id}"))
@@ -321,7 +319,7 @@ async fn http_crud_with_stale_revision() {
                 .header("if-match", "1")
                 .body(Body::from(json!({ "description": "stale" }).to_string()))
                 .expect("req"),
-        )
+        ))
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -445,4 +443,39 @@ async fn reconciler_loop_drives_volume_to_ready() {
     }
     shutdown.cancel();
     task.await.expect("reconciler exits");
+}
+
+fn admin_caller() -> Caller {
+    Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "dev-admin".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    }
+}
+
+fn with_admin(mut req: Request<Body>) -> Request<Body> {
+    req.extensions_mut().insert(admin_caller());
+    req
+}
+
+#[tokio::test]
+async fn missing_caller_is_unauthorized() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = slab::http::router(client(&dir));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/volumes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "no credentials");
 }

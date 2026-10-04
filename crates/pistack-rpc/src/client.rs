@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::error::RpcError;
 use crate::proto::{
     AgentHello, Command, CommandResult, Heartbeat, HeartbeatAck, HelloAck, ReportAck,
-    DEFAULT_POLL_BATCH, MAX_LONG_POLL_SECS,
+    DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
 };
 
 /// Slack added to a long-poll's request timeout so a server that honours
@@ -72,9 +72,19 @@ impl AgentClient {
         })
     }
 
-    /// Send `Authorization: Bearer <token>` on every request.
+    /// Send [`JOIN_HEADER`] on every request when `token` is non-empty.
+    ///
+    /// Blank input clears the token so the header is absent. The clear text
+    /// is not written to logs (`Debug` redacts it). This is not an
+    /// `Authorization` bearer.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(token.into());
+        let token = token.into();
+        let trimmed = token.trim();
+        self.token = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        };
         self
     }
 
@@ -92,7 +102,7 @@ impl AgentClient {
 
     fn prepare(&self, rb: RequestBuilder) -> RequestBuilder {
         match &self.token {
-            Some(t) => rb.bearer_auth(t),
+            Some(t) => rb.header(JOIN_HEADER, t),
             None => rb,
         }
     }
@@ -203,5 +213,96 @@ mod tests {
         assert!(matches!(e, RpcError::InvalidUrl(_)), "{e}");
         let c = c.with_token("secret");
         assert!(!format!("{c:?}").contains("secret"));
+        assert!(format!("{c:?}").contains("<set>"));
+        let blank = c.with_token("  ");
+        assert!(!format!("{blank:?}").contains("<set>"));
+        assert_eq!(JOIN_HEADER, "x-pistack-join");
+    }
+
+    #[tokio::test]
+    async fn join_header_on_every_rpc_and_absent_when_empty() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let record = record.clone();
+            async move {
+                let join = req
+                    .headers()
+                    .get(JOIN_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let auth = req
+                    .headers()
+                    .contains_key(axum::http::header::AUTHORIZATION);
+                record.lock().expect("lock").push((
+                    req.method().to_string(),
+                    req.uri().path().to_owned(),
+                    join,
+                    auth,
+                ));
+                axum::http::StatusCode::NO_CONTENT
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+
+        let send = |token: Option<&str>| {
+            let base = base.clone();
+            let token = token.map(str::to_owned);
+            async move {
+                let mut client = AgentClient::new(&base, "n1").unwrap();
+                if let Some(t) = token {
+                    client = client.with_token(t);
+                }
+                let hello = AgentHello {
+                    node_name: "n1".into(),
+                    capabilities: vec![],
+                    resources: pistack_types::Resources::default(),
+                    version: String::new(),
+                    labels: Default::default(),
+                    underlay_ip: None,
+                };
+                let _ = client.hello(&hello).await;
+                let _ = client
+                    .heartbeat(&Heartbeat {
+                        node_name: "n1".into(),
+                        resources_free: pistack_types::Resources::default(),
+                        machines: vec![],
+                        at: chrono::Utc::now(),
+                    })
+                    .await;
+                let _ = client.next_commands(Duration::ZERO).await;
+                let _ = client.report(&[CommandResult::ok(uuid::Uuid::nil())]).await;
+            }
+        };
+        send(Some("  pij_secret  ")).await;
+        send(Some("")).await;
+        send(None).await;
+
+        let got = seen.lock().expect("lock").clone();
+        assert_eq!(got.len(), 12, "{got:?}");
+        for (i, row) in got.iter().enumerate() {
+            assert!(!row.3, "authorization on {row:?}");
+            if i < 4 {
+                assert_eq!(row.2.as_deref(), Some("pij_secret"), "{row:?}");
+            } else {
+                assert_eq!(row.2, None, "{row:?}");
+            }
+        }
+        let paths: Vec<&str> = got.iter().take(4).map(|r| r.1.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/agents/hello",
+                "/agents/heartbeat",
+                "/agents/n1/commands",
+                "/agents/n1/results",
+            ]
+        );
+        server.abort();
     }
 }

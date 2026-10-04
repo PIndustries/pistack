@@ -12,7 +12,7 @@
 //! wins under `Strategy::Pack`), then free vcpus, then host id for a
 //! deterministic tie-break.
 
-use crate::types::{Host, MachineSpec};
+use crate::types::{usable_underlay, Host, MachineSpec};
 use pistack_types::{ApiError, ApiResult, Id, Phase, Resources};
 use std::collections::BTreeMap;
 
@@ -152,6 +152,33 @@ pub fn place(
     // deterministic regardless of input order.
     candidates.sort_by(|(sa, ha), (sb, hb)| sb.cmp(sa).then_with(|| ha.meta.id.cmp(&hb.meta.id)));
     Ok(candidates[0].1.meta.id.clone())
+}
+
+/// Place a machine that named a network onto a host on the underlay.
+///
+/// Hosts whose `underlay_ip` is missing or not a private unicast IPv4 are
+/// not on the segment. When none remain, the error names the segment and
+/// how many hosts lacked an underlay. Otherwise this is [`place`] on the
+/// hosts that remain, including that function's resource and driver errors.
+pub fn place_on_segment(
+    spec: &MachineSpec,
+    size: &Resources,
+    hosts: &[Host],
+    allocations: &Allocations,
+    strategy: Strategy,
+) -> ApiResult<Id> {
+    let on_segment: Vec<Host> = hosts
+        .iter()
+        .filter(|h| usable_underlay(h.spec.underlay_ip.as_deref()).is_some())
+        .cloned()
+        .collect();
+    if on_segment.is_empty() {
+        let lacked = hosts.len();
+        return Err(ApiError::unavailable(format!(
+            "no host is on the network segment ({lacked} hosts lacked an underlay)"
+        )));
+    }
+    place(spec, size, &on_segment, allocations, strategy)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -415,5 +442,112 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn place_still_accepts_hosts_without_underlay() {
+        let h = host("a", 8192, &["kvm"]);
+        assert!(h.spec.underlay_ip.is_none());
+        assert!(place(
+            &spec(MachineKind::Vm),
+            &SIZE,
+            &[h],
+            &Allocations::new(),
+            Strategy::Spread
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn place_on_segment_rejects_a_host_with_no_underlay() {
+        let h = host("a", 32768, &["kvm"]);
+        assert_eq!(h.status.phase, Phase::Ready);
+        let err = place_on_segment(
+            &spec(MachineKind::Vm),
+            &SIZE,
+            &[h.clone()],
+            &Allocations::new(),
+            Strategy::Spread,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable);
+        assert!(err.message.contains("segment"), "{}", err.message);
+        assert!(err.message.contains("1"), "{}", err.message);
+        assert!(err.message.contains("underlay"), "{}", err.message);
+        assert!(place(
+            &spec(MachineKind::Vm),
+            &SIZE,
+            &[h],
+            &Allocations::new(),
+            Strategy::Spread
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn place_on_segment_accepts_a_private_underlay() {
+        for ip in [
+            "10.1.0.2",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+        ] {
+            let mut h = host("a", 32768, &["kvm"]);
+            h.spec.underlay_ip = Some(ip.into());
+            let got = place_on_segment(
+                &spec(MachineKind::Vm),
+                &SIZE,
+                &[h.clone()],
+                &Allocations::new(),
+                Strategy::Spread,
+            )
+            .unwrap_or_else(|e| panic!("{ip}: {e}"));
+            assert_eq!(got, h.meta.id, "{ip}");
+        }
+    }
+
+    #[test]
+    fn place_on_segment_rejects_public_and_unspecified() {
+        for ip in [
+            "8.8.8.8",
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "100.128.0.1",
+            "169.254.1.1",
+        ] {
+            let mut h = host("a", 32768, &["kvm"]);
+            h.spec.underlay_ip = Some(ip.into());
+            let err = place_on_segment(
+                &spec(MachineKind::Vm),
+                &SIZE,
+                &[h],
+                &Allocations::new(),
+                Strategy::Spread,
+            )
+            .unwrap_err();
+            assert!(err.message.contains("segment"), "{ip}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn place_on_segment_returns_place_errors_for_hosts_on_the_segment() {
+        let mut h = host("a", 8192, &["youki"]);
+        h.spec.underlay_ip = Some("10.1.0.2".into());
+        let err = place_on_segment(
+            &spec(MachineKind::Vm),
+            &SIZE,
+            &[h],
+            &Allocations::new(),
+            Strategy::Spread,
+        )
+        .unwrap_err();
+        assert!(!err.message.contains("segment"), "{}", err.message);
+        assert_eq!(
+            err.details.get("no_driver").and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Quota hook. `gate` owns quotas; slab only asks. Until gate exposes a
-//! checker, `AllowAll` is wired in.
+//! Extra quota hook. Project `volumes` limits are enforced through `gate`
+//! in `Client`. This trait is an additional check; `AllowAll` is the default.
 
 use async_trait::async_trait;
 use pistack_types::{ApiResult, Id};

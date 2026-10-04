@@ -1,6 +1,6 @@
 [package]
 name = "relay"
-description = "Load balancers: L4 via OVN, L7 via Pingora (planned)"
+description = "Load balancers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

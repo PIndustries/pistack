@@ -9,6 +9,7 @@
 //! `forge::MachineRuntime`; both are plain data and map one-to-one.
 
 pub mod libvirt;
+mod metal;
 pub mod mock;
 pub mod youki;
 
@@ -18,12 +19,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use libvirt::LibvirtRuntime;
+pub use metal::MetalRuntime;
 pub use mock::MockRuntime;
 pub use youki::YoukiRuntime;
 
 /// The request/result shapes are the wire types from `pistack-rpc`, so a
 /// `Command` payload deserialises straight into what a runtime executes.
-pub use pistack_rpc::proto::{MachineKind, MachineRef, MachineRequest, PowerState, RunningMachine};
+pub use pistack_rpc::proto::{
+    MachineKind, MachineRef, MachineRequest, NicAttachment, PowerState, RunningMachine, VolumeAttach,
+    VolumeDetach,
+};
 
 /// One per machine kind the host supports. Same semantics as
 /// `forge::HostDriver`: `start` is idempotent, `delete` of an unknown id is
@@ -36,6 +41,25 @@ pub trait MachineRuntime: Send + Sync + 'static {
     async fn stop(&self, id: &Id) -> ApiResult<()>;
     async fn delete(&self, id: &Id) -> ApiResult<()>;
     async fn list(&self) -> ApiResult<Vec<RunningMachine>>;
+
+    /// Hotplug `req` into a machine this runtime holds. The returned string
+    /// is the guest device name (`vdb`). Default: this runtime has no disks.
+    async fn attach_volume(&self, req: &VolumeAttach) -> ApiResult<String> {
+        let _ = req;
+        Err(ApiError::not_implemented(format!(
+            "{} does not attach volumes",
+            self.name()
+        )))
+    }
+
+    /// Unplug a volume. Missing disk is success. Default: nothing to detach.
+    async fn detach_volume(&self, req: &VolumeDetach) -> ApiResult<()> {
+        let _ = req;
+        Err(ApiError::not_implemented(format!(
+            "{} does not detach volumes",
+            self.name()
+        )))
+    }
 }
 
 pub type SharedRuntime = Arc<dyn MachineRuntime>;
@@ -125,6 +149,43 @@ impl Runtimes {
         Err(last)
     }
 
+    /// Attach on the first runtime that holds the machine. `not_found` and
+    /// `not_implemented` move on to the next runtime.
+    pub async fn attach_volume(&self, req: &VolumeAttach) -> ApiResult<String> {
+        let mut last = ApiError::not_implemented("no runtime on this host attaches volumes");
+        for rt in self.distinct() {
+            match rt.attach_volume(req).await {
+                Ok(dev) => return Ok(dev),
+                Err(e)
+                    if e.code == pistack_types::error::ErrorCode::NotFound
+                        || e.code == pistack_types::error::ErrorCode::NotImplemented =>
+                {
+                    last = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// Detach on the first runtime that holds the machine.
+    pub async fn detach_volume(&self, req: &VolumeDetach) -> ApiResult<()> {
+        let mut last = ApiError::not_implemented("no runtime on this host detaches volumes");
+        for rt in self.distinct() {
+            match rt.detach_volume(req).await {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if e.code == pistack_types::error::ErrorCode::NotFound
+                        || e.code == pistack_types::error::ErrorCode::NotImplemented =>
+                {
+                    last = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
     /// Delete from every runtime; deleting an unknown id is not an error.
     pub async fn delete(&self, id: &Id) -> ApiResult<()> {
         let mut first_err = None;
@@ -167,6 +228,9 @@ pub fn select_runtimes(capabilities: &[String], allow_mock: bool) -> Runtimes {
         let rt: Option<SharedRuntime> = match kind {
             MachineKind::Vm if has("libvirt") || has("kvm") => Some(Arc::new(LibvirtRuntime)),
             MachineKind::Container if has("youki") => Some(Arc::new(YoukiRuntime)),
+            MachineKind::Metal if has("metal") || has("ipmi") || has("redfish") => {
+                Some(Arc::new(MetalRuntime))
+            }
             _ if allow_mock => Some(mock.clone()),
             _ => None,
         };
@@ -177,8 +241,10 @@ pub fn select_runtimes(capabilities: &[String], allow_mock: bool) -> Runtimes {
     r
 }
 
-/// Pick a runtime for a kind from the detected capabilities. Today only the
-/// mock is real; the others exist so the wiring compiles end to end.
+/// Pick a runtime for a kind from the detected capabilities. KVM uses
+/// libvirt. youki is still a stub. Metal is this host when `metal`,
+/// `ipmi` or `redfish` is advertised. The mock covers kinds with no real
+/// runtime.
 pub fn select(
     kind: MachineKind,
     capabilities: &[String],
@@ -188,6 +254,9 @@ pub fn select(
     match kind {
         MachineKind::Vm if has("libvirt") || has("kvm") => Some(Arc::new(LibvirtRuntime)),
         MachineKind::Container if has("youki") => Some(Arc::new(YoukiRuntime)),
+        MachineKind::Metal if has("metal") || has("ipmi") || has("redfish") => {
+            Some(Arc::new(MetalRuntime))
+        }
         _ if allow_mock => Some(Arc::new(MockRuntime::default())),
         _ => None,
     }

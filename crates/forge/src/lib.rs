@@ -10,6 +10,7 @@
 //! * [`agent_driver`] — `RpcDriver` (a `HostDriver` over `pistack-rpc`) and
 //!   the `Registrar` that turns agent hellos into `Host`s.
 //! * [`reconcile`] — the loop that turns `spec` into `status`.
+//! * [`console`] — a ticketed WebSocket in front of the guest's loopback VNC.
 //! * [`http`] — the `compute` API.
 //!
 //! `Forge::default()` is dev mode: a single `local` host backed by a
@@ -19,11 +20,16 @@
 //! registrar registers an `RpcDriver` per host as agents say hello.
 
 pub mod agent_driver;
+pub mod console;
 pub mod driver;
 pub mod http;
+mod metadata;
+mod nic;
+mod overlay;
 pub mod reconcile;
 pub mod scheduler;
 pub mod types;
+mod usage;
 
 pub use agent_driver::{Registrar, RpcDriver};
 pub use driver::{
@@ -31,7 +37,7 @@ pub use driver::{
     MachineRuntime, MockDriver,
 };
 pub use reconcile::Reconciler;
-pub use scheduler::{place, Allocations, Strategy};
+pub use scheduler::{place, place_on_segment, Allocations, Strategy};
 pub use types::*;
 
 use async_trait::async_trait;
@@ -203,6 +209,7 @@ impl Module for Forge {
             store: (*store).clone(),
             drivers: self.drivers.clone(),
             dev_admin: self.dev_admin,
+            queue: self.queue.clone(),
         })
     }
 
@@ -221,7 +228,13 @@ impl Module for Forge {
             tokio::spawn(registrar.run(ctx.shutdown.clone()));
             tracing::info!("forge: agent registrar listening");
         }
-        let reconciler = Reconciler::new(store, self.drivers.clone(), self.strategy);
+        let meta_store = store.clone();
+        let meta_shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move { metadata::serve(meta_store, meta_shutdown).await });
+        let mut reconciler = Reconciler::new(store, self.drivers.clone(), self.strategy);
+        if let Some(queue) = &self.queue {
+            reconciler = reconciler.with_queue(queue.clone());
+        }
         tokio::spawn(reconciler.run(ctx));
         Ok(())
     }

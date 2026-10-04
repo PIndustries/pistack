@@ -7,6 +7,8 @@
 //! host (start, stop, reboot, delete) is recorded as desired state and the
 //! reconciler carries it out, so every mutating call returns quickly with
 //! the resource as stored and the client polls `status.phase`.
+//! Live migration is the exception: it enqueues on the source node and only
+//! then records the destination on `status`, so port binding can follow.
 //!
 //! Project scoping reads `pistack_types::Caller` from request extensions
 //! when the gateway's auth layer attached one. With no `Caller` the request
@@ -22,6 +24,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use pistack_rpc::CommandQueue;
 use pistack_store::{Collection, Store};
 use pistack_types::{ApiError, ApiResult, Caller, Id, Kind, ListQuery, Page, Phase};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -34,6 +37,8 @@ pub struct AppState {
     pub drivers: Arc<DriverRegistry>,
     /// Treat unauthenticated requests as cloud admin.
     pub dev_admin: bool,
+    /// Agent transport. Absent in dev mode; live migration is refused then.
+    pub queue: Option<CommandQueue>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -47,7 +52,9 @@ pub fn router(state: AppState) -> Router {
         .route("/machines/{id}/start", post(start_machine))
         .route("/machines/{id}/stop", post(stop_machine))
         .route("/machines/{id}/reboot", post(reboot_machine))
+        .route("/machines/{id}/migrate", post(migrate_machine))
         .route("/machines/{id}/console", get(console))
+        .route("/machines/{id}/console/vnc", get(console_vnc))
         .route("/hosts", get(list_hosts))
         .route("/hosts/{id}", get(get_host))
         .route("/sizes", get(list_sizes).post(create_size))
@@ -324,10 +331,12 @@ async fn create_machine(
     // change what the scheduler looks up.
     spec.size = size.meta.name.clone();
     spec.restarts = 0;
+    crate::usage::admit_create(&s.store, scope.project.as_ref())?;
     let mut m = new_machine(body.name, scope.project.clone(), spec);
     m.meta.description = body.description;
     m.meta.labels = body.labels;
     let m = machines(&s).create(m)?;
+    crate::usage::note_create(&s.store, m.meta.project.as_ref());
     Ok(created(m))
 }
 
@@ -386,6 +395,7 @@ async fn delete_machine(
             .insert(DELETE_ANNOTATION.into(), Utc::now().to_rfc3339());
         Ok(())
     })?;
+    crate::usage::note_delete(&s.store, m.meta.project.as_ref());
     Ok((StatusCode::ACCEPTED, Json(m)).into_response())
 }
 
@@ -440,16 +450,71 @@ async fn reboot_machine(
     .await
 }
 
+#[derive(Debug, Deserialize)]
+struct MigrateBody {
+    host: String,
+}
+
+async fn migrate_machine(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<MigrateBody>,
+) -> ApiResult<Json<Machine>> {
+    let m = load_machine(&s, &scope, &id)?;
+    if m.meta.annotations.contains_key(DELETE_ANNOTATION) {
+        return Err(ApiError::conflict("machine is being deleted"));
+    }
+    let dest = hosts(&s).resolve(None, &body.host)?;
+    let queue = s
+        .queue
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("live migration needs the agent transport"))?;
+    // Host placement is updated in `begin_migration` after the command is
+    // queued, not here.
+    let m = crate::agent_driver::begin_migration(&s.store, &queue, &m, &dest)?;
+    Ok(Json(m))
+}
+
+#[derive(Serialize)]
+struct ConsoleTicket {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    websocket: String,
+}
+
 async fn console(
     State(s): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
-) -> ApiResult<Response> {
+) -> ApiResult<Json<ConsoleTicket>> {
     let m = load_machine(&s, &scope, &id)?;
-    Err(ApiError::not_implemented(format!(
-        "serial/VNC console for {} is not available yet",
-        m.meta.name
-    )))
+    let ticket = crate::console::mint_ticket(&m.meta.id.to_string());
+    Ok(Json(ConsoleTicket {
+        kind: "vnc",
+        websocket: format!(
+            "/compute/machines/{}/console/vnc?ticket={ticket}",
+            m.meta.id
+        ),
+    }))
+}
+
+/// The browser cannot send the bearer token on a WebSocket. The ticket from
+/// [`console`] is the only credential, and it is checked before the upgrade.
+async fn console_vnc(
+    Path(id): Path<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let ticket = crate::console::query_ticket(raw.as_deref())?;
+    crate::console::check_ticket(&ticket, &id)?;
+    let port = crate::console::display_port(&id).await?;
+    Ok(ws.on_upgrade(move |socket| async move {
+        if crate::console::take_ticket(&ticket, &id).is_err() {
+            return;
+        }
+        crate::console::splice(socket, port).await;
+    }))
 }
 
 // ---- hosts -------------------------------------------------------------------
@@ -625,5 +690,103 @@ mod tests {
         assert!(validate_name("Web").is_err());
         assert!(validate_name("").is_err());
         assert!(validate_name("-x").is_err());
+    }
+
+    #[tokio::test]
+    async fn migrate_route_refuses_without_underlay_and_enqueues() {
+        use crate::types::new_host;
+        use axum::body::Body as HttpBody;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use pistack_rpc::proto::{CommandKind, MigrateRequest};
+        use pistack_types::Resources;
+        use tower::ServiceExt;
+
+        let store = Store::in_memory().unwrap();
+        let queue = CommandQueue::default();
+        let cap = Resources {
+            vcpus: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            gpus: 0,
+        };
+        let labels = BTreeMap::new();
+        let src = store
+            .collection::<Host>()
+            .create(new_host(
+                "src",
+                "node-src",
+                cap,
+                vec!["kvm".into()],
+                labels.clone(),
+            ))
+            .unwrap();
+        let mut bare = new_host("bare", "node-bare", cap, vec!["kvm".into()], labels.clone());
+        bare.spec.underlay_ip = None;
+        store.collection::<Host>().create(bare).unwrap();
+        let mut dest = new_host("dest", "node-dest", cap, vec!["kvm".into()], labels);
+        dest.spec.underlay_ip = Some("10.1.0.2".into());
+        let dest = store.collection::<Host>().create(dest).unwrap();
+        let mut m = new_machine(
+            "web",
+            None,
+            MachineSpec {
+                size: "s.1x1".into(),
+                image: "ubuntu".into(),
+                networks: vec!["tenant".into()],
+                ..Default::default()
+            },
+        );
+        m.status.host = Some(src.meta.id.clone());
+        m.status.phase = Phase::Ready;
+        let m = store.collection::<Machine>().create(m).unwrap();
+        let id = m.meta.id.to_string();
+        let app = router(AppState {
+            store: store.clone(),
+            drivers: Arc::new(DriverRegistry::new()),
+            dev_admin: true,
+            queue: Some(queue.clone()),
+        });
+
+        async fn post(app: &axum::Router, path: &str, host: &str) -> (StatusCode, Vec<u8>) {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(HttpBody::from(
+                    serde_json::to_vec(&serde_json::json!({ "host": host })).unwrap(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec();
+            (status, bytes)
+        }
+
+        let (st, bytes) = post(&app, &format!("/machines/{id}/migrate"), "bare").await;
+        assert_ne!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let still = store.collection::<Machine>().get(&m.meta.id).unwrap();
+        assert_eq!(still.status.host.as_ref(), Some(&src.meta.id));
+        assert_eq!(queue.pending_count(), 0);
+
+        let (st, bytes) = post(&app, &format!("/machines/{id}/migrate"), "dest").await;
+        assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let body: Machine = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.status.phase, Phase::Updating);
+        assert_eq!(body.status.message, format!("migrating {}", dest.meta.id));
+        assert_eq!(body.status.host.as_ref(), Some(&src.meta.id));
+        let cmds = queue
+            .next("node-src", std::time::Duration::from_secs(1), 4)
+            .await;
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].kind, CommandKind::MigrateMachine);
+        let req: MigrateRequest = serde_json::from_value(cmds[0].payload.clone()).unwrap();
+        assert_eq!(req.dest, "qemu+ssh://10.1.0.2/system");
     }
 }

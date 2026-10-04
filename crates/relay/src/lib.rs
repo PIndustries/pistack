@@ -1,29 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! `relay`: load balancers. L4 through OVN's `Load_Balancer` table, L7
-//! through relay's own Pingora proxy (planned); both behind one
-//! [`provider::LbProvider`] seam. Replaces Octavia without amphora VMs.
+//! `relay`: load balancers. L4 is an in-process TCP forwarder. HTTP is an
+//! in-process reverse proxy. Both sit behind [`provider::LbProvider`].
 //!
 //! Layout:
 //! * [`types`] — `Balancer`, `Listener`, `Pool`, `Member`.
 //! * [`Client`] — validation and writes; the library API other modules use
 //!   ([`Client::ensure_tcp_balancer`] for `loom` services).
-//! * [`provider`] — the `LbProvider` trait, `MockProvider`, and the OVN and
-//!   Pingora stubs with their design notes.
+//! * [`provider`] — the `LbProvider` trait, `MockProvider`, `ForwardProvider`,
+//!   and the HTTP reverse proxy.
+//! * [`door`] — publish a listener. Cloudflared and tailscale run when the
+//!   binary is present. WireGuard and edge start no process.
 //! * `reconcile` — turns spec into provider state and writes status.
 //! * [`health`] — active TCP/HTTP checks driving `Member.operating_status`.
 //! * `api` — HTTP, mounted at `/balancers`.
 
 pub mod api;
 pub mod client;
+pub mod door;
 pub mod health;
 pub mod provider;
 mod reconcile;
 pub mod types;
 
 pub use client::Client;
-pub use provider::{Call, LbProvider, MockProvider, OvnProvider, Providers, RelayL7Provider};
+pub use door::{DoorKind, DoorPlan};
+pub use provider::{
+    Call, ForwardProvider, LbProvider, MockProvider, OvnProvider, Providers, RelayL7Provider,
+};
 pub use types::*;
 
 use async_trait::async_trait;
@@ -36,8 +41,8 @@ use std::time::Duration;
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The module. `Default` uses the mock provider so a single-node server is
-/// functional end to end; production wires [`OvnProvider`] and
-/// [`RelayL7Provider`] via [`Relay::with_providers`].
+/// functional end to end. [`Relay::forward`] is the in-process L4 forwarder
+/// and the HTTP reverse proxy (`PISTACK_RELAY_BACKEND=forward`).
 pub struct Relay {
     providers: Providers,
 }
@@ -55,6 +60,15 @@ impl Relay {
         }
     }
 
+    /// In-process L4 TCP forwarder and HTTP reverse proxy.
+    /// Selected when `PISTACK_RELAY_BACKEND=forward`.
+    pub fn forward() -> Self {
+        Self::with_providers(vec![
+            Arc::new(ForwardProvider::new()),
+            Arc::new(RelayL7Provider::new()),
+        ])
+    }
+
     /// A `Client` over the context's store and this module's providers.
     pub fn client(&self, ctx: &ModuleContext) -> Client {
         let store = ctx.store::<Store>();
@@ -68,7 +82,7 @@ impl Module for Relay {
         ModuleInfo {
             name: "relay",
             prefix: "balancers",
-            summary: "Load balancers: L4 via OVN, L7 via Pingora",
+            summary: "Load balancers",
             version: env!("CARGO_PKG_VERSION"),
         }
     }

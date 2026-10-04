@@ -9,6 +9,10 @@ license.workspace = true
 pistack-types.workspace = true
 pistack-store.workspace = true
 pistack-rpc.workspace = true
+fabric.workspace = true
+gate.workspace = true
+keep.workspace = true
+gauge.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 axum.workspace = true
@@ -21,6 +25,7 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

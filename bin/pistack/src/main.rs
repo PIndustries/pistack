@@ -4,13 +4,18 @@
 //! `pistack` — the one binary.
 //!
 //! ```text
-//! pistack server --init          first control-plane node: create store, CA, admin
-//! pistack server --join URL      additional control-plane node
+//! pistack server                 private address, no store: discover, adopt, or found
+//! pistack server --init          found a new cluster even if peers answer
+//! pistack server --join URL      adopt that control plane and skip discovery
+//! pistack server                 existing store: stay in that cluster and announce
 //! pistack agent  --join URL      a host (anvil)
 //! pistack store dump             inspect state
+//! pistack store backup --to FILE copy the store and open the copy
 //! ```
 
+mod cluster;
 mod gateway;
+mod listen;
 mod server;
 
 use clap::{Parser, Subcommand};
@@ -33,21 +38,26 @@ struct Cli {
 enum Cmd {
     /// Run a control-plane node (API gateway + all modules).
     Server {
-        /// Initialise a brand-new cloud in `data_dir`.
+        /// Found a new cluster even if other clusters answer on the private prefix.
         #[arg(long)]
         init: bool,
-        /// Join an existing control plane.
+        /// Adopt an existing control plane. Skips discovery.
         #[arg(long, conflicts_with = "init")]
         join: Option<String>,
-        /// Listen address for the API.
+        /// Listen address. A private IPv4 address with no store discovers its /24.
+        /// `0.0.0.0` does not discover.
         #[arg(long, env = "PISTACK_LISTEN", default_value = "0.0.0.0:8443")]
         listen: String,
         /// Public URL clients use (defaults to https://<listen>).
         #[arg(long, env = "PISTACK_PUBLIC_URL")]
         public_url: Option<String>,
-        /// Serve plain HTTP (dev only).
+        /// Serve plain HTTP (dev only). Does not disable `--tls-listen`.
         #[arg(long)]
         insecure_http: bool,
+        /// Extra HTTPS listener. Must be a specific address, not 0.0.0.0 or ::.
+        /// Plain HTTP on `--listen` stays up. No default.
+        #[arg(long, env = "PISTACK_TLS_LISTEN")]
+        tls_listen: Option<String>,
         /// Dev mode: mock local host, unauthenticated requests act as admin.
         #[arg(long)]
         dev: bool,
@@ -70,6 +80,12 @@ enum Cmd {
 enum StoreCmd {
     /// Dump every resource as JSON lines.
     Dump,
+    /// Copy `data_dir/state.redb` to `--to` and open the copy.
+    Backup {
+        /// Destination file. It must not already exist.
+        #[arg(long)]
+        to: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             listen,
             public_url,
             insecure_http,
+            tls_listen,
             dev,
         } => {
             server::run(server::ServerOpts {
@@ -96,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 public_url,
                 insecure_http,
+                tls_listen,
                 dev,
             })
             .await
@@ -108,8 +126,9 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Cmd::Store {
-            cmd: StoreCmd::Dump,
-        } => server::dump(cli.data_dir),
+        Cmd::Store { cmd } => match cmd {
+            StoreCmd::Dump => server::dump(cli.data_dir),
+            StoreCmd::Backup { to } => server::backup(cli.data_dir, to),
+        },
     }
 }

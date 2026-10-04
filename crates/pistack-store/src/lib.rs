@@ -13,10 +13,11 @@
 
 use parking_lot::RwLock;
 use pistack_types::{ApiError, Event, EventAction, Id, Kind, Meta};
-use redb::{Database, TableDefinition};
-use serde::{de::DeserializeOwned, Serialize};
+use redb::{Database, ReadableTable, TableDefinition};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -87,6 +88,11 @@ pub trait Backend: Send + Sync + 'static {
     fn scan(&self, table: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>>;
     /// Atomic multi-op write.
     fn batch(&self, ops: Vec<Op>) -> Result<()>;
+    fn set_record_log(&self, on: bool);
+    fn set_log_term(&self, term: u64);
+    fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>>;
+    /// Current record flag. `apply_entries` turns recording off, then restores this.
+    fn record_log(&self) -> bool;
 }
 
 #[derive(Debug, Clone)]
@@ -102,9 +108,69 @@ pub enum Op {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogOp {
+    pub table: String,
+    pub key: String,
+    pub value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub index: u64,
+    pub term: u64,
+    pub ops: Vec<LogOp>,
+}
+
+/// Meta keys written by the log itself, or by cluster bookkeeping. They are
+/// stored, but they are not log entries and do not advance the commit index.
+fn is_bookkeeping(op: &Op) -> bool {
+    let (table, key) = match op {
+        Op::Put { table, key, .. } | Op::Delete { table, key } => (table.as_str(), key.as_str()),
+    };
+    table == "meta"
+        && (key == "cluster_commit"
+            || key.starts_with("cluster_log/")
+            || matches!(
+                key,
+                "cluster_term" | "cluster_voted_for" | "cluster_leader" | "node_id"
+            ))
+}
+
+fn log_op_from(op: &Op) -> LogOp {
+    match op {
+        Op::Put { table, key, value } => LogOp {
+            table: table.clone(),
+            key: key.clone(),
+            value: Some(value.clone()),
+        },
+        Op::Delete { table, key } => LogOp {
+            table: table.clone(),
+            key: key.clone(),
+            value: None,
+        },
+    }
+}
+
+fn op_from_log(op: &LogOp) -> Op {
+    match &op.value {
+        Some(value) => Op::Put {
+            table: op.table.clone(),
+            key: op.key.clone(),
+            value: value.clone(),
+        },
+        None => Op::Delete {
+            table: op.table.clone(),
+            key: op.key.clone(),
+        },
+    }
+}
+
 /// redb-backed `Backend`.
 pub struct RedbBackend {
     db: Database,
+    record: AtomicBool,
+    term: AtomicU64,
 }
 
 impl RedbBackend {
@@ -118,7 +184,11 @@ impl RedbBackend {
             tx.open_table(META)?;
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            record: AtomicBool::new(false),
+            term: AtomicU64::new(0),
+        })
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -130,7 +200,11 @@ impl RedbBackend {
             tx.open_table(META)?;
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            record: AtomicBool::new(false),
+            term: AtomicU64::new(0),
+        })
     }
 
     fn table_def(name: &str) -> Result<TableDefinition<'static, &'static str, &'static [u8]>> {
@@ -198,11 +272,32 @@ impl Backend for RedbBackend {
     }
 
     fn batch(&self, ops: Vec<Op>) -> Result<()> {
+        let recording = self.record.load(Ordering::Acquire);
         let tx = self.db.begin_write()?;
         {
             let mut res = tx.open_table(RESOURCES)?;
             let mut names = tx.open_table(NAMES)?;
             let mut meta = tx.open_table(META)?;
+            // One log row for the non-bookkeeping ops, in this same transaction.
+            let logged: Vec<LogOp> = if recording {
+                ops.iter()
+                    .filter(|op| !is_bookkeeping(op))
+                    .map(log_op_from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let next = if logged.is_empty() {
+                None
+            } else {
+                let current = {
+                    match meta.get("cluster_commit")? {
+                        Some(raw) => serde_json::from_slice::<u64>(raw.value())?,
+                        None => 0,
+                    }
+                };
+                Some(current + 1)
+            };
             for op in ops {
                 match op {
                     Op::Put { table, key, value } => match table.as_str() {
@@ -233,9 +328,49 @@ impl Backend for RedbBackend {
                     },
                 }
             }
+            if let Some(index) = next {
+                let entry = LogEntry {
+                    index,
+                    term: self.term.load(Ordering::Acquire),
+                    ops: logged,
+                };
+                let raw = serde_json::to_vec(&entry)?;
+                let key = format!("cluster_log/{index:020}");
+                meta.insert(key.as_str(), raw.as_slice())?;
+                let commit = serde_json::to_vec(&index)?;
+                meta.insert("cluster_commit", commit.as_slice())?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn set_record_log(&self, on: bool) {
+        self.record.store(on, Ordering::Release);
+    }
+
+    fn set_log_term(&self, term: u64) {
+        self.term.store(term, Ordering::Release);
+    }
+
+    fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for (_key, raw) in self.scan("meta", "cluster_log/")? {
+            let entry: LogEntry = serde_json::from_slice(&raw)?;
+            if entry.index > after {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by_key(|e| e.index);
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    fn record_log(&self) -> bool {
+        self.record.load(Ordering::Acquire)
     }
 }
 
@@ -294,6 +429,93 @@ impl Store {
 
     pub fn put_meta<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         self.backend.put("meta", key, &serde_json::to_vec(value)?)
+    }
+
+    pub fn set_record_log(&self, on: bool) {
+        self.backend.set_record_log(on);
+    }
+
+    pub fn set_log_term(&self, term: u64) {
+        self.backend.set_log_term(term);
+    }
+
+    pub fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>> {
+        self.backend.read_log(after, limit)
+    }
+
+    pub fn commit_index(&self) -> Result<u64> {
+        Ok(self.get_meta::<u64>("cluster_commit")?.unwrap_or(0))
+    }
+
+    /// Apply follower entries. Recording is off for the duration, then restored.
+    /// Each entry's index must be one past the commit index. A gap leaves earlier
+    /// entries applied and returns `StoreError::Conflict`.
+    pub fn apply_entries(&self, entries: &[LogEntry]) -> Result<()> {
+        let prev = self.backend.record_log();
+        self.set_record_log(false);
+        let result = (|| {
+            let mut have = self.commit_index()?;
+            let mut applied = None;
+            for entry in entries {
+                if entry.index != have + 1 {
+                    if let Some(index) = applied {
+                        self.put_meta("cluster_commit", &index)?;
+                    }
+                    return Err(StoreError::Conflict(format!(
+                        "gap: have {have}, got {}",
+                        entry.index
+                    )));
+                }
+                let ops = entry.ops.iter().map(op_from_log).collect();
+                if let Err(e) = self.backend.batch(ops) {
+                    if let Some(index) = applied {
+                        self.put_meta("cluster_commit", &index)?;
+                    }
+                    return Err(e);
+                }
+                have = entry.index;
+                applied = Some(have);
+            }
+            if let Some(index) = applied {
+                self.put_meta("cluster_commit", &index)?;
+            }
+            Ok(())
+        })();
+        self.set_record_log(prev);
+        result
+    }
+
+    /// Copy `src` while this process holds it open. Does not open `src`.
+    /// `dst` must not already exist. A copy that will not open is removed.
+    pub fn snapshot_file(&self, src: &Path, dst: &Path) -> Result<()> {
+        if dst.exists() {
+            return Err(StoreError::Storage(format!(
+                "{} already exists",
+                dst.display()
+            )));
+        }
+        if let Some(parent) = dst.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| StoreError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let _g = self.write_lock.write();
+            std::fs::copy(src, dst).map_err(|e| StoreError::Storage(e.to_string()))?;
+        }
+        let check = match Database::open(dst) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = std::fs::remove_file(dst);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = check.begin_read() {
+            drop(check);
+            let _ = std::fs::remove_file(dst);
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     fn res_key(kind_: &str, id: &Id) -> String {
@@ -535,6 +757,54 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
 }
 
+/// Copy a redb file and open the copy.
+///
+/// The write lock is held for the copy, so the bytes stay at the last commit.
+/// `dst` must not already exist.
+pub fn backup_file(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        return Err(StoreError::Storage(format!(
+            "{} already exists",
+            dst.display()
+        )));
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::Storage(e.to_string()))?;
+        }
+    }
+    match Database::open(src) {
+        Ok(db) => {
+            let txn = db.begin_write()?;
+            copy_db(src, dst)?;
+            drop(txn);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already open") || msg.contains("lock") {
+                copy_db(src, dst)?;
+            } else {
+                return Err(e.into());
+            }
+        }
+    }
+    match Database::open(dst) {
+        Ok(check) => {
+            let _ = check.begin_read()?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(dst);
+            Err(e.into())
+        }
+    }
+}
+
+fn copy_db(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::copy(src, dst).map_err(|e| StoreError::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// Re-export so modules can name the shared kinds without importing types.
 pub use pistack_types::kind as kinds;
 
@@ -542,6 +812,35 @@ pub use pistack_types::kind as kinds;
 mod tests {
     use super::*;
     use pistack_types::{kind, Meta, Resource};
+
+    #[test]
+    fn backup_round_trips_a_value() {
+        let dir = std::env::temp_dir().join(format!("pistack-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("state.redb");
+        let dst = dir.join("copy.redb");
+        let (events, _) = broadcast::channel(8);
+        let store = Store::open(&src, events).unwrap();
+        store.put_meta("cluster_id", &"abc".to_owned()).unwrap();
+        drop(store);
+        backup_file(&src, &dst).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let opened = Store::open(&dst, events).unwrap();
+        let id: Option<String> = opened.get_meta("cluster_id").unwrap();
+        assert_eq!(id.as_deref(), Some("abc"));
+        let err = backup_file(&src, &dst).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let held = Database::open(&src).unwrap();
+        let second = dir.join("live.redb");
+        backup_file(&src, &second).unwrap();
+        drop(held);
+        let (events, _) = broadcast::channel(8);
+        let opened = Store::open(&second, events).unwrap();
+        let id: Option<String> = opened.get_meta("cluster_id").unwrap();
+        assert_eq!(id.as_deref(), Some("abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use serde::Deserialize;
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -632,5 +931,97 @@ mod tests {
         let s = Store::open(&path, tx).unwrap();
         assert_eq!(s.collection::<Widget>().list(None).unwrap().len(), 1);
         assert_eq!(s.get_meta::<String>("cluster_id").unwrap().unwrap(), "abc");
+    }
+
+    #[test]
+    fn record_off_writes_no_log() {
+        let store = Store::in_memory().unwrap();
+        store.put_meta("cluster_id", &"abc").unwrap();
+        assert_eq!(store.commit_index().unwrap(), 0);
+        assert!(store.read_log(0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_on_appends_one_entry() {
+        let store = Store::in_memory().unwrap();
+        store.set_log_term(3);
+        store.set_record_log(true);
+        store.put_meta("cluster_id", &"abc").unwrap();
+        assert_eq!(store.commit_index().unwrap(), 1);
+        let log = store.read_log(0, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].index, 1);
+        assert_eq!(log[0].term, 3);
+        assert!(log[0].ops.iter().any(|op| op.key == "cluster_id"));
+        assert!(store.read_log(0, 0).unwrap().is_empty());
+        store.put_meta("members", &"[]").unwrap();
+        assert_eq!(store.commit_index().unwrap(), 2);
+        let second = store.read_log(1, 10).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].index, 2);
+        assert!(second[0].ops.iter().any(|op| op.key == "members"));
+    }
+
+    #[test]
+    fn bookkeeping_is_not_a_log_entry() {
+        let store = Store::in_memory().unwrap();
+        store.set_record_log(true);
+        store.put_meta("node_id", &"n1").unwrap();
+        store.put_meta("cluster_commit", &7u64).unwrap();
+        assert_eq!(store.commit_index().unwrap(), 7);
+        assert!(store.read_log(0, 10).unwrap().is_empty());
+        assert!(store.raw_scan("meta", "cluster_log/").unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_copies_onto_a_quiet_store() {
+        let a = Store::in_memory().unwrap();
+        a.set_record_log(true);
+        a.put_meta("cluster_id", &"abc").unwrap();
+        let log = a.read_log(0, 10).unwrap();
+        let b = Store::in_memory().unwrap();
+        b.apply_entries(&log).unwrap();
+        assert_eq!(
+            b.get_meta::<String>("cluster_id").unwrap().as_deref(),
+            Some("abc")
+        );
+        assert!(b.read_log(0, 10).unwrap().is_empty());
+        assert_eq!(b.commit_index().unwrap(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_a_gap() {
+        let store = Store::in_memory().unwrap();
+        let entry = LogEntry {
+            index: 2,
+            term: 1,
+            ops: vec![LogOp {
+                table: "meta".into(),
+                key: "cluster_id".into(),
+                value: Some(serde_json::to_vec("abc").unwrap()),
+            }],
+        };
+        let err = store.apply_entries(std::slice::from_ref(&entry)).unwrap_err();
+        assert!(err.to_string().contains("gap"), "{err}");
+        assert!(store.get_meta::<String>("cluster_id").unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("state.redb");
+        let dst = dir.path().join("snap.redb");
+        let (events, _) = broadcast::channel(8);
+        let store = Store::open(&src, events).unwrap();
+        store.put_meta("cluster_id", &"abc").unwrap();
+        store.snapshot_file(&src, &dst).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let opened = Store::open(&dst, events).unwrap();
+        assert_eq!(
+            opened.get_meta::<String>("cluster_id").unwrap().as_deref(),
+            Some("abc")
+        );
+        let err = store.snapshot_file(&src, &dst).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
     }
 }

@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 pistack-types.workspace = true
+pistack-store.workspace = true
+keep.workspace = true
 tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true

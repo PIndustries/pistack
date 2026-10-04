@@ -57,9 +57,15 @@ observed!(FloatingIp);
 
 /// Write a status outcome. `extra` runs before the phase is set and may
 /// fill kind-specific status fields.
+///
+/// `acted` is the revision this pass read. A spec write during the backend
+/// call must stay stale: the event loop handles one event at a time, so
+/// that write's event is still queued, and claiming it here would skip the
+/// backend work for the new spec.
 fn finish<K: Observed>(
     col: &Collection<K>,
     id: &Id,
+    acted: u64,
     outcome: ApiResult<()>,
     mut extra: impl FnMut(&mut K),
 ) -> Phase {
@@ -68,6 +74,9 @@ fn finish<K: Observed>(
         Err(e) => (Phase::Error, e.to_string()),
     };
     let res = col.modify(id, |cur| {
+        if cur.meta().revision != acted {
+            return Err(StoreError::Conflict("reconcile superseded".into()));
+        }
         extra(cur);
         let next = cur.meta().revision + 1;
         cur.set_result(phase, msg.clone(), next);
@@ -80,12 +89,19 @@ fn finish<K: Observed>(
             } else {
                 tracing::debug!(kind = K::KIND, %id, "reconciled");
             }
+            phase
         }
         // Deleted while we worked; the Deleted event cleans up.
-        Err(StoreError::NotFound(_)) => {}
-        Err(e) => tracing::error!(kind = K::KIND, %id, error = %e, "status write failed"),
+        Err(StoreError::NotFound(_)) => phase,
+        Err(StoreError::Conflict(reason)) if reason == "reconcile superseded" => {
+            tracing::debug!(kind = K::KIND, %id, "spec changed during reconcile");
+            Phase::Updating
+        }
+        Err(e) => {
+            tracing::error!(kind = K::KIND, %id, error = %e, "status write failed");
+            phase
+        }
     }
-    phase
 }
 
 fn api(e: StoreError) -> ApiError {
@@ -222,12 +238,59 @@ impl Client {
                 None => self.next_segment().ok(),
             },
         };
+        let mut net = net;
+        if let Some(s) = segment {
+            net.status.segment_id = Some(s);
+        }
+        let datapath = self.stick_datapath(&net);
         let outcome = self.backend().ensure_network(&net).await;
-        finish(&col, id, outcome, |n| n.status.segment_id = segment)
+        finish(&col, id, net.meta.revision, outcome, |n| {
+            n.status.segment_id = segment;
+            if n.status.datapath.is_none() {
+                if let Some(path) = datapath.clone() {
+                    n.status.datapath = Some(path);
+                }
+            }
+        })
     }
 
-    /// Overlay segment ids come from a store counter; OVN's own tunnel key
-    /// is mirrored over this once the real backend reads it back.
+    /// First realisation wins. A guest port already bound `hostnat`, the
+    /// shared 10.88.0.0/24 network, or a host-NAT backend stays on that
+    /// bridge. The choice is not rewritten when the backend flag changes.
+    fn stick_datapath(&self, net: &Network) -> Option<String> {
+        if net.status.datapath.is_some() {
+            return None;
+        }
+        let shared = self
+            .subnets()
+            .list(None)
+            .unwrap_or_default()
+            .iter()
+            .any(|s| &s.spec.network == &net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24");
+        let hostnat_port = self
+            .ports()
+            .list(None)
+            .unwrap_or_default()
+            .iter()
+            .any(|p| {
+                &p.spec.network == &net.meta.id
+                    && !p.is_router_port()
+                    && p.status
+                        .binding
+                        .as_ref()
+                        .is_some_and(|b| b.vif_type == "hostnat")
+            });
+        if shared || hostnat_port || self.backend().name() == "hostnat" {
+            return Some("hostnat".into());
+        }
+        if self.backend().name() == "overlay" && matches!(net.spec.kind, NetworkKind::Overlay) {
+            return Some("overlay".into());
+        }
+        None
+    }
+
+    /// Overlay segment ids are VXLAN VNIs from a store counter. The backend
+    /// is given the segment before ensure.
     fn next_segment(&self) -> ApiResult<u32> {
         const KEY: &str = "fabric/next_segment";
         let cur: u32 = self.store().get_meta(KEY).map_err(api)?.unwrap_or(1);
@@ -261,7 +324,9 @@ impl Client {
             .used_addresses(&sub)
             .map(|u| u.len() as u32)
             .unwrap_or(sub.status.allocated);
-        finish(&col, id, outcome, |s| s.status.allocated = allocated)
+        finish(&col, id, sub.meta.revision, outcome, |s| {
+            s.status.allocated = allocated
+        })
     }
 
     /// Recount a subnet's held addresses without touching the backend.
@@ -300,7 +365,7 @@ impl Client {
             Ok(b) => (Ok(()), Some(b)),
             Err(e) => (Err(e), None),
         };
-        let phase = finish(&col, id, res, |p| {
+        let phase = finish(&col, id, port.meta.revision, res, |p| {
             if binding.is_some() {
                 p.status.binding = binding.clone();
             }
@@ -376,7 +441,7 @@ impl Client {
             self.backend().ensure_router(&view).await
         }
         .await;
-        finish(&col, id, outcome, |r| {
+        finish(&col, id, router.meta.revision, outcome, |r| {
             r.status.gateway_port = gateway_port.clone();
             r.status.external_ip = external_ip;
         })
@@ -392,11 +457,13 @@ impl Client {
                 .into_iter()
                 .filter(|p| p.spec.security_groups.contains(id))
                 .collect(),
-            Err(e) => return finish(&col, id, Err(api(e)), |_| {}),
+            Err(e) => return finish(&col, id, sg.meta.revision, Err(api(e)), |_| {}),
         };
         let n = members.len() as u32;
         let outcome = self.backend().apply_security_group(&sg, &members).await;
-        finish(&col, id, outcome, |s| s.status.members = n)
+        finish(&col, id, sg.meta.revision, outcome, |s| {
+            s.status.members = n
+        })
     }
 
     pub async fn reconcile_floating_ip(&self, id: &Id) -> Phase {
@@ -427,29 +494,21 @@ impl Client {
                     Some((port, ip))
                 }
             };
+            // A router is how OVN will carry the NAT. Host NAT does not need
+            // one: the hypervisor is the router, and the fixed IP is enough.
             let router = match &target {
                 None => None,
                 Some((port, _)) => {
-                    let sid = port.spec.subnet.clone().ok_or_else(|| {
-                        ApiError::unprocessable(format!("port {} has no subnet", port.meta.id))
-                    })?;
-                    let r = self
-                        .routers()
-                        .list(None)
-                        .map_err(api)?
-                        .into_iter()
-                        .find(|r| {
-                            r.spec.interfaces.contains(&sid)
+                    let found = port.spec.subnet.as_ref().and_then(|sid| {
+                        self.routers().list(None).ok()?.into_iter().find(|r| {
+                            r.spec.interfaces.contains(sid)
                                 && r.spec.external_network.as_ref() == Some(&fip.spec.network)
                         })
-                        .ok_or_else(|| {
-                            ApiError::unprocessable(format!(
-                                "no router connects subnet {sid} to external network {}",
-                                fip.spec.network
-                            ))
-                        })?;
-                    router_id = Some(r.meta.id.clone());
-                    Some(r)
+                    });
+                    if let Some(r) = &found {
+                        router_id = Some(r.meta.id.clone());
+                    }
+                    found
                 }
             };
             let view = FipView {
@@ -460,9 +519,189 @@ impl Client {
             self.backend().associate_fip(&view).await
         }
         .await;
-        finish(&col, id, outcome, |f| {
+        finish(&col, id, fip.meta.revision, outcome, |f| {
             f.status.fixed_ip = fixed_ip;
             f.status.router = router_id.clone();
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{FipView, NetBackend, RouterView};
+    use crate::Client;
+    use async_trait::async_trait;
+    use pistack_store::Store;
+    use pistack_types::Meta;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    /// Holds the first floating-IP call so a spec write can land underneath it.
+    struct Gate {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        held: AtomicBool,
+        calls: parking_lot::Mutex<Vec<Option<Id>>>,
+    }
+
+    #[async_trait]
+    impl NetBackend for Gate {
+        fn name(&self) -> &'static str {
+            "gate"
+        }
+        async fn ensure_network(&self, _: &Network) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn delete_network(&self, _: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn ensure_subnet(&self, _: &Network, _: &Subnet) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn delete_subnet(&self, _: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn ensure_port(
+            &self,
+            _: &Network,
+            _: &Port,
+            _: &[SecurityGroup],
+        ) -> ApiResult<PortBinding> {
+            Ok(PortBinding::default())
+        }
+        async fn delete_port(&self, _: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn ensure_router(&self, _: &RouterView) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn delete_router(&self, _: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn apply_security_group(&self, _: &SecurityGroup, _: &[Port]) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn delete_security_group(&self, _: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn associate_fip(&self, view: &FipView) -> ApiResult<()> {
+            self.calls.lock().push(view.fip.spec.port.clone());
+            if !self.held.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+        async fn delete_fip(&self, _: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn spec_change_during_reconcile_stays_stale() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gate = Arc::new(Gate {
+            entered: entered.clone(),
+            release: release.clone(),
+            held: AtomicBool::new(false),
+            calls: parking_lot::Mutex::new(Vec::new()),
+        });
+        let store = Store::in_memory().unwrap();
+        let client = Client::new(store, gate.clone());
+        client.ensure_default_template().unwrap();
+        let project = Id::new(kind::PROJECT);
+        let mut ext = NetworkSpec::default();
+        ext.external = true;
+        let net = client
+            .create_network(
+                Meta::new(kind::NETWORK, "fleet", Some(project.clone())),
+                ext,
+            )
+            .unwrap();
+        let sub = client
+            .create_subnet(
+                Meta::new(kind::SUBNET, "pool", Some(project.clone())),
+                SubnetSpec {
+                    network: net.meta.id.clone(),
+                    cidr: "10.66.66.80/28".parse().unwrap(),
+                    gateway: Some("10.66.66.81".parse().unwrap()),
+                    allocation_pools: vec![],
+                    dns_nameservers: vec![],
+                    enable_dhcp: false,
+                    host_routes: vec![],
+                },
+            )
+            .unwrap();
+        let guest = client
+            .create_network(
+                Meta::new(kind::NETWORK, "guest", Some(project.clone())),
+                NetworkSpec::default(),
+            )
+            .unwrap();
+        client
+            .create_subnet(
+                Meta::new(kind::SUBNET, "guest", Some(project.clone())),
+                SubnetSpec {
+                    network: guest.meta.id.clone(),
+                    cidr: "10.88.0.0/24".parse().unwrap(),
+                    gateway: Some("10.88.0.1".parse().unwrap()),
+                    allocation_pools: vec![],
+                    dns_nameservers: vec![],
+                    enable_dhcp: true,
+                    host_routes: vec![],
+                },
+            )
+            .unwrap();
+        let port = client
+            .create_port(
+                Meta::new(kind::PORT, "demo", Some(project.clone())),
+                PortSpec {
+                    network: guest.meta.id,
+                    fixed_ips: vec!["10.88.0.187".parse().unwrap()],
+                    ..PortSpec::default()
+                },
+            )
+            .unwrap();
+        let fip = client
+            .create_floating_ip(
+                Meta::new(kind::FLOATING_IP, "demo", Some(project)),
+                FloatingIpSpec {
+                    network: net.meta.id,
+                    address: None,
+                    port: None,
+                },
+            )
+            .unwrap();
+        let _ = sub;
+
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        let id = fip.meta.id.clone();
+        let worker = client.clone();
+        let task = tokio::spawn(async move { worker.reconcile_floating_ip(&id).await });
+        waiting.await;
+        client
+            .associate_floating_ip(&fip.meta.id, Some(port.meta.id.clone()))
+            .unwrap();
+        release.notify_one();
+        let _ = task.await.unwrap();
+
+        let mid = client.floating_ips().get(&fip.meta.id).unwrap();
+        assert!(
+            mid.stale(),
+            "the in-flight pass must not mark the new port observed"
+        );
+        assert_eq!(mid.spec.port, Some(port.meta.id.clone()));
+
+        client.reconcile_floating_ip(&fip.meta.id).await;
+        let done = client.floating_ips().get(&fip.meta.id).unwrap();
+        assert_eq!(done.status.phase, Phase::Ready);
+        assert_eq!(done.status.fixed_ip, Some("10.88.0.187".parse().unwrap()));
+        assert!(!done.stale());
+        let calls = gate.calls.lock().clone();
+        assert_eq!(calls, vec![None, Some(port.meta.id)]);
     }
 }

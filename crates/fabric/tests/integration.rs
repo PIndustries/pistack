@@ -9,7 +9,7 @@ use fabric::backend::Call;
 use fabric::*;
 use pistack_store::Store;
 use pistack_types::error::ErrorCode;
-use pistack_types::{kind, Id, Meta, Module, ModuleContext, Phase};
+use pistack_types::{kind, Caller, Id, Meta, Module, ModuleContext, Phase};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -763,9 +763,10 @@ async fn call(
     if let Some(r) = if_match {
         req = req.header(header::IF_MATCH, r.to_string());
     }
-    let req = req
+    let mut req = req
         .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
         .unwrap();
+    req.extensions_mut().insert(admin_caller());
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -1109,4 +1110,32 @@ async fn http_scopes_non_admin_callers() {
     .await;
     assert_eq!(st, StatusCode::CREATED);
     assert_eq!(created["project"], h.project.to_string());
+}
+
+fn admin_caller() -> Caller {
+    Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "dev-admin".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    }
+}
+
+#[tokio::test]
+async fn missing_caller_is_unauthorized() {
+    let h = harness();
+    let app = api::router(h.client.clone());
+    let req = Request::builder()
+        .uri("/networks")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "no credentials");
 }

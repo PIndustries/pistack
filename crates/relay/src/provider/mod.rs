@@ -10,10 +10,9 @@
 //! by itself (the VIP that was allocated, a provider-side handle). The
 //! reconciler is the only caller.
 //!
-//! Three implementations: [`MockProvider`] for tests and single-node
-//! development, [`OvnProvider`] (L4, a stub documenting the OVN northbound
-//! mapping) and [`RelayL7Provider`] (HTTP, a stub documenting the Pingora
-//! plan).
+//! Implementations: [`MockProvider`] for tests and single-node development,
+//! [`ForwardProvider`] (in-process L4 TCP), [`RelayL7Provider`] (in-process
+//! HTTP), and [`OvnProvider`] (unimplemented).
 
 use crate::types::{Balancer, Listener, Member, Pool, Provider};
 use async_trait::async_trait;
@@ -21,10 +20,12 @@ use pistack_types::{ApiResult, Id};
 use std::net::IpAddr;
 use std::sync::Arc;
 
+pub mod forward;
 pub mod mock;
 pub mod ovn;
 pub mod relay_l7;
 
+pub use forward::ForwardProvider;
 pub use mock::{Call, MockProvider};
 pub use ovn::OvnProvider;
 pub use relay_l7::RelayL7Provider;

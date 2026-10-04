@@ -1,0 +1,1641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiStack</title>
+<style>
+  :root {
+    --bg: #04060a;
+    --panel: rgba(14, 30, 18, .92);
+    --panel-solid: #0c1610;
+    --line: rgba(75, 222, 128, .22);
+    --text: #eafaef;
+    --muted: #7e9b86;
+    --accent: #34c759;
+    --ok: #8df06a;
+    --press: #159a3c;
+    --ink: #04140a;
+    --bad: #e07a6a;
+    --wait: #c5d6a8;
+    --field: #07140c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 520px at 50% -12%, rgba(52, 199, 89, .09), transparent 58%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.45 ui-sans-serif, system-ui, sans-serif;
+  }
+  button, input, select, textarea {
+    font: inherit;
+    color: inherit;
+    background: var(--field);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.45rem 0.65rem;
+  }
+  button { cursor: pointer; background: var(--panel-solid); }
+  button.primary { background: var(--accent); color: var(--ink); border-color: transparent; font-weight: 650; }
+  button.primary:active { background: var(--press); }
+  button.danger { color: var(--bad); }
+  canvas.screen {
+    width: 100%;
+    height: auto;
+    background: #000;
+    border: 1px solid var(--line);
+    display: block;
+    margin-top: 0.8rem;
+  }
+  button.linkish {
+    background: transparent;
+    border-color: transparent;
+    color: var(--ok);
+    padding: 0;
+    font-weight: 650;
+    text-align: left;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button:focus-visible, input:focus, select:focus, textarea:focus {
+    outline: 2px solid rgba(52, 199, 89, .55);
+    outline-offset: 1px;
+  }
+  a { color: var(--accent); }
+  /* display is only set when the section is shown. A plain display rule
+     beats the hidden attribute, which left the login card on top of the
+     console after sign-in. */
+  #login:not([hidden]) {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 1.5rem;
+  }
+  #login h1::after {
+    content: "";
+    display: inline-block;
+    width: 0.48rem;
+    height: 0.48rem;
+    margin-left: 0.4rem;
+    border-radius: 50%;
+    background: var(--ok);
+    vertical-align: 0.12em;
+  }
+  #login form, .card, form.create, .detail, .once {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 1.25rem;
+  }
+  #login form, .card { width: min(420px, 100%); }
+  h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+  h2, h3 { font-weight: 650; }
+  h2 { font-size: 1.15rem; margin: 0; }
+  h3 { font-size: 0.95rem; margin: 1rem 0 0.35rem; }
+  .sub { color: var(--muted); margin: 0 0 1rem; }
+  label { display: block; margin: 0.7rem 0 0.25rem; color: var(--muted); font-size: 0.85rem; }
+  input, select, textarea { width: 100%; }
+  textarea { min-height: 4.5rem; resize: vertical; }
+  .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; }
+  .row > * { flex: 1; min-width: 8rem; }
+  #shell:not([hidden]) { display: grid; grid-template-columns: 200px 1fr; min-height: 100vh; }
+  #shell:not([hidden]) > div { min-width: 0; }
+  nav { border-right: 1px solid var(--line); padding: 1rem 0.6rem; background: var(--field); }
+  nav button { display: block; width: 100%; text-align: left; margin: 0.15rem 0; background: transparent; border-color: transparent; }
+  nav button[aria-current="page"], nav button:active { background: var(--press); color: var(--ink); border-color: transparent; font-weight: 650; }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.8rem 1.1rem; border-bottom: 1px solid var(--line);
+  }
+  main { padding: 1rem 1.1rem 2rem; min-width: 0; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.45rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.78rem; letter-spacing: 0.03em; }
+  .phase { text-transform: lowercase; }
+  .phase.ready, .phase.on { color: var(--ok); }
+  .phase.error, .phase.off { color: var(--bad); }
+  .phase.pending, .phase.creating, .phase.deleting { color: var(--wait); }
+  .rules { margin: 0.25rem 0 0; padding-left: 1.1rem; }
+  .detail { width: min(760px, 100%); }
+  .detail p { margin: 0.22rem 0; }
+  .detail .k { color: var(--muted); display: inline-block; min-width: 9.5rem; }
+  .once { color: var(--ok); border-radius: 8px; padding: 0.6rem 0.75rem; margin: 0 0 0.8rem; word-break: break-all; }
+  #err, #note, #login-err:not(:empty) {
+    border-radius: 8px; padding: 0.6rem 0.75rem; margin: 0 0 0.8rem;
+  }
+  #err { background: #3a2222; color: #ffd0c8; display: none; }
+  #login-err:not(:empty) { background: #3a2222; color: #ffd0c8; }
+  #note { background: var(--panel); color: var(--muted); border: 1px solid var(--line); }
+  #note:empty { display: none; }
+  .tools { display: flex; gap: 0.5rem; align-items: center; margin: 0 0 0.8rem; flex-wrap: wrap; }
+  form.create { border-radius: 10px; padding: 0.8rem; margin: 0 0 1rem; width: auto; }
+  @media (max-width: 800px) {
+    #login:not([hidden]) { padding: 1rem; }
+    #shell:not([hidden]) { grid-template-columns: 1fr; }
+    nav { display: flex; gap: 0.25rem; overflow: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    nav button { width: auto; white-space: nowrap; }
+  }
+</style>
+</head>
+<body>
+<section id="login">
+  <form id="login-form" autocomplete="off" onsubmit="event.preventDefault()">
+    <h1>PiStack</h1>
+    <p class="sub">Sign in to this cloud. The token stays in this tab.</p>
+    <label for="user">Name</label>
+    <input id="user" name="name" autocomplete="username" value="admin" required>
+    <label for="pass">Password</label>
+    <input id="pass" name="password" type="password" autocomplete="off" spellcheck="false" required>
+    <p id="login-err"></p>
+    <button class="primary" type="submit">Sign in</button>
+  </form>
+</section>
+<div id="shell" hidden>
+  <nav>
+    <button type="button" data-view="machines" aria-current="page">Machines</button>
+    <button type="button" data-view="hosts">Hosts</button>
+    <button type="button" data-view="networks">Networks</button>
+    <button type="button" data-view="subnets">Subnets</button>
+    <button type="button" data-view="ports">Ports</button>
+    <button type="button" data-view="routers">Routers</button>
+    <button type="button" data-view="security">Security groups</button>
+    <button type="button" data-view="fips">Floating IPs</button>
+    <button type="button" data-view="volumes">Volumes</button>
+    <button type="button" data-view="images">Images</button>
+    <button type="button" data-view="buckets">Buckets</button>
+    <button type="button" data-view="projects">Projects</button>
+    <button type="button" data-view="users">Users</button>
+    <button type="button" data-view="keys">Keys</button>
+    <button type="button" data-view="secrets">Secrets</button>
+    <button type="button" data-view="dns">DNS</button>
+    <button type="button" data-view="balancers">Load balancers</button>
+  </nav>
+  <div>
+    <header>
+      <strong id="who">PiStack</strong>
+      <button type="button" id="logout">Sign out</button>
+    </header>
+    <main>
+      <p id="note"></p>
+      <div id="err"></div>
+      <div id="view"></div>
+    </main>
+  </div>
+</div>
+<script>
+const VIEWS = {
+  machines: {
+    title: "Machines",
+    path: "/compute/machines",
+    note: "Guests boot on the host NAT network 10.88.0.0/24. SSH from the fleet host as ubuntu@the address. Attach a volume from Volumes and it shows up in the guest as a virtio disk.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Power", i => i.status && i.status.power],
+      ["Size", i => i.spec && i.spec.size],
+      ["Image", i => i.spec && i.spec.image],
+      ["Address", i => ((i.status && i.status.addresses) || []).join(", ")],
+      ["Floating IP", i => matchingFips(i, machineFips).map(f => f.spec && f.spec.address).filter(Boolean).join(", ")],
+    ],
+    actions: true,
+  },
+  hosts: {
+    title: "Hosts",
+    path: "/compute/hosts",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Node", i => i.spec && i.spec.node_name],
+      ["vCPU free", i => i.status && i.status.free && (i.status.free.vcpus + " / " + (i.spec.capacity ? i.spec.capacity.vcpus : ""))],
+      ["Drivers", i => ((i.spec && i.spec.drivers) || []).join(", ")],
+    ],
+  },
+  networks: {
+    title: "Networks",
+    path: "/network/networks",
+    note: "These records are the API. The running guest network is the host bridge pistack0, not an OVN switch.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Type", i => i.spec && i.spec.kind && i.spec.kind.type],
+      ["External", i => i.spec && String(!!i.spec.external)],
+    ],
+  },
+  subnets: {
+    title: "Subnets",
+    path: "/network/subnets",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["CIDR", i => i.spec && i.spec.cidr],
+      ["Gateway", i => i.spec && i.spec.gateway],
+      ["Network", i => i.spec && i.spec.network],
+    ],
+  },
+  ports: {
+    title: "Ports",
+    path: "/network/ports",
+    note: "Ports are API records. The guest NIC is still the host bridge pistack0.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["MAC", i => i.spec && i.spec.mac],
+      ["Fixed IPs", i => ((i.spec && i.spec.fixed_ips) || []).join(", ")],
+      ["Device", i => i.spec && i.spec.device],
+      ["Network", i => i.spec && i.spec.network],
+    ],
+  },
+  routers: {
+    title: "Routers",
+    path: "/network/routers",
+    note: "These records are stored. The guest uses the host bridge pistack0, not this router.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["External network", i => i.spec && i.spec.external_network],
+      ["External IP", i => i.status && i.status.external_ip],
+    ],
+  },
+  security: {
+    title: "Security groups",
+    path: "/network/security-groups",
+    note: "Ingress rules on a member port are installed on the host. Traffic that does not match is dropped.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Rules", i => (i.spec && i.spec.rules ? i.spec.rules.length : 0)],
+      ["Members", i => i.status && i.status.members],
+    ],
+    rules: true,
+  },
+  fips: {
+    title: "Floating IPs",
+    path: "/network/floating-ips",
+    note: "A floating IP is an address on the fleet tunnel, drawn from 10.66.66.80/28. Associate it with a machine and that address reaches the guest. Traffic is accepted only from 10.66.66.0/24.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Address", i => i.spec && i.spec.address],
+      ["Fixed", i => i.status && i.status.fixed_ip],
+      ["Machine port", i => i.spec && i.spec.port],
+    ],
+  },
+  volumes: {
+    title: "Volumes",
+    path: "/volume/volumes",
+    note: "Create a volume, then attach it to a running machine. Attach still hotplugs; the guest sees a new virtio disk. Detach before delete. A snapshot is a copy of the volume file.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["GiB", i => i.spec && i.spec.size_gib],
+      ["Device", i => i.status && i.status.device],
+      ["Attached", i => i.status && i.status.attached_to],
+    ],
+  },
+  images: {
+    title: "Images",
+    path: "/image/images",
+    note: "Import stores the file in the catalog. A new machine whose image name matches a Ready catalog image boots that file.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Format", i => i.spec && i.spec.format],
+      ["Size", i => i.status && i.status.size_bytes],
+    ],
+  },
+  buckets: {
+    title: "Buckets",
+    path: "/silo/buckets",
+    note: "Stored by silo. This screen does not upload objects yet.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+    ],
+  },
+  projects: {
+    title: "Projects",
+    path: "/identity/projects",
+    cols: [
+      ["Name", i => i.name],
+      ["ID", i => i.id],
+      ["Enabled", i => yesNo(i.spec && i.spec.enabled)],
+    ],
+  },
+  users: {
+    title: "Users",
+    path: "/identity/principals",
+    cols: [
+      ["Name", i => i.name],
+      ["Kind", i => i.spec && i.spec.kind],
+      ["Enabled", i => yesNo(i.spec && i.spec.enabled)],
+    ],
+  },
+  keys: {
+    title: "Keys",
+    path: "/identity/keys",
+    note: "A new key secret is shown once on this page, then dropped.",
+    cols: [
+      ["Name", i => i.name],
+      ["ID", i => i.id],
+      ["Principal", i => i.spec && i.spec.principal],
+      ["Project", i => i.spec && i.spec.project],
+      ["Expires", i => i.spec && i.spec.expires_at],
+    ],
+  },
+  secrets: {
+    title: "Secrets",
+    path: "/secrets/secrets",
+    note: "Stored by keep. This screen lists names only.",
+    cols: [
+      ["Name", i => i.name],
+      ["ID", i => i.id],
+      ["Kind", i => i.spec && i.spec.kind],
+    ],
+  },
+  dns: {
+    title: "DNS",
+    path: "/dns/zones",
+    note: "A zone labelled pistack.io/auto=true gets an A record for each machine, using its floating IP.",
+    multi: "dns",
+  },
+  balancers: {
+    title: "Load balancers",
+    path: "/balancers/balancers",
+    note: "Stored by relay. Nothing is programmed on the host yet.",
+    multi: "balancers",
+  },
+};
+
+let current = "machines";
+let timer = 0;
+let renderGen = 0;
+let openMachine = null;
+let machineFips = [];
+// One-time key secret. Shown in the DOM, then dropped. Not stored.
+let keyOnce = null;
+
+function el(tag, text, cls) {
+  const n = document.createElement(tag);
+  if (text != null) n.textContent = text;
+  if (cls) n.className = cls;
+  return n;
+}
+function token() { return sessionStorage.getItem("pistack.token") || ""; }
+function setToken(t) { sessionStorage.setItem("pistack.token", t); }
+function clearToken() { sessionStorage.removeItem("pistack.token"); }
+
+async function api(method, path, body, auth) {
+  const headers = {};
+  if (auth !== false && token()) headers.Authorization = "Bearer " + token();
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch (e) { data = { error: { message: text.slice(0, 200) } }; }
+  }
+  if (res.status === 401 && auth !== false) { showLogin(); throw new Error("session ended"); }
+  if (!res.ok) throw new Error((data && data.error && data.error.message) || res.statusText);
+  return data;
+}
+
+function showLogin() {
+  clearToken();
+  keyOnce = null;
+  openMachine = null;
+  document.getElementById("shell").hidden = true;
+  document.getElementById("login").hidden = false;
+}
+function showApp() {
+  document.getElementById("login").hidden = true;
+  document.getElementById("shell").hidden = false;
+}
+function setErr(msg) {
+  const n = document.getElementById("err");
+  n.style.display = msg ? "block" : "none";
+  n.textContent = msg || "";
+}
+function option(value, label) {
+  const o = el("option", label == null ? value : label);
+  o.value = value;
+  return o;
+}
+function yesNo(v) {
+  if (v == null || v === "") return "";
+  return v ? "yes" : "no";
+}
+function show(value) {
+  return value == null || value === "" ? "—" : String(value);
+}
+function bareAddr(value) {
+  const s = String(value == null ? "" : value).trim();
+  const i = s.indexOf("/");
+  return i === -1 ? s : s.slice(0, i).trim();
+}
+function matchingFips(machine, fips) {
+  const addrs = {};
+  for (const a of (machine.status && machine.status.addresses) || []) {
+    addrs[String(a)] = true;
+    const bare = bareAddr(a);
+    if (bare) addrs[bare] = true;
+  }
+  return (fips || []).filter(f => {
+    const fixed = f.status && f.status.fixed_ip;
+    if (!fixed) return false;
+    return addrs[String(fixed)] || addrs[bareAddr(fixed)];
+  });
+}
+function ruleLine(r) {
+  const dir = r.direction || "—";
+  const proto = r.protocol || "any";
+  let ports = "any";
+  if (r.port_range && r.port_range.min != null && r.port_range.max != null) {
+    ports = String(r.port_range.min) === String(r.port_range.max)
+      ? String(r.port_range.min)
+      : String(r.port_range.min) + "-" + String(r.port_range.max);
+  }
+  let remote = "any";
+  if (r.remote && typeof r.remote === "object") {
+    if (r.remote.cidr) remote = String(r.remote.cidr);
+    else if (r.remote.group) remote = String(r.remote.group);
+  } else if (typeof r.remote === "string" && r.remote) {
+    remote = r.remote;
+  }
+  return dir + " · " + proto + " · " + ports + " · " + remote;
+}
+function protoText(p) {
+  if (p == null || p === "") return "";
+  if (typeof p === "string") return p;
+  if (p.type) return String(p.type);
+  return "";
+}
+function itemsOf(page) {
+  return (page && page.items) || [];
+}
+
+document.getElementById("login-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const err = document.getElementById("login-err");
+  err.textContent = "";
+  try {
+    const data = await api("POST", "/identity/tokens", {
+      name: document.getElementById("user").value.trim(),
+      password: document.getElementById("pass").value,
+    }, false);
+    setToken(data.token);
+    document.getElementById("pass").value = "";
+    const who = data.caller || {};
+    document.getElementById("who").textContent = (who.principal_name || "admin") + (who.project ? " · " + who.project : "");
+    showApp();
+    await render();
+  } catch (e) {
+    err.textContent = e.message === "invalid credentials"
+      ? "Password was not accepted. Clear the box and paste it again. A password manager may have replaced it."
+      : e.message;
+  }
+});
+document.getElementById("logout").addEventListener("click", () => { showLogin(); });
+document.querySelector("nav").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button[data-view]");
+  if (!b) return;
+  current = b.dataset.view;
+  openMachine = null;
+  for (const n of document.querySelectorAll("nav button")) n.removeAttribute("aria-current");
+  b.setAttribute("aria-current", "page");
+  render();
+});
+
+function field(label, node) {
+  const wrap = el("div");
+  wrap.append(el("label", label), node);
+  return wrap;
+}
+
+function createForm() {
+  const form = el("form");
+  form.className = "create";
+  form.autocomplete = "off";
+  if (current === "machines") {
+    const name = el("input"); name.required = true; name.placeholder = "demo";
+    const size = el("input"); size.value = "s.1x1";
+    const image = el("input"); image.value = "ubuntu-24.04";
+    const network = el("input"); network.placeholder = "app";
+    const group = el("input"); group.placeholder = "default";
+    const key = el("textarea"); key.placeholder = "ssh-ed25519 AAAA...";
+    const userData = el("textarea"); userData.placeholder = "#cloud-config";
+    form.append(el("strong", "New machine"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Size", size), field("Image", image));
+    const netRow = el("div"); netRow.className = "row";
+    netRow.append(field("Network", network), field("Security group", group));
+    form.append(row, netRow, field("SSH public key", key), field("User data", userData));
+    form.append(el("p", "When the guest gets an address, the fleet pool gives it a floating IP and the auto DNS zone publishes its name.", "sub"));
+    form.append(el("p", "Name a network to boot on that project's bridge. A router on that network NATs the guest. The address on the port is the address the guest uses.", "sub"));
+    const go = el("button", "Create machine"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const spec = { kind: "vm", size: size.value.trim(), image: image.value.trim(), networks: [], volumes: [] };
+        const net = network.value.trim();
+        if (net) spec.networks = [net];
+        const sg = group.value.trim();
+        if (sg) spec.security_groups = [sg];
+        if (userData.value.trim()) spec.user_data = userData.value;
+        const line = key.value.trim();
+        if (line) spec.ssh_keys = [line];
+        await api("POST", "/compute/machines", { name: name.value.trim(), spec });
+        name.value = ""; key.value = ""; network.value = ""; group.value = ""; userData.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "networks") {
+    const name = el("input"); name.required = true;
+    form.append(field("Network name", name));
+    const go = el("button", "Create network"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      try {
+        await api("POST", "/network/networks", { name: name.value.trim(), spec: { kind: { type: "overlay" }, mtu: 1500, external: false } });
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+    });
+    return form;
+  }
+  if (current === "ports") {
+    const name = el("input"); name.required = true;
+    const network = el("input"); network.required = true; network.placeholder = "fleet";
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Network", network));
+    form.append(el("strong", "New port"), row);
+    const go = el("button", "Create port"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const net = await api("GET", "/network/networks/" + encodeURIComponent(network.value.trim()));
+        await api("POST", "/network/ports", { name: name.value.trim(), spec: { network: net.id } });
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "routers") {
+    const name = el("input"); name.required = true;
+    const network = el("input"); network.placeholder = "optional";
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("External network", network));
+    form.append(el("strong", "New router"), row);
+    const go = el("button", "Create router"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const spec = {};
+        const ext = network.value.trim();
+        if (ext) {
+          const net = await api("GET", "/network/networks/" + encodeURIComponent(ext));
+          spec.external_network = net.id;
+        }
+        await api("POST", "/network/routers", { name: name.value.trim(), spec });
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "security") {
+    const name = el("input"); name.required = true;
+    const dir = el("select");
+    dir.append(option("ingress"), option("egress"));
+    const proto = el("select");
+    proto.append(option("", "any"), option("tcp"), option("udp"), option("icmp"));
+    const port = el("input"); port.inputMode = "numeric"; port.placeholder = "22";
+    const remote = el("input"); remote.placeholder = "any or 10.0.0.0/8";
+    form.append(el("strong", "New security group"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Direction", dir), field("Protocol", proto), field("Port", port), field("Remote", remote));
+    form.append(row);
+    const go = el("button", "Create security group"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const spec = {};
+        const portVal = port.value.trim();
+        const protoVal = proto.value;
+        const remoteVal = remote.value.trim();
+        const wantRule = portVal || protoVal || (remoteVal && remoteVal !== "any");
+        if (wantRule) {
+          const rule = { direction: dir.value || "ingress" };
+          if (protoVal) rule.protocol = protoVal;
+          if (portVal) {
+            const n = Number(portVal);
+            if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error("port must be 1-65535");
+            if (rule.protocol !== "tcp" && rule.protocol !== "udp") {
+              throw new Error("port range requires protocol tcp or udp");
+            }
+            rule.port_range = { min: n, max: n };
+          }
+          if (!remoteVal || remoteVal === "any") rule.remote = "any";
+          else {
+            rule.remote = { cidr: remoteVal };
+            if (remoteVal.indexOf(":") !== -1) rule.ethertype = "ipv6";
+          }
+          spec.rules = [rule];
+        }
+        await api("POST", "/network/security-groups", { name: name.value.trim(), spec });
+        name.value = ""; port.value = ""; remote.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    const add = el("form"); add.className = "create"; add.autocomplete = "off";
+    const group = el("input"); group.required = true; group.placeholder = "web";
+    const ruleDir = el("select");
+    ruleDir.append(option("ingress"), option("egress"));
+    const ruleProto = el("select");
+    ruleProto.append(option("", "any"), option("tcp"), option("udp"), option("icmp"));
+    const rulePort = el("input"); rulePort.inputMode = "numeric"; rulePort.placeholder = "22 or 8000-9000";
+    const ruleRemote = el("input"); ruleRemote.placeholder = "any or 10.0.0.0/8";
+    add.append(el("strong", "Add rule"));
+    const addRow = el("div"); addRow.className = "row";
+    addRow.append(field("Group", group), field("Direction", ruleDir), field("Protocol", ruleProto), field("Port", rulePort), field("Remote", ruleRemote));
+    const addGo = el("button", "Add rule"); addGo.className = "primary"; addGo.type = "submit";
+    add.append(addRow, addGo);
+    add.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      addGo.disabled = true;
+      try {
+        const sg = await api("GET", "/network/security-groups/" + encodeURIComponent(group.value.trim()));
+        const rule = { direction: ruleDir.value || "ingress" };
+        const protoVal = ruleProto.value;
+        const portVal = rulePort.value.trim();
+        const remoteVal = ruleRemote.value.trim();
+        if (protoVal) rule.protocol = protoVal;
+        if (portVal) {
+          if (rule.protocol !== "tcp" && rule.protocol !== "udp") {
+            throw new Error("port range requires protocol tcp or udp");
+          }
+          const bits = portVal.split("-");
+          if (bits.length > 2) throw new Error("port must be 22 or 8000-9000");
+          const min = Number(bits[0].trim());
+          const max = bits.length === 2 ? Number(bits[1].trim()) : min;
+          if (!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max > 65535 || min > max) {
+            throw new Error("port must be 1-65535");
+          }
+          rule.port_range = { min, max };
+        }
+        if (!remoteVal || remoteVal === "any") rule.remote = "any";
+        else {
+          rule.remote = { cidr: remoteVal };
+          if (remoteVal.indexOf(":") !== -1) rule.ethertype = "ipv6";
+        }
+        await api("POST", "/network/security-groups/" + encodeURIComponent(sg.id) + "/rules", rule);
+        rulePort.value = "";
+        ruleRemote.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      addGo.disabled = false;
+    });
+    const wrap = el("div");
+    wrap.append(form, add);
+    return wrap;
+  }
+  if (current === "volumes") {
+    const wrap = el("div");
+    const name = el("input"); name.required = true;
+    const size = el("input"); size.type = "number"; size.min = "1"; size.value = "10";
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Size GiB", size));
+    form.append(el("strong", "New volume"), row);
+    const go = el("button", "Create volume"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        await api("POST", "/volume/volumes", { name: name.value.trim(), spec: { size_gib: Number(size.value) } });
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    const attach = el("form"); attach.className = "create"; attach.autocomplete = "off";
+    const volName = el("input"); volName.required = true; volName.placeholder = "data";
+    const machName = el("input"); machName.required = true; machName.placeholder = "demo";
+    const device = el("input"); device.placeholder = "vdb";
+    const arow = el("div"); arow.className = "row";
+    arow.append(field("Volume", volName), field("Machine", machName), field("Device", device));
+    const attachGo = el("button", "Attach volume"); attachGo.className = "primary"; attachGo.type = "submit";
+    const detachGo = el("button", "Detach volume"); detachGo.type = "button";
+    attach.append(el("strong", "Attach"), arow, attachGo, document.createTextNode(" "), detachGo);
+    attach.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      attachGo.disabled = true;
+      try {
+        const vol = await api("GET", "/volume/volumes/" + encodeURIComponent(volName.value.trim()));
+        const mach = await api("GET", "/compute/machines/" + encodeURIComponent(machName.value.trim()));
+        const body = { machine: mach.id };
+        const dev = device.value.trim();
+        if (dev) body.device = dev;
+        await api("POST", "/volume/volumes/" + vol.id + "/attach", body);
+        await render();
+      } catch (e) { setErr(e.message); }
+      attachGo.disabled = false;
+    });
+    detachGo.addEventListener("click", async () => {
+      setErr("");
+      detachGo.disabled = true;
+      try {
+        const vol = await api("GET", "/volume/volumes/" + encodeURIComponent(volName.value.trim()));
+        await api("POST", "/volume/volumes/" + vol.id + "/detach");
+        await render();
+      } catch (e) { setErr(e.message); }
+      detachGo.disabled = false;
+    });
+    const snap = el("form"); snap.className = "create"; snap.autocomplete = "off";
+    const snapName = el("input"); snapName.required = true; snapName.placeholder = "data-1";
+    const snapVol = el("input"); snapVol.required = true; snapVol.placeholder = "data";
+    const srow = el("div"); srow.className = "row";
+    srow.append(field("Snapshot name", snapName), field("Volume name", snapVol));
+    const snapGo = el("button", "Create snapshot"); snapGo.className = "primary"; snapGo.type = "submit";
+    snap.append(el("strong", "New snapshot"), srow, snapGo);
+    snap.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      snapGo.disabled = true;
+      try {
+        const vol = await api("GET", "/volume/volumes/" + encodeURIComponent(snapVol.value.trim()));
+        await api("POST", "/volume/snapshots", { name: snapName.value.trim(), spec: { volume: vol.id } });
+        snapName.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      snapGo.disabled = false;
+    });
+    wrap.append(form, attach, snap);
+    return wrap;
+  }
+  if (current === "fips") {
+    const wrap = el("div");
+    const name = el("input"); name.required = true; name.placeholder = "demo";
+    const network = el("input"); network.required = true; network.placeholder = "fleet";
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("External network", network));
+    form.append(el("strong", "New floating IP"), row);
+    const go = el("button", "Create floating IP"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const net = await api("GET", "/network/networks/" + encodeURIComponent(network.value.trim()));
+        await api("POST", "/network/floating-ips", { name: name.value.trim(), spec: { network: net.id } });
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    const assoc = el("form"); assoc.className = "create"; assoc.autocomplete = "off";
+    const fipName = el("input"); fipName.required = true; fipName.placeholder = "demo";
+    const machName = el("input"); machName.required = true; machName.placeholder = "demo";
+    const arow = el("div"); arow.className = "row";
+    arow.append(field("Floating IP", fipName), field("Machine", machName));
+    const ago = el("button", "Associate"); ago.className = "primary"; ago.type = "submit";
+    assoc.append(el("strong", "Associate"), arow, ago);
+    assoc.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      ago.disabled = true;
+      try {
+        const fip = await api("GET", "/network/floating-ips/" + encodeURIComponent(fipName.value.trim()));
+        const mach = await api("GET", "/compute/machines/" + encodeURIComponent(machName.value.trim()));
+        await api("POST", "/network/floating-ips/" + encodeURIComponent(fip.id) + "/associate", { machine: mach.id });
+        await render();
+      } catch (e) { setErr(e.message); }
+      ago.disabled = false;
+    });
+    wrap.append(form, assoc);
+    return wrap;
+  }
+  if (current === "images") {
+    const name = el("input"); name.required = true; name.placeholder = "ubuntu-24.04";
+    const format = el("select");
+    format.append(option("qcow2"), option("raw"), option("oci"));
+    const url = el("input"); url.required = true; url.placeholder = "https://example.com/ubuntu-24.04.qcow2";
+    form.append(el("strong", "Import image"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Format", format), field("URL", url));
+    form.append(row);
+    const go = el("button", "Import"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      let created = null;
+      try {
+        created = await api("POST", "/image/images", {
+          name: name.value.trim(),
+          spec: { format: format.value || "qcow2" },
+        });
+        await api("POST", "/image/images/" + encodeURIComponent(created.id) + "/import", { url: url.value.trim() });
+        name.value = "";
+        url.value = "";
+        await render();
+      } catch (e) {
+        setErr(e.message);
+        if (created) {
+          name.value = "";
+          url.value = "";
+          await render().catch(() => {});
+          setErr(e.message);
+        }
+      }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "buckets") {
+    const name = el("input"); name.required = true;
+    form.append(field("Bucket name", name));
+    const go = el("button", "Create bucket"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      try {
+        await api("POST", "/silo/buckets", { name: name.value.trim() });
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+    });
+    return form;
+  }
+  if (current === "projects") {
+    const name = el("input"); name.required = true;
+    const desc = el("input");
+    const enabled = el("select");
+    enabled.append(option("true", "yes"), option("false", "no"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Description", desc), field("Enabled", enabled));
+    form.append(el("strong", "New project"), row);
+    const go = el("button", "Create project"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const body = { name: name.value.trim(), enabled: enabled.value === "true" };
+        const d = desc.value.trim();
+        if (d) body.description = d;
+        await api("POST", "/identity/projects", body);
+        name.value = ""; desc.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "users") {
+    const name = el("input"); name.required = true; name.autocomplete = "off";
+    const kind = el("select");
+    kind.append(option("user", "user"), option("service_account", "service account"));
+    const email = el("input"); email.type = "email"; email.autocomplete = "off";
+    const password = el("input");
+    password.type = "password";
+    password.autocomplete = "new-password";
+    password.spellcheck = false;
+    const enabled = el("select");
+    enabled.append(option("true", "yes"), option("false", "no"));
+    form.append(el("strong", "New user"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Kind", kind), field("Email", email), field("Enabled", enabled));
+    form.append(row, field("Password", password));
+    const go = el("button", "Create user"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const body = { name: name.value.trim(), kind: kind.value, enabled: enabled.value === "true" };
+        const em = email.value.trim();
+        if (em) body.email = em;
+        const pw = password.value;
+        if (pw) body.password = pw;
+        await api("POST", "/identity/principals", body);
+        password.value = "";
+        name.value = "";
+        email.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "keys") {
+    const name = el("input"); name.required = true; name.placeholder = "laptop"; name.autocomplete = "off";
+    form.append(field("Name", name));
+    const go = el("button", "Create key"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        const data = await api("POST", "/identity/keys", { name: name.value.trim() });
+        keyOnce = data && data.secret ? String(data.secret) : "";
+        name.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  if (current === "dns") {
+    const name = el("input"); name.required = true; name.placeholder = "lab";
+    const apex = el("input"); apex.required = true; apex.placeholder = "lab.cloud.";
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Apex", apex));
+    form.append(el("strong", "New zone"), row);
+    const go = el("button", "Create zone"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      setErr("");
+      go.disabled = true;
+      try {
+        await api("POST", "/dns/zones", {
+          name: name.value.trim(),
+          labels: { "pistack.io/auto": "true" },
+          spec: { name: apex.value.trim(), kind: { type: "primary" } },
+        });
+        name.value = "";
+        apex.value = "";
+        await render();
+      } catch (e) { setErr(e.message); }
+      go.disabled = false;
+    });
+    return form;
+  }
+  return null;
+}
+
+function simpleTable(cols, items) {
+  const table = el("table");
+  const head = el("tr");
+  for (const c of cols) head.append(el("th", c[0]));
+  const thead = el("thead");
+  thead.append(head);
+  table.append(thead);
+  const body = el("tbody");
+  for (const item of items) {
+    const tr = el("tr");
+    for (const c of cols) {
+      const value = c[1](item);
+      const td = el("td", show(value));
+      if (c[0] === "Phase" || c[0] === "Power") td.className = "phase " + String(value || "");
+      tr.append(td);
+    }
+    body.append(tr);
+  }
+  if (!items.length) {
+    const tr = el("tr");
+    const td = el("td", "Nothing here yet.");
+    td.colSpan = cols.length;
+    tr.append(td);
+    body.append(tr);
+  }
+  table.append(body);
+  return table;
+}
+
+function line(k, v, phase) {
+  const p = el("p");
+  p.append(el("span", k, "k"));
+  const val = el("span", show(v));
+  if (phase) val.className = "phase " + String(v || "");
+  p.append(val);
+  return p;
+}
+
+function openConsole(card, id) {
+  if (card.querySelector("canvas.screen")) return;
+  const status = el("p", "Connecting", "sub");
+  const canvas = el("canvas", null, "screen");
+  canvas.tabIndex = 0;
+  card.append(status, canvas);
+  const ctx = canvas.getContext("2d");
+  let ws = null;
+  let buf = new Uint8Array(0);
+  let off = 0;
+  let stage = "version";
+  let pf = null;
+  let fbW = 0;
+  let fbH = 0;
+  let rectsLeft = 0;
+  let rect = null;
+  let rawLeft = 0;
+  let pending = 0;
+  let buttons = 0;
+
+  function append(chunk) {
+    if (off > 65536) {
+      buf = buf.slice(off);
+      off = 0;
+    }
+    const next = new Uint8Array(buf.length - off + chunk.length);
+    next.set(buf.subarray(off), 0);
+    next.set(chunk, buf.length - off);
+    buf = next;
+    off = 0;
+  }
+  function take(n) {
+    if (buf.length - off < n) return null;
+    const out = buf.subarray(off, off + n);
+    off += n;
+    return out;
+  }
+  function u16(a, o) { return (a[o] << 8) | a[o + 1]; }
+  function u32(a, o) { return ((a[o] << 24) | (a[o + 1] << 16) | (a[o + 2] << 8) | a[o + 3]) >>> 0; }
+  function i32(a, o) { return (a[o] << 24) | (a[o + 1] << 16) | (a[o + 2] << 8) | a[o + 3]; }
+  function send(bytes) {
+    if (ws && ws.readyState === 1) ws.send(bytes);
+  }
+  function fail(text) {
+    status.textContent = text;
+    stage = "dead";
+    try { if (ws) ws.close(); } catch (e) {}
+  }
+  function requestFb(incremental) {
+    const m = new Uint8Array(10);
+    m[0] = 3;
+    m[1] = incremental ? 1 : 0;
+    m[6] = (fbW >> 8) & 255;
+    m[7] = fbW & 255;
+    m[8] = (fbH >> 8) & 255;
+    m[9] = fbH & 255;
+    send(m);
+  }
+  function paint(r, pixels) {
+    const img = ctx.createImageData(r.w, r.h);
+    const view = new DataView(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+    for (let i = 0; i < r.w * r.h; i++) {
+      const v = pf.big ? view.getUint32(i * 4, false) : view.getUint32(i * 4, true);
+      let red = (v >>> pf.redShift) & pf.redMax;
+      let green = (v >>> pf.greenShift) & pf.greenMax;
+      let blue = (v >>> pf.blueShift) & pf.blueMax;
+      if (pf.redMax && pf.redMax !== 255) red = Math.round(red * 255 / pf.redMax);
+      if (pf.greenMax && pf.greenMax !== 255) green = Math.round(green * 255 / pf.greenMax);
+      if (pf.blueMax && pf.blueMax !== 255) blue = Math.round(blue * 255 / pf.blueMax);
+      const o = i * 4;
+      img.data[o] = red;
+      img.data[o + 1] = green;
+      img.data[o + 2] = blue;
+      img.data[o + 3] = 255;
+    }
+    ctx.putImageData(img, r.x, r.y);
+  }
+  function pump() {
+    while (stage !== "dead") {
+      if (stage === "version") {
+        const v = take(12);
+        if (!v) return;
+        let s = "";
+        for (const b of v) s += String.fromCharCode(b);
+        if (s !== "RFB 003.008\n") { fail("unexpected RFB version"); return; }
+        send(new TextEncoder().encode("RFB 003.008\n"));
+        stage = "sec-count";
+        continue;
+      }
+      if (stage === "sec-count") {
+        const n = take(1);
+        if (!n) return;
+        if (n[0] === 0) { fail("VNC refused the connection"); return; }
+        pending = n[0];
+        stage = "sec-types";
+        continue;
+      }
+      if (stage === "sec-types") {
+        const types = take(pending);
+        if (!types) return;
+        let none = false;
+        for (const b of types) if (b === 1) none = true;
+        if (!none) { fail("VNC security is not None"); return; }
+        send(new Uint8Array([1]));
+        stage = "sec-result";
+        continue;
+      }
+      if (stage === "sec-result") {
+        const r = take(4);
+        if (!r) return;
+        if (u32(r, 0) !== 0) { fail("VNC security rejected"); return; }
+        send(new Uint8Array([1]));
+        stage = "init";
+        continue;
+      }
+      if (stage === "init") {
+        const h = take(24);
+        if (!h) return;
+        fbW = u16(h, 0);
+        fbH = u16(h, 2);
+        if (h[4] !== 32) { fail("framebuffer is " + h[4] + " bpp"); return; }
+        pf = {
+          big: h[6] === 1,
+          redMax: u16(h, 8),
+          greenMax: u16(h, 10),
+          blueMax: u16(h, 12),
+          redShift: h[14],
+          greenShift: h[15],
+          blueShift: h[16],
+        };
+        pending = u32(h, 20);
+        stage = "name";
+        continue;
+      }
+      if (stage === "name") {
+        const name = take(pending);
+        if (!name) return;
+        canvas.width = fbW;
+        canvas.height = fbH;
+        status.textContent = fbW + "×" + fbH;
+        const enc = new Uint8Array(8);
+        enc[0] = 2;
+        enc[3] = 1;
+        send(enc);
+        requestFb(false);
+        stage = "msg";
+        continue;
+      }
+      if (stage === "msg") {
+        const t = take(1);
+        if (!t) return;
+        if (t[0] === 0) { stage = "fbu"; continue; }
+        if (t[0] === 2) continue;
+        if (t[0] === 3) { stage = "cut"; continue; }
+        fail("unknown server message " + t[0]);
+        return;
+      }
+      if (stage === "fbu") {
+        const h = take(3);
+        if (!h) return;
+        rectsLeft = u16(h, 1);
+        if (!rectsLeft) { requestFb(true); stage = "msg"; continue; }
+        stage = "rect";
+        continue;
+      }
+      if (stage === "rect") {
+        const h = take(12);
+        if (!h) return;
+        rect = { x: u16(h, 0), y: u16(h, 2), w: u16(h, 4), h: u16(h, 6), enc: i32(h, 8) };
+        if (rect.enc !== 0) { fail("encoding " + rect.enc + " is not Raw"); return; }
+        rawLeft = rect.w * rect.h * 4;
+        stage = "raw";
+        continue;
+      }
+      if (stage === "raw") {
+        const pixels = take(rawLeft);
+        if (!pixels) return;
+        paint(rect, pixels);
+        rectsLeft -= 1;
+        if (rectsLeft > 0) stage = "rect";
+        else { requestFb(true); stage = "msg"; }
+        continue;
+      }
+      if (stage === "cut") {
+        const h = take(7);
+        if (!h) return;
+        pending = u32(h, 3);
+        stage = "cut-body";
+        continue;
+      }
+      if (stage === "cut-body") {
+        if (!take(pending)) return;
+        stage = "msg";
+        continue;
+      }
+      return;
+    }
+  }
+  function pointer(ev, mask) {
+    if (!fbW || stage === "dead") return;
+    const box = canvas.getBoundingClientRect();
+    if (!box.width || !box.height) return;
+    const x = Math.max(0, Math.min(fbW - 1, Math.floor((ev.clientX - box.left) * (fbW / box.width))));
+    const y = Math.max(0, Math.min(fbH - 1, Math.floor((ev.clientY - box.top) * (fbH / box.height))));
+    const m = new Uint8Array(6);
+    m[0] = 5;
+    m[1] = mask & 255;
+    m[2] = (x >> 8) & 255;
+    m[3] = x & 255;
+    m[4] = (y >> 8) & 255;
+    m[5] = y & 255;
+    send(m);
+  }
+  canvas.addEventListener("pointerdown", (ev) => {
+    canvas.focus();
+    ev.preventDefault();
+    buttons |= (1 << ev.button);
+    pointer(ev, buttons);
+  });
+  canvas.addEventListener("pointerup", (ev) => {
+    buttons &= ~(1 << ev.button);
+    pointer(ev, buttons);
+  });
+  canvas.addEventListener("pointermove", (ev) => { pointer(ev, buttons); });
+  canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  function keysym(ev) {
+    const named = {
+      Enter: 0xff0d, Backspace: 0xff08, Tab: 0xff09, Escape: 0xff1b,
+      ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+      Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+      Insert: 0xff63, Delete: 0xffff, " ": 0x20,
+      Shift: 0xffe1, Control: 0xffe3, Alt: 0xffe9, Meta: 0xffe7,
+    };
+    if (named[ev.key] != null) return named[ev.key];
+    if (ev.key.length === 1) return ev.key.charCodeAt(0);
+    return null;
+  }
+  function sendKey(k, down) {
+    const m = new Uint8Array(8);
+    m[0] = 4;
+    m[1] = down;
+    m[4] = (k >>> 24) & 255;
+    m[5] = (k >>> 16) & 255;
+    m[6] = (k >>> 8) & 255;
+    m[7] = k & 255;
+    send(m);
+  }
+  canvas.addEventListener("keydown", (ev) => {
+    const k = keysym(ev);
+    if (k == null) return;
+    ev.preventDefault();
+    sendKey(k, 1);
+  });
+  canvas.addEventListener("keyup", (ev) => {
+    const k = keysym(ev);
+    if (k == null) return;
+    ev.preventDefault();
+    sendKey(k, 0);
+  });
+
+  api("GET", "/compute/machines/" + encodeURIComponent(id) + "/console").then((data) => {
+    const path = (data && data.websocket) || "";
+    if (!path.includes("console/vnc")) {
+      status.textContent = "console/vnc path missing";
+      return;
+    }
+    const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    ws = new WebSocket(proto + location.host + path);
+    ws.binaryType = "arraybuffer";
+    ws.addEventListener("message", (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) { fail("console frame was not binary"); return; }
+      append(new Uint8Array(ev.data));
+      pump();
+    });
+    ws.addEventListener("close", () => {
+      if (stage !== "dead") status.textContent = "Console closed";
+    });
+    ws.addEventListener("error", () => { status.textContent = "Console connection failed"; });
+  }).catch((e) => { status.textContent = e.message; });
+}
+
+async function renderMachine(id, gen) {
+  const root = document.getElementById("view");
+  root.replaceChildren();
+  const tools = el("div"); tools.className = "tools";
+  const back = el("button", "Back"); back.type = "button";
+  back.addEventListener("click", () => { openMachine = null; render(); });
+  const refresh = el("button", "Refresh"); refresh.type = "button";
+  refresh.addEventListener("click", () => render());
+  tools.append(back, el("h2", "Machine"), refresh);
+  root.append(tools);
+  let machine;
+  try {
+    machine = await api("GET", "/compute/machines/" + encodeURIComponent(id));
+  } catch (e) {
+    if (gen !== renderGen) return;
+    setErr(e.message);
+    return;
+  }
+  if (gen !== renderGen) return;
+  let fips = [];
+  let vols = [];
+  const problems = [];
+  try {
+    fips = itemsOf(await api("GET", "/network/floating-ips"));
+  } catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  try {
+    const all = itemsOf(await api("GET", "/volume/volumes"));
+    vols = all.filter(v => v.status && String(v.status.attached_to || "") === String(machine.id));
+  } catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  if (problems.length) setErr(problems.join(" "));
+  const card = el("div"); card.className = "detail";
+  const addrs = ((machine.status && machine.status.addresses) || []).join(", ");
+  card.append(
+    line("Name", machine.name),
+    line("ID", machine.id),
+    line("Phase", machine.status && machine.status.phase, true),
+    line("Power", machine.status && machine.status.power, true),
+    line("Size", machine.spec && machine.spec.size),
+    line("Image", machine.spec && machine.spec.image),
+    line("Private addresses", addrs),
+  );
+  const matched = matchingFips(machine, fips);
+  if (!matched.length) {
+    card.append(line("Floating IP", ""), line("Fixed IP", ""));
+  } else {
+    for (const f of matched) {
+      card.append(line("Floating IP", f.spec && f.spec.address));
+      card.append(line("Fixed IP", f.status && f.status.fixed_ip));
+    }
+  }
+  card.append(el("h3", "Volumes"));
+  card.append(simpleTable([
+    ["Name", v => v.name],
+    ["GiB", v => v.spec && v.spec.size_gib],
+    ["Device", v => v.status && v.status.device],
+  ], vols));
+  const actions = el("div"); actions.className = "tools";
+  const screen = el("button", "Console"); screen.type = "button";
+  screen.addEventListener("click", () => { openConsole(card, machine.id); });
+  const reboot = el("button", "Reboot"); reboot.type = "button";
+  const start = el("button", "Start"); start.type = "button"; start.className = "primary";
+  const stop = el("button", "Stop"); stop.type = "button";
+  const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
+  const mid = encodeURIComponent(machine.id);
+  reboot.addEventListener("click", async () => {
+    setErr("");
+    try { await api("POST", "/compute/machines/" + mid + "/reboot"); await render(); }
+    catch (e) { setErr(e.message); }
+  });
+  start.addEventListener("click", async () => {
+    setErr("");
+    try { await api("POST", "/compute/machines/" + mid + "/start"); await render(); }
+    catch (e) { setErr(e.message); }
+  });
+  stop.addEventListener("click", async () => {
+    setErr("");
+    try { await api("POST", "/compute/machines/" + mid + "/stop"); await render(); }
+    catch (e) { setErr(e.message); }
+  });
+  del.addEventListener("click", async () => {
+    if (!confirm("Delete " + machine.name + "?")) return;
+    setErr("");
+    try {
+      await api("DELETE", "/compute/machines/" + mid);
+      openMachine = null;
+      await render();
+    } catch (e) { setErr(e.message); }
+  });
+  actions.append(screen, reboot, start, stop, del);
+  card.append(actions);
+  root.append(card);
+  const phase = machine.status && machine.status.phase;
+  if (["pending", "creating", "deleting"].includes(phase)) {
+    timer = setInterval(() => {
+      const viewEl = document.getElementById("view");
+      if (viewEl.contains(document.activeElement)) return;
+      render();
+    }, 3000);
+  }
+}
+
+async function renderDns(root, gen) {
+  let zones = [];
+  let records = [];
+  const problems = [];
+  try { zones = itemsOf(await api("GET", "/dns/zones")); }
+  catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  try { records = itemsOf(await api("GET", "/dns/recordsets")); }
+  catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  if (problems.length) setErr(problems.join(" "));
+  root.append(el("h3", "Zones"));
+  root.append(simpleTable([
+    ["Name", i => i.name],
+    ["Phase", i => i.status && i.status.phase],
+    ["Apex", i => i.spec && i.spec.name],
+  ], zones));
+  root.append(el("h3", "Records"));
+  root.append(simpleTable([
+    ["Name", i => i.spec && i.spec.name],
+    ["Type", i => i.spec && i.spec.type],
+    ["Records", i => ((i.spec && i.spec.records) || []).join(", ")],
+  ], records));
+}
+
+async function renderBalancers(root, gen) {
+  let lbs = [];
+  let listeners = [];
+  let pools = [];
+  const problems = [];
+  try { lbs = itemsOf(await api("GET", "/balancers/balancers")); }
+  catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  try { listeners = itemsOf(await api("GET", "/balancers/listeners")); }
+  catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  try { pools = itemsOf(await api("GET", "/balancers/pools")); }
+  catch (e) { problems.push(e.message); }
+  if (gen !== renderGen) return;
+  if (problems.length) setErr(problems.join(" "));
+  root.append(el("h3", "Balancers"));
+  root.append(simpleTable([
+    ["Name", i => i.name],
+    ["Phase", i => i.status && i.status.phase],
+    ["VIP", i => (i.status && i.status.vip) || (i.spec && i.spec.vip_address) || ""],
+    ["Network", i => i.spec && i.spec.vip_network],
+  ], lbs));
+  root.append(el("h3", "Listeners"));
+  root.append(simpleTable([
+    ["Name", i => i.name],
+    ["Phase", i => i.status && i.status.phase],
+    ["Protocol", i => protoText(i.spec && i.spec.protocol)],
+    ["Port", i => i.spec && i.spec.port],
+    ["Balancer", i => i.spec && i.spec.balancer],
+  ], listeners));
+  root.append(el("h3", "Pools"));
+  root.append(simpleTable([
+    ["Name", i => i.name],
+    ["Phase", i => i.status && i.status.phase],
+    ["Protocol", i => protoText(i.spec && i.spec.protocol)],
+    ["Algorithm", i => i.spec && i.spec.algorithm],
+    ["Members", i => i.status && i.status.members],
+    ["Balancer", i => i.spec && i.spec.balancer],
+  ], pools));
+}
+
+async function render() {
+  const gen = ++renderGen;
+  clearInterval(timer);
+  const view = VIEWS[current];
+  const root = document.getElementById("view");
+  root.replaceChildren();
+  document.getElementById("note").textContent = view.note || "";
+  setErr("");
+  if (current === "machines" && openMachine) {
+    await renderMachine(openMachine, gen);
+    return;
+  }
+  const tools = el("div"); tools.className = "tools";
+  tools.append(el("h2", view.title));
+  const refresh = el("button", "Refresh"); refresh.type = "button";
+  refresh.addEventListener("click", () => render());
+  tools.append(refresh);
+  root.append(tools);
+  if (current === "keys" && keyOnce) {
+    const shown = keyOnce;
+    keyOnce = null;
+    root.append(el("p", "Copy this key secret now. It is not shown again. " + shown, "once"));
+  }
+  const form = createForm();
+  if (form) root.append(form);
+  if (view.multi === "dns") { await renderDns(root, gen); return; }
+  if (view.multi === "balancers") { await renderBalancers(root, gen); return; }
+  let page;
+  try { page = await api("GET", view.path); }
+  catch (e) {
+    if (gen !== renderGen) return;
+    setErr(e.message);
+    return;
+  }
+  if (gen !== renderGen) return;
+  if (current === "machines") {
+    try {
+      const fp = await api("GET", "/network/floating-ips");
+      if (gen !== renderGen) return;
+      machineFips = itemsOf(fp);
+    } catch (e) {
+      if (gen !== renderGen) return;
+      machineFips = [];
+      setErr(e.message);
+    }
+  }
+  const items = itemsOf(page);
+  root.append(simpleTable(view.cols, items));
+  const table = root.lastElementChild;
+  const body = table.querySelector("tbody");
+  if (view.actions || view.rules) {
+    const head = table.querySelector("tr");
+    if (view.actions) head.append(el("th", ""));
+    const rows = body.querySelectorAll("tr");
+    if (!items.length) {
+      const td = rows[0] && rows[0].firstChild;
+      if (td) td.colSpan = view.cols.length + (view.actions ? 1 : 0);
+    } else {
+      items.forEach((item, idx) => {
+        const tr = rows[idx];
+        if (!tr) return;
+        if (current === "machines") {
+          const nameCell = tr.firstChild;
+          if (nameCell) {
+            nameCell.replaceChildren();
+            const btn = el("button", item.name || "—");
+            btn.type = "button";
+            btn.className = "linkish";
+            btn.addEventListener("click", () => { openMachine = item.id; render(); });
+            nameCell.append(btn);
+          }
+        }
+        if (view.rules) {
+          const rules = (item.spec && item.spec.rules) || [];
+          const cell = tr.children[2];
+          if (cell) {
+            cell.replaceChildren(document.createTextNode(String(rules.length)));
+            if (rules.length) {
+              const ul = el("ul"); ul.className = "rules";
+              for (const r of rules) ul.append(el("li", ruleLine(r)));
+              cell.append(ul);
+            }
+          }
+        }
+        if (view.actions) {
+          const td = el("td");
+          const start = el("button", "Start"); start.type = "button";
+          const stop = el("button", "Stop"); stop.type = "button";
+          const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
+          start.addEventListener("click", async () => {
+            setErr("");
+            try { await api("POST", view.path + "/" + item.id + "/start"); await render(); }
+            catch (e) { setErr(e.message); }
+          });
+          stop.addEventListener("click", async () => {
+            setErr("");
+            try { await api("POST", view.path + "/" + item.id + "/stop"); await render(); }
+            catch (e) { setErr(e.message); }
+          });
+          del.addEventListener("click", async () => {
+            if (!confirm("Delete " + item.name + "?")) return;
+            setErr("");
+            try { await api("DELETE", view.path + "/" + item.id); await render(); }
+            catch (e) { setErr(e.message); }
+          });
+          td.append(start, document.createTextNode(" "), stop, document.createTextNode(" "), del);
+          tr.append(td);
+        }
+      });
+    }
+  }
+  if (current === "volumes") {
+    try {
+      const snaps = itemsOf(await api("GET", "/volume/snapshots"));
+      if (gen !== renderGen) return;
+      root.append(el("h3", "Snapshots"));
+      root.append(simpleTable([
+        ["Name", i => i.name],
+        ["Phase", i => i.status && i.status.phase],
+        ["Volume", i => i.spec && i.spec.volume],
+        ["GiB", i => i.status && i.status.size_gib],
+      ], snaps));
+    } catch (e) {
+      if (gen !== renderGen) return;
+      setErr(e.message);
+    }
+  }
+  if (current === "machines" && items.some(i => ["pending", "creating", "deleting"].includes(i.status && i.status.phase))) {
+    timer = setInterval(() => {
+      const viewEl = document.getElementById("view");
+      if (viewEl.contains(document.activeElement)) return;
+      render();
+    }, 3000);
+  }
+}
+
+if (token()) {
+  api("GET", "/identity/tokens/self").then((who) => {
+    document.getElementById("who").textContent = (who.principal_name || "signed in") + (who.project ? " · " + who.project : "");
+    showApp();
+    render();
+  }).catch(() => showLogin());
+}
+</script>
+</body>
+</html>
