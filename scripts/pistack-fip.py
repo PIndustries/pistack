@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 P. Industries LLC and PiStack contributors
-"""Install or remove one floating-IP NAT on the fleet WireGuard interface.
+"""Install or remove one floating-IP NAT on the configured underlay interface.
 
-The address must come from 10.66.66.80/28. It is added on wg-fleet only, and
-DNAT accepts traffic sourced from 10.66.66.0/24. The public NIC is never
-given the address.
+The pool, guest network, source CIDR, interface, and host address come from
+the environment. A missing value refuses the command. The public NIC is
+never named here and is never given the address.
 
-    pistack-fip ensure --id fip-... --floating 10.66.66.82 --fixed 10.88.0.187
+    PISTACK_FIP_POOL=10.20.0.80/28
+    PISTACK_FIP_GUESTS=10.80.0.0/24
+    PISTACK_FIP_SOURCE=10.20.0.0/24
+    PISTACK_FIP_IFACE=underlay0
+    PISTACK_FIP_HOST=10.20.0.1
+    pistack-fip ensure --id fip-... --floating 10.20.0.82 --fixed 10.80.0.187
     pistack-fip delete --id fip-...
     pistack-fip ensure ... --dry-run
-    pistack-fip sg --fixed 10.88.0.187 --policy - <<'JSON'
-    {"ingress":[{"proto":"tcp","port_min":22,"port_max":22,"cidr":"10.66.66.0/24"}],"egress":[]}
+    pistack-fip sg --fixed 10.80.0.187 --policy - <<'JSON'
+    {"ingress":[{"proto":"tcp","port_min":22,"port_max":22,"cidr":"10.20.0.0/24"}],"egress":[]}
     JSON
-    pistack-fip sg --fixed 10.88.0.187 --clear
-    pistack-fip guest-cidr add --cidr 10.90.0.0/24
+    pistack-fip sg --fixed 10.80.0.187 --clear
+    pistack-fip guest-cidr add --cidr 10.70.0.0/24
     pistack-fip metadata-on --bridge pistack0
     pistack-fip restore
     pistack-fip --self-test
@@ -24,11 +29,11 @@ comment prefix pistack-sg-<fixed>. ensure still installs the blanket
 FORWARD accept. sg removes that accept only after a non-empty ingress
 policy is in place. --dry-run prints commands and changes nothing.
 
-Fixed addresses must sit in 10.88.0.0/24 or a CIDR added to
-$PISTACK_FIP_STATE/guest-cidrs. metadata-on puts 169.254.169.254/32 on
+Fixed addresses must sit in the network named by PISTACK_FIP_GUESTS,
+or in a CIDR added to $PISTACK_FIP_STATE/guest-cidrs. metadata-on puts 169.254.169.254/32 on
 that bridge, sets route_localnet only there, and DNATs tcp/80 to
 127.0.0.1:18880. filter INPUT accepts tcp/18880 only from that bridge.
-It does not DNAT on wg-fleet and it does not open the public NIC.
+It does not DNAT on the underlay interface and it does not open the public NIC.
 metadata-on records that bridge, once, in $PISTACK_FIP_STATE/bridges.
 restore replays stored floating IPs, security groups, and those bridges.
 guest-cidrs is left as stored. A missing or empty state directory prints
@@ -50,13 +55,7 @@ import sys
 import tempfile
 from typing import NoReturn, Optional
 
-POOL = ipaddress.ip_network("10.66.66.80/28")
-GUESTS = ipaddress.ip_network("10.88.0.0/24")
-SOURCE = ipaddress.ip_network("10.66.66.0/24")
-IFACE = "wg-fleet"
-GATEWAY = ipaddress.ip_address("10.88.0.1")
-HOST = ipaddress.ip_address("10.66.66.1")
-# Shorter than this is a fleet-sized (or larger) network, not a guest subnet.
+# Shorter than this is a network larger than a guest subnet.
 MIN_GUEST_PREFIX = 20
 METADATA_ADDR = "169.254.169.254"
 METADATA_COMMENT = "pistack-metadata"
@@ -76,6 +75,54 @@ def die(msg: str) -> NoReturn:
     raise SystemExit(2)
 
 
+def _required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        die(f"{name} is not set")
+    return value
+
+
+def _network(name: str) -> ipaddress.IPv4Network:
+    text = _required(name)
+    try:
+        net = ipaddress.ip_network(text, strict=True)
+    except ValueError:
+        die(f"{name} {text} is not an ipv4 network")
+    if not isinstance(net, ipaddress.IPv4Network):
+        die(f"{name} must be ipv4")
+    return net
+
+
+def pool() -> ipaddress.IPv4Network:
+    return _network("PISTACK_FIP_POOL")
+
+
+def guests() -> ipaddress.IPv4Network:
+    return _network("PISTACK_FIP_GUESTS")
+
+
+def source() -> ipaddress.IPv4Network:
+    return _network("PISTACK_FIP_SOURCE")
+
+
+def iface() -> str:
+    value = _required("PISTACK_FIP_IFACE")
+    if value.startswith("-") or any(c.isspace() or c in "/;|&$`\"'\\" for c in value):
+        die(f"PISTACK_FIP_IFACE {value} is not an interface name")
+    return value
+
+
+def host_addr() -> ipaddress.IPv4Address:
+    return parse_ip(_required("PISTACK_FIP_HOST"), "PISTACK_FIP_HOST")
+
+
+def gateway() -> ipaddress.IPv4Address:
+    gw = conventional_gateway(guests())
+    if gw is None:
+        die(f"{guests()} has no gateway address")
+    return gw
+
+
 def parse_ip(text: str, what: str) -> ipaddress.IPv4Address:
     try:
         ip = ipaddress.ip_address(text)
@@ -93,10 +140,11 @@ def check_id(value: str) -> str:
 
 
 def check_floating(ip: ipaddress.IPv4Address) -> None:
-    if ip not in POOL or ip in (POOL.network_address, POOL.broadcast_address):
-        die(f"{ip} is outside the floating pool {POOL}")
-    if ip == HOST or ip in peer_addrs():
-        die(f"{ip} is already a fleet peer address")
+    net = pool()
+    if ip not in net or ip in (net.network_address, net.broadcast_address):
+        die(f"{ip} is outside the floating pool {net}")
+    if ip == host_addr() or ip in peer_addrs():
+        die(f"{ip} is already an underlay address")
 
 
 def state_dir() -> str:
@@ -106,8 +154,8 @@ def state_dir() -> str:
 
 def check_fixed(ip: ipaddress.IPv4Address) -> None:
     allowed = allowed_guest_cidrs()
-    # 10.88.0.1 stays refused even if a later CIDR would otherwise contain it.
-    if ip != GATEWAY and any(fixed_usable(ip, net) for net in allowed):
+    # The guest gateway stays refused even if a later CIDR would contain it.
+    if ip != gateway() and any(fixed_usable(ip, net) for net in allowed):
         return
     shown = ", ".join(str(net) for net in allowed)
     die(f"{ip} is not a guest address on {shown}")
@@ -153,12 +201,12 @@ def parse_guest_cidr(text: str) -> ipaddress.IPv4Network:
 def refuse_guest_cidr(net: ipaddress.IPv4Network) -> None:
     if net.prefixlen < MIN_GUEST_PREFIX:
         die(f"{net} prefix length is under {MIN_GUEST_PREFIX}")
-    if HOST in net:
-        die(f"{net} contains {HOST}")
-    if net.overlaps(POOL):
-        die(f"{net} overlaps {POOL}")
-    if net.overlaps(SOURCE):
-        die(f"{net} overlaps {SOURCE}")
+    if host_addr() in net:
+        die(f"{net} contains {host_addr()}")
+    if net.overlaps(pool()):
+        die(f"{net} overlaps {pool()}")
+    if net.overlaps(source()):
+        die(f"{net} overlaps {source()}")
 
 
 def stored_guest_cidrs() -> list[ipaddress.IPv4Network]:
@@ -187,8 +235,8 @@ def stored_guest_cidrs() -> list[ipaddress.IPv4Network]:
 
 
 def allowed_guest_cidrs() -> list[ipaddress.IPv4Network]:
-    """10.88.0.0/24 is always allowed, even when guest-cidrs is missing."""
-    found = [GUESTS]
+    """The configured guest network is always allowed, even when guest-cidrs is missing."""
+    found = [guests()]
     for net in stored_guest_cidrs():
         if net not in found:
             found.append(net)
@@ -384,7 +432,7 @@ def metadata_on(bridge: str) -> None:
     on the bridge already. DNAT in PREROUTING aims it at the loopback
     listener. route_localnet is enabled on that bridge only, and filter
     INPUT accepts tcp/18880 only from that bridge. The previous REDIRECT
-    rule is removed. Nothing is opened on wg-fleet or the public NIC.
+    rule is removed. Nothing is opened on the underlay interface or the public NIC.
     The name is recorded for restore only after check_bridge accepts it.
     """
     _apply_metadata(record_metadata_bridge(bridge))
@@ -407,7 +455,7 @@ def _apply_metadata(name: str) -> None:
 def peer_addrs() -> set[ipaddress.IPv4Address]:
     try:
         out = subprocess.run(
-            ["wg", "show", IFACE, "allowed-ips"],
+            ["wg", "show", iface(), "allowed-ips"],
             check=False,
             capture_output=True,
             text=True,
@@ -464,7 +512,7 @@ def nat_specs(fip_id: str, floating: str, fixed: str) -> list[tuple[str, str, li
                 "PREROUTING",
                 [
                     "-s",
-                    str(SOURCE),
+                    str(source()),
                     "-d",
                     f"{floating}/32",
                     "-p",
@@ -488,7 +536,7 @@ def nat_specs(fip_id: str, floating: str, fixed: str) -> list[tuple[str, str, li
                     "-s",
                     f"{fixed}/32",
                     "-d",
-                    str(SOURCE),
+                    str(source()),
                     "-p",
                     proto,
                     "-m",
@@ -508,7 +556,7 @@ def nat_specs(fip_id: str, floating: str, fixed: str) -> list[tuple[str, str, li
             "FORWARD",
             [
                 "-s",
-                str(SOURCE),
+                str(source()),
                 "-d",
                 f"{fixed}/32",
                 "-m",
@@ -555,7 +603,7 @@ def ensure(fip_id: str, floating: str, fixed: str, dry: bool) -> None:
         if group_installed and table == "filter":
             continue
         run(["iptables", "-t", table, "-I", chain, "1", *spec], dry)
-    run(["ip", "addr", "replace", f"{floating}/32", "dev", IFACE], dry)
+    run(["ip", "addr", "replace", f"{floating}/32", "dev", iface()], dry)
     if not dry:
         write_state(fip_id, floating, fixed)
         # Blanket FORWARD accepts are inserted at position 1. If a group
@@ -564,7 +612,7 @@ def ensure(fip_id: str, floating: str, fixed: str, dry: bool) -> None:
 
 
 def del_addr(floating: str, dry: bool) -> None:
-    cmd = ["ip", "addr", "del", f"{floating}/32", "dev", IFACE]
+    cmd = ["ip", "addr", "del", f"{floating}/32", "dev", iface()]
     if dry:
         print(" ".join(cmd))
         return
@@ -1195,6 +1243,12 @@ def self_test() -> None:
     State goes to a temp directory via PISTACK_FIP_STATE. iptables, ip, and
     sysctl are not invoked.
     """
+    # Fixtures only. A real host sets these itself. Nothing here is built in.
+    os.environ["PISTACK_FIP_POOL"] = "10.66.66.80/28"
+    os.environ["PISTACK_FIP_GUESTS"] = "10.88.0.0/24"
+    os.environ["PISTACK_FIP_SOURCE"] = "10.66.66.0/24"
+    os.environ["PISTACK_FIP_IFACE"] = "underlay0"
+    os.environ["PISTACK_FIP_HOST"] = "10.66.66.1"
     saved_env = os.environ.get("PISTACK_FIP_STATE")
     td = tempfile.mkdtemp(prefix="pistack-fip-selftest-")
     os.environ["PISTACK_FIP_STATE"] = td

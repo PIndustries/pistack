@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Single-host floating IPs. Guests start on the libvirt NAT `10.88.0.0/24`.
-//! A floating address is drawn from `10.66.66.80/28` and installed on
-//! `wg-fleet` by `scripts/pistack-fip.py`. That helper is the privilege
-//! boundary: it refuses any address outside the pool, any fixed address
-//! outside the guest CIDR allow-list, and the public NIC.
+//! Single-host floating IPs. Guests start on the libvirt NAT network.
+//! `scripts/pistack-fip.py` installs each floating address on the underlay
+//! interface named by its environment. That helper is the privilege
+//! boundary: it refuses any address outside the configured pool, any fixed
+//! address outside the guest CIDR allow-list, and the public NIC.
 //!
 //! `ensure_subnet` adds a non-external IPv4 CIDR to that allow-list.
-//! External networks (the fleet pool) are not added. Networks, ports, and
+//! External networks are not added. Networks, ports, and
 //! routers have no virtual switch here, so those calls succeed and the
 //! reconciler can mark them ready. Floating IPs and security groups change
 //! the host: groups land in the filter chain `PISTACK-SG` through the same
