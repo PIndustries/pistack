@@ -2,7 +2,7 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Where image bytes live. `mold` keeps metadata in the state store and
-//! hands the bytes to an `ImageStore`: local disk today, `silo` (S3) later.
+//! hands the bytes to an `ImageStore`: a local directory, or a silo bucket.
 
 use async_trait::async_trait;
 use pistack_types::ApiResult;
