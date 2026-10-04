@@ -12,6 +12,7 @@
 
 use crate::provider::{LbProvider, Providers};
 use crate::types::*;
+use pistack_rpc::CommandQueue;
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Id, Meta};
 use std::net::IpAddr;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 pub struct Client {
     store: Store,
     providers: Providers,
+    queue: Option<CommandQueue>,
 }
 
 fn store_err(e: StoreError) -> ApiError {
@@ -29,11 +31,25 @@ fn store_err(e: StoreError) -> ApiError {
 
 impl Client {
     pub fn new(store: Store, providers: Providers) -> Self {
-        Self { store, providers }
+        Self {
+            store,
+            providers,
+            queue: None,
+        }
+    }
+
+    /// Queue used by an edge door. Without one, that door stays unavailable.
+    pub fn with_queue(mut self, queue: CommandQueue) -> Self {
+        self.queue = Some(queue);
+        self
     }
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn queue(&self) -> Option<&CommandQueue> {
+        self.queue.as_ref()
     }
     pub fn providers(&self) -> &Providers {
         &self.providers

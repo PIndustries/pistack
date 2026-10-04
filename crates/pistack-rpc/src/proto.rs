@@ -275,6 +275,9 @@ pub enum CommandKind {
     SyncOverlay,
     /// Live-migrate a running domain. The payload is [`MigrateRequest`].
     MigrateMachine,
+    /// Ask an edge host to publish a listener. The payload is the listener
+    /// id, the listen port, and the upstream. It does not power a host.
+    Publish,
 }
 
 impl std::fmt::Display for CommandKind {
@@ -289,6 +292,7 @@ impl std::fmt::Display for CommandKind {
             CommandKind::UnplugPort => "unplug_port",
             CommandKind::SyncOverlay => "sync_overlay",
             CommandKind::MigrateMachine => "migrate_machine",
+            CommandKind::Publish => "publish",
         };
         f.write_str(s)
     }

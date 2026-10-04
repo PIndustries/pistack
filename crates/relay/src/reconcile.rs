@@ -168,6 +168,10 @@ impl Client {
                         kind,
                         &listen,
                         &upstream,
+                        crate::door::DoorSide {
+                            store: self.store(),
+                            queue: self.queue(),
+                        },
                     )
                     .await
                     {
@@ -214,10 +218,15 @@ impl Client {
             }
             None => None,
         };
+        let tls = match &l.spec.protocol {
+            ListenerProtocol::Terminated { cert } => Some(crate::tls::load_kept(self.store(), cert)?),
+            _ => None,
+        };
         Ok(Some(ListenerView {
             balancer,
             listener: l.clone(),
             pool,
+            tls,
         }))
     }
 

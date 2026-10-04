@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! In-process L4 forwarder. One TCP socket per balancer.
+//! In-process L4 forwarder. One TCP socket per balancer, and a UDP socket
+//! when the listener is UDP.
 //!
 //! `ensure_balancer` binds `127.0.0.1:0` unless `spec.vip_address` is
 //! loopback or private, in which case it binds that address on an ephemeral
-//! port. `0.0.0.0`, public addresses, and multicast are refused so this
-//! process never listens on an unspecified or public interface.
+//! port. Unspecified, public, multicast, broadcast, link-local, and
+//! 100.64/10 addresses are refused.
 //! `provider_ref` is the bound socket, `127.0.0.1:PORT` when the bind
-//! address is loopback. The accept loop dials the first member and copies
-//! both directions. An empty member list, or a member that does not accept,
-//! is accepted and closed. A later `ensure_listener` replaces the member
-//! list without rebinding. `delete_listener` and `delete_balancer` stop the
-//! task and drop the socket.
+//! address is loopback. The TCP accept loop dials the first member and
+//! copies both directions. An empty TCP member list, or a member that does
+//! not accept, is accepted and closed. UDP copies datagrams to an up member
+//! and is not ready when that list is empty. A later `ensure_listener`
+//! replaces the member list without rebinding. `delete_listener` and
+//! `delete_balancer` stop the task and drop the socket.
 
 use super::{LbProvider, ListenerView, Realized};
 use crate::types::{Balancer, ListenerProtocol, Provider};
@@ -31,10 +33,11 @@ struct Slot {
     task: Option<JoinHandle<()>>,
     cancel: tokio_util::sync::CancellationToken,
     members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    udp: Option<crate::udp::UdpForward>,
 }
 
-/// Local TCP forwarder. Serves [`Provider::Ovn`] (L4). The Pingora provider
-/// remains the HTTP one.
+/// Local TCP forwarder. Serves [`Provider::Ovn`] (L4). HTTP stays on
+/// [`super::RelayL7Provider`].
 pub struct ForwardProvider {
     slots: parking_lot::Mutex<HashMap<Id, Slot>>,
 }
@@ -54,8 +57,11 @@ impl ForwardProvider {
 
     async fn stop(&self, id: &Id) {
         let slot = self.slots.lock().remove(id);
-        if let Some(slot) = slot {
+        if let Some(mut slot) = slot {
             slot.cancel.cancel();
+            if let Some(udp) = slot.udp.take() {
+                udp.shutdown().await;
+            }
             if let Some(task) = slot.task {
                 let _ = task.await;
             }
@@ -75,23 +81,8 @@ impl Drop for ForwardProvider {
     }
 }
 
-/// Loopback or private (RFC 1918 / IPv6 unique local). Unspecified, public,
-/// multicast, broadcast, and link-local are not allowed.
 fn vip_allowed(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
-                return false;
-            }
-            v4.is_loopback() || v4.is_private()
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_unspecified() || v6.is_multicast() {
-                return false;
-            }
-            v6.is_loopback() || v6.is_unique_local()
-        }
-    }
+    crate::bind::allowed(ip)
 }
 
 fn bind_target(lb: &Balancer) -> ApiResult<SocketAddr> {
@@ -198,6 +189,7 @@ impl LbProvider for ForwardProvider {
                 task: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 members: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                udp: None,
             },
         );
         Ok(realized(bound))
@@ -210,7 +202,7 @@ impl LbProvider for ForwardProvider {
 
     async fn ensure_listener(&self, view: &ListenerView) -> ApiResult<String> {
         if matches!(view.listener.spec.protocol, ListenerProtocol::Udp) {
-            return Err(ApiError::bad_request("forward provider is TCP only"));
+            return self.ensure_udp(view).await;
         }
         let addrs = member_addrs(view);
         let id = view.balancer.meta.id.clone();
@@ -235,6 +227,45 @@ impl LbProvider for ForwardProvider {
     async fn delete_listener(&self, balancer: &Id, _listener: &Id) -> ApiResult<()> {
         self.stop(balancer).await;
         Ok(())
+    }
+}
+
+impl ForwardProvider {
+    async fn ensure_udp(&self, view: &ListenerView) -> ApiResult<String> {
+        let targets = crate::udp::targets(view);
+        let id = view.balancer.meta.id.clone();
+        if targets.is_empty() {
+            if let Some(slot) = self.slots.lock().get(&id) {
+                if let Some(udp) = &slot.udp {
+                    udp.set_members(Vec::new());
+                }
+            }
+            return Err(ApiError::unavailable("udp pool has no up member"));
+        }
+        let ip = {
+            let slots = self.slots.lock();
+            let slot = slots.get(&id).ok_or_else(|| {
+                ApiError::bad_request("forward balancer is not bound")
+            })?;
+            if let Some(udp) = &slot.udp {
+                udp.set_members(targets);
+                return Ok(udp.bound().to_string());
+            }
+            slot.bound.ip()
+        };
+        let udp = crate::udp::UdpForward::bind(ip, targets).await?;
+        let bound = udp.bound().to_string();
+        let mut slots = self.slots.lock();
+        let slot = slots.get_mut(&id).ok_or_else(|| {
+            ApiError::bad_request("forward balancer is not bound")
+        })?;
+        if let Some(existing) = &slot.udp {
+            existing.set_members(crate::udp::targets(view));
+            drop(udp);
+            return Ok(existing.bound().to_string());
+        }
+        slot.udp = Some(udp);
+        Ok(bound)
     }
 }
 
@@ -308,7 +339,17 @@ mod tests {
                 status: ListenerStatus::default(),
             },
             pool: Some((pool, member_rows)),
+            tls: None,
         }
+    }
+
+    fn udp_view(lb: &Balancer, members: Vec<SocketAddr>) -> ListenerView {
+        let mut view = view_with(lb, members);
+        view.listener.spec.protocol = ListenerProtocol::Udp;
+        if let Some((pool, _)) = view.pool.as_mut() {
+            pool.spec.protocol = PoolProtocol::Udp;
+        }
+        view
     }
 
     async fn answer(listener: TcpListener, body: &'static [u8]) {
@@ -358,6 +399,8 @@ mod tests {
         assert!(!vip_allowed(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
         assert!(!vip_allowed(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
         assert!(!vip_allowed(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!vip_allowed("fe80::1".parse().unwrap()));
+        assert!(vip_allowed("fd00::1".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -459,5 +502,41 @@ mod tests {
             .expect("timed out")
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_copies_to_an_up_member_and_empty_is_not_ready() {
+        let p = ForwardProvider::new();
+        let lb = balancer(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        p.ensure_balancer(&lb).await.unwrap();
+        let empty = p.ensure_listener(&udp_view(&lb, vec![])).await.unwrap_err();
+        assert_eq!(empty.code, ErrorCode::Unavailable);
+        assert!(empty.message.contains("no up member"));
+
+        let member = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let member_addr = member.local_addr().unwrap();
+        let member_task = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, peer) = member.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            member.send_to(b"pong", peer).await.unwrap();
+        });
+        let bound = p
+            .ensure_listener(&udp_view(&lb, vec![member_addr]))
+            .await
+            .unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", &bound).await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        member_task.await.unwrap();
+
+        let err = p.ensure_listener(&udp_view(&lb, vec![])).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        p.delete_balancer(&lb.meta.id).await.unwrap();
     }
 }
