@@ -5,7 +5,7 @@
 //!
 //! * [`types`] — `Image`, `ImageMember`.
 //! * [`store`] — the `ImageStore` seam: `LocalDirStore` (content-addressed
-//!   by sha256, real) and `SiloStore` (S3, stub).
+//!   by sha256) and `SiloStore` (silo object API, key `sha256/<hex>`).
 //! * [`inspect`] — `qemu-img info` wrapper with a header-parsing fallback;
 //!   rejects images with backing files.
 //! * [`Client`] — the module core; `forge` and `slab` use
