@@ -8,7 +8,7 @@
 //!   verify client certificates, read secret payloads.
 //! * [`tls::server_config`] / [`tls::client_config`] — rustls configs built
 //!   from `keep` material, so the gateway and agents can speak (m)TLS.
-//! * [`redeem_join_token`] — turn an agent's `--join` token into a grant.
+//! * [`redeem_join_token`] — turn a join token into a grant and mark one use.
 //! * The resource types in [`types`].
 //!
 //! Secret payloads and private keys are encrypted at rest with AES-256-GCM
@@ -37,7 +37,7 @@ pub use ca::{Ca, Issued};
 pub use client::Client;
 pub use crypto::{RootKey, Sealed};
 pub use error::{KeepError, Result};
-pub use join::{create_join_token, redeem_join_token};
+pub use join::{authorize_join_token, create_join_token, redeem_join_token};
 pub use tls::Pki;
 pub use types::*;
 

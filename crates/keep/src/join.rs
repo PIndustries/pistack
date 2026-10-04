@@ -4,9 +4,10 @@
 //! Join tokens for `pistack agent --join`.
 //!
 //! An admin mints a token (`POST /join-tokens`); only its SHA-256 is stored.
-//! The agent presents the token once; [`redeem_join_token`] checks it and
-//! burns it (unless multi-use). The grant tells the caller which token was
-//! used so the agent's certificate request can be tied back to it.
+//! [`redeem_join_token`] checks the clear text and marks one use. A
+//! single-use token then stays in the store as spent, so a second redeem is
+//! unauthorized. The grant names the token record. It does not carry the
+//! clear text.
 
 use chrono::{Duration, Utc};
 use pistack_store::Store;
@@ -51,31 +52,50 @@ pub fn create_join_token(
     Ok((tok, clear))
 }
 
-/// Validate a clear-text join token and consume one use of it.
-pub fn redeem_join_token(store: &Store, token: &str) -> Result<JoinGrant> {
+/// Confirm a clear-text join token is known, unexpired, and not spent.
+///
+/// Does not write the store. The clear text is not logged and is not copied
+/// into the error.
+pub fn authorize_join_token(store: &Store, token: &str) -> Result<JoinToken> {
     let token = token.trim();
     if token.is_empty() {
         return Err(KeepError::Unauthorized("empty join token".into()));
     }
     let hash = sha256_hex(token.as_bytes());
-    let col = store.collection::<JoinToken>();
-    let found = col
+    let found = store
+        .collection::<JoinToken>()
         .list(None)?
         .into_iter()
         .find(|t| t.spec.hash == hash)
         .ok_or_else(|| KeepError::Unauthorized("unknown join token".into()))?;
-    let now = Utc::now();
-    if join_token_expired(&found, now) {
+    if join_token_expired(&found, Utc::now()) {
         return Err(KeepError::Unauthorized("join token expired".into()));
     }
     if join_token_spent(&found) {
         return Err(KeepError::Unauthorized("join token already used".into()));
     }
+    Ok(found)
+}
+
+/// Validate a clear-text join token and mark one use of it.
+///
+/// A single-use token is spent after this returns. A second call is
+/// unauthorized (`join token already used`). An expired token stays expired
+/// and is not marked spent. The clear text is not stored, logged, or returned.
+pub fn redeem_join_token(store: &Store, token: &str) -> Result<JoinGrant> {
+    let found = authorize_join_token(store, token)?;
+    let now = Utc::now();
     let id: Id = found.meta.id.clone();
+    let col = store.collection::<JoinToken>();
     let updated = col.modify(&id, |t| {
+        // Re-check under the write. A race must not spend an expired token
+        // or spend a token twice.
+        if join_token_expired(t, now) {
+            return Err(pistack_store::StoreError::Conflict(
+                "join token expired".into(),
+            ));
+        }
         if join_token_spent(t) {
-            // Lost a race with another redeemer; surface as conflict and map
-            // to unauthorized below.
             return Err(pistack_store::StoreError::Conflict(
                 "join token already used".into(),
             ));
@@ -89,10 +109,6 @@ pub fn redeem_join_token(store: &Store, token: &str) -> Result<JoinGrant> {
         Err(pistack_store::StoreError::Conflict(m)) => return Err(KeepError::Unauthorized(m)),
         Err(e) => return Err(e.into()),
     };
-    // A single-use token is deleted once redeemed; nothing else can use it.
-    if !updated.spec.multi_use {
-        col.delete(&id)?;
-    }
     Ok(JoinGrant {
         token: id,
         token_name: updated.meta.name,
@@ -106,8 +122,15 @@ pub fn redeem_join_token(store: &Store, token: &str) -> Result<JoinGrant> {
 mod tests {
     use super::*;
 
+    fn unauthorized(result: Result<JoinGrant>) -> String {
+        match result {
+            Err(KeepError::Unauthorized(message)) => message,
+            other => panic!("expected unauthorized, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn single_use_token_burns() {
+    fn single_use_token_is_spent_once() {
         let store = Store::in_memory().unwrap();
         let (tok, clear) = create_join_token(&store, "rack-a", "admin", false, None).unwrap();
         assert!(clear.starts_with(JOIN_TOKEN_PREFIX));
@@ -115,15 +138,101 @@ mod tests {
         let grant = redeem_join_token(&store, &clear).unwrap();
         assert_eq!(grant.token, tok.meta.id);
         assert_eq!(grant.token_name, "rack-a");
-        assert!(matches!(
-            redeem_join_token(&store, &clear),
-            Err(KeepError::Unauthorized(_))
-        ));
-        assert!(store
+        assert_eq!(grant.remaining_uses, Some(0));
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        assert!(!grant_json.contains(&clear));
+
+        let stored = store.collection::<JoinToken>().get(&tok.meta.id).unwrap();
+        assert_eq!(stored.status.uses, 1);
+        assert!(stored.status.last_used.is_some());
+        assert!(crate::join_token_spent(&stored));
+        assert_eq!(stored.spec.hash, tok.spec.hash);
+        let stored_json = serde_json::to_string(&stored).unwrap();
+        assert!(!stored_json.contains(&clear));
+
+        let again = unauthorized(redeem_join_token(&store, &clear));
+        assert_eq!(again, "join token already used");
+        assert!(!again.contains(&clear));
+        let stored = store.collection::<JoinToken>().get(&tok.meta.id).unwrap();
+        assert_eq!(stored.status.uses, 1);
+    }
+
+    #[test]
+    fn expired_token_is_not_marked_spent() {
+        let store = Store::in_memory().unwrap();
+        let (tok, clear) = create_join_token(&store, "old", "admin", false, None).unwrap();
+        store
             .collection::<JoinToken>()
-            .list(None)
-            .unwrap()
-            .is_empty());
+            .modify(&tok.meta.id, |t| {
+                t.spec.expires_at = Utc::now() - Duration::seconds(1);
+                Ok(())
+            })
+            .unwrap();
+        let message = unauthorized(redeem_join_token(&store, &clear));
+        assert_eq!(message, "join token expired");
+        assert!(!message.contains(&clear));
+        let stored = store.collection::<JoinToken>().get(&tok.meta.id).unwrap();
+        assert_eq!(stored.status.uses, 0);
+        assert!(stored.status.last_used.is_none());
+
+        // A token that was spent and then expires still reports expiry.
+        let (spent, spent_clear) =
+            create_join_token(&store, "spent", "admin", false, None).unwrap();
+        redeem_join_token(&store, &spent_clear).unwrap();
+        store
+            .collection::<JoinToken>()
+            .modify(&spent.meta.id, |t| {
+                t.spec.expires_at = Utc::now() - Duration::seconds(1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            unauthorized(redeem_join_token(&store, &spent_clear)),
+            "join token expired"
+        );
+        assert_eq!(
+            store
+                .collection::<JoinToken>()
+                .get(&spent.meta.id)
+                .unwrap()
+                .status
+                .uses,
+            1
+        );
+    }
+
+    #[test]
+    fn two_redeems_spend_a_single_use_token_once() {
+        let store = Store::in_memory().unwrap();
+        let (tok, clear) = create_join_token(&store, "race", "admin", false, None).unwrap();
+        let left_store = store.clone();
+        let right_store = store.clone();
+        let left_clear = clear.clone();
+        let right_clear = clear;
+        let left = std::thread::spawn(move || redeem_join_token(&left_store, &left_clear));
+        let right = std::thread::spawn(move || redeem_join_token(&right_store, &right_clear));
+        let results = [left.join().unwrap(), right.join().unwrap()];
+        let spent = results.iter().filter(|result| result.is_ok()).count();
+        let denied = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(KeepError::Unauthorized(message)) if message == "join token already used"
+                )
+            })
+            .count();
+        assert_eq!(spent, 1);
+        assert_eq!(denied, 1);
+        assert_eq!(
+            store
+                .collection::<JoinToken>()
+                .get(&tok.meta.id)
+                .unwrap()
+                .status
+                .uses,
+            1
+        );
     }
 
     #[test]
@@ -136,13 +245,21 @@ mod tests {
         let col = store.collection::<JoinToken>();
         let t = col.get(&g.token).unwrap();
         assert_eq!(t.status.uses, 2);
+        assert!(!crate::join_token_spent(&t));
         col.modify(&g.token, |t| {
             t.spec.expires_at = Utc::now() - Duration::seconds(1);
             Ok(())
         })
         .unwrap();
-        assert!(redeem_join_token(&store, &clear).is_err());
-        assert!(redeem_join_token(&store, "pij_nope").is_err());
+        assert_eq!(
+            unauthorized(redeem_join_token(&store, &clear)),
+            "join token expired"
+        );
+        assert_eq!(col.get(&g.token).unwrap().status.uses, 2);
+        assert_eq!(
+            unauthorized(redeem_join_token(&store, "pij_nope")),
+            "unknown join token"
+        );
         assert!(create_join_token(&store, "x", "admin", true, Some(Duration::days(2))).is_err());
     }
 }

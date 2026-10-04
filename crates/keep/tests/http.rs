@@ -568,7 +568,12 @@ async fn join_tokens_over_http() {
     .await;
     assert_eq!(st, StatusCode::OK, "{grant}");
     assert_eq!(grant["token_name"], "rack-a");
-    let (st, _) = call(
+    assert!(!grant.to_string().contains(&clear));
+    let (st, got) = call(&app, "GET", "/join-tokens/rack-a", Some("admin"), None).await;
+    assert_eq!(st, StatusCode::OK, "{got}");
+    assert_eq!(got["status"]["uses"], 1);
+    assert!(!got.to_string().contains(&clear));
+    let (st, denied) = call(
         &app,
         "POST",
         "/join-tokens/redeem",
@@ -577,6 +582,11 @@ async fn join_tokens_over_http() {
     )
     .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied["error"]["message"], "join token already used");
+    assert!(!denied.to_string().contains(&clear));
+    let (st, got) = call(&app, "GET", "/join-tokens/rack-a", Some("admin"), None).await;
+    assert_eq!(st, StatusCode::OK, "{got}");
+    assert_eq!(got["status"]["uses"], 1);
 
     // Multi-use token through the library entry point, with a short ttl.
     let (st, t) = call(

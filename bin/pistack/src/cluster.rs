@@ -775,10 +775,23 @@ fn store_err(err: impl std::fmt::Display) -> ApiError {
 }
 
 fn enforce_join(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
-    let required = std::env::var(REQUIRE_JOIN_ENV)
-        .ok()
-        .is_some_and(|value| value.trim() == "1");
-    if !required {
+    let configured = std::env::var(REQUIRE_JOIN_ENV).ok();
+    enforce_join_value(store, headers, configured.as_deref())
+}
+
+fn join_required_value(value: Option<&str>) -> bool {
+    value.is_some_and(|item| item.trim() == "1")
+}
+
+/// When `required` is not exactly `1`, the route stays open. Otherwise the
+/// header must name an unexpired token that is not spent. This does not
+/// redeem, and it does not log the clear text.
+fn enforce_join_value(
+    store: &Store,
+    headers: &HeaderMap,
+    required: Option<&str>,
+) -> Result<(), ApiError> {
+    if !join_required_value(required) {
         return Ok(());
     }
     let token = match headers.get(JOIN_HEADER) {
@@ -789,23 +802,9 @@ fn enforce_join(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
             Err(_) => return Err(ApiError::unauthorized("malformed join token")),
         },
     };
-    let hash = keep::crypto::sha256_hex(token.as_bytes());
-    let found = store
-        .collection::<keep::JoinToken>()
-        .list(None)
-        .map_err(ApiError::from)?
-        .into_iter()
-        .find(|item| item.spec.hash == hash);
-    let Some(found) = found else {
-        return Err(ApiError::unauthorized("unknown join token"));
-    };
-    if keep::join_token_expired(&found, chrono::Utc::now()) {
-        return Err(ApiError::unauthorized("join token expired"));
-    }
-    if keep::join_token_spent(&found) {
-        return Err(ApiError::unauthorized("join token already used"));
-    }
-    Ok(())
+    keep::authorize_join_token(store, token)
+        .map(|_| ())
+        .map_err(ApiError::from)
 }
 
 fn majority(voters: usize) -> usize {
@@ -1079,5 +1078,105 @@ mod tests {
         assert_eq!(third.members.len(), 3);
         assert!(third.members.iter().all(|member| member.role == Role::Voter));
         assert!(third.members.iter().any(|member| member.id == "node-b"));
+    }
+
+    #[test]
+    fn join_stays_open_until_required_and_a_redeem_spends_once() {
+        assert!(!join_required_value(None));
+        assert!(!join_required_value(Some("")));
+        assert!(!join_required_value(Some("true")));
+        assert!(join_required_value(Some("1")));
+        assert!(join_required_value(Some(" 1 ")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let (once, clear) = keep::create_join_token(&store, "once", "admin", false, None).unwrap();
+        let open = HeaderMap::new();
+        enforce_join_value(&store, &open, None).unwrap();
+        enforce_join_value(&store, &open, Some("")).unwrap();
+
+        let missing = enforce_join_value(&store, &open, Some("1")).unwrap_err();
+        assert_eq!(missing.message, "missing join token");
+
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            JOIN_HEADER,
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        let malformed = enforce_join_value(&store, &bad, Some("1")).unwrap_err();
+        assert_eq!(malformed.message, "malformed join token");
+
+        let mut unknown = HeaderMap::new();
+        unknown.insert(JOIN_HEADER, "pij_nope".parse().unwrap());
+        let unknown = enforce_join_value(&store, &unknown, Some("1")).unwrap_err();
+        assert_eq!(unknown.message, "unknown join token");
+        assert!(!unknown.message.contains("pij_nope"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(JOIN_HEADER, format!("  {clear}  ").parse().unwrap());
+        enforce_join_value(&store, &headers, Some("1")).unwrap();
+        assert_eq!(
+            store
+                .collection::<keep::JoinToken>()
+                .get(&once.meta.id)
+                .unwrap()
+                .status
+                .uses,
+            0
+        );
+
+        keep::redeem_join_token(&store, &clear).unwrap();
+        let spent = enforce_join_value(&store, &headers, Some("1")).unwrap_err();
+        assert_eq!(spent.message, "join token already used");
+        assert!(!spent.message.contains(&clear));
+        assert_eq!(
+            store
+                .collection::<keep::JoinToken>()
+                .get(&once.meta.id)
+                .unwrap()
+                .status
+                .uses,
+            1
+        );
+
+        let (old, old_clear) =
+            keep::create_join_token(&store, "old", "admin", false, None).unwrap();
+        store
+            .collection::<keep::JoinToken>()
+            .modify(&old.meta.id, |token| {
+                token.spec.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+                Ok(())
+            })
+            .unwrap();
+        let mut expired = HeaderMap::new();
+        expired.insert(JOIN_HEADER, old_clear.parse().unwrap());
+        let expired = enforce_join_value(&store, &expired, Some("1")).unwrap_err();
+        assert_eq!(expired.message, "join token expired");
+        assert!(!expired.message.contains(&old_clear));
+        assert_eq!(
+            store
+                .collection::<keep::JoinToken>()
+                .get(&old.meta.id)
+                .unwrap()
+                .status
+                .uses,
+            0
+        );
+
+        let (many, many_clear) =
+            keep::create_join_token(&store, "many", "admin", true, None).unwrap();
+        keep::redeem_join_token(&store, &many_clear).unwrap();
+        let mut multi = HeaderMap::new();
+        multi.insert(JOIN_HEADER, many_clear.parse().unwrap());
+        enforce_join_value(&store, &multi, Some("1")).unwrap();
+        assert_eq!(
+            store
+                .collection::<keep::JoinToken>()
+                .get(&many.meta.id)
+                .unwrap()
+                .status
+                .uses,
+            1
+        );
     }
 }
