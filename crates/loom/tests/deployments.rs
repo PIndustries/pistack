@@ -17,7 +17,7 @@ use loom::{
     MACHINE_POD_LABEL, POD_TEMPLATE_HASH,
 };
 use pistack_store::Store;
-use pistack_types::{Module, ModuleContext, Page, Phase};
+use pistack_types::{kind, Caller, Id, Meta, Module, ModuleContext, Page, Phase};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,11 +58,41 @@ async fn harness() -> Harness {
                 disk_gib: 10_000,
                 gpus: 0,
             };
+            // A machine that names a network is placed on a host that has a
+            // private underlay address.
+            h.spec.underlay_ip = Some("10.1.0.2".into());
             Ok(())
         })
         .unwrap();
+    // Pod machines join the network named "default" and need a project
+    // before a port can be allocated.
+    let project = Id::new(kind::PROJECT);
+    fabric::Client::new(
+        store.clone(),
+        Arc::new(fabric::MockBackend::new()),
+    )
+    .create_network(
+        Meta::new(kind::NETWORK, "default", None),
+        fabric::NetworkSpec::default(),
+    )
+    .unwrap();
+    let caller = Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "loom-test".into(),
+        project: Some(project),
+        roles: vec!["admin".into()],
+        system: false,
+    };
     let loom = Loom;
-    let app = loom.router(ctx.clone());
+    let app = loom.router(ctx.clone()).layer(axum::middleware::from_fn(
+        move |mut req: Request<Body>, next: axum::middleware::Next| {
+            let caller = caller.clone();
+            async move {
+                req.extensions_mut().insert(caller);
+                next.run(req).await
+            }
+        },
+    ));
     loom.start(ctx).await.unwrap();
     Harness {
         app,
@@ -285,7 +315,7 @@ async fn deployment_to_running_pods_and_back() {
     assert_eq!(page.total, 0);
     let pid = page_first_id(&pods);
     let (st, _) = raw(app, "GET", &format!("/pods/{pid}/logs"), None).await;
-    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
 
     // Scale to one: two pods and their machines go away; one endpoint remains.
     let (st, d) = call::<Deployment>(

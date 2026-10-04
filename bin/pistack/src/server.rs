@@ -52,7 +52,7 @@ pub fn assemble(dev: bool) -> Assembly {
     let modules: Vec<Arc<dyn Module>> = vec![
         gate_m.clone(),
         forge_m.clone(),
-        Arc::new(loom::Loom),
+        Arc::new(loom::Loom::configured(loom::LoomConfig::production(dev, queue.clone()))),
         Arc::new(fabric_module()),
         Arc::new(slab::Slab::default().with_queue(queue.clone())),
         Arc::new(mold::Mold::default()),

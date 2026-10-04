@@ -8,7 +8,9 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+pistack-rpc.workspace = true
 forge.workspace = true
+relay.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -25,3 +27,4 @@ ipnet.workspace = true
 tower.workspace = true
 http-body-util = "0.1"
 tokio-util.workspace = true
+fabric.workspace = true
