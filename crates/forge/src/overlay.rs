@@ -12,11 +12,11 @@
 //! the project router. The shared 10.88.0.0/24 network is left on host NAT.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use fabric::overlay::{
-    plan, DhcpLease, DhcpRoute, DnatRule, OverlayPlan, PlanFloat, PlanHost, PlanNetwork, PlanPort,
-    PlanProvider, PlanRouter, SegmentPlan, SgRule, PLAN_VERSION,
+    is_private_ula, plan, DhcpLease, DhcpRoute, DnatRule, OverlayPlan, PlanFloat, PlanHost,
+    PlanNetwork, PlanPort, PlanProvider, PlanRouter, SegmentPlan, SgRule, PLAN_VERSION,
 };
 use fabric::{
     Direction, EtherType, FloatingIp, Network, NetworkKind, Port, Protocol, Remote, Router,
@@ -318,7 +318,34 @@ fn shared_nat_network(net: &Network, subnets: &[Subnet]) -> bool {
 }
 
 fn refused_physnet(name: &str) -> bool {
-    name == "wg-fleet" || name == "pistack0" || name.starts_with("pi")
+    name.is_empty()
+        || name == "wg-fleet"
+        || name == "pistack0"
+        || name == "simbr0"
+        || name.starts_with("pi")
+}
+
+/// IPv4 external addresses stay as they are. A unique-local IPv6 address is
+/// SNAT for an IPv6-only router. A public IPv6 address is not an underlay
+/// and is not an external address.
+fn external_for(router: &Router, subnet: &Subnet, subnets: &[Subnet]) -> Option<String> {
+    match router.status.external_ip? {
+        IpAddr::V4(ip) => Some(ip.to_string()),
+        IpAddr::V6(ip) => {
+            if !is_private_ula(ip) || !subnet.spec.cidr.addr().is_ipv6() {
+                return None;
+            }
+            let mixed = subnets.iter().any(|other| {
+                router.spec.interfaces.iter().any(|id| id == &other.meta.id)
+                    && other.spec.cidr.addr().is_ipv4()
+            });
+            if mixed {
+                None
+            } else {
+                Some(ip.to_string())
+            }
+        }
+    }
 }
 
 fn placed_guests(ports: &[Port], machines: &[Machine], hosts: &[Host]) -> ApiResult<Vec<Guest>> {
@@ -637,55 +664,55 @@ fn routers_on(
         let Some(gateway) = subnet.spec.gateway else {
             continue;
         };
-        let external_ip = router
-            .status
-            .external_ip
-            .filter(|ip| ip.is_ipv4())
-            .map(|ip| ip.to_string());
-        let dnat = fips
-            .iter()
-            .filter(|f| {
-                f.spec.port.as_ref().is_some_and(|p| {
-                    bound.iter().any(|b| &b.port.meta.id == p)
-                        && (f.status.router.as_ref() == Some(&router.meta.id)
-                            || f.status.router.is_none())
+        let external_ip = external_for(router, subnet, subnets);
+        let dnat = if external_ip.as_ref().is_some_and(|ip| ip.contains(':')) {
+            // IPv6 SNAT does not rewrite an IPv4 floating address.
+            Vec::new()
+        } else {
+            fips.iter()
+                .filter(|f| {
+                    f.spec.port.as_ref().is_some_and(|p| {
+                        bound.iter().any(|b| &b.port.meta.id == p)
+                            && (f.status.router.as_ref() == Some(&router.meta.id)
+                                || f.status.router.is_none())
+                    })
                 })
-            })
-            .filter(|f| {
-                networks
-                    .iter()
-                    .find(|n| n.meta.id == f.spec.network)
-                    .is_none_or(|n| !follows_port(n, subnets))
-            })
-            .filter_map(|f| {
-                let floating = f.spec.address.filter(|a| a.is_ipv4())?.to_string();
-                if external_ip.as_ref() == Some(&floating) {
-                    return None;
-                }
-                let fixed = f
-                    .status
-                    .fixed_ip
-                    .filter(|a| a.is_ipv4())
-                    .map(|a| a.to_string())
-                    .or_else(|| {
-                        ports
-                            .iter()
-                            .find(|p| Some(&p.meta.id) == f.spec.port.as_ref())
-                            .and_then(|p| {
-                                p.spec
-                                    .fixed_ips
-                                    .iter()
-                                    .find(|ip| ip.is_ipv4())
-                                    .map(|ip| ip.to_string())
-                            })
-                    })?;
-                Some(DnatRule {
-                    id: f.meta.id.to_string(),
-                    floating,
-                    fixed,
+                .filter(|f| {
+                    networks
+                        .iter()
+                        .find(|n| n.meta.id == f.spec.network)
+                        .is_none_or(|n| !follows_port(n, subnets))
                 })
-            })
-            .collect();
+                .filter_map(|f| {
+                    let floating = f.spec.address.filter(|a| a.is_ipv4())?.to_string();
+                    if external_ip.as_ref() == Some(&floating) {
+                        return None;
+                    }
+                    let fixed = f
+                        .status
+                        .fixed_ip
+                        .filter(|a| a.is_ipv4())
+                        .map(|a| a.to_string())
+                        .or_else(|| {
+                            ports
+                                .iter()
+                                .find(|p| Some(&p.meta.id) == f.spec.port.as_ref())
+                                .and_then(|p| {
+                                    p.spec
+                                        .fixed_ips
+                                        .iter()
+                                        .find(|ip| ip.is_ipv4())
+                                        .map(|ip| ip.to_string())
+                                })
+                        })?;
+                    Some(DnatRule {
+                        id: f.meta.id.to_string(),
+                        floating,
+                        fixed,
+                    })
+                })
+                .collect()
+        };
         out.push(PlanRouter {
             id: router.meta.id.to_string(),
             gateway: gateway.to_string(),
@@ -1423,5 +1450,95 @@ mod tests {
                 .any(|n| n.id == ext.meta.id.to_string()),
             "the external segment stays even though the machine does not name it"
         );
+    }
+
+    #[tokio::test]
+    async fn ipv6_router_external_snat_is_a_private_ula() {
+        let store = Store::in_memory().unwrap();
+        let client = Client::new(store.clone(), Arc::new(MockBackend::new()));
+        let a = host("a", "10.1.0.1");
+        store.collection::<Host>().create(a.clone()).unwrap();
+        let project = Id::new(kind::PROJECT);
+        let net = client
+            .create_network(
+                Meta::new(kind::NETWORK, "app6", Some(project.clone())),
+                NetworkSpec::default(),
+            )
+            .unwrap();
+        store
+            .collection::<Network>()
+            .modify(&net.meta.id, |n| {
+                n.status.segment_id = Some(11);
+                Ok(())
+            })
+            .unwrap();
+        let sub = client
+            .create_subnet(
+                Meta::new(kind::SUBNET, "app6-net", Some(project.clone())),
+                SubnetSpec {
+                    network: net.meta.id.clone(),
+                    cidr: "fd00:90::/64".parse().unwrap(),
+                    gateway: Some("fd00:90::1".parse().unwrap()),
+                    allocation_pools: vec![],
+                    dns_nameservers: vec![],
+                    enable_dhcp: true,
+                    host_routes: vec![],
+                },
+            )
+            .unwrap();
+        let machine = placed("box6", &project, "app6", &a);
+        store
+            .collection::<Machine>()
+            .create(machine.clone())
+            .unwrap();
+        ensure_ports(&store, &machine).await.unwrap();
+        let router = client
+            .create_router(
+                Meta::new(kind::ROUTER, "app6-edge", Some(project.clone())),
+                RouterSpec {
+                    external_network: None,
+                    interfaces: vec![sub.meta.id],
+                    routes: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .collection::<Router>()
+            .modify(&router.meta.id, |r| {
+                r.status.external_ip = Some("fd00:66::9".parse().unwrap());
+                Ok(())
+            })
+            .unwrap();
+
+        let plan = plan_for(&all_plans(&store).unwrap(), "a");
+        assert_eq!(plan.host, "10.1.0.1");
+        let seg = plan
+            .networks
+            .iter()
+            .find(|n| n.id == net.meta.id.to_string())
+            .unwrap();
+        assert_eq!(seg.routers.len(), 1);
+        assert!(seg.routers[0].snat);
+        assert_eq!(seg.routers[0].external_ip.as_deref(), Some("fd00:66::9"));
+        assert_eq!(seg.routers[0].interfaces[0].cidr, "fd00:90::/64");
+        assert_eq!(seg.routers[0].interfaces[0].gateway, "fd00:90::1");
+        assert!(seg.routers[0].dnat.is_empty());
+
+        store
+            .collection::<Router>()
+            .modify(&router.meta.id, |r| {
+                r.status.external_ip = Some("2001:db8::9".parse().unwrap());
+                Ok(())
+            })
+            .unwrap();
+        let plan = plan_for(&all_plans(&store).unwrap(), "a");
+        let seg = plan
+            .networks
+            .iter()
+            .find(|n| n.id == net.meta.id.to_string())
+            .unwrap();
+        assert!(!seg.routers[0].snat);
+        assert!(seg.routers[0].external_ip.is_none());
+        assert_eq!(plan.host, "10.1.0.1");
     }
 }

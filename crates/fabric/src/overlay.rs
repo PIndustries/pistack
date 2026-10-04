@@ -105,7 +105,8 @@ pub struct RouterNamespace {
     pub external_veth_root: String,
     /// Namespace end of the external veth. `d` plus the same 12 hex digits.
     pub external_veth_ns: String,
-    /// Router address on the external network. Installed as a /32 in the namespace.
+    /// Router address on the external network. Installed as a host prefix
+    /// (`/32` or `/128`) in the namespace. IPv6 is unique-local (`fc00::/7`).
     pub external_ip: Option<String>,
     /// Recorded only. The agent must not move, enslave, or address this device.
     pub external_dev: String,
@@ -399,6 +400,11 @@ pub fn plan(
     for router in pending {
         segments[router.at].routers.push(router.ns);
     }
+    for seg in &segments {
+        for ns in &seg.routers {
+            v6_snat_agrees(ns)?;
+        }
+    }
 
     Ok(OverlayPlan {
         version: PLAN_VERSION,
@@ -595,6 +601,7 @@ fn canonical_provider(
         || physnet.contains('/')
         || physnet == "pistack0"
         || physnet == "wg-fleet"
+        || physnet == "simbr0"
         || physnet.starts_with("pi")
     {
         return Err(PlanError::Invalid(format!("refusing physnet {physnet}")));
@@ -764,6 +771,46 @@ fn usable_v6(ip: Ipv6Addr) -> bool {
     !ip.is_unspecified() && !ip.is_multicast()
 }
 
+/// Unique-local IPv6 (`fc00::/7`). Not link-local, not global, and not an underlay.
+pub fn is_private_ula(ip: Ipv6Addr) -> bool {
+    let [first, ..] = ip.octets();
+    first & 0xfe == 0xfc
+}
+
+/// IPv6 SNAT is the external address plus every tenant prefix of that family.
+/// A public IPv6 external address never reaches this check.
+fn v6_snat_agrees(ns: &RouterNamespace) -> Result<(), PlanError> {
+    let Some(ext) = &ns.external_ip else {
+        return Ok(());
+    };
+    if !ext.contains(':') {
+        return Ok(());
+    }
+    if !ns.snat {
+        return Err(PlanError::Invalid(format!(
+            "router {} has an ipv6 external address and snat is off",
+            ns.id
+        )));
+    }
+    for iface in &ns.interfaces {
+        if !iface.cidr.contains(':') {
+            return Err(PlanError::Invalid(format!(
+                "router {} snat family does not match external ip",
+                ns.id
+            )));
+        }
+    }
+    for rule in &ns.dnat {
+        if !rule.floating.contains(':') {
+            return Err(PlanError::Invalid(format!(
+                "router {} floating family does not match external ip",
+                ns.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn canonical_cidr(role: &str, raw: &str) -> Result<String, PlanError> {
     let net: IpNet = raw.parse().map_err(|_| {
         PlanError::Invalid(format!("{role} {raw} is not an ip network"))
@@ -845,7 +892,13 @@ fn gateway_in_cidr(gateway: &str, prefix: u8, cidr: &str) -> Result<(String, Str
 fn canonical_external_ip(raw: &Option<String>) -> Result<Option<String>, PlanError> {
     match raw {
         None => Ok(None),
-        Some(s) => Ok(Some(unicast("external ip", s)?.to_string())),
+        Some(s) => match canonical_ip("external ip", s)? {
+            IpAddr::V4(ip) => Ok(Some(ip.to_string())),
+            IpAddr::V6(ip) if is_private_ula(ip) => Ok(Some(ip.to_string())),
+            IpAddr::V6(ip) => Err(PlanError::Ip(format!(
+                "external ip {ip} is not a private ipv6 address"
+            ))),
+        },
     }
 }
 
@@ -1464,5 +1517,81 @@ mod tests {
         }];
         let nets = [network(NET_A, 1, vec![], vec![bad])];
         assert!(plan(&host("10.0.0.1"), &nets, &[]).is_err());
+    }
+
+    #[test]
+    fn ipv6_external_snat_is_a_private_ula() {
+        let mut leg = router(RTR_A, "fd00:0090::0001", "fd00:0090::/64");
+        leg.prefix = 64;
+        leg.external_ip = Some("fd00:0066::0009".into());
+        leg.external_dev = "external".into();
+        leg.dnat = vec![DnatRule {
+            id: "fip6".into(),
+            floating: "fd00:0066::000a".into(),
+            fixed: "fd00:0090::0010".into(),
+        }];
+        let nets = [network(NET_A, 11, vec![leg], vec![])];
+        let got = plan(&host("10.0.0.1"), &nets, &[]).unwrap();
+        let ns = &got.networks[0].routers[0];
+        assert!(ns.snat);
+        assert_eq!(ns.external_ip.as_deref(), Some("fd00:66::9"));
+        assert_eq!(ns.interfaces[0].cidr, "fd00:90::/64");
+        assert_eq!(ns.interfaces[0].gateway, "fd00:90::1");
+        assert_eq!(ns.dnat[0].floating, "fd00:66::a");
+        assert_eq!(ns.dnat[0].fixed, "fd00:90::10");
+        assert_eq!(got.host, "10.0.0.1");
+
+        let mut ula = router(RTR_A, "fc00::1", "fc00::/64");
+        ula.prefix = 64;
+        ula.external_ip = Some("fc00:66::1".into());
+        let nets = [network(NET_A, 12, vec![ula], vec![])];
+        let got = plan(&host("10.1.0.1"), &nets, &[]).unwrap();
+        assert!(got.networks[0].routers[0].snat);
+        assert_eq!(
+            got.networks[0].routers[0].external_ip.as_deref(),
+            Some("fc00:66::1")
+        );
+
+        for bad in ["2001:db8::9", "fe80::1", "::1", "2001:db8:1::1"] {
+            let mut leg = router(RTR_A, "fd00:90::1", "fd00:90::/64");
+            leg.prefix = 64;
+            leg.external_ip = Some(bad.into());
+            let nets = [network(NET_A, 13, vec![leg], vec![])];
+            let err = plan(&host("10.0.0.1"), &nets, &[]).unwrap_err();
+            assert!(
+                matches!(err, PlanError::Ip(ref msg) if msg.contains("not a private ipv6")),
+                "{bad}: {err}"
+            );
+        }
+
+        // An IPv6 address is not an underlay, public or unique-local.
+        let nets = [network(NET_A, 1, vec![], vec![])];
+        assert!(plan(&host("2001:db8::1"), &nets, &[]).is_err());
+        let nets = [network(NET_A, 1, vec![], vec![])];
+        assert!(plan(&host("fd00::1"), &nets, &[]).is_err());
+        let nets = [network(NET_A, 1, vec![], vec![])];
+        assert!(plan(&host("10.0.0.1"), &nets, &["2001:db8::2".into()]).is_err());
+
+        let mut mixed = router(RTR_A, "10.90.0.1", "10.90.0.0/24");
+        mixed.external_ip = Some("fd00:66::9".into());
+        let nets = [network(NET_A, 14, vec![mixed], vec![])];
+        let err = plan(&host("10.0.0.1"), &nets, &[]).unwrap_err();
+        assert!(matches!(err, PlanError::Invalid(ref msg) if msg.contains("snat family")));
+    }
+
+    #[test]
+    fn simbr0_physnet_is_refused() {
+        let mut provider = network(NET_A, 0, vec![], vec![]);
+        provider.provider = Some(PlanProvider {
+            physnet: "simbr0".into(),
+            vlan: None,
+        });
+        assert!(plan(&host("10.0.0.1"), &[provider], &[]).is_err());
+        let mut empty = network(NET_A, 0, vec![], vec![]);
+        empty.provider = Some(PlanProvider {
+            physnet: String::new(),
+            vlan: None,
+        });
+        assert!(plan(&host("10.0.0.1"), &[empty], &[]).is_err());
     }
 }

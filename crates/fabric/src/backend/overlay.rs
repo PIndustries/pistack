@@ -5,7 +5,10 @@
 //!
 //! This backend does not create devices and does not call iptables. An overlay
 //! network must already carry a VXLAN VNI in `status.segment_id`. The agent
-//! applies [`crate::overlay::OverlayPlan`].
+//! applies [`crate::overlay::OverlayPlan`]. Deleting a record succeeds here.
+//! The next plan omits it, and the helper removes only the bridge, VXLAN,
+//! namespace, and veth that plan created. A second delete is a success when
+//! those devices are already gone.
 
 use super::{FipView, NetBackend, RouterView};
 use crate::types::{Network, NetworkKind, Port, PortBinding, SecurityGroup, Subnet};

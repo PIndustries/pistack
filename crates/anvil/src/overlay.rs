@@ -4,9 +4,12 @@
 //! Apply a fabric overlay plan on this host.
 //!
 //! The plan is the document `pistack-overlay` converges: one bridge and one
-//! VXLAN device per segment, one network namespace per router. This module
-//! does not invent topology. A missing helper is a failure, because a guest
-//! must not boot onto a bridge that was never created.
+//! VXLAN device per segment, one network namespace per router. A later plan
+//! that omits a network, subnet, port, router, security group, or floating
+//! IP removes only the bridge, VXLAN, namespace, and veth that plan created
+//! for the record. A second apply succeeds when those devices are already
+//! gone. This module does not invent topology. A missing helper is a failure,
+//! because a guest must not boot onto a bridge that was never created.
 
 use pistack_types::{ApiError, ApiResult};
 use std::path::Path;
