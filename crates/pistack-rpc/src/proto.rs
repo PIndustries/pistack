@@ -275,6 +275,9 @@ pub enum CommandKind {
     SyncOverlay,
     /// Live-migrate a running domain. The payload is [`MigrateRequest`].
     MigrateMachine,
+    /// Read the text of one machine. The payload is `{"id":"<machine id>"}`.
+    /// The result payload carries that text in `text`.
+    ReadLogs,
 }
 
 impl std::fmt::Display for CommandKind {
@@ -289,6 +292,7 @@ impl std::fmt::Display for CommandKind {
             CommandKind::UnplugPort => "unplug_port",
             CommandKind::SyncOverlay => "sync_overlay",
             CommandKind::MigrateMachine => "migrate_machine",
+            CommandKind::ReadLogs => "read_logs",
         };
         f.write_str(s)
     }

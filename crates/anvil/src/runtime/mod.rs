@@ -8,6 +8,7 @@
 //! [`MachineRequest`] and a [`RunningMachine`] back into
 //! `forge::MachineRuntime`; both are plain data and map one-to-one.
 
+pub mod cloud;
 pub mod libvirt;
 mod metal;
 pub mod mock;
@@ -18,6 +19,7 @@ use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub use cloud::CloudRuntime;
 pub use libvirt::LibvirtRuntime;
 pub use metal::MetalRuntime;
 pub use mock::MockRuntime;
@@ -226,7 +228,9 @@ pub fn select_runtimes(capabilities: &[String], allow_mock: bool) -> Runtimes {
     for kind in [MachineKind::Vm, MachineKind::Container, MachineKind::Metal] {
         let has = |c: &str| capabilities.iter().any(|x| x == c);
         let rt: Option<SharedRuntime> = match kind {
+            // libvirt remains the runtime when kvm or libvirt is present.
             MachineKind::Vm if has("libvirt") || has("kvm") => Some(Arc::new(LibvirtRuntime)),
+            MachineKind::Vm if has("cloud-hypervisor") => Some(Arc::new(CloudRuntime)),
             MachineKind::Container if has("youki") => Some(Arc::new(YoukiRuntime)),
             MachineKind::Metal if has("metal") || has("ipmi") || has("redfish") => {
                 Some(Arc::new(MetalRuntime))
@@ -241,10 +245,12 @@ pub fn select_runtimes(capabilities: &[String], allow_mock: bool) -> Runtimes {
     r
 }
 
-/// Pick a runtime for a kind from the detected capabilities. KVM uses
-/// libvirt. youki is still a stub. Metal is this host when `metal`,
-/// `ipmi` or `redfish` is advertised. The mock covers kinds with no real
-/// runtime.
+/// Pick a runtime for a kind from the detected capabilities. libvirt
+/// remains the runtime when `kvm` or `libvirt` is present.
+/// `cloud-hypervisor` is selected when that capability is present and
+/// those are not. youki runs containers when that capability is present.
+/// Metal is this host when `metal`, `ipmi` or `redfish` is advertised.
+/// The mock covers kinds with no real runtime.
 pub fn select(
     kind: MachineKind,
     capabilities: &[String],
@@ -253,6 +259,7 @@ pub fn select(
     let has = |c: &str| capabilities.iter().any(|x| x == c);
     match kind {
         MachineKind::Vm if has("libvirt") || has("kvm") => Some(Arc::new(LibvirtRuntime)),
+        MachineKind::Vm if has("cloud-hypervisor") => Some(Arc::new(CloudRuntime)),
         MachineKind::Container if has("youki") => Some(Arc::new(YoukiRuntime)),
         MachineKind::Metal if has("metal") || has("ipmi") || has("redfish") => {
             Some(Arc::new(MetalRuntime))

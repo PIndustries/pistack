@@ -18,6 +18,7 @@
 
 pub mod cronjob;
 pub mod deployment;
+pub mod ingress;
 pub mod job;
 pub mod pod;
 pub mod replicaset;

@@ -24,6 +24,8 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use pistack_rpc::proto::CommandKind;
+use pistack_rpc::CommandQueue;
 use pistack_store::{Collection, Store};
 use pistack_types::{ApiError, ApiResult, Caller, Id, Kind, ListQuery, Page, Resource, Spec};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -34,6 +36,8 @@ pub struct AppState {
     pub store: Store,
     /// Treat unauthenticated requests as cloud admin.
     pub dev_admin: bool,
+    /// `None` until the server supplies the command queue.
+    pub queue: Option<CommandQueue>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -647,11 +651,39 @@ async fn pod_logs(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let p = load::<PodSpec>(&s, &scope, &id)?;
-    Err(ApiError::not_implemented(format!(
-        "logs for pod {} are not available yet (needs anvil log streaming)",
-        p.meta.name
-    )))
+    let pod = load::<PodSpec>(&s, &scope, &id)?;
+    let machine = pod.status.machine.clone().ok_or_else(|| {
+        ApiError::unavailable("pod logs are not available")
+    })?;
+    let host_id = pod.status.host.clone().ok_or_else(|| {
+        ApiError::unavailable("pod logs are not available")
+    })?;
+    let host = s
+        .store
+        .collection::<forge::Host>()
+        .get(&host_id)
+        .map_err(|_| ApiError::unavailable("pod logs are not available"))?;
+    if host.spec.node_name.is_empty() {
+        return Err(ApiError::unavailable("pod logs are not available"));
+    }
+    let queue = s.queue.clone().ok_or_else(|| {
+        ApiError::unavailable("pod logs are not configured")
+    })?;
+    let ticket = queue.enqueue(
+        &host.spec.node_name,
+        CommandKind::ReadLogs,
+        serde_json::json!({"id": machine.to_string()}),
+    )?;
+    let value = ticket.wait().await?.into_api_result()?;
+    let text = match value.get("text").and_then(|v| v.as_str()) {
+        Some(text) => text.to_owned(),
+        None => return Err(ApiError::unavailable("pod log text is missing")),
+    };
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        text,
+    )
+        .into_response())
 }
 
 /// The document the pod's machine carries to anvil; handy for debugging.

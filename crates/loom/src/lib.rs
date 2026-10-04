@@ -18,7 +18,8 @@
 //! `Loom` is dev mode: unauthenticated requests are admin, services are
 //! realised by [`NoopRealizer`], cluster IPs come from `10.96.0.0/12`.
 //! Production wiring builds a [`LoomConfig`] and mounts
-//! [`Loom::configured`].
+//! [`Loom::configured`]. [`LoomConfig::production`] programs service and
+//! ingress listeners through relay and reads pod logs from the command queue.
 
 pub mod controllers;
 pub mod cron;
@@ -29,7 +30,7 @@ pub mod types;
 
 pub use controllers::pod::{PodSandbox, EXITED_CONDITION, SANDBOX_API_VERSION, SANDBOX_KIND};
 pub use cron::{CronError, Schedule};
-pub use realizer::{NoopRealizer, ServiceRealizer};
+pub use realizer::{NoopRealizer, RelayRealizer, ServiceRealizer};
 pub use types::*;
 
 use async_trait::async_trait;
@@ -37,12 +38,14 @@ use axum::Router;
 use controllers::{
     cronjob::CronJobController,
     deployment::DeploymentController,
+    ingress::IngressController,
     job::JobController,
     pod::PodController,
     replicaset::ReplicaSetController,
     service::{ServiceController, DEFAULT_SERVICE_CIDR},
 };
 use ipnet::IpNet;
+use pistack_rpc::CommandQueue;
 use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::sync::Arc;
@@ -56,6 +59,10 @@ pub struct LoomConfig {
     pub service_cidr: IpNet,
     /// What makes cluster IPs route.
     pub realizer: Arc<dyn ServiceRealizer>,
+    /// Service and ingress listeners. `None` in dev mode.
+    pub relay: Option<Arc<RelayRealizer>>,
+    /// Pod log reads. `None` until the server supplies the command queue.
+    pub queue: Option<CommandQueue>,
 }
 
 impl Default for LoomConfig {
@@ -66,6 +73,25 @@ impl Default for LoomConfig {
                 .parse()
                 .unwrap_or(IpNet::V4(ipnet::Ipv4Net::default())),
             realizer: Arc::new(NoopRealizer),
+            relay: None,
+            queue: None,
+        }
+    }
+}
+
+impl LoomConfig {
+    /// Relay listeners for services and ingresses, and the command queue
+    /// pod logs are read through. `dev_admin` matches the server flag.
+    pub fn production(dev_admin: bool, queue: CommandQueue) -> Self {
+        let relay = Arc::new(RelayRealizer::new());
+        Self {
+            dev_admin,
+            service_cidr: DEFAULT_SERVICE_CIDR
+                .parse()
+                .unwrap_or(IpNet::V4(ipnet::Ipv4Net::default())),
+            realizer: relay.clone(),
+            relay: Some(relay),
+            queue: Some(queue),
         }
     }
 }
@@ -121,11 +147,15 @@ fn router(config: &LoomConfig, ctx: ModuleContext) -> Router {
     http::router(http::AppState {
         store: (*store).clone(),
         dev_admin: config.dev_admin,
+        queue: config.queue.clone(),
     })
 }
 
 async fn start(config: &LoomConfig, ctx: ModuleContext) -> anyhow::Result<()> {
     let store = (*ctx.store::<Store>()).clone();
+    if let Some(relay) = &config.relay {
+        relay.bind_store(store.clone());
+    }
     tokio::spawn(controllers::run(
         PodController::new(store.clone()),
         ctx.clone(),
@@ -140,6 +170,10 @@ async fn start(config: &LoomConfig, ctx: ModuleContext) -> anyhow::Result<()> {
     ));
     tokio::spawn(controllers::run(
         ServiceController::new(store.clone(), config.service_cidr, config.realizer.clone()),
+        ctx.clone(),
+    ));
+    tokio::spawn(controllers::run(
+        IngressController::new(store.clone(), config.relay.clone()),
         ctx.clone(),
     ));
     tokio::spawn(controllers::run(
