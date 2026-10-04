@@ -14,8 +14,8 @@
 //!
 //! Join-token enforcement is off unless the router was built with a store
 //! and `PISTACK_REQUIRE_JOIN=1`. Unset, `/rpc` is the open router. The check
-//! compares SHA-256 of `x-pistack-join` to a stored join token and does not
-//! redeem it, so a long-poll does not burn a one-time token.
+//! asks keep whether `x-pistack-join` matches an unexpired token that is not
+//! spent. It does not redeem, so a long-poll does not burn a one-time token.
 
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ pub fn router(queue: CommandQueue) -> Router {
 /// Same routes as [`router`]. When [`REQUIRE_JOIN_ENV`] is exactly `1`, every
 /// request must carry [`JOIN_HEADER`] matching an unexpired stored join token
 /// that is not a spent one-time token. The token is not redeemed. Any other
-/// env value returns the open router, ignoring `store`.
+/// env value, including unset, returns the open router and ignores `store`.
 pub fn router_with_store(queue: CommandQueue, store: Store) -> Router {
     if join_required() {
         tracing::info!("/rpc requires a join token");
@@ -88,8 +88,8 @@ async fn require_join(State(store): State<Store>, req: Request, next: Next) -> R
     next.run(req).await
 }
 
-/// Hash `x-pistack-join` and compare it to a stored token. Does not write
-/// the store and does not log the clear text.
+/// Ask keep whether `x-pistack-join` is usable. Does not write the store
+/// and does not log the clear text.
 fn check_join(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
     let token = presented_token(headers)?;
     accept_join_token(store, token)
@@ -108,23 +108,9 @@ fn presented_token(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 fn accept_join_token(store: &Store, token: &str) -> Result<(), ApiError> {
     // `token` is clear text. Do not log it, or interpolate it into errors.
-    let hash = keep::crypto::sha256_hex(token.as_bytes());
-    let found = store
-        .collection::<keep::JoinToken>()
-        .list(None)
-        .map_err(ApiError::from)?
-        .into_iter()
-        .find(|t| t.spec.hash == hash);
-    let Some(found) = found else {
-        return Err(ApiError::unauthorized("unknown join token"));
-    };
-    if keep::join_token_expired(&found, chrono::Utc::now()) {
-        return Err(ApiError::unauthorized("join token expired"));
-    }
-    if keep::join_token_spent(&found) {
-        return Err(ApiError::unauthorized("join token already used"));
-    }
-    Ok(())
+    keep::authorize_join_token(store, token)
+        .map(|_| ())
+        .map_err(ApiError::from)
 }
 
 fn check_node_name(name: &str) -> ApiResult<()> {
@@ -368,8 +354,16 @@ mod tests {
 
         let (status, body) = call(&base, "GET", "/agents/n1/commands", Some(&burned_clear)).await;
         assert_eq!(status, 401, "{body}");
-        message_is(&body, "unknown join token");
+        message_is(&body, "join token already used");
         assert!(!body.contains(&burned_clear));
+        let burned = store
+            .collection::<JoinToken>()
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .find(|token| token.meta.name == "burned")
+            .unwrap();
+        assert_eq!(burned.status.uses, 1);
 
         // A gate bearer is not a join token, even when the clear text is valid.
         let http = reqwest::Client::new();
@@ -431,6 +425,22 @@ mod tests {
         assert_eq!(status, 404, "{body}");
         assert!(!body.contains(&many_clear));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unset_require_join_leaves_the_router_open() {
+        if join_required() {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_store(CommandQueue::default(), Store::in_memory().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = AgentClient::new(format!("http://{addr}"), "n1").unwrap();
+        client.hello(&hello("n1")).await.unwrap();
         server.abort();
     }
 }
