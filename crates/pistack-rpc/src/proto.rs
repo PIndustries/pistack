@@ -175,10 +175,31 @@ pub struct MachineRequest {
     pub bmc_user: Option<String>,
 }
 
-/// Payload of [`CommandKind::StopMachine`] and [`CommandKind::DeleteMachine`].
+/// Payload of [`CommandKind::StopMachine`], [`CommandKind::DeleteMachine`],
+/// and [`CommandKind::ReadLogs`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineRef {
     pub id: Id,
+}
+
+/// Payload of [`CommandKind::PlugPort`] and [`CommandKind::UnplugPort`].
+///
+/// The NIC is the fabric port. When [`NicAttachment::segment_id`] is set, the
+/// host attaches the overlay bridge named `po` plus 12 hex digits of
+/// `network_id` — the bridge the overlay plan already computed. That path
+/// does not use `pistack0`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortPlug {
+    pub machine: Id,
+    #[serde(flatten)]
+    pub nic: NicAttachment,
+}
+
+/// Result payload of [`CommandKind::ReadLogs`]. `text` is utf-8 from the
+/// youki bundle log or the libvirt console log.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogText {
+    pub text: String,
 }
 
 /// Payload of [`CommandKind::MigrateMachine`]. `dest` is a libvirt URI,
@@ -191,9 +212,56 @@ pub struct MigrateRequest {
     pub dest: String,
 }
 
+/// How a host reaches a volume that is not only a filesystem path.
+///
+/// `Local` is a file or an LVM device path. `Rbd` is the attach target
+/// `slab` reports for a Ceph image. `key_secret`, when set, is a keyring
+/// file path. It is not written into guest XML and it is not shown in Debug.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum DiskTarget {
+    Local {
+        path: String,
+    },
+    Rbd {
+        pool: String,
+        image: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        monitors: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_secret: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for DiskTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskTarget::Local { path } => f.debug_struct("Local").field("path", path).finish(),
+            DiskTarget::Rbd {
+                pool,
+                image,
+                monitors,
+                user,
+                key_secret,
+            } => f
+                .debug_struct("Rbd")
+                .field("pool", pool)
+                .field("image", image)
+                .field("monitors", monitors)
+                .field("user", user)
+                .field("key_secret", &key_secret.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
+}
+
 /// Payload of [`CommandKind::AttachVolume`]. `path` is the host file `slab`
-/// created. The agent may stage a copy under its libvirt image directory
-/// when AppArmor will not let qemu open `path` in place.
+/// created, or an LVM device path under `/dev`. `target` is set when the
+/// volume is an RBD image. The agent may stage a copy of a regular file
+/// under its libvirt image directory when AppArmor will not let qemu open
+/// `path` in place. A block device is attached in place.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeAttach {
     pub machine: Id,
@@ -203,6 +271,9 @@ pub struct VolumeAttach {
     pub device: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+    /// Slab attach target. Absent for a host path carried in `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<DiskTarget>,
 }
 
 /// What the guest disk was named, so `slab` can record `status.device`.
@@ -219,6 +290,9 @@ pub struct VolumeDetach {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// Present when the disk was attached from an RBD target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<DiskTarget>,
 }
 
 /// Result payload of a successful [`CommandKind::StartMachine`]: what the
@@ -275,6 +349,9 @@ pub enum CommandKind {
     SyncOverlay,
     /// Live-migrate a running domain. The payload is [`MigrateRequest`].
     MigrateMachine,
+    /// Read the youki bundle log or the libvirt console log. The payload is
+    /// [`MachineRef`]. The result is [`LogText`].
+    ReadLogs,
 }
 
 impl std::fmt::Display for CommandKind {
@@ -289,6 +366,7 @@ impl std::fmt::Display for CommandKind {
             CommandKind::UnplugPort => "unplug_port",
             CommandKind::SyncOverlay => "sync_overlay",
             CommandKind::MigrateMachine => "migrate_machine",
+            CommandKind::ReadLogs => "read_logs",
         };
         f.write_str(s)
     }
@@ -393,6 +471,89 @@ mod tests {
         let v = serde_json::to_value(CommandKind::MigrateMachine).unwrap();
         assert_eq!(v, serde_json::json!("migrate_machine"));
         assert_eq!(CommandKind::MigrateMachine.to_string(), "migrate_machine");
+        let v = serde_json::to_value(CommandKind::ReadLogs).unwrap();
+        assert_eq!(v, serde_json::json!("read_logs"));
+        assert_eq!(CommandKind::ReadLogs.to_string(), "read_logs");
+        let back: CommandKind = serde_json::from_value(v).unwrap();
+        assert_eq!(back, CommandKind::ReadLogs);
+        assert_eq!(CommandKind::PlugPort.to_string(), "plug_port");
+        assert_eq!(CommandKind::UnplugPort.to_string(), "unplug_port");
+    }
+
+    fn sample_id(kind: &str) -> String {
+        format!("{kind}-018f2c3a-7b6e-7a11-8c22-123456789abc")
+    }
+
+    #[test]
+    fn volume_attach_accepts_an_lvm_path_and_an_rbd_target() {
+        let old: VolumeAttach = serde_json::from_str(&format!(
+            r#"{{"machine":"{}","volume":"{}","path":"/dev/vg/lv"}}"#,
+            sample_id("mach"),
+            sample_id("vol")
+        ))
+        .unwrap();
+        assert!(old.target.is_none());
+        assert_eq!(old.path, "/dev/vg/lv");
+
+        let secret = "super-secret-value";
+        let with = serde_json::json!({
+            "machine": sample_id("mach"),
+            "volume": sample_id("vol"),
+            "path": "",
+            "target": {
+                "protocol": "rbd",
+                "pool": "volumes",
+                "image": "vol-1",
+                "monitors": ["10.1.0.5:6789"],
+                "user": "pistack",
+                "key_secret": secret
+            }
+        });
+        let parsed: VolumeAttach = serde_json::from_value(with.clone()).unwrap();
+        match &parsed.target {
+            Some(DiskTarget::Rbd {
+                pool,
+                image,
+                monitors,
+                user,
+                key_secret,
+            }) => {
+                assert_eq!(pool, "volumes");
+                assert_eq!(image, "vol-1");
+                assert_eq!(monitors, &vec!["10.1.0.5:6789".to_string()]);
+                assert_eq!(user, "pistack");
+                assert_eq!(key_secret.as_deref(), Some(secret));
+            }
+            other => panic!("expected rbd target, got {other:?}"),
+        }
+        let shown = format!("{:?}", parsed.target);
+        assert!(!shown.contains(secret));
+        assert!(shown.contains("<redacted>"));
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["target"]["pool"], "volumes");
+    }
+
+    #[test]
+    fn port_plug_and_log_text_round_trip() {
+        let plug = PortPlug {
+            machine: Id::parse("mach", &sample_id("mach")).unwrap(),
+            nic: NicAttachment {
+                network_id: "net-01a102de-3f33-73bf-86f7-57fe3b47f1ea".into(),
+                mac: "52:54:00:aa:bb:cc".into(),
+                address: "10.90.0.10".into(),
+                prefix: 24,
+                gateway: "10.90.0.1".into(),
+                routed: true,
+                segment_id: Some(7),
+            },
+        };
+        let text = serde_json::to_string(&plug).unwrap();
+        assert!(text.contains("\"segment_id\":7"));
+        assert!(!text.contains("\"nic\""));
+        let back: PortPlug = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, plug);
+        let logs: LogText = serde_json::from_str(r#"{"text":"boot ok"}"#).unwrap();
+        assert_eq!(logs.text, "boot ok");
     }
 
     #[test]

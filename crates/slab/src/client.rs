@@ -446,6 +446,7 @@ impl Client {
             path,
             device,
             read_only: info.read_only,
+            target: None,
         };
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue.enqueue(&node, CommandKind::AttachVolume, payload)?;
@@ -475,6 +476,7 @@ impl Client {
             volume: id.clone(),
             path,
             device,
+            target: None,
         };
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue.enqueue(&node, CommandKind::DetachVolume, payload)?;

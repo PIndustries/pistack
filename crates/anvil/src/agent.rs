@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use pistack_rpc::proto::{
-    AgentHello, Command, CommandKind, CommandResult, Heartbeat, MachineRef, MachineReport,
-    MachineRequest, MigrateRequest, VolumeAttach, VolumeAttached, VolumeDetach, MAX_LONG_POLL_SECS,
+    AgentHello, Command, CommandKind, CommandResult, Heartbeat, LogText, MachineRef, MachineReport,
+    MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached, VolumeDetach,
+    MAX_LONG_POLL_SECS,
 };
 use pistack_rpc::{AgentClient, RpcError};
 use pistack_types::{ApiError, Phase, Resources};
@@ -328,6 +329,18 @@ impl Agent {
                 self.runtimes.detach_volume(&req).await?;
                 Ok(serde_json::Value::Null)
             }
+            CommandKind::PlugPort => {
+                let req: PortPlug = payload(c.payload)?;
+                tracing::info!(machine = %req.machine, "anvil: plug port");
+                crate::runtime::libvirt::plug_port(&req).await?;
+                Ok(serde_json::Value::Null)
+            }
+            CommandKind::UnplugPort => {
+                let req: PortPlug = payload(c.payload)?;
+                tracing::info!(machine = %req.machine, "anvil: unplug port");
+                crate::runtime::libvirt::unplug_port(&req).await?;
+                Ok(serde_json::Value::Null)
+            }
             CommandKind::SyncOverlay => {
                 tracing::info!("anvil: sync overlay");
                 crate::overlay::apply_plan(&c.payload).await?;
@@ -340,11 +353,226 @@ impl Agent {
                 crate::runtime::libvirt::migrate(&domain, &req.dest).await?;
                 Ok(serde_json::Value::Null)
             }
-            other => Err(ApiError::not_implemented(format!(
-                "anvil: {other} is not implemented yet"
-            ))),
+            CommandKind::ReadLogs => {
+                let req: MachineRef = payload(c.payload)?;
+                tracing::info!(machine = %req.id, "anvil: read logs");
+                let text = read_machine_logs(&req.id).await?;
+                serde_json::to_value(LogText { text })
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            }
         }
     }
+}
+
+const LOG_CAP: usize = 256 * 1024;
+
+fn youki_state_dir() -> std::path::PathBuf {
+    match std::env::var_os("PISTACK_YOUKI_STATE") {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => std::path::PathBuf::from("/var/lib/pistack/youki"),
+    }
+}
+
+fn bundle_name(id: &pistack_types::Id) -> Result<String, ApiError> {
+    let name = id.to_string();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(ApiError::bad_request(format!(
+            "machine id {name} cannot name a log"
+        )));
+    }
+    Ok(name)
+}
+
+/// Youki bundle log (`log`, then `console.log`) when one exists, otherwise
+/// the libvirt console log for the same machine. Lines that carry user data,
+/// ssh keys, or passwords are removed.
+async fn read_machine_logs(id: &pistack_types::Id) -> Result<String, ApiError> {
+    read_machine_logs_in(
+        id,
+        &youki_state_dir(),
+        &crate::runtime::libvirt::images_dir(),
+    )
+    .await
+}
+
+async fn read_machine_logs_in(
+    id: &pistack_types::Id,
+    youki_state: &std::path::Path,
+    libvirt_root: &std::path::Path,
+) -> Result<String, ApiError> {
+    let name = bundle_name(id)?;
+    let mut candidates = Vec::new();
+    let bundle = youki_state.join(&name);
+    candidates.push((bundle.join("log"), bundle.clone()));
+    candidates.push((bundle.join("console.log"), bundle));
+    let domain = format!("pistack-{name}");
+    let vm = libvirt_root.join("machines").join(domain);
+    candidates.push((vm.join("console.log"), vm));
+
+    let mut empty = None;
+    for (path, jail) in candidates {
+        if let Some(text) = read_jailed_log(&path, &jail).await? {
+            if !text.is_empty() {
+                return Ok(scrub_log(&text));
+            }
+            if empty.is_none() {
+                empty = Some(text);
+            }
+        }
+    }
+    if let Some(text) = empty {
+        return Ok(scrub_log(&text));
+    }
+    Err(ApiError::not_found(format!("no log for machine {id}")))
+}
+
+async fn read_jailed_log(
+    path: &std::path::Path,
+    jail: &std::path::Path,
+) -> Result<Option<String>, ApiError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ApiError::unavailable(format!("reading log: {e}"))),
+    }
+    let canon = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?;
+    let jail_canon = match tokio::fs::canonicalize(jail).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ApiError::unavailable(format!("reading log: {e}"))),
+    };
+    if !canon.starts_with(&jail_canon) {
+        return Ok(None);
+    }
+    let mut file = tokio::fs::File::open(&canon)
+        .await
+        .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?
+        .len();
+    if len > LOG_CAP as u64 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(len - LOG_CAP as u64))
+            .await
+            .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?;
+    }
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .await
+        .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?;
+    Ok(Some(tail_log_bytes(&buf, LOG_CAP)))
+}
+
+fn tail_log_bytes(bytes: &[u8], cap: usize) -> String {
+    if cap == 0 || bytes.is_empty() {
+        return String::new();
+    }
+    let slice = if bytes.len() > cap {
+        let mut start = bytes.len() - cap;
+        while start < bytes.len() && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
+            start += 1;
+        }
+        &bytes[start..]
+    } else {
+        bytes
+    };
+    String::from_utf8_lossy(slice).into_owned()
+}
+
+fn secret_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "ssh-ed25519",
+        "ssh-rsa",
+        "ssh-dss",
+        "ecdsa-sha2-",
+        "sk-ssh-",
+        "sk-ecdsa-",
+        "begin openssh private key",
+        "begin rsa private key",
+        "begin dsa private key",
+        "begin ec private key",
+        "begin private key",
+        "begin openssh",
+        "user_data",
+        "user-data",
+        "ssh_authorized_keys",
+        "authorized_keys",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+fn secret_key_at(lower: &str, i: usize) -> Option<usize> {
+    let rest = &lower[i..];
+    let key = if rest.starts_with("password") {
+        "password"
+    } else if rest.starts_with("passwd") {
+        "passwd"
+    } else {
+        return None;
+    };
+    if i > 0 && lower.as_bytes()[i - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    Some(key.len())
+}
+
+fn redact_secrets(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(key_len) = secret_key_at(&lower, i) {
+            let after = i + key_len;
+            let rest = &lower[after..];
+            let spaces = rest.len() - rest.trim_start_matches(' ').len();
+            let trimmed = &rest[spaces..];
+            if trimmed.starts_with(':') || trimmed.starts_with('=') {
+                out.push_str(&line[i..after]);
+                out.push_str(&line[after..after + spaces]);
+                let sep_at = after + spaces;
+                out.push(bytes[sep_at] as char);
+                let mut j = sep_at + 1;
+                while j < bytes.len() && bytes[j] == b' ' {
+                    out.push(' ');
+                    j += 1;
+                }
+                out.push_str("***");
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn scrub_log(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        if secret_line(body) {
+            continue;
+        }
+        out.push_str(&redact_secrets(body));
+        out.push_str(nl);
+    }
+    out
 }
 
 fn payload<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Result<T, ApiError> {
@@ -636,5 +864,148 @@ mod tests {
         .await
         .expect("agent returned")
         .expect("ok");
+    }
+
+    #[test]
+    fn scrub_drops_keys_and_user_data_and_redacts_passwords() {
+        let raw = "\
+hello
+password: hunter2
+passwd=secret
+Failed password for invalid user
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISecret demo
+user_data: cloud-config
+authorized_keys: present
+still here
+";
+        let text = scrub_log(raw);
+        assert!(text.contains("hello"));
+        assert!(text.contains("still here"));
+        assert!(text.contains("password: ***"));
+        assert!(text.contains("passwd=***"));
+        assert!(text.contains("Failed password for invalid user"));
+        assert!(!text.contains("hunter2"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("ssh-ed25519"));
+        assert!(!text.contains("AAAAC3"));
+        assert!(!text.contains("user_data"));
+        assert!(!text.contains("cloud-config"));
+        assert!(!text.contains("authorized_keys"));
+        let tail = tail_log_bytes("abcdefghijklmnop".as_bytes(), 4);
+        assert_eq!(tail, "mnop");
+        let split = tail_log_bytes(&[b'a', 0xc3, 0xa9, b'b'], 2);
+        assert!(!split.contains('\u{fffd}') || split.ends_with('b') || split == "éb" || split == "b");
+        assert!(split.ends_with('b'));
+    }
+
+    #[tokio::test]
+    async fn read_logs_prefers_the_youki_bundle_and_skips_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "pistack-logs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let id = pistack_types::Id::parse(
+            pistack_types::kind::MACHINE,
+            "mach-018f2c3a-7b6e-7a11-8c22-123456789abc",
+        )
+        .unwrap();
+        let name = id.to_string();
+        let youki = root.join("youki");
+        let images = root.join("images");
+        let bundle = youki.join(&name);
+        let vm = images.join("machines").join(format!("pistack-{name}"));
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::write(bundle.join("log"), "from-youki\npassword: hunter2\n").unwrap();
+        std::fs::write(vm.join("console.log"), "from-kvm\n").unwrap();
+        let text = read_machine_logs_in(&id, &youki, &images).await.unwrap();
+        assert!(text.contains("from-youki"));
+        assert!(text.contains("password: ***"));
+        assert!(!text.contains("hunter2"));
+        assert!(!text.contains("from-kvm"));
+
+        std::fs::remove_file(bundle.join("log")).unwrap();
+        let text = read_machine_logs_in(&id, &youki, &images).await.unwrap();
+        assert_eq!(text, "from-kvm\n");
+
+        let outside = root.join("secret.txt");
+        std::fs::write(&outside, "ssh-ed25519 AAAALEAK demo\n").unwrap();
+        std::os::unix::fs::symlink(&outside, bundle.join("log")).unwrap();
+        std::fs::remove_file(vm.join("console.log")).unwrap();
+        let err = read_machine_logs_in(&id, &youki, &images).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::NotFound);
+        assert!(!err.message.contains("AAAALEAK"));
+        assert!(!err.message.contains("ssh-ed25519"));
+
+        std::fs::write(vm.join("console.log"), "").unwrap();
+        let text = read_machine_logs_in(&id, &youki, &images).await.unwrap();
+        assert_eq!(text, "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn read_logs_command_rejects_a_bad_payload() {
+        let client = AgentClient::new("http://127.0.0.1:1", "n1").unwrap();
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::new());
+        let agent = Agent {
+            client,
+            runtimes: Runtimes::all(rt),
+            facts: facts::gather(),
+        };
+        let bad = agent
+            .execute(Command {
+                id: uuid::Uuid::now_v7(),
+                kind: CommandKind::ReadLogs,
+                payload: serde_json::json!({}),
+                issued_at: Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, pistack_types::error::ErrorCode::BadRequest);
+        let bad = agent
+            .execute(Command {
+                id: uuid::Uuid::now_v7(),
+                kind: CommandKind::PlugPort,
+                payload: serde_json::json!({"machine": "nope"}),
+                issued_at: Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, pistack_types::error::ErrorCode::BadRequest);
+        let bad = agent
+            .execute(Command {
+                id: uuid::Uuid::now_v7(),
+                kind: CommandKind::UnplugPort,
+                payload: serde_json::json!(null),
+                issued_at: Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, pistack_types::error::ErrorCode::BadRequest);
+
+        let id = pistack_types::Id::new(pistack_types::kind::MACHINE);
+        match agent
+            .execute(Command {
+                id: uuid::Uuid::now_v7(),
+                kind: CommandKind::ReadLogs,
+                payload: serde_json::json!({"id": id.to_string()}),
+                issued_at: Utc::now(),
+            })
+            .await
+        {
+            Err(e) => {
+                assert_eq!(e.code, pistack_types::error::ErrorCode::NotFound);
+                assert!(!e.message.contains("ssh-"));
+            }
+            Ok(v) => {
+                let n = v.get("text").and_then(|t| t.as_str()).map(|s| s.len()).unwrap_or(0);
+                panic!("expected no log for a fresh id, got {n} bytes");
+            }
+        }
     }
 }

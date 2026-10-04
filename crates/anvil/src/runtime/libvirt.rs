@@ -18,9 +18,10 @@ use super::{
     VolumeDetach,
 };
 use async_trait::async_trait;
+use pistack_rpc::proto::{DiskTarget, PortPlug};
 use pistack_types::{kind, ApiError, ApiResult, Id};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -121,55 +122,64 @@ impl MachineRuntime for LibvirtRuntime {
 
     async fn attach_volume(&self, req: &VolumeAttach) -> ApiResult<String> {
         let domain = domain_name(&req.machine)?;
-        if dom_state(&domain).await.is_err() {
-            return Err(ApiError::not_found(format!(
-                "machine {} is not on this host",
-                req.machine
-            )));
+        if let Err(e) = dom_state(&domain).await {
+            return Err(if e.code == pistack_types::error::ErrorCode::Unavailable {
+                e
+            } else {
+                ApiError::not_found(format!("machine {} is not on this host", req.machine))
+            });
         }
-        let source = volume_source(&req.path)?;
-        let disk = stage_volume(&req.volume, &source).await?;
         if let Some(dev) = req.device.as_deref() {
             check_device(dev)?;
         }
-        let listing = virsh(["domblklist", &domain]).await?;
-        if let Some(existing) = target_for_source(&listing, &disk.to_string_lossy()) {
-            return Ok(existing);
-        }
-        let device = match req.device.clone() {
-            Some(dev) => dev,
-            None => next_device(&listing)?,
-        };
         let state = dom_state(&domain).await?;
-        let mut args = vec![
-            "attach-disk".to_owned(),
-            domain,
-            disk.to_string_lossy().into_owned(),
-            device.clone(),
-            "--targetbus".into(),
-            "virtio".into(),
-            "--subdriver".into(),
-            "raw".into(),
-            "--config".into(),
-        ];
-        if req.read_only {
-            args.push("--mode".into());
-            args.push("readonly".into());
+        let live = state == "running" || state == "paused";
+        match resolve_disk(req).await? {
+            HostDisk::File(source) => {
+                let disk = stage_volume(&req.volume, &source).await?;
+                attach_host_disk(
+                    &domain,
+                    &disk.to_string_lossy(),
+                    req.device.as_deref(),
+                    req.read_only,
+                    false,
+                    live,
+                )
+                .await
+            }
+            HostDisk::Block(source) => {
+                attach_host_disk(
+                    &domain,
+                    &source.to_string_lossy(),
+                    req.device.as_deref(),
+                    req.read_only,
+                    true,
+                    live,
+                )
+                .await
+            }
+            HostDisk::Rbd(disk) => {
+                attach_rbd(&domain, req.device.as_deref(), req.read_only, &disk, live).await
+            }
         }
-        if state == "running" || state == "paused" {
-            args.push("--live".into());
-        }
-        virsh(args).await?;
-        Ok(device)
     }
 
     async fn detach_volume(&self, req: &VolumeDetach) -> ApiResult<()> {
         let domain = domain_name(&req.machine)?;
-        if dom_state(&domain).await.is_err() {
-            return Err(ApiError::not_found(format!(
-                "machine {} is not on this host",
-                req.machine
-            )));
+        if let Err(e) = dom_state(&domain).await {
+            return Err(if e.code == pistack_types::error::ErrorCode::Unavailable {
+                e
+            } else {
+                ApiError::not_found(format!("machine {} is not on this host", req.machine))
+            });
+        }
+        if let Some(DiskTarget::Rbd { pool, image, .. }) = &req.target {
+            let spec = rbd_names(pool, image)?;
+            return detach_by_source(&domain, &spec, req.device.as_deref()).await;
+        }
+        if let Ok(HostDisk::Block(source)) = classify_path(&req.path).await {
+            return detach_by_source(&domain, &source.to_string_lossy(), req.device.as_deref())
+                .await;
         }
         let source = PathBuf::from(&req.path);
         let staged = staged_path(&req.volume, &source);
@@ -237,6 +247,7 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
         .await
         .map_err(|e| ApiError::internal(format!("creating {}: {e}", vm.display())))?;
     let disk = vm.join("disk.qcow2");
+    ensure_console_log(&vm.join("console.log")).await?;
     let gib = if req.resources.disk_gib == 0 {
         10
     } else {
@@ -431,6 +442,14 @@ async fn dom_state(domain: &str) -> ApiResult<String> {
     Ok(out.trim().to_owned())
 }
 
+/// `PISTACK_VIRSH`, when set and non-empty, replaces the `virsh` binary.
+fn virsh_bin() -> String {
+    match std::env::var("PISTACK_VIRSH") {
+        Ok(v) if !v.trim().is_empty() && !v.contains('\0') => v,
+        _ => "virsh".to_owned(),
+    }
+}
+
 async fn virsh<I, S>(args: I) -> ApiResult<String>
 where
     I: IntoIterator<Item = S>,
@@ -438,7 +457,7 @@ where
 {
     let mut full = vec!["-c".to_owned(), URI.to_owned()];
     full.extend(args.into_iter().map(|s| s.as_ref().to_owned()));
-    run("virsh", full.iter().map(String::as_str)).await
+    run(&virsh_bin(), full.iter().map(String::as_str)).await
 }
 
 async fn run<I, S>(bin: &str, args: I) -> ApiResult<String>
@@ -498,6 +517,7 @@ fn target_for_source(listing: &str, source: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn volume_source(path: &str) -> ApiResult<PathBuf> {
     if path.contains('\0') || !Path::new(path).is_absolute() {
         return Err(ApiError::bad_request("volume path must be absolute"));
@@ -513,6 +533,438 @@ fn volume_source(path: &str) -> ApiResult<PathBuf> {
         )));
     }
     Ok(path)
+}
+
+#[derive(Debug)]
+enum HostDisk {
+    File(PathBuf),
+    Block(PathBuf),
+    Rbd(RbdDisk),
+}
+
+#[derive(Debug)]
+struct RbdDisk {
+    pool: String,
+    image: String,
+    user: String,
+    monitors: Vec<(String, u16)>,
+    keyring: Option<PathBuf>,
+}
+
+fn volume_path(path: &str) -> ApiResult<PathBuf> {
+    if path.is_empty()
+        || path.contains('\0')
+        || path.contains('\n')
+        || path.contains('\r')
+        || !Path::new(path).is_absolute()
+    {
+        return Err(ApiError::bad_request("volume path must be absolute"));
+    }
+    let path = PathBuf::from(path);
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(ApiError::bad_request("volume path is not allowed"));
+    }
+    Ok(path)
+}
+
+/// `/dev/<name>/...`. The path itself must name something inside `/dev`.
+fn under_dev(path: &Path) -> bool {
+    let mut comps = path.components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::RootDir), Some(Component::Normal(dev))) => {
+            dev == "dev" && comps.next().is_some()
+        }
+        _ => false,
+    }
+}
+
+fn classify_flags(
+    requested: &Path,
+    canon: &Path,
+    is_file: bool,
+    is_block: bool,
+) -> ApiResult<HostDisk> {
+    if is_block {
+        if !under_dev(requested) || !under_dev(canon) {
+            return Err(ApiError::bad_request(
+                "block volume must be a device path under /dev",
+            ));
+        }
+        return Ok(HostDisk::Block(canon.to_path_buf()));
+    }
+    if is_file {
+        return Ok(HostDisk::File(requested.to_path_buf()));
+    }
+    Err(ApiError::bad_request(
+        "volume path is not a file or a block device",
+    ))
+}
+
+async fn classify_path(path: &str) -> ApiResult<HostDisk> {
+    let requested = volume_path(path)?;
+    let meta = match tokio::fs::symlink_metadata(&requested).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::not_found(format!(
+                "volume path {} not found",
+                requested.display()
+            )))
+        }
+        Err(e) => {
+            return Err(ApiError::unavailable(format!(
+                "volume path {}: {e}",
+                requested.display()
+            )))
+        }
+    };
+    // Follow a symlink only after the requested path is known. A symlink
+    // outside /dev must not become a block attach of some other device.
+    let followed = tokio::fs::metadata(&requested).await.map_err(|e| {
+        ApiError::unavailable(format!("volume path {}: {e}", requested.display()))
+    })?;
+    let canon = if meta.file_type().is_symlink() {
+        tokio::fs::canonicalize(&requested).await.map_err(|e| {
+            ApiError::unavailable(format!("volume path {}: {e}", requested.display()))
+        })?
+    } else {
+        requested.clone()
+    };
+    use std::os::unix::fs::FileTypeExt;
+    let ft = followed.file_type();
+    classify_flags(&requested, &canon, ft.is_file(), ft.is_block_device())
+}
+
+fn ident_ok(kind: &str, value: &str) -> ApiResult<()> {
+    let ok = (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{kind} must match [A-Za-z0-9._-]{{1,64}}"
+        )))
+    }
+}
+
+fn rbd_names(pool: &str, image: &str) -> ApiResult<String> {
+    ident_ok("pool", pool)?;
+    ident_ok("image", image)?;
+    Ok(format!("{pool}/{image}"))
+}
+
+fn parse_monitor(raw: &str) -> ApiResult<(String, u16)> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 128 || raw.chars().any(|c| c.is_control() || c == '\'' || c == '"')
+    {
+        return Err(ApiError::bad_request(
+            "rbd monitor must be a host or host:port",
+        ));
+    }
+    let (host, port) = if let Some((host, port)) = raw.rsplit_once(':') {
+        if host.is_empty() {
+            return Err(ApiError::bad_request(
+                "rbd monitor must be a host or host:port",
+            ));
+        }
+        let port: u16 = port.parse().map_err(|_| {
+            ApiError::bad_request("rbd monitor must be a host or host:port")
+        })?;
+        if port == 0 {
+            return Err(ApiError::bad_request(
+                "rbd monitor must be a host or host:port",
+            ));
+        }
+        (host, port)
+    } else {
+        (raw, 6789)
+    };
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(ApiError::bad_request(
+            "rbd monitor must be a host or host:port",
+        ));
+    }
+    Ok((host.to_owned(), port))
+}
+
+/// `key_secret` is a keyring path. The key bytes are not read and are not
+/// placed on a command line. Anything that is not an existing file is refused.
+fn keyring_file(secret: &Option<String>) -> ApiResult<Option<PathBuf>> {
+    let Some(raw) = secret.as_deref() else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let path = Path::new(raw);
+    let safe = path.is_absolute()
+        && !raw.contains('\0')
+        && !raw.chars().any(|c| c.is_control())
+        && !path.components().any(|c| matches!(c, Component::ParentDir));
+    if !safe {
+        return Err(ApiError::unavailable("rbd keyring file is not available"));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Err(ApiError::unavailable("rbd keyring file is not available")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ApiError::unavailable("rbd keyring file is not available"))
+        }
+        Err(_) => Err(ApiError::unavailable("rbd keyring file is not available")),
+    }
+}
+
+fn rbd_disk(
+    pool: &str,
+    image: &str,
+    monitors: &[String],
+    user: &str,
+    key_secret: &Option<String>,
+) -> ApiResult<RbdDisk> {
+    ident_ok("pool", pool)?;
+    ident_ok("image", image)?;
+    let user = if user.is_empty() {
+        "pistack".to_owned()
+    } else {
+        user.to_owned()
+    };
+    ident_ok("user", &user)?;
+    if monitors.len() > 16 {
+        return Err(ApiError::bad_request("rbd monitor list is too long"));
+    }
+    let monitors = monitors
+        .iter()
+        .map(|m| parse_monitor(m))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let keyring = keyring_file(key_secret)?;
+    Ok(RbdDisk {
+        pool: pool.to_owned(),
+        image: image.to_owned(),
+        user,
+        monitors,
+        keyring,
+    })
+}
+
+fn rbd_bin() -> String {
+    match std::env::var("PISTACK_RBD_BIN") {
+        Ok(v) if !v.trim().is_empty() && !v.contains('\0') => v.trim().to_owned(),
+        _ => "rbd".to_owned(),
+    }
+}
+
+fn rbd_info_args(disk: &RbdDisk) -> Vec<String> {
+    let mut args = vec![
+        "info".to_owned(),
+        format!("{}/{}", disk.pool, disk.image),
+        "--id".to_owned(),
+        disk.user.clone(),
+    ];
+    if !disk.monitors.is_empty() {
+        args.push("-m".into());
+        args.push(
+            disk.monitors
+                .iter()
+                .map(|(host, port)| format!("{host}:{port}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    if let Some(keyring) = &disk.keyring {
+        args.push("--keyring".into());
+        args.push(keyring.to_string_lossy().into_owned());
+    }
+    args
+}
+
+async fn probe_rbd(disk: &RbdDisk) -> ApiResult<()> {
+    let bin = rbd_bin();
+    let args = rbd_info_args(disk);
+    let child = Command::new(&bin).args(&args).kill_on_drop(true).output();
+    match tokio::time::timeout(Duration::from_secs(30), child).await {
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = err.trim();
+            Err(ApiError::internal(if msg.is_empty() {
+                "rbd info failed".into()
+            } else {
+                format!("rbd info failed: {msg}")
+            }))
+        }
+        Ok(Err(e)) => Err(ApiError::unavailable(format!("rbd is not installed ({e})"))),
+        Err(_) => Err(ApiError::unavailable("rbd info timed out")),
+    }
+}
+
+async fn resolve_disk(req: &VolumeAttach) -> ApiResult<HostDisk> {
+    match &req.target {
+        Some(DiskTarget::Rbd {
+            pool,
+            image,
+            monitors,
+            user,
+            key_secret,
+        }) => {
+            let disk = rbd_disk(pool, image, monitors, user, key_secret)?;
+            probe_rbd(&disk).await?;
+            Ok(HostDisk::Rbd(disk))
+        }
+        Some(DiskTarget::Local { path }) if !path.is_empty() => classify_path(path).await,
+        _ => classify_path(&req.path).await,
+    }
+}
+
+fn attach_disk_args(
+    domain: &str,
+    source: &str,
+    device: &str,
+    block: bool,
+    read_only: bool,
+    live: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "attach-disk".to_owned(),
+        domain.to_owned(),
+        source.to_owned(),
+        device.to_owned(),
+        "--targetbus".into(),
+        "virtio".into(),
+        "--subdriver".into(),
+        "raw".into(),
+        "--config".into(),
+    ];
+    if block {
+        args.push("--sourcetype".into());
+        args.push("block".into());
+    }
+    if read_only {
+        args.push("--mode".into());
+        args.push("readonly".into());
+    }
+    if live {
+        args.push("--live".into());
+    }
+    args
+}
+
+async fn attach_host_disk(
+    domain: &str,
+    source: &str,
+    device: Option<&str>,
+    read_only: bool,
+    block: bool,
+    live: bool,
+) -> ApiResult<String> {
+    let listing = virsh(["domblklist", domain]).await?;
+    if let Some(existing) = target_for_source(&listing, source) {
+        return Ok(existing);
+    }
+    let device = match device {
+        Some(dev) => dev.to_owned(),
+        None => next_device(&listing)?,
+    };
+    virsh(attach_disk_args(domain, source, &device, block, read_only, live)).await?;
+    Ok(device)
+}
+
+fn rbd_disk_xml(disk: &RbdDisk, device: &str, read_only: bool) -> String {
+    let mut hosts = String::new();
+    for (name, port) in &disk.monitors {
+        hosts.push_str(&format!(
+            "\n    <host name='{}' port='{port}'/>",
+            xml_escape(name),
+        ));
+    }
+    let ro = if read_only { "\n  <readonly/>" } else { "" };
+    format!(
+        "<disk type='network' device='disk'>\n  <driver name='qemu' type='raw'/>\n  <source protocol='rbd' name='{name}'>{hosts}\n  </source>\n  <target dev='{device}' bus='virtio'/>{ro}\n</disk>\n",
+        name = xml_escape(&format!("{}/{}", disk.pool, disk.image)),
+    )
+}
+
+async fn attach_rbd(
+    domain: &str,
+    device: Option<&str>,
+    read_only: bool,
+    disk: &RbdDisk,
+    live: bool,
+) -> ApiResult<String> {
+    let listing = virsh(["domblklist", domain]).await?;
+    let needle = format!("{}/{}", disk.pool, disk.image);
+    if let Some(existing) = target_for_source_containing(&listing, &needle) {
+        check_device(&existing)?;
+        return Ok(existing);
+    }
+    let device = match device {
+        Some(dev) => dev.to_owned(),
+        None => next_device(&listing)?,
+    };
+    let xml = rbd_disk_xml(disk, &device, read_only);
+    attach_device_xml(domain, &xml, live).await?;
+    Ok(device)
+}
+
+fn target_for_source_containing(listing: &str, needle: &str) -> Option<String> {
+    if needle.is_empty() {
+        return None;
+    }
+    for line in listing.lines() {
+        let mut cols = line.split_whitespace();
+        let Some(dev) = cols.next() else { continue };
+        let Some(src) = cols.next() else { continue };
+        if src.contains(needle) && check_device(dev).is_ok() {
+            return Some(dev.to_owned());
+        }
+    }
+    None
+}
+
+async fn detach_by_source(domain: &str, needle: &str, device: Option<&str>) -> ApiResult<()> {
+    let listing = virsh(["domblklist", domain]).await.unwrap_or_default();
+    let found = target_for_source(&listing, needle)
+        .or_else(|| target_for_source_containing(&listing, needle))
+        .or_else(|| {
+            device
+                .filter(|dev| check_device(dev).is_ok())
+                .filter(|dev| listing.split_whitespace().any(|col| col == *dev))
+                .map(str::to_owned)
+        });
+    let Some(dev) = found else {
+        return Ok(());
+    };
+    check_device(&dev)?;
+    let state = dom_state(domain).await?;
+    let mut args = vec!["detach-disk".to_owned(), domain.to_owned(), dev, "--config".into()];
+    if state == "running" || state == "paused" {
+        args.push("--live".into());
+    }
+    virsh(args).await.map(|_| ())
+}
+
+async fn ensure_console_log(path: &Path) -> ApiResult<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(ApiError::unavailable(format!(
+            "console log {} is not a file",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::write(path, b"")
+                .await
+                .map_err(|e| ApiError::internal(format!("creating {}: {e}", path.display())))?;
+            chmod_rw(path).await
+        }
+        Err(e) => Err(ApiError::internal(format!(
+            "console log {}: {e}",
+            path.display()
+        ))),
+    }
 }
 
 fn image_dir() -> PathBuf {
@@ -688,6 +1140,18 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn console_path(disk: &Path) -> PathBuf {
+    disk.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("console.log"))
+        .unwrap_or_else(|| PathBuf::from("console.log"))
+}
+
+/// Image directory the agent uses for disks and console logs.
+pub fn images_dir() -> PathBuf {
+    LibvirtRuntime::dir()
+}
+
 fn domain_xml(
     domain: &str,
     memory_mib: u64,
@@ -697,6 +1161,7 @@ fn domain_xml(
     nics: &[NicAttachment],
 ) -> ApiResult<String> {
     let ifaces = interfaces(nics)?;
+    let console = console_path(disk);
     Ok(format!(
         r#"<domain type='kvm'>
   <name>{domain}</name>
@@ -721,13 +1186,21 @@ fn domain_xml(
       <readonly/>
     </disk>
 {ifaces}    <graphics type='vnc' autoport='yes' listen='127.0.0.1'/>
-    <console type='pty'/>
+    <serial type='file'>
+      <source path='{console}'/>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <console type='file'>
+      <source path='{console}'/>
+      <target type='serial' port='0'/>
+    </console>
   </devices>
 </domain>
 "#,
         domain = xml_escape(domain),
         disk = xml_escape(&disk.to_string_lossy()),
         seed = xml_escape(&seed.to_string_lossy()),
+        console = xml_escape(&console.to_string_lossy()),
     ))
 }
 
@@ -756,6 +1229,194 @@ fn interfaces(nics: &[NicAttachment]) -> ApiResult<String> {
         ));
     }
     Ok(out)
+}
+
+enum NicEndpoint {
+    Bridge(String),
+    Network(String),
+}
+
+struct IfaceRow {
+    kind: String,
+    source: String,
+    mac: String,
+}
+
+/// Where a hot-plugged port lands. An overlay port (`segment_id` set) uses
+/// the `po` bridge from the network id. It never falls through to `pistack0`,
+/// even when the address is on the shared subnet.
+fn nic_endpoint(nic: &NicAttachment) -> ApiResult<NicEndpoint> {
+    check_nic(nic)?;
+    if nic.segment_id.is_some() {
+        let bridge = overlay_bridge(&nic.network_id)?;
+        if bridge == BRIDGE || bridge.starts_with("pi") || !bridge.starts_with("po") {
+            return Err(ApiError::bad_request(
+                "overlay port cannot plug onto pistack0",
+            ));
+        }
+        return Ok(NicEndpoint::Bridge(bridge));
+    }
+    Ok(NicEndpoint::Network(guest_network(nic)?))
+}
+
+fn endpoint_matches(ep: &NicEndpoint, row: &IfaceRow) -> bool {
+    match ep {
+        NicEndpoint::Bridge(bridge) => {
+            row.kind == "bridge" && row.source == *bridge && row.source != BRIDGE
+        }
+        NicEndpoint::Network(net) => row.kind == "network" && row.source == *net,
+    }
+}
+
+fn hotplug_xml(nic: &NicAttachment) -> ApiResult<String> {
+    let ep = nic_endpoint(nic)?;
+    let xml = interfaces(std::slice::from_ref(nic))?;
+    if let NicEndpoint::Bridge(bridge) = &ep {
+        if xml.contains("pistack0")
+            || xml.contains("network='pistack'")
+            || !xml.contains(&format!("bridge='{bridge}'"))
+        {
+            return Err(ApiError::internal(
+                "refusing to plug an overlay port onto pistack0",
+            ));
+        }
+    }
+    Ok(xml)
+}
+
+fn parse_ifaces(text: &str) -> Vec<IfaceRow> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        let mac = cols[cols.len() - 1];
+        if !mac_ok(mac) {
+            continue;
+        }
+        out.push(IfaceRow {
+            kind: cols[1].to_owned(),
+            source: cols[2].to_owned(),
+            mac: mac.to_owned(),
+        });
+    }
+    out
+}
+
+fn iface_by_mac(text: &str, mac: &str) -> Option<IfaceRow> {
+    parse_ifaces(text)
+        .into_iter()
+        .find(|row| row.mac.eq_ignore_ascii_case(mac))
+}
+
+fn domain_gone(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("failed to get domain")
+        || m.contains("domain not found")
+        || m.contains("no domain with matching name")
+}
+
+async fn require_domain(domain: &str) -> ApiResult<String> {
+    match dom_state(domain).await {
+        Ok(state) => Ok(state),
+        Err(e) if e.code == pistack_types::error::ErrorCode::Unavailable => Err(e),
+        Err(e) if domain_gone(&e.message) => Err(ApiError::unavailable(format!(
+            "domain {domain} is not on this host"
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_live(state: &str) -> bool {
+    state == "running" || state == "paused"
+}
+
+async fn attach_device_xml(domain: &str, xml: &str, live: bool) -> ApiResult<()> {
+    let path = std::env::temp_dir().join(format!(
+        "pistack-dev-{}-{}.xml",
+        std::process::id(),
+        device_nonce()
+    ));
+    tokio::fs::write(&path, xml)
+        .await
+        .map_err(|e| ApiError::internal(format!("writing device xml: {e}")))?;
+    let mut args = vec![
+        "attach-device".to_owned(),
+        domain.to_owned(),
+        path.to_string_lossy().into_owned(),
+        "--config".into(),
+    ];
+    if live {
+        args.push("--live".into());
+    }
+    let result = virsh(args).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    result.map(|_| ())
+}
+
+fn device_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+async fn detach_iface(domain: &str, kind: &str, mac: &str, live: bool) -> ApiResult<()> {
+    let kind = match kind {
+        "bridge" | "network" => kind,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "nic type {other} is not a port"
+            )))
+        }
+    };
+    let mut args = vec![
+        "detach-interface".to_owned(),
+        domain.to_owned(),
+        kind.to_owned(),
+        "--mac".to_owned(),
+        mac.to_owned(),
+        "--config".to_owned(),
+    ];
+    if live {
+        args.push("--live".into());
+    }
+    virsh(args).await.map(|_| ())
+}
+
+/// Attach `req`'s NIC to the libvirt domain. A missing domain is unavailable.
+/// An overlay port is plugged onto its `po` bridge, never `pistack0`.
+pub async fn plug_port(req: &PortPlug) -> ApiResult<()> {
+    let domain = domain_name(&req.machine)?;
+    let state = require_domain(&domain).await?;
+    let xml = hotplug_xml(&req.nic)?;
+    let ep = nic_endpoint(&req.nic)?;
+    let listing = virsh(["domiflist", &domain]).await?;
+    if let Some(row) = iface_by_mac(&listing, &req.nic.mac) {
+        if endpoint_matches(&ep, &row) {
+            return Ok(());
+        }
+        detach_iface(&domain, &row.kind, &req.nic.mac, is_live(&state)).await?;
+    }
+    if matches!(ep, NicEndpoint::Network(_)) {
+        prepare_nic(&req.nic).await?;
+    }
+    attach_device_xml(&domain, &xml, is_live(&state)).await
+}
+
+/// Remove the NIC with this MAC. A missing domain is unavailable. A NIC that
+/// is already gone is success.
+pub async fn unplug_port(req: &PortPlug) -> ApiResult<()> {
+    let domain = domain_name(&req.machine)?;
+    let state = require_domain(&domain).await?;
+    if !mac_ok(&req.nic.mac) {
+        return Err(ApiError::bad_request("nic mac is not an address"));
+    }
+    let listing = virsh(["domiflist", &domain]).await?;
+    let Some(row) = iface_by_mac(&listing, &req.nic.mac) else {
+        return Ok(());
+    };
+    detach_iface(&domain, &row.kind, &req.nic.mac, is_live(&state)).await
 }
 
 /// `po` plus 12 hex digits of the network id. Same rule as fabric's overlay
@@ -1115,6 +1776,9 @@ mod tests {
         assert!(xml.contains("a&amp;b.qcow2"));
         assert!(!xml.contains("a&b"));
         assert!(xml.contains("<memory unit='MiB'>1024</memory>"));
+        assert!(xml.contains("console.log"));
+        assert!(xml.contains("<console type='file'>"));
+        assert!(!xml.contains("type='pty'"));
     }
 
     #[test]
@@ -1350,6 +2014,378 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("migrate-failed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn overlay_plug_uses_the_po_bridge_and_not_pistack0() {
+        let mut overlay = nic("10.88.0.10", true);
+        overlay.segment_id = Some(4);
+        let xml = hotplug_xml(&overlay).unwrap();
+        assert!(xml.contains("<interface type='bridge'>"));
+        assert!(xml.contains("<source bridge='po01a102de3f33'/>"));
+        assert!(!xml.contains("pistack0"));
+        assert!(!xml.contains("network='pistack'"));
+        match nic_endpoint(&overlay).unwrap() {
+            NicEndpoint::Bridge(name) => assert_eq!(name, "po01a102de3f33"),
+            NicEndpoint::Network(_) => panic!("overlay port must not use a libvirt network"),
+        }
+
+        let shared = hotplug_xml(&nic("10.88.0.10", true)).unwrap();
+        assert!(shared.contains("<source network='pistack'/>"));
+        assert!(!shared.contains("pistack0"));
+        assert!(!shared.contains("type='bridge'"));
+    }
+
+    #[test]
+    fn block_volume_must_stay_under_dev_and_disk_args_name_the_source() {
+        let dev = Path::new("/dev/vg/lv");
+        let canon = Path::new("/dev/dm-0");
+        match classify_flags(dev, canon, false, true).unwrap() {
+            HostDisk::Block(path) => assert_eq!(path, canon),
+            _ => panic!("expected a block device"),
+        }
+        assert!(classify_flags(Path::new("/tmp/link"), canon, false, true).is_err());
+        assert!(classify_flags(dev, Path::new("/etc/passwd"), false, true).is_err());
+        assert!(!under_dev(Path::new("/dev")));
+        assert!(!under_dev(Path::new("/etc/passwd")));
+        assert!(under_dev(dev));
+
+        let file_args = attach_disk_args("dom", "/images/data.raw", "vdb", false, false, true);
+        assert_eq!(
+            file_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "attach-disk",
+                "dom",
+                "/images/data.raw",
+                "vdb",
+                "--targetbus",
+                "virtio",
+                "--subdriver",
+                "raw",
+                "--config",
+                "--live",
+            ]
+        );
+        let block_args = attach_disk_args("dom", "/dev/dm-0", "vdc", true, true, false);
+        assert!(block_args
+            .windows(2)
+            .any(|w| w[0] == "--sourcetype" && w[1] == "block"));
+        assert!(block_args
+            .windows(2)
+            .any(|w| w[0] == "--mode" && w[1] == "readonly"));
+        assert!(!block_args.iter().any(|a| a == "--live"));
+
+        let secret = "super-secret-value";
+        let disk = RbdDisk {
+            pool: "volumes".into(),
+            image: "vol-1".into(),
+            user: "pistack".into(),
+            monitors: vec![("10.1.0.5".into(), 6789)],
+            keyring: Some(PathBuf::from("/tmp/keyring")),
+        };
+        let xml = rbd_disk_xml(&disk, "vdb", false);
+        assert!(xml.contains("protocol='rbd'"));
+        assert!(xml.contains("name='volumes/vol-1'"));
+        assert!(xml.contains("name='10.1.0.5'"));
+        assert!(xml.contains("port='6789'"));
+        assert!(!xml.contains(secret));
+        assert!(!xml.contains("keyring"));
+        assert!(parse_monitor("10.1.0.5").unwrap() == ("10.1.0.5".into(), 6789));
+        assert!(parse_monitor("not a host").is_err());
+        assert!(keyring_file(&Some(secret.into())).is_err());
+        let err = keyring_file(&Some(secret.into())).unwrap_err();
+        assert!(!err.message.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn classify_path_accepts_a_file_and_rejects_a_char_device() {
+        let file = std::env::temp_dir().join(format!("pistack-class-{}", std::process::id()));
+        std::fs::write(&file, b"disk").unwrap();
+        match classify_path(&file.to_string_lossy()).await.unwrap() {
+            HostDisk::File(path) => assert_eq!(path, file),
+            _ => panic!("expected a file"),
+        }
+        let err = classify_path("/dev/null").await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::BadRequest);
+        assert!(classify_path("relative.raw").await.is_err());
+        assert!(classify_path("/tmp/../etc/passwd").await.is_err());
+        assert!(classify_path("/dev/pistack-no-such-lv").await.is_err());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    fn write_virsh(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("virsh");
+        let out = dir.to_string_lossy().replace('\'', "'\\''");
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> '{out}/calls'
+printf '\n' >> '{out}/calls'
+cmd=""
+skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
+  if [ "$a" = "-c" ]; then
+    skip=1
+    continue
+  fi
+  cmd="$a"
+  break
+done
+case "$cmd" in
+  domstate)
+    if [ -f '{out}/missing' ]; then
+      echo "error: failed to get domain" >&2
+      exit 1
+    fi
+    echo running
+    ;;
+  domiflist)
+    if [ -f '{out}/iflist' ]; then
+      cat '{out}/iflist'
+    fi
+    ;;
+  domblklist)
+    if [ -f '{out}/blklist' ]; then
+      cat '{out}/blklist'
+    fi
+    ;;
+  attach-device)
+    for a in "$@"; do
+      if [ -f "$a" ]; then
+        cp "$a" '{out}/device.xml'
+      fi
+    done
+    ;;
+  attach-disk)
+    printf '%s\n' "$@" > '{out}/attach-disk'
+    ;;
+  detach-interface)
+    printf '%s\n' "$@" > '{out}/detach'
+    ;;
+  *)
+    echo "unexpected: $cmd" >&2
+    exit 1
+    ;;
+esac
+exit 0
+"#
+        );
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn port_req(address: &str, segment: Option<u32>) -> PortPlug {
+        let mut nic = nic(address, true);
+        nic.segment_id = segment;
+        PortPlug {
+            machine: req("ubuntu").id,
+            nic,
+        }
+    }
+
+    #[tokio::test]
+    async fn plug_and_unplug_use_the_overlay_bridge_and_a_missing_domain_is_unavailable() {
+        let _lock = VIRSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "pistack-plug-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = write_virsh(&root);
+        std::env::set_var("PISTACK_VIRSH", &bin);
+        let _guard = ClearEnv("PISTACK_VIRSH");
+
+        std::fs::write(root.join("missing"), b"1").unwrap();
+        let missing = plug_port(&port_req("10.90.0.10", Some(4))).await.unwrap_err();
+        assert_eq!(missing.code, pistack_types::error::ErrorCode::Unavailable);
+        let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+        assert!(calls.contains("domstate"));
+        assert!(!calls.contains("attach-device"));
+        assert!(!calls.contains("migrate"));
+        let _ = std::fs::remove_file(root.join("missing"));
+        let _ = std::fs::remove_file(root.join("calls"));
+
+        let plugged = plug_port(&port_req("10.88.0.10", Some(4))).await.unwrap();
+        let _ = plugged;
+        let xml = std::fs::read_to_string(root.join("device.xml")).unwrap();
+        assert!(xml.contains("<source bridge='po01a102de3f33'/>"));
+        assert!(!xml.contains("pistack0"));
+        assert!(!xml.contains("network='pistack'"));
+        let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+        assert!(!calls.contains("net-start"));
+        assert!(!calls.contains("net-define"));
+        let _ = std::fs::remove_file(root.join("calls"));
+        let _ = std::fs::remove_file(root.join("device.xml"));
+
+        std::fs::write(
+            root.join("iflist"),
+            " Interface   Type     Source           Model    MAC\n\
+             -------------------------------------------------------\n\
+              vnet0       bridge   pistack0         virtio   52:54:00:aa:bb:cc\n",
+        )
+        .unwrap();
+        plug_port(&port_req("10.90.0.10", Some(4))).await.unwrap();
+        let xml = std::fs::read_to_string(root.join("device.xml")).unwrap();
+        assert!(xml.contains("bridge='po01a102de3f33'"));
+        assert!(!xml.contains("pistack0"));
+        let detach = std::fs::read_to_string(root.join("detach")).unwrap();
+        assert!(detach.contains("detach-interface"));
+        assert!(detach.contains("bridge"));
+        assert!(detach.contains("52:54:00:aa:bb:cc"));
+        assert!(!detach.contains("pistack0"));
+        let _ = std::fs::remove_file(root.join("device.xml"));
+        let _ = std::fs::remove_file(root.join("detach"));
+        let _ = std::fs::remove_file(root.join("calls"));
+
+        std::fs::write(
+            root.join("iflist"),
+            " Interface   Type     Source             Model    MAC\n\
+             -------------------------------------------------------\n\
+              vnet0       bridge   po01a102de3f33     virtio   52:54:00:aa:bb:cc\n",
+        )
+        .unwrap();
+        plug_port(&port_req("10.90.0.10", Some(4))).await.unwrap();
+        assert!(!root.join("device.xml").exists());
+
+        unplug_port(&port_req("10.90.0.10", Some(4))).await.unwrap();
+        let detach = std::fs::read_to_string(root.join("detach")).unwrap();
+        assert!(detach.contains("52:54:00:aa:bb:cc"));
+        assert!(detach.contains("bridge"));
+        assert!(!detach.contains("pistack0"));
+
+        std::fs::write(root.join("iflist"), "").unwrap();
+        let _ = std::fs::remove_file(root.join("detach"));
+        unplug_port(&port_req("10.90.0.10", Some(4))).await.unwrap();
+        assert!(!root.join("detach").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_rbd(dir: &std::path::Path, code: i32) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("rbd");
+        let out = dir.to_string_lossy().replace('\'', "'\\''");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{out}/rbd-args'\nif [ {code} -ne 0 ]; then echo rbd-failed >&2; exit {code}; fi\nexit 0\n"
+        );
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn rbd_attach_uses_the_tool_and_a_missing_tool_is_unavailable() {
+        let _lock = VIRSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "pistack-rbd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let virsh_bin = write_virsh(&root.join("virshd"));
+        let rbd = write_rbd(&root.join("rbdd"), 0);
+        let images = root.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let prev_virsh = std::env::var_os("PISTACK_VIRSH");
+        let prev_rbd = std::env::var_os("PISTACK_RBD_BIN");
+        let prev_dir = std::env::var_os("PISTACK_LIBVIRT_DIR");
+        std::env::set_var("PISTACK_VIRSH", &virsh_bin);
+        std::env::set_var("PISTACK_RBD_BIN", &rbd);
+        std::env::set_var("PISTACK_LIBVIRT_DIR", &images);
+
+        let secret = "super-secret-value";
+        let machine = req("ubuntu").id;
+        let volume = Id::parse(kind::VOLUME, "vol-018f2c3a-7b6e-7a11-8c22-123456789abc").unwrap();
+        let req = VolumeAttach {
+            machine: machine.clone(),
+            volume: volume.clone(),
+            path: String::new(),
+            device: None,
+            read_only: false,
+            target: Some(DiskTarget::Rbd {
+                pool: "volumes".into(),
+                image: "vol-1".into(),
+                monitors: vec!["10.1.0.5:6789".into()],
+                user: "pistack".into(),
+                key_secret: Some(secret.into()),
+            }),
+        };
+        let rt = LibvirtRuntime;
+        let missing_key = rt.attach_volume(&req).await.unwrap_err();
+        assert_eq!(
+            missing_key.code,
+            pistack_types::error::ErrorCode::Unavailable
+        );
+        assert!(!missing_key.message.contains(secret));
+        assert!(!root.join("rbdd").join("rbd-args").exists());
+
+        let mut ok = req.clone();
+        if let Some(DiskTarget::Rbd { key_secret, .. }) = &mut ok.target {
+            *key_secret = None;
+        }
+        let dev = rt.attach_volume(&ok).await.unwrap();
+        assert_eq!(dev, "vdb");
+        let args = std::fs::read_to_string(root.join("rbdd").join("rbd-args")).unwrap();
+        assert!(args.contains("info"));
+        assert!(args.contains("volumes/vol-1"));
+        assert!(!args.contains(secret));
+        let xml = std::fs::read_to_string(root.join("virshd").join("device.xml")).unwrap();
+        assert!(xml.contains("protocol='rbd'"));
+        assert!(xml.contains("volumes/vol-1"));
+        assert!(!xml.contains(secret));
+        assert!(!xml.contains("keyring"));
+
+        std::env::set_var("PISTACK_RBD_BIN", root.join("no-such-rbd"));
+        let gone = rt.attach_volume(&ok).await.unwrap_err();
+        assert_eq!(gone.code, pistack_types::error::ErrorCode::Unavailable);
+
+        let file = images.join("data.raw");
+        std::fs::write(&file, b"raw").unwrap();
+        let _ = std::fs::remove_file(root.join("virshd").join("calls"));
+        let file_req = VolumeAttach {
+            machine,
+            volume,
+            path: file.to_string_lossy().into_owned(),
+            device: None,
+            read_only: false,
+            target: None,
+        };
+        let dev = rt.attach_volume(&file_req).await.unwrap();
+        assert_eq!(dev, "vdb");
+        let recorded = std::fs::read_to_string(root.join("virshd").join("attach-disk")).unwrap();
+        assert!(recorded.contains("attach-disk"));
+        assert!(recorded.contains("--subdriver"));
+        assert!(!recorded.contains("--sourcetype"));
+        assert!(!recorded.contains("migrate"));
+
+        match prev_virsh {
+            Some(v) => std::env::set_var("PISTACK_VIRSH", v),
+            None => std::env::remove_var("PISTACK_VIRSH"),
+        }
+        match prev_rbd {
+            Some(v) => std::env::set_var("PISTACK_RBD_BIN", v),
+            None => std::env::remove_var("PISTACK_RBD_BIN"),
+        }
+        match prev_dir {
+            Some(v) => std::env::set_var("PISTACK_LIBVIRT_DIR", v),
+            None => std::env::remove_var("PISTACK_LIBVIRT_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

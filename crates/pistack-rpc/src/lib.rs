@@ -27,9 +27,10 @@ pub use client::AgentClient;
 pub use error::RpcError;
 pub use events::{EventBus, EventStream};
 pub use proto::{
-    AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat,
-    HeartbeatAck, HelloAck, MachineKind, MachineRef, MachineReport, MachineRequest, PowerState,
-    ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER,
+    AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, DiskTarget, Heartbeat,
+    HeartbeatAck, HelloAck, LogText, MachineKind, MachineRef, MachineReport, MachineRequest,
+    PortPlug, PowerState, ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach,
+    JOIN_HEADER,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
 pub use server::{router, router_with_store, REQUIRE_JOIN_ENV};
