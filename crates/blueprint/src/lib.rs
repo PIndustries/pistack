@@ -4,19 +4,22 @@
 //! Declarative stacks, workflows and kits.
 //!
 //! A stack is a PiStack resource (`Resource<StackSpec, StackStatus>`): YAML
-//! or JSON text in `spec.document`, plus `spec.parameters`. It is not Heat
-//! HOT and not OpenTofu. OpenTofu can be a client of this API later; it is
-//! not the engine inside the binary.
+//! or JSON text in `spec.document`, plus `spec.parameters`.
 //!
-//! This slice accepts documents and stores them. [`Client::apply_stack`]
-//! re-validates the document and, when it is a YAML stream of resources
-//! (a single JSON object is a one-document stream), creates `network`,
-//! `subnet` and `machine` rows in the same store. Unknown kinds are
-//! skipped. `status.phase` stays `accepted`. `status.created` lists the
-//! ids that apply inserted.
+//! [`Client::apply_stack`] re-validates the document and, when it is a YAML
+//! stream of resources (a single JSON object is a one-document stream),
+//! creates `network`, `subnet`, `machine`, `router`, `pod`, `listener`, and
+//! record set rows in the same store. A name that already exists in the
+//! project is left in place. Unknown kinds are skipped. `status.phase`
+//! stays `accepted`. `status.created` lists the ids that apply inserted.
 //!
-//! HTTP is mounted at `/blueprint`: `GET|POST /stacks`,
-//! `GET|DELETE /stacks/{id}`, `POST /stacks/{id}/apply`.
+//! A kit is a stored document. [`Client::apply_kit`] runs that same path.
+//! A workflow is an ordered list of stack names in one project.
+//! [`Client::apply_workflow`] applies those stacks in order and stops on
+//! the first error.
+//!
+//! HTTP is mounted at `/blueprint`. Stacks, kits, and workflows each have
+//! `GET|POST`, `GET|DELETE /{id}`, and `POST /{id}/apply`.
 
 pub mod api;
 pub mod client;

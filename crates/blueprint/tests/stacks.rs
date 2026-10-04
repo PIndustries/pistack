@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use blueprint::{Blueprint, ACCEPTED_MESSAGE};
+use blueprint::{Blueprint, ACCEPTED_MESSAGE, WORKFLOW_ACCEPTED_MESSAGE};
 use pistack_store::Store;
 use pistack_types::{kind, Caller, Id, Module, ModuleContext};
 use serde_json::{json, Value};
@@ -124,6 +124,113 @@ async fn create_apply_and_reject_empty_document() {
             .contains("empty"),
         "{rejected}"
     );
+}
+
+#[tokio::test]
+async fn kit_and_workflow_apply_over_http() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, info) = call(&app, "GET", "/", None).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    let resources = info["resources"].as_array().expect("resources");
+    assert!(resources.iter().any(|v| v == "stacks"));
+    assert!(resources.iter().any(|v| v == "kits"));
+    assert!(resources.iter().any(|v| v == "workflows"));
+
+    let (status, kit) = call(
+        &app,
+        "POST",
+        "/kits",
+        Some(json!({
+            "name": "base",
+            "spec": {
+                "name": "base",
+                "document": "kind: network\nname: kit-net\nspec: {}\n"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{kit}");
+    assert_eq!(kit["status"]["message"], ACCEPTED_MESSAGE);
+    let kit_id = kit["id"].as_str().unwrap();
+    assert!(kit_id.starts_with("kit-"), "{kit_id}");
+
+    let (status, applied) = call(&app, "POST", &format!("/kits/{kit_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["status"]["created"].as_array().unwrap().len(), 1);
+
+    let (status, again) = call(&app, "POST", &format!("/kits/{kit_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert!(again["status"]["created"].as_array().unwrap().is_empty());
+    assert!(again["status"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("present"));
+
+    let (status, first) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "first",
+            "spec": {
+                "name": "first",
+                "document": "kind: network\nname: app\nspec: {}\n"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+
+    let (status, bad) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "bad",
+            "spec": {
+                "name": "bad",
+                "document": "kind: machine\nname: broken\nspec: {}\n"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{bad}");
+
+    let (status, wf) = call(
+        &app,
+        "POST",
+        "/workflows",
+        Some(json!({
+            "name": "rollout",
+            "spec": {
+                "name": "rollout",
+                "stacks": ["first", "bad"]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{wf}");
+    assert_eq!(wf["status"]["message"], WORKFLOW_ACCEPTED_MESSAGE);
+    let wf_id = wf["id"].as_str().unwrap();
+    assert!(wf_id.starts_with("workflow-"), "{wf_id}");
+
+    let (status, stopped) = call(&app, "POST", &format!("/workflows/{wf_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{stopped}");
+    assert_eq!(stopped["error"]["code"], "bad_request");
+    assert!(
+        stopped["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stopped on stack bad"),
+        "{stopped}"
+    );
+
+    let (status, stored) = call(&app, "GET", &format!("/workflows/{wf_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    assert_eq!(stored["status"]["phase"], "failed");
+    assert_eq!(stored["status"]["applied"], json!(["first"]));
 }
 
 fn admin_caller() -> Caller {
