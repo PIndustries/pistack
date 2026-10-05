@@ -503,8 +503,9 @@ fn port_endpoint(
             guest.port.meta.id
         )));
     }
+    let v6 = address.contains(':');
     let (ingress, egress) = if guest.port.spec.port_security {
-        security_rules(&guest.port, groups, ports)?
+        security_rules(&guest.port, v6, groups, ports)?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -546,8 +547,14 @@ fn choose_address(port: &Port, want_v4: Option<bool>) -> Option<String> {
         .map(|ip| ip.to_string())
 }
 
+/// Security group rules for one port, in the family of its planned address.
+///
+/// The helper filters traffic to that one address, so an IPv4 port gets the
+/// IPv4 rules and an IPv6 port gets the IPv6 rules (applied with ip6tables).
+/// A rule for the other family has nothing to match and is left out.
 fn security_rules(
     port: &Port,
+    v6: bool,
     groups: &[SecurityGroup],
     ports: &[Port],
 ) -> ApiResult<(Vec<SgRule>, Vec<SgRule>)> {
@@ -558,7 +565,8 @@ fn security_rules(
             continue;
         };
         for rule in &group.spec.rules {
-            if rule.ethertype != EtherType::IPv4 {
+            let want = if v6 { EtherType::IPv6 } else { EtherType::IPv4 };
+            if rule.ethertype != want {
                 continue;
             }
             let (proto, port_min, port_max) = match rule.protocol {
@@ -574,15 +582,16 @@ fn security_rules(
                 Some(Protocol::Any) | None => ("any", 0, 0),
             };
             let cidrs = match &rule.remote {
+                Remote::Any if v6 => vec!["::/0".to_string()],
                 Remote::Any => vec!["0.0.0.0/0".to_string()],
                 Remote::Cidr(net) => {
                     let text = net.to_string();
-                    if text.contains(':') {
+                    if text.contains(':') != v6 {
                         continue;
                     }
                     vec![text]
                 }
-                Remote::Group(gid) => member_cidrs(gid, ports),
+                Remote::Group(gid) => member_cidrs(gid, v6, ports),
             };
             for cidr in cidrs {
                 let item = SgRule {
@@ -608,15 +617,18 @@ fn span(range: Option<(u16, u16)>) -> (u16, u16) {
     }
 }
 
-fn member_cidrs(group: &Id, ports: &[Port]) -> Vec<String> {
+/// Host prefixes of every port in `group`, in one address family.
+fn member_cidrs(group: &Id, v6: bool, ports: &[Port]) -> Vec<String> {
     let mut out = Vec::new();
     for port in ports {
         if !port.spec.security_groups.iter().any(|g| g == group) {
             continue;
         }
         for ip in &port.spec.fixed_ips {
-            if ip.is_ipv4() {
-                out.push(format!("{ip}/32"));
+            match ip {
+                IpAddr::V4(_) if !v6 => out.push(format!("{ip}/32")),
+                IpAddr::V6(_) if v6 => out.push(format!("{ip}/128")),
+                _ => {}
             }
         }
     }
@@ -926,8 +938,8 @@ mod tests {
     use crate::nic::ensure_ports;
     use crate::types::{new_host, new_machine, MachineSpec};
     use fabric::{
-        Client, FloatingIpSpec, FloatingIpStatus, MockBackend, NetworkSpec, RouterSpec, Rule,
-        SecurityGroupSpec, SubnetSpec,
+        Client, FloatingIpSpec, FloatingIpStatus, MockBackend, NetworkSpec, PortSpec, RouterSpec,
+        Rule, SecurityGroupSpec, SubnetSpec,
     };
     use pistack_types::{Meta, Phase, Resources};
     use std::collections::BTreeMap;
@@ -1542,5 +1554,63 @@ mod tests {
         assert!(!seg.routers[0].snat);
         assert!(seg.routers[0].external_ip.is_none());
         assert_eq!(plan.host, "10.1.0.1");
+    }
+
+    fn sg_port(ips: &[&str], group: &Id) -> Port {
+        Port {
+            meta: Meta::new(kind::PORT, "p", None),
+            spec: PortSpec {
+                fixed_ips: ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+                security_groups: vec![group.clone()],
+                ..PortSpec::default()
+            },
+            status: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ipv6_port_gets_ipv6_rules_and_ipv4_port_keeps_ipv4_rules() {
+        let mut group = SecurityGroup {
+            meta: Meta::new(kind::SECGROUP, "web", None),
+            spec: SecurityGroupSpec { rules: vec![] },
+            status: Default::default(),
+        };
+        let gid = group.meta.id.clone();
+        group.spec.rules = vec![
+            Rule::new(Direction::Ingress, EtherType::IPv4)
+                .protocol(Protocol::Tcp)
+                .ports(22, 22),
+            Rule::new(Direction::Ingress, EtherType::IPv6)
+                .protocol(Protocol::Tcp)
+                .ports(443, 443),
+            Rule::new(Direction::Ingress, EtherType::IPv6)
+                .protocol(Protocol::Icmp)
+                .remote(Remote::Group(gid.clone())),
+            Rule::new(Direction::Ingress, EtherType::IPv6)
+                .remote(Remote::Cidr("10.0.0.0/8".parse().unwrap())),
+            Rule::new(Direction::Egress, EtherType::IPv6),
+        ];
+        let me = sg_port(&["10.90.0.5", "fd00::5"], &gid);
+        let peer = sg_port(&["10.90.0.6", "fd00::6"], &gid);
+        let ports = vec![me.clone(), peer];
+        let groups = vec![group];
+
+        let (ing, eg) = security_rules(&me, true, &groups, &ports).unwrap();
+        assert!(ing
+            .iter()
+            .any(|r| r.proto == "tcp" && r.port_min == 443 && r.cidr == "::/0"));
+        assert!(ing
+            .iter()
+            .any(|r| r.proto == "icmp" && r.cidr == "fd00::6/128"));
+        assert!(ing.iter().all(|r| r.cidr.contains(':')), "{ing:?}");
+        assert!(ing.iter().all(|r| r.port_min != 22));
+        assert_eq!(eg.len(), 1);
+        assert_eq!(eg[0].cidr, "::/0");
+
+        let (ing4, eg4) = security_rules(&me, false, &groups, &ports).unwrap();
+        assert_eq!(ing4.len(), 1);
+        assert_eq!(ing4[0].port_min, 22);
+        assert_eq!(ing4[0].cidr, "0.0.0.0/0");
+        assert!(eg4.is_empty());
     }
 }
