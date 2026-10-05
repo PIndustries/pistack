@@ -17,11 +17,12 @@
 //! GET    ?uploadId=X                      ListParts
 //! ```
 //!
-//! Auth is the same bearer/`Caller` mechanism as the rest of silo. AWS
-//! Signature Version 4 is **not** verified in this crate; a request that
-//! only carries SigV4 headers and no gate token is rejected as
-//! unauthorized. Single-PUT ETag is the content MD5 hex (quoted);
-//! completed multipart ETag is `{md5-of-part-md5s}-{n}` (quoted).
+//! Auth: gate bearer `Caller` (request extensions) or AWS Signature
+//! Version 4 ([`crate::sigv4`]) via keep access keys. Header SigV4 and
+//! presigned GET/PUT URLs are supported; `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+//! (aws-chunked) returns `NotImplemented`. Single-PUT ETag is the content
+//! MD5 hex (quoted); completed multipart ETag is `{md5-of-part-md5s}-{n}`
+//! (quoted).
 //!
 //! Staging dirs under `.uploads/` are removed on abort and complete, and
 //! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
@@ -31,6 +32,7 @@
 use crate::client::Client;
 use crate::http::{content_type_header, load_bucket};
 use crate::multipart::{self, s3_code_of};
+use crate::sigv4::{self, ExpectedPayloadSha256};
 use crate::types::*;
 use axum::{
     body::Body,
@@ -104,13 +106,25 @@ async fn put_object_inner(
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
     let len = content_length(&headers)?;
+    let expected_sha = req
+        .extensions()
+        .get::<ExpectedPayloadSha256>()
+        .map(|e| e.0.clone());
     if let (Some(upload_id), Some(part_raw)) = (q.upload_id.as_deref(), q.part_number.as_deref()) {
         let part_number: u32 = part_raw
             .parse()
             .map_err(|_| multipart::s3_err("InvalidArgument", "partNumber must be a number"))?;
         let stream = req.into_body().into_data_stream();
         let etag = c
-            .upload_part(&bucket.meta.id, &key, upload_id, part_number, stream, len)
+            .upload_part(
+                &bucket.meta.id,
+                &key,
+                upload_id,
+                part_number,
+                stream,
+                len,
+                expected_sha.as_deref(),
+            )
             .await?;
         let mut resp = StatusCode::OK.into_response();
         if let Ok(v) = HeaderValue::from_str(&format!("\"{etag}\"")) {
@@ -123,7 +137,14 @@ async fn put_object_inner(
     let ctype = content_type_header(&headers);
     let stream = req.into_body().into_data_stream();
     let obj = c
-        .put_object_stream(&bucket.meta.id, &key, stream, len, ctype)
+        .put_object_stream_sha(
+            &bucket.meta.id,
+            &key,
+            stream,
+            len,
+            ctype,
+            expected_sha.as_deref(),
+        )
         .await?;
     let etag = etag_value(&obj);
     let mut resp = StatusCode::OK.into_response();
@@ -193,8 +214,9 @@ pub async fn delete_object(
     ext: Option<Extension<Caller>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<ObjectQuery>,
+    req: Request,
 ) -> Response {
-    match delete_object_inner(c, ext, bucket, key, q).await {
+    match delete_object_inner(c, ext, bucket, key, q, req).await {
         Ok(status) => status.into_response(),
         Err(err) => s3_error(err),
     }
@@ -206,9 +228,17 @@ async fn delete_object_inner(
     bucket: String,
     key: String,
     q: ObjectQuery,
+    req: Request,
 ) -> ApiResult<StatusCode> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
+    let expected = req.extensions().get::<ExpectedPayloadSha256>().cloned();
+    if expected.is_some() {
+        let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+        sigv4::verify_body_sha256(expected.as_ref(), &body)?;
+    }
     if let Some(upload_id) = q.upload_id.as_deref() {
         c.abort_multipart_upload(&bucket.meta.id, &key, upload_id)
             .await?;
@@ -243,7 +273,12 @@ async fn post_object_inner(
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
+    let expected = req.extensions().get::<ExpectedPayloadSha256>().cloned();
     if q.uploads.is_some() && q.upload_id.is_none() {
+        let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+        sigv4::verify_body_sha256(expected.as_ref(), &body)?;
         let ctype = content_type_header(&headers);
         let upload_id = c
             .create_multipart_upload(&bucket.meta.id, &key, ctype)
@@ -272,6 +307,7 @@ async fn post_object_inner(
     let body = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
         .await
         .map_err(|e| ApiError::bad_request(format!("reading complete body: {e}")))?;
+    sigv4::verify_body_sha256(expected.as_ref(), &body)?;
     let body = std::str::from_utf8(&body)
         .map_err(|_| multipart::s3_err("MalformedXML", "body is not UTF-8"))?;
     let parts = multipart::parse_complete_xml(body)?;

@@ -28,6 +28,9 @@ pub const MIN_PART_BYTES: usize = 5 * 1024 * 1024;
 /// (7 days).
 pub const MULTIPART_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Default SigV4 region advertised under `[modules.silo] region`.
+pub const DEFAULT_REGION: &str = "pistack";
+
 /// Module settings under `[modules.silo]` / `PISTACK__MODULES__SILO__*`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -37,6 +40,8 @@ pub struct SiloConfig {
     /// Seconds after initiation before an unfinished multipart upload's
     /// staging is swept (default [`MULTIPART_TTL_SECS`]).
     pub multipart_ttl_secs: u64,
+    /// Region name accepted in SigV4 credentials (default [`DEFAULT_REGION`]).
+    pub region: String,
 }
 
 impl Default for SiloConfig {
@@ -44,13 +49,14 @@ impl Default for SiloConfig {
         Self {
             max_object_bytes: MAX_OBJECT_BYTES,
             multipart_ttl_secs: MULTIPART_TTL_SECS,
+            region: DEFAULT_REGION.to_owned(),
         }
     }
 }
 
 impl SiloConfig {
-    /// Reject `max_object_bytes = 0` and `multipart_ttl_secs = 0` (unset
-    /// fields use their defaults).
+    /// Reject `max_object_bytes = 0`, `multipart_ttl_secs = 0`, or an empty
+    /// `region` (unset fields use their defaults).
     pub fn validate(&self) -> Result<(), pistack_config::ConfigError> {
         let invalid = |message: &str| pistack_config::ConfigError::Module {
             module: "silo".into(),
@@ -62,6 +68,9 @@ impl SiloConfig {
         if self.multipart_ttl_secs == 0 {
             return Err(invalid("multipart_ttl_secs must be greater than 0"));
         }
+        if self.region.trim().is_empty() {
+            return Err(invalid("region must not be empty"));
+        }
         Ok(())
     }
 
@@ -72,8 +81,8 @@ impl SiloConfig {
     }
 
     /// Read `[modules.silo]` from a loaded config. Missing section → defaults.
-    /// A present section with `max_object_bytes = 0` or
-    /// `multipart_ttl_secs = 0` is rejected.
+    /// A present section with `max_object_bytes = 0`,
+    /// `multipart_ttl_secs = 0`, or an empty `region` is rejected.
     pub fn from_config(cfg: &pistack_config::Config) -> Result<Self, pistack_config::ConfigError> {
         let silo: Self = cfg.module("silo")?;
         silo.validate()?;
@@ -82,9 +91,9 @@ impl SiloConfig {
 
     /// Load process config (file + `PISTACK__*`) and take `[modules.silo]`.
     ///
-    /// No config file → defaults (5 GiB, 7-day multipart TTL). Invalid silo
-    /// settings (including a zero size or TTL) return an error so assemble
-    /// can refuse to start.
+    /// No config file → defaults (5 GiB, 7-day multipart TTL, region
+    /// `pistack`). Invalid silo settings (including a zero size or TTL, or
+    /// empty region) return an error so assemble can refuse to start.
     pub fn load() -> Result<Self, pistack_config::ConfigError> {
         let cfg = pistack_config::Config::load(None)?;
         Self::from_config(&cfg)
@@ -267,11 +276,23 @@ mod tests {
     #[test]
     fn silo_config_defaults() {
         assert_eq!(SiloConfig::default().max_object_bytes, MAX_OBJECT_BYTES);
+        assert_eq!(SiloConfig::default().region, DEFAULT_REGION);
         let cfg = pistack_config::Config::from_toml("[modules.silo]\nmax_object_bytes = 1048576\n")
             .unwrap();
         let silo = SiloConfig::from_config(&cfg).unwrap();
         assert_eq!(silo.max_object_bytes, 1024 * 1024);
         assert_eq!(silo.multipart_ttl_secs, MULTIPART_TTL_SECS);
+        assert_eq!(silo.region, DEFAULT_REGION);
+        let cfg =
+            pistack_config::Config::from_toml("[modules.silo]\nregion = \"us-east-1\"\n").unwrap();
+        assert_eq!(SiloConfig::from_config(&cfg).unwrap().region, "us-east-1");
+    }
+
+    #[test]
+    fn silo_config_rejects_empty_region() {
+        let cfg = pistack_config::Config::from_toml("[modules.silo]\nregion = \"\"\n").unwrap();
+        let err = SiloConfig::from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("region"), "{err}");
     }
 
     #[test]

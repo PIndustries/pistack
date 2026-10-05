@@ -20,8 +20,9 @@ use futures::Stream;
 use md5::Md5;
 use pistack_types::{ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default minimum size of every part except the last (5 MiB, S3 rule).
@@ -109,6 +110,12 @@ impl Client {
     }
 
     /// UploadPart: stream a part body to disk; return the part MD5 ETag (hex).
+    ///
+    /// When `expected_sha256` is set (lowercase hex from SigV4
+    /// `x-amz-content-sha256`), the streamed body must match or the staged
+    /// part file is discarded and `XAmzContentSHA256Mismatch` is returned.
+    /// `None` means `UNSIGNED-PAYLOAD` (or non-SigV4) — no payload check.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_part<S, E>(
         &self,
         bucket_id: &Id,
@@ -117,6 +124,7 @@ impl Client {
         part_number: u32,
         body: S,
         content_length: Option<u64>,
+        expected_sha256: Option<&str>,
     ) -> ApiResult<String>
     where
         S: Stream<Item = Result<Bytes, E>> + Send,
@@ -145,8 +153,14 @@ impl Client {
         }
         let dir = self.upload_dir(bucket_id, upload_id)?;
         let part_path = dir.join(format!("part-{part_number}"));
-        let written =
-            write_part_atomic(&part_path, body, self.max_object_bytes(), content_length).await?;
+        let written = write_part_atomic(
+            &part_path,
+            body,
+            self.max_object_bytes(),
+            content_length,
+            expected_sha256,
+        )
+        .await?;
         let etag_path = dir.join(format!("part-{part_number}.md5"));
         tokio::fs::write(&etag_path, written.md5.as_bytes())
             .await
@@ -557,8 +571,20 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
     let message = message.into();
     let status_code = match code {
         "NoSuchUpload" | "NoSuchKey" | "NoSuchBucket" => ApiError::not_found(message),
-        "EntityTooLarge" | "EntityTooSmall" | "InvalidPart" | "InvalidPartOrder"
-        | "InvalidArgument" | "InvalidRequest" | "MalformedXML" => ApiError::bad_request(message),
+        "EntityTooLarge"
+        | "EntityTooSmall"
+        | "InvalidPart"
+        | "InvalidPartOrder"
+        | "InvalidArgument"
+        | "InvalidRequest"
+        | "MalformedXML"
+        | "AuthorizationHeaderMalformed"
+        | "XAmzContentSHA256Mismatch" => ApiError::bad_request(message),
+        "InvalidAccessKeyId"
+        | "SignatureDoesNotMatch"
+        | "AccessDenied"
+        | "RequestTimeTooSkewed" => ApiError::forbidden(message),
+        "NotImplemented" => ApiError::not_implemented(message),
         _ => ApiError::internal(message),
     };
     status_code.with_detail("s3_code", code)
@@ -604,6 +630,7 @@ async fn write_part_atomic<S, E>(
     body: S,
     max: usize,
     content_length: Option<u64>,
+    expected_sha256: Option<&str>,
 ) -> ApiResult<PartWritten>
 where
     S: Stream<Item = Result<Bytes, E>> + Send,
@@ -618,6 +645,7 @@ where
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut md5 = Md5::new();
+        let mut sha = Sha256::new();
         let mut size: u64 = 0;
         let mut body = std::pin::pin!(body);
         while let Some(chunk) = body.next().await {
@@ -634,6 +662,7 @@ where
                 }
             }
             md5.update(&chunk);
+            sha.update(&chunk);
             file.write_all(&chunk).await.map_err(io_err)?;
             size = next;
         }
@@ -647,6 +676,16 @@ where
         file.flush().await.map_err(io_err)?;
         file.sync_all().await.map_err(io_err)?;
         drop(file);
+        let sha256 = hex_encode(sha.finalize().as_slice());
+        if let Some(want) = expected_sha256 {
+            let want = want.to_ascii_lowercase();
+            if !bool::from(sha256.as_bytes().ct_eq(want.as_bytes())) {
+                return Err(s3_err(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided 'x-amz-content-sha256' header does not match what was computed.",
+                ));
+            }
+        }
         tokio::fs::rename(&tmp, dest).await.map_err(io_err)?;
         Ok(PartWritten {
             md5: hex_encode(md5.finalize().as_slice()),
@@ -654,6 +693,8 @@ where
     }
     .await;
     if result.is_err() {
+        // Discard the temp file only. A prior successful part at `dest`
+        // stays until a later UploadPart renames over it.
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     result
