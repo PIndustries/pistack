@@ -184,6 +184,11 @@ fn validate_probe(container: &str, which: &str, probe: &Probe) -> ApiResult<()> 
                 "container '{container}' {which} exec command is empty"
             )));
         }
+        if exec.command.iter().any(|arg| arg.contains('\0')) {
+            return Err(ApiError::bad_request(format!(
+                "container '{container}' {which} exec command contains a NUL byte"
+            )));
+        }
     }
     Ok(())
 }
@@ -1188,7 +1193,36 @@ mod tests {
             }),
             ..Probe::default()
         });
-        assert!(validate_pod_spec(&spec).is_err());
+        let empty = validate_pod_spec(&spec).unwrap_err();
+        assert!(
+            empty.message.contains("exec command is empty"),
+            "{}",
+            empty.message
+        );
+        assert!(empty.message.contains("web"), "{}", empty.message);
+        assert!(
+            empty.message.contains("liveness_probe"),
+            "{}",
+            empty.message
+        );
+
+        spec.containers[0].liveness_probe = Some(Probe {
+            exec: Some(ExecProbe {
+                command: vec!["/bin/echo".into(), format!("a{}b", '\0')],
+            }),
+            ..Probe::default()
+        });
+        let nul = validate_pod_spec(&spec).unwrap_err();
+        assert!(nul.message.contains("NUL byte"), "{}", nul.message);
+        assert!(nul.message.contains("web"), "{}", nul.message);
+
+        spec.containers[0].liveness_probe = Some(Probe {
+            exec: Some(ExecProbe {
+                command: vec!["/bin/true".into()],
+            }),
+            ..Probe::default()
+        });
+        assert!(validate_pod_spec(&spec).is_ok());
 
         spec.containers[0].readiness_probe = Some(Probe {
             http_get: Some(HttpGetProbe {

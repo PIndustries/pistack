@@ -43,6 +43,7 @@ Each phase ends at a gate an outside tool decides.
 ## Phase 2 — Containers and platform
 
 - [x] youki runtime: an OCI bundle and `youki create` / `youki start` when the binary is on the host. A missing binary is unavailable.
+- [x] Command probes: an exec probe runs its argv in the container with youki exec. Exit 0 passes. A non-zero exit or a timeout fails. Other runtimes report the probe unsupported.
 - [x] Stack apply writes `network`, `subnet`, and `machine` rows from the stack document. `pi apply` already writes one resource at a time.
 - [x] L4 forwarder when `PISTACK_RELAY_BACKEND=forward`: a loopback or private listener copies bytes to a pool member.
 - [x] HTTP reverse proxy for the same setting. It answers `GET` from an up member. TLS termination stays unavailable until a certificate is configured. UDP is refused.
