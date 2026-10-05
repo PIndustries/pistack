@@ -528,10 +528,7 @@ async fn detach_port(runtimes: &Runtimes, req: &PortPlug) -> Result<(), ApiError
 const LOG_CAP: usize = 256 * 1024;
 
 fn youki_state_dir() -> std::path::PathBuf {
-    match std::env::var_os("PISTACK_YOUKI_STATE") {
-        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
-        _ => std::path::PathBuf::from("/var/lib/pistack/youki"),
-    }
+    crate::runtime::youki::state_dir()
 }
 
 fn bundle_name(id: &pistack_types::Id) -> Result<String, ApiError> {
@@ -562,29 +559,107 @@ async fn read_machine_logs_in(
     libvirt_root: &std::path::Path,
 ) -> Result<String, ApiError> {
     let name = bundle_name(id)?;
-    let mut candidates = Vec::new();
     let bundle = youki_state.join(&name);
-    candidates.push((bundle.join("log"), bundle.clone()));
-    candidates.push((bundle.join("console.log"), bundle));
-    let domain = format!("pistack-{name}");
-    let vm = libvirt_root.join("machines").join(domain);
-    candidates.push((vm.join("console.log"), vm));
-
+    let vm = libvirt_root
+        .join("machines")
+        .join(format!("pistack-{name}"));
     let mut empty = None;
-    for (path, jail) in candidates {
-        if let Some(text) = read_jailed_log(&path, &jail).await? {
-            if !text.is_empty() {
-                return Ok(scrub_log(&text));
-            }
-            if empty.is_none() {
-                empty = Some(text);
-            }
+    for (path, jail) in [
+        (bundle.join("log"), bundle.clone()),
+        (bundle.join("console.log"), bundle.clone()),
+    ] {
+        if let Some(text) = consider_log(&path, &jail, &mut empty).await? {
+            return Ok(text);
         }
     }
+    // Pod containers keep their own `log` under the sandbox bundle. The
+    // sandbox pause process does not write one.
+    if let Some(text) = read_container_logs(&bundle).await? {
+        if !text.is_empty() {
+            return Ok(scrub_log(&text));
+        }
+        if empty.is_none() {
+            empty = Some(String::new());
+        }
+    }
+    if let Some(text) = consider_log(&vm.join("console.log"), &vm, &mut empty).await? {
+        return Ok(text);
+    }
     if let Some(text) = empty {
-        return Ok(scrub_log(&text));
+        return Ok(text);
     }
     Err(ApiError::not_found(format!("no log for machine {id}")))
+}
+
+async fn consider_log(
+    path: &std::path::Path,
+    jail: &std::path::Path,
+    empty: &mut Option<String>,
+) -> Result<Option<String>, ApiError> {
+    if let Some(text) = read_jailed_log(path, jail).await? {
+        if !text.is_empty() {
+            return Ok(Some(scrub_log(&text)));
+        }
+        if empty.is_none() {
+            *empty = Some(scrub_log(&text));
+        }
+    }
+    Ok(None)
+}
+
+async fn read_container_logs(bundle: &std::path::Path) -> Result<Option<String>, ApiError> {
+    let root = bundle.join("containers");
+    let mut rd = match tokio::fs::read_dir(&root).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ApiError::unavailable(format!("reading log: {e}"))),
+    };
+    let mut dirs = Vec::new();
+    while let Some(ent) = rd
+        .next_entry()
+        .await
+        .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?
+    {
+        let ft = ent
+            .file_type()
+            .await
+            .map_err(|e| ApiError::unavailable(format!("reading log: {e}")))?;
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        dirs.push(ent.path());
+    }
+    dirs.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    });
+    let mut combined = String::new();
+    let mut saw = false;
+    for dir in dirs {
+        let Some(text) = read_jailed_log(&dir.join("log"), &dir).await? else {
+            continue;
+        };
+        saw = true;
+        if text.is_empty() {
+            continue;
+        }
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&text);
+    }
+    if saw {
+        Ok(Some(combined))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn read_jailed_log(
@@ -1223,6 +1298,18 @@ still here
         std::fs::write(vm.join("console.log"), "").unwrap();
         let text = read_machine_logs_in(&id, &youki, &images).await.unwrap();
         assert_eq!(text, "");
+
+        std::fs::remove_file(vm.join("console.log")).unwrap();
+        let c0 = bundle.join("containers").join("0");
+        let c1 = bundle.join("containers").join("1");
+        std::fs::create_dir_all(&c0).unwrap();
+        std::fs::create_dir_all(&c1).unwrap();
+        std::fs::write(c0.join("log"), "from-c0\n").unwrap();
+        std::fs::write(c1.join("log"), "password: hunter2\nfrom-c1\n").unwrap();
+        let text = read_machine_logs_in(&id, &youki, &images).await.unwrap();
+        assert!(text.find("from-c0").unwrap() < text.find("from-c1").unwrap());
+        assert!(text.contains("password: ***"));
+        assert!(!text.contains("hunter2"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
