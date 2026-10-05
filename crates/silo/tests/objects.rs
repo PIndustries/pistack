@@ -2693,3 +2693,268 @@ async fn trailing_slash_key_rejected_on_put_and_create_multipart() {
         String::from_utf8_lossy(&body)
     );
 }
+
+// ---- encoding-type=url ---------------------------------------------------------
+
+fn s3_unquote(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+fn query_escape(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+#[tokio::test]
+async fn encoding_type_url_list_objects_v2() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "enc-lov2").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    for (key, body) in [
+        ("a b.txt", b"1" as &[u8]),
+        ("a+b.txt", b"2"),
+        ("a%b.txt", b"3"),
+        ("a&b.txt", b"4"),
+        ("café.txt", "5".as_bytes()),
+        ("x%2Fy.txt", b"6"),
+    ] {
+        client
+            .put_object(&bucket_id, key, body, None)
+            .await
+            .unwrap_or_else(|e| panic!("put {key}: {e}"));
+    }
+
+    // Without encoding-type: raw keys (XML-escaped only).
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2")).await;
+    assert!(xml_tag(&xml, "EncodingType").is_none());
+    assert!(listed_contents_keys(&xml).contains(&"a b.txt".to_owned()));
+    // xml_escape turns & into &amp; inside the element text.
+    assert!(listed_contents_keys(&xml).contains(&"a&amp;b.txt".to_owned()));
+
+    // With encoding-type=url.
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&encoding-type=url&prefix=a"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "EncodingType").as_deref(), Some("url"));
+    assert_eq!(xml_tag(&xml, "Prefix").as_deref(), Some("a"));
+    let keys = listed_contents_keys(&xml);
+    assert!(keys.iter().any(|k| k == "a%20b.txt"), "{keys:?}");
+    assert!(keys.iter().any(|k| k == "a%2Bb.txt"), "{keys:?}");
+    assert!(keys.iter().any(|k| k == "a%25b.txt"), "{keys:?}");
+    assert!(keys.iter().any(|k| k == "a%26b.txt"), "{keys:?}");
+    // Round-trip decode.
+    assert_eq!(s3_unquote("a%20b.txt"), "a b.txt");
+    assert_eq!(s3_unquote("a%2Bb.txt"), "a+b.txt");
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&encoding-type=url&prefix=x"),
+    )
+    .await;
+    assert!(
+        listed_contents_keys(&xml)
+            .iter()
+            .any(|k| k == "x%252Fy.txt"),
+        "{xml}"
+    );
+
+    // Unicode.
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!(
+            "/{bucket}?list-type=2&encoding-type=url&prefix={}",
+            query_escape("café")
+        ),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "Prefix").as_deref(), Some("caf%C3%A9"));
+    assert!(
+        listed_contents_keys(&xml)
+            .iter()
+            .any(|k| k == "caf%C3%A9.txt"),
+        "{xml}"
+    );
+
+    // Invalid encoding-type.
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}?list-type=2&encoding-type=base64"),
+        None,
+        "",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("InvalidArgument")
+            || String::from_utf8_lossy(&body).contains("encoding-type"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn encoding_type_url_list_multipart_uploads() {
+    let (_dir, client, app, project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "enc-mpu").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    for key in ["a b.bin", "a+b.bin", "x%2Fy.bin"] {
+        client
+            .create_multipart_upload(&bucket_id, key, None)
+            .await
+            .unwrap_or_else(|e| panic!("create {key}: {e}"));
+    }
+
+    let xml = list_uploads(&app, &who, &format!("/{bucket}?uploads&encoding-type=url")).await;
+    assert_eq!(xml_tag(&xml, "EncodingType").as_deref(), Some("url"));
+    let keys: Vec<_> = listed_uploads(&xml).into_iter().map(|(k, _)| k).collect();
+    assert!(keys.iter().any(|k| k == "a%20b.bin"), "{keys:?}");
+    assert!(keys.iter().any(|k| k == "a%2Bb.bin"), "{keys:?}");
+    assert!(keys.iter().any(|k| k == "x%252Fy.bin"), "{keys:?}");
+
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}?uploads&encoding-type=bogus"),
+        None,
+        "",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn encoding_type_url_delimiter_paging_round_trip() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "enc-page").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    // Odd prefixes as common-prefix boundaries, plus a key with literal %2F.
+    for key in ["a b/1", "a b/2", "a+b/1", "plain.txt", "x%2Fy/z"] {
+        client
+            .put_object(&bucket_id, key, b"x", None)
+            .await
+            .unwrap_or_else(|e| panic!("put {key}: {e}"));
+    }
+
+    // Page 1: CommonPrefix "a b/"
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=1"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "EncodingType").as_deref(), Some("url"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["a%20b/".to_owned()]);
+    let token = xml_tag(&xml, "NextContinuationToken").expect("token");
+    // Opaque continuation token stays unencoded (literal space + slash).
+    assert_eq!(token, "a b/");
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!(
+            "/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=1&continuation-token={}",
+            query_escape(&token)
+        ),
+    )
+    .await;
+    assert_eq!(listed_common_prefixes(&xml), vec!["a%2Bb/".to_owned()]);
+    let token2 = xml_tag(&xml, "NextContinuationToken").expect("token2");
+    assert_eq!(token2, "a+b/");
+
+    // Finish pages: plain then x%2Fy/
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!(
+            "/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=2&continuation-token={}",
+            query_escape(&token2)
+        ),
+    )
+    .await;
+    assert!(listed_contents_keys(&xml).iter().any(|k| k == "plain.txt"));
+    assert!(
+        listed_common_prefixes(&xml).iter().any(|p| p == "x%252Fy/"),
+        "{xml}"
+    );
+
+    // Multipart: same odd prefixes, max-uploads=1, KeyMarker round-trip.
+    let (_dir2, client2, app2, project2, who2) = app_multipart(64, 4);
+    let bucket2 = ensure_bucket(&app2, &who2, "enc-mpu-page").await;
+    let bucket2_id = client2
+        .list_buckets(Some(&project2))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket2)
+        .unwrap()
+        .meta
+        .id;
+    for key in ["a b/1", "a+b/1", "plain", "x%2Fy/z"] {
+        client2
+            .create_multipart_upload(&bucket2_id, key, None)
+            .await
+            .unwrap_or_else(|e| panic!("create {key}: {e}"));
+    }
+
+    let xml = list_uploads(
+        &app2,
+        &who2,
+        &format!("/{bucket2}?uploads&delimiter=/&encoding-type=url&max-uploads=1"),
+    )
+    .await;
+    assert_eq!(listed_common_prefixes(&xml), vec!["a%20b/".to_owned()]);
+    let marker = xml_tag(&xml, "NextKeyMarker").expect("NextKeyMarker");
+    assert_eq!(marker, "a%20b/");
+    let decoded = s3_unquote(&marker);
+    assert_eq!(decoded, "a b/");
+    let xml = list_uploads(
+        &app2,
+        &who2,
+        &format!(
+            "/{bucket2}?uploads&delimiter=/&encoding-type=url&max-uploads=1&key-marker={}",
+            query_escape(&decoded)
+        ),
+    )
+    .await;
+    assert_eq!(listed_common_prefixes(&xml), vec!["a%2Bb/".to_owned()]);
+    let marker2 = xml_tag(&xml, "NextKeyMarker").expect("NextKeyMarker2");
+    assert_eq!(s3_unquote(&marker2), "a+b/");
+    // Echoed KeyMarker on the follow-up page is also encoded.
+    assert_eq!(xml_tag(&xml, "KeyMarker").as_deref(), Some("a%20b/"));
+}

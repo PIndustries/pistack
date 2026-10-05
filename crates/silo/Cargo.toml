@@ -35,5 +35,6 @@ sha1.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+percent-encoding.workspace = true
 tower = { workspace = true, features = ["util"] }
 gate.workspace = true
