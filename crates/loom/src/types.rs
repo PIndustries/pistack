@@ -32,6 +32,7 @@ pub mod kinds {
     pub const JOB: &str = "job";
     pub const CRON_JOB: &str = "cron";
     pub const INGRESS: &str = "ing";
+    pub const AUTOSCALER: &str = "scaler";
 }
 
 /// Annotation a DELETE handler sets to ask a controller to tear the
@@ -843,6 +844,75 @@ pub struct IngressStatus {
 }
 
 pub type Ingress = Resource<IngressSpec, IngressStatus>;
+
+// ---- Autoscaler ------------------------------------------------------------------
+
+/// Workload an autoscaler may adjust.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum ScaleTargetKind {
+    Deployment,
+    StatefulSet,
+}
+
+/// Scale a Deployment or StatefulSet from a gauge metric.
+///
+/// `desired = ceil(current * metric / target_value)`, clamped to
+/// `[min_replicas, max_replicas]`. When `current` is zero the ratio uses
+/// one replica as the base so a high metric can still scale out.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AutoscalerSpec {
+    pub target_kind: ScaleTargetKind,
+    pub target_name: String,
+    pub metric: String,
+    pub target_value: f64,
+    #[serde(default = "one")]
+    pub min_replicas: u32,
+    pub max_replicas: u32,
+}
+
+impl Spec for AutoscalerSpec {
+    const KIND: &'static str = kinds::AUTOSCALER;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct AutoscalerStatus {
+    #[serde(default)]
+    pub desired_replicas: u32,
+    #[serde(default)]
+    pub current_replicas: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_metric: Option<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+}
+
+pub type Autoscaler = Resource<AutoscalerSpec, AutoscalerStatus>;
+
+/// Desired replica count from the latest metric sample.
+pub fn desired_replicas(
+    current: u32,
+    metric_value: f64,
+    target_value: f64,
+    min_replicas: u32,
+    max_replicas: u32,
+) -> u32 {
+    let lo = min_replicas;
+    let hi = max_replicas.max(lo);
+    if !metric_value.is_finite() || !target_value.is_finite() || target_value <= 0.0 {
+        return current.clamp(lo, hi);
+    }
+    let base = if current == 0 { 1 } else { current };
+    let raw = (base as f64) * metric_value / target_value;
+    let desired = if raw.is_finite() {
+        raw.ceil().max(0.0) as u32
+    } else {
+        current
+    };
+    desired.clamp(lo, hi)
+}
 
 // ---- helpers ---------------------------------------------------------------------
 
