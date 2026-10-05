@@ -3,12 +3,13 @@
 
 //! A stack is a PiStack resource: a document the user wrote (YAML or JSON
 //! text) plus string parameters. Apply creates network, subnet, machine,
-//! router, pod, listener, and record set rows from that document, and
-//! updates the rows an earlier apply of the same stack created. Each
-//! successful stack apply records the spec as a revision; rollback puts an
-//! earlier revision back and applies it. A kit is a stored document applied
-//! the same way. A workflow applies named stacks in order and stops on the
-//! first error. Apply does not run a reconciler.
+//! router, pod, listener, and record set rows from that document, updates
+//! the rows an earlier apply of the same stack created, and deletes managed
+//! rows the document no longer names. Each successful stack apply records
+//! the spec as a revision; rollback puts an earlier revision back and
+//! applies it. A kit is a stored document applied the same way. A workflow
+//! applies named stacks in order and stops on the first error. Apply does
+//! not run a reconciler.
 
 use chrono::{DateTime, Utc};
 use pistack_types::{kind, ApiError, ApiResult, Resource, Spec};
@@ -84,8 +85,9 @@ pub struct StackStatus {
     /// Ids whose spec the last apply changed.
     #[serde(default)]
     pub updated: Vec<String>,
-    /// Managed ids the last successful apply's document no longer names.
-    /// They are kept, not deleted.
+    /// Managed ids the last apply's document no longer named that could not
+    /// be deleted (unknown kind). Successfully deleted managed ids are not
+    /// listed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub left: Vec<String>,
     /// Every id an apply of this resource inserted. Later applies update
