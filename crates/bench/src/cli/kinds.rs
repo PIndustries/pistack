@@ -85,6 +85,36 @@ fn created(v: &Value, now: DateTime<Utc>) -> String {
 fn phase(v: &Value, _: DateTime<Utc>) -> String {
     str_at(v, "/status/phase")
 }
+fn source_image(v: &Value, _: DateTime<Utc>) -> String {
+    if str_at(v, "/spec/source/kind") != "image" {
+        return String::new();
+    }
+    short_id(&str_at(v, "/spec/source/id"))
+}
+
+/// `Attaching` until the host path is confirmed, then `Attached`.
+fn attach_state(v: &Value, _: DateTime<Utc>) -> String {
+    let Some(items) = v.pointer("/status/conditions").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let Some(cond) = items
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("Attached"))
+    else {
+        return String::new();
+    };
+    if cond.get("status").and_then(Value::as_bool).unwrap_or(false) {
+        return "Attached".to_owned();
+    }
+    match cond.get("reason").and_then(Value::as_str).unwrap_or("") {
+        "" => String::new(),
+        reason => reason.to_owned(),
+    }
+}
+
+fn host_path(v: &Value, _: DateTime<Utc>) -> String {
+    str_at(v, "/status/host_path")
+}
 
 macro_rules! col {
     ($h:literal, $f:ident) => {
@@ -495,8 +525,11 @@ pub static KINDS: &[KindDef] = &[
             col!("SIZE-GIB", "/spec/size_gib"),
             col!("TYPE", "/spec/volume_type"),
             col!("BOOTABLE", "/spec/bootable"),
+            col!("ATTACH", attach_state),
             col!("ATTACHED-TO", short "/status/attached_to"),
             col!("DEVICE", "/status/device"),
+            col!("HOST-PATH", host_path),
+            col!("IMAGE", source_image),
             col!("AGE", created),
         ],
         wide: &[
@@ -799,5 +832,36 @@ mod tests {
             let last = k.columns.last().unwrap().header;
             assert!(last == "AGE" || last == "LAST-SEEN", "{}: {last}", k.noun);
         }
+    }
+
+    #[test]
+    fn volume_list_shows_the_source_image() {
+        let kind = by_noun("volume").unwrap();
+        let column = kind
+            .columns
+            .iter()
+            .find(|c| c.header == "IMAGE")
+            .expect("IMAGE column");
+        let now = Utc::now();
+        let image = serde_json::json!({
+            "spec": {
+                "source": {
+                    "kind": "image",
+                    "id": "img-0199a5e0-1111-7000-8000-0000000000ab"
+                }
+            }
+        });
+        assert_eq!((column.get)(&image, now), "img-000000ab");
+        let blank = serde_json::json!({ "spec": { "source": { "kind": "none" } } });
+        assert_eq!((column.get)(&blank, now), "");
+        let snap = serde_json::json!({
+            "spec": {
+                "source": {
+                    "kind": "snapshot",
+                    "id": "snap-0199a5e0-1111-7000-8000-0000000000ab"
+                }
+            }
+        });
+        assert_eq!((column.get)(&snap, now), "");
     }
 }

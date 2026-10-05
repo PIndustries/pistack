@@ -12,8 +12,14 @@
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::time::Duration;
 
 use crate::types::{Snapshot, Volume};
+
+/// `$PISTACK_QEMU_IMG_BIN`, when set and non-empty, replaces `qemu-img`.
+pub(crate) const ENV_QEMU_IMG: &str = "PISTACK_QEMU_IMG_BIN";
+const QEMU_IMG_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 pub mod local;
 pub mod lvm;
@@ -131,9 +137,15 @@ pub trait BlockBackend: Send + Sync + 'static {
     /// Short name matching `VolumeTypeSpec::backend`.
     fn name(&self) -> &'static str;
 
-    /// Create storage for `vol` (blank, or populated from `spec.source` when
-    /// the backend can do so natively). Returns the handle to store.
+    /// Create blank storage for `vol` at `spec.size_gib`. Image bytes are
+    /// written afterwards by [`BlockBackend::write_image`].
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef>;
+
+    /// Copy the disk image at `src` onto `vol` as raw bytes. `format` is
+    /// `raw` or `qcow2` and is passed to `qemu-img` as `-f` so the tool
+    /// does not probe. The volume from [`BlockBackend::create`] must
+    /// already exist at its full size (`qemu-img -n`).
+    async fn write_image(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<()>;
 
     /// Delete the storage behind `vol`. Must be idempotent.
     async fn delete(&self, vol: &Volume) -> ApiResult<()>;
@@ -198,9 +210,85 @@ fn command_exists(bin: &str) -> bool {
     }
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
+
+/// `qemu-img convert -O raw -f <format> -n <src> <dest>`.
+///
+/// `-f` stops qemu from probing (a probed raw file can name a backing
+/// file). `-n` writes into the volume created just before this instead of
+/// replacing it, which is what keeps a pre-sized file, LV, or rbd image
+/// at `size_gib`.
+pub(crate) fn qemu_img_convert_argv(format: &str, src: &Path, dest: &str) -> Vec<String> {
+    let mut args = Vec::with_capacity(8);
+    args.push("convert".to_owned());
+    args.push("-O".to_owned());
+    args.push("raw".to_owned());
+    if !format.is_empty() {
+        args.push("-f".to_owned());
+        args.push(format.to_owned());
+    }
+    args.push("-n".to_owned());
+    args.push(src.display().to_string());
+    args.push(dest.to_owned());
+    args
+}
+
+/// Run `args` with `qemu-img` (or [`ENV_QEMU_IMG`]). `src` must be a file.
+pub(crate) async fn run_qemu_img(src: &Path, args: &[String]) -> ApiResult<()> {
+    if !src.is_file() {
+        return Err(ApiError::not_found(format!(
+            "image file {} does not exist",
+            src.display()
+        )));
+    }
+    let bin = configured_bin(ENV_QEMU_IMG, "qemu-img");
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let finished = tokio::time::timeout(QEMU_IMG_TIMEOUT, cmd.output()).await;
+    let output = match finished {
+        Err(_) => {
+            return Err(ApiError::unavailable(format!(
+                "qemu-img timed out after {}s",
+                QEMU_IMG_TIMEOUT.as_secs()
+            )))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::unavailable("qemu-img is not available"))
+        }
+        Ok(Err(e)) => return Err(ApiError::internal(format!("qemu-img: {e}"))),
+        Ok(Ok(output)) => output,
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    let detail = format!("{}{}", clip(&output.stderr), clip(&output.stdout));
+    let detail = if detail.is_empty() {
+        format!("exit {code}")
+    } else {
+        detail
+    };
+    Err(ApiError::internal(format!(
+        "qemu-img convert failed: {detail}"
+    )))
+}
+
+fn clip(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(400)
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) static QEMU_IMG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

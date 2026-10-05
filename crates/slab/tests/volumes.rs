@@ -9,11 +9,14 @@ use axum::{
     Router,
 };
 use pistack_rpc::{
-    CommandKind, CommandQueue, CommandResult, QueueConfig, VolumeAttach, VolumeDetach,
+    AgentHello, CommandKind, CommandQueue, CommandResult, QueueConfig, VolumeAttach, VolumeDetach,
 };
 use pistack_types::{kind, Caller, Id, Phase, Resource, Spec};
 use serde_json::{json, Value};
-use slab::{Client, Create, LocalFileBackend, Protocol, SnapshotSpec, VolumeSource, VolumeSpec};
+use slab::{
+    Client, Create, LocalFileBackend, Protocol, SnapshotSpec, VolumeSource, VolumeSpec,
+    VolumeTypeSpec,
+};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -175,39 +178,277 @@ async fn create_snapshot_delete_on_local_backend() {
     assert!(c.volumes().try_get(&vol.meta.id).expect("store").is_none());
 }
 
+fn attached(v: &slab::Volume) -> (bool, &str, &str) {
+    let c = v
+        .status
+        .conditions
+        .iter()
+        .find(|c| c.kind == "Attached")
+        .expect("Attached condition");
+    (c.status, c.reason.as_str(), c.message.as_str())
+}
+
 #[tokio::test]
-async fn attach_detach_rules() {
+async fn attach_is_ready_only_when_the_host_path_is_real() {
     let dir = tempfile::tempdir().expect("tempdir");
     let c = client(&dir);
     let vol = c.create_volume(create("a", spec(1))).await.expect("create");
     let machine = Id::new("mach");
+    let machine_id = machine.to_string();
 
-    // not ready yet
     assert!(c
-        .mark_attached(&vol.meta.id, &machine, Some("vdb".into()))
+        .begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
         .is_err());
-    c.reconcile_volume(&vol.meta.id).await.expect("reconcile");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let real = LocalFileBackend::new(dir.path()).volume_path(&vol);
+    assert!(real.is_file());
 
     let v = c
-        .mark_attached(&vol.meta.id, &machine, Some("vdb".into()))
+        .begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
         .expect("attach");
     assert_eq!(v.status.attached_to.as_ref(), Some(&machine));
     assert_eq!(v.status.device.as_deref(), Some("vdb"));
+    assert!(v.status.host_path.is_none());
+    assert_eq!(attached(&v), (false, "Attaching", machine_id.as_str()));
+    assert!(v.is_attached_ready().is_none());
 
-    // another machine is refused; same machine is idempotent
+    // A second attach is rejected while the first is still Attaching.
     assert!(c
-        .mark_attached(&vol.meta.id, &Id::new("mach"), None)
+        .begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
         .is_err());
-    c.mark_attached(&vol.meta.id, &machine, Some("vdb".into()))
-        .expect("idempotent");
-
-    // attached volumes cannot be deleted
+    assert!(c
+        .begin_attach(&vol.meta.id, &Id::new("mach"), None)
+        .is_err());
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert_eq!(v.status.attached_to.as_ref(), Some(&machine));
+    assert_eq!(attached(&v).1, "Attaching");
     assert!(c.request_delete_volume(&vol.meta.id).is_err());
+
+    let missing = dir.path().join("missing-disk");
+    let err = c
+        .confirm_attach(
+            &vol.meta.id,
+            &machine,
+            Some("vdb".into()),
+            Some(missing.to_str().expect("utf8")),
+        )
+        .expect_err("missing path");
+    assert!(err.message.contains("does not exist"), "{err}");
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+    assert!(v.status.host_path.is_none());
+    assert!(!attached(&v).0);
+    assert_eq!(attached(&v).1, "AttachFailed");
+    assert!(attached(&v).2.contains("does not exist"));
+    assert!(v.is_attached_ready().is_none());
+
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("attach again");
+    let v = c
+        .confirm_attach(
+            &vol.meta.id,
+            &machine,
+            Some("vdb".into()),
+            Some(real.to_str().expect("utf8")),
+        )
+        .expect("confirm");
+    assert_eq!(attached(&v), (true, "attached", machine_id.as_str()));
+    assert_eq!(v.status.host_path.as_deref(), Some(real.to_str().unwrap()));
+    assert_eq!(v.status.device.as_deref(), Some("vdb"));
+    assert_eq!(v.is_attached_ready(), Some(real.as_path()));
+    // Same machine stays attached. A different machine is still refused.
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("idempotent");
+    assert!(c
+        .begin_attach(&vol.meta.id, &Id::new("mach"), None)
+        .is_err());
 
     let v = c.mark_detached(&vol.meta.id).expect("detach");
     assert!(v.status.attached_to.is_none());
+    assert!(v.status.host_path.is_none());
+    assert!(v.status.device.is_none());
+    assert_eq!(attached(&v), (false, "detached", ""));
+    assert!(v.is_attached_ready().is_none());
     c.request_delete_volume(&vol.meta.id)
         .expect("delete after detach");
+}
+
+#[tokio::test]
+async fn rbd_network_disk_confirms_without_a_host_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    c.create_volume_type(Create {
+        name: "ceph".into(),
+        description: String::new(),
+        labels: Default::default(),
+        annotations: Default::default(),
+        project: None,
+        spec: VolumeTypeSpec {
+            backend: "rbd".into(),
+            params: Default::default(),
+        },
+    })
+    .expect("type");
+    let mut spec = spec(1);
+    spec.volume_type = "ceph".into();
+    let vol = c.create_volume(create("img", spec)).await.expect("create");
+    // Ready without calling rbd. This test only covers the attach record.
+    c.volumes()
+        .modify(&vol.meta.id, |v| {
+            v.status.phase = Phase::Ready;
+            Ok(())
+        })
+        .expect("ready");
+    let machine = Id::new("mach");
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("attach");
+    let v = c
+        .confirm_attach(&vol.meta.id, &machine, Some("vdb".into()), None)
+        .expect("network disk");
+    assert!(attached(&v).0);
+    assert!(v.status.host_path.is_none());
+    assert!(v.is_attached_ready().is_none());
+
+    c.mark_detached(&vol.meta.id).expect("detach");
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("attach");
+    let missing = dir.path().join("no-rbd");
+    let err = c
+        .confirm_attach(
+            &vol.meta.id,
+            &machine,
+            Some("vdb".into()),
+            Some(missing.to_str().expect("utf8")),
+        )
+        .expect_err("missing mapped device");
+    assert!(err.message.contains("does not exist"), "{err}");
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+    assert_eq!(attached(&v).1, "AttachFailed");
+}
+
+#[tokio::test]
+async fn stale_machine_attach_is_cleared() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    let vol = c.create_volume(create("a", spec(1))).await.expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let real = LocalFileBackend::new(dir.path()).volume_path(&vol);
+    let machine = place_machine(&c, "fleet");
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("attach");
+    let v = c
+        .confirm_attach(
+            &vol.meta.id,
+            &machine,
+            Some("vdb".into()),
+            Some(real.to_str().expect("utf8")),
+        )
+        .expect("confirm");
+    assert_eq!(v.status.attach_node.as_deref(), Some("fleet"));
+    c.reconcile_stale_attaches().await.expect("reconcile");
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert_eq!(v.status.attached_to.as_ref(), Some(&machine));
+    assert!(v.is_attached_ready().is_some());
+
+    delete_machine(&c, &machine);
+    c.reconcile_stale_attaches().await.expect("reconcile");
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+    assert!(v.status.host_path.is_none());
+    assert!(v.status.attach_node.is_none());
+    assert_eq!(attached(&v), (false, "detached", ""));
+}
+
+#[tokio::test]
+async fn stale_rbd_map_on_a_live_agent_is_unmapped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(5),
+        ..QueueConfig::default()
+    });
+    let c = client(&dir).with_queue(queue.clone());
+    let vol = c.create_volume(create("a", spec(1))).await.expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let real = LocalFileBackend::new(dir.path()).volume_path(&vol);
+    let machine = place_machine(&c, "fleet");
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("attach");
+    c.confirm_attach(
+        &vol.meta.id,
+        &machine,
+        Some("vdb".into()),
+        Some(real.to_str().expect("utf8")),
+    )
+    .expect("confirm");
+    // The map path is what the agent recorded. The volume file stands in
+    // for the confirmed attach; the stale pass keys off the rbd device path.
+    c.volumes()
+        .modify(&vol.meta.id, |v| {
+            v.status.host_path = Some("/dev/rbd0".into());
+            Ok(())
+        })
+        .expect("record map");
+    delete_machine(&c, &machine);
+
+    // No hello yet: the agent is gone, so status is cleared without a command.
+    c.reconcile_stale_attaches().await.expect("reconcile");
+    assert_eq!(queue.pending_count(), 0);
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+
+    // Put the claim back, announce the agent, and require an unmap.
+    c.volumes()
+        .modify(&vol.meta.id, |v| {
+            v.status.attached_to = Some(machine.clone());
+            v.status.host_path = Some("/dev/rbd0".into());
+            v.status.attach_node = Some("fleet".into());
+            v.status.device = Some("vdb".into());
+            Ok(())
+        })
+        .expect("claim");
+    queue.hello(&AgentHello {
+        node_name: "fleet".into(),
+        capabilities: Vec::new(),
+        resources: Default::default(),
+        version: String::new(),
+        labels: Default::default(),
+        underlay_ip: None,
+    });
+    let agent = tokio::spawn({
+        let queue = queue.clone();
+        async move {
+            let cmds = queue.next("fleet", Duration::from_secs(5), 1).await;
+            let cmd = cmds.into_iter().next().expect("detach command");
+            assert_eq!(cmd.kind, CommandKind::DetachVolume);
+            let payload = cmd.payload.clone();
+            queue
+                .ack("fleet", CommandResult::ok(cmd.id))
+                .expect("ack detach");
+            payload
+        }
+    });
+    c.reconcile_stale_attaches().await.expect("reconcile");
+    let payload = agent.await.expect("agent");
+    let detach: VolumeDetach = serde_json::from_value(payload).expect("detach payload");
+    assert_eq!(detach.path, "/dev/rbd0");
+    assert_eq!(detach.volume, vol.meta.id);
+    assert!(detach.target.is_none());
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+    assert!(v.status.host_path.is_none());
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
@@ -261,6 +502,13 @@ fn place_machine(c: &Client, node: &str) -> Id {
         .id
 }
 
+fn delete_machine(c: &Client, id: &Id) {
+    c.store()
+        .collection::<Resource<MachineSpec, MachineStatus>>()
+        .delete(id)
+        .expect("delete machine");
+}
+
 #[tokio::test]
 async fn local_file_attach_and_detach_use_the_agent_queue() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -300,11 +548,12 @@ async fn local_file_attach_and_detach_use_the_agent_queue() {
             payload
         }
     });
-    let device = c
+    let attached = c
         .plug_volume(&vol.meta.id, &machine, Some("vdb".into()))
         .await
         .expect("plug");
-    assert_eq!(device, "vdb");
+    assert_eq!(attached.device, "vdb");
+    assert!(attached.host_path.is_none());
     let payload = agent.await.expect("agent");
     let attach: VolumeAttach = serde_json::from_value(payload).expect("attach payload");
     assert_eq!(attach.machine, machine);
@@ -336,6 +585,84 @@ async fn local_file_attach_and_detach_use_the_agent_queue() {
     assert!(detach.target.is_none());
     assert_eq!(detach.device.as_deref(), Some("vdb"));
     assert_eq!(detach.volume, vol.meta.id);
+}
+
+#[tokio::test]
+async fn agent_confirm_sets_attached_and_a_failure_clears_the_claim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(5),
+        ..QueueConfig::default()
+    });
+    let c = client(&dir).with_queue(queue.clone());
+    let vol = c
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let path = LocalFileBackend::new(dir.path())
+        .volume_path(&vol)
+        .to_string_lossy()
+        .into_owned();
+    let machine = place_machine(&c, "fleet");
+    let machine_id = machine.to_string();
+
+    let agent = tokio::spawn({
+        let queue = queue.clone();
+        async move {
+            let cmds = queue.next("fleet", Duration::from_secs(5), 1).await;
+            let cmd = cmds.into_iter().next().expect("attach command");
+            queue
+                .ack(
+                    "fleet",
+                    CommandResult::failed(cmd.id, "host path /data/disk does not exist"),
+                )
+                .expect("ack failure");
+        }
+    });
+    let err = c
+        .attach_volume(&vol.meta.id, &machine, Some("vdb".into()))
+        .await
+        .expect_err("agent failure");
+    agent.await.expect("agent");
+    assert!(err.message.contains("does not exist"), "{err}");
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+    assert_eq!(attached(&v).1, "AttachFailed");
+    assert!(attached(&v).2.contains("does not exist"));
+
+    let agent = tokio::spawn({
+        let queue = queue.clone();
+        let path = path.clone();
+        async move {
+            let cmds = queue.next("fleet", Duration::from_secs(5), 1).await;
+            let cmd = cmds.into_iter().next().expect("attach command");
+            queue
+                .ack(
+                    "fleet",
+                    CommandResult::ok(cmd.id).with_payload(json!({
+                        "device": "vdb",
+                        "host_path": path,
+                    })),
+                )
+                .expect("ack attach");
+        }
+    });
+    let v = c
+        .attach_volume(&vol.meta.id, &machine, Some("vdb".into()))
+        .await
+        .expect("attach");
+    agent.await.expect("agent");
+    assert_eq!(attached(&v), (true, "attached", machine_id.as_str()));
+    assert_eq!(v.status.host_path.as_deref(), Some(path.as_str()));
+    assert_eq!(
+        v.is_attached_ready().map(std::path::Path::to_path_buf),
+        Some(std::path::PathBuf::from(&path))
+    );
 }
 
 async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -488,6 +815,15 @@ async fn http_crud_with_stale_revision() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["status"]["attached_to"], machine);
+    let cond = v["status"]["conditions"]
+        .as_array()
+        .expect("conditions")
+        .iter()
+        .find(|c| c["type"] == "Attached")
+        .expect("Attached");
+    assert_eq!(cond["status"], false);
+    assert_eq!(cond["reason"], "Attaching");
+    assert!(v["status"].get("host_path").is_none());
     let (st, _) = call(&app, "DELETE", &format!("/volumes/{id}"), None).await;
     assert_eq!(
         st,

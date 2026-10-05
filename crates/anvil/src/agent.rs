@@ -24,12 +24,12 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use keep::Pki;
 use pistack_rpc::proto::{
-    AgentHello, Command, CommandKind, CommandResult, ExecRequest, Heartbeat, LogText, MachineKind,
-    MachineRef, MachineReport, MachineRequest, MigrateRequest, PortPlug, VolumeAttach,
+    AgentHello, Command, CommandKind, CommandResult, DiskTarget, ExecRequest, Heartbeat, LogText,
+    MachineKind, MachineRef, MachineReport, MachineRequest, MigrateRequest, PortPlug, VolumeAttach,
     VolumeAttached, VolumeDetach, MAX_LONG_POLL_SECS,
 };
 use pistack_rpc::{AgentClient, RpcError, RPC_INSECURE_ENV};
-use pistack_types::{ApiError, Id, Phase, Resources};
+use pistack_types::{ApiError, ApiResult, Id, Phase, Resources};
 use tokio_util::sync::CancellationToken;
 
 use pistack_types::node::{self, NodeIdentity, NODE_NAME_ENV};
@@ -516,9 +516,8 @@ impl Agent {
             CommandKind::AttachVolume => {
                 let req: VolumeAttach = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, volume = %req.volume, "anvil: attach volume");
-                let device = self.runtimes.attach_volume(&req).await?;
-                serde_json::to_value(VolumeAttached { device })
-                    .map_err(|e| ApiError::internal(e.to_string()))
+                let attached = confirm_volume_attach(&self.runtimes, &req).await?;
+                serde_json::to_value(attached).map_err(|e| ApiError::internal(e.to_string()))
             }
             CommandKind::DetachVolume => {
                 let req: VolumeDetach = payload(c.payload)?;
@@ -581,6 +580,140 @@ impl Agent {
             )),
         }
     }
+}
+
+/// Attach, then confirm only when the host path is real.
+///
+/// A local file or an LVM device is checked before the runtime records it.
+/// An RBD pod map is checked after the runtime publishes `/dev/rbdN` or
+/// the recorded path. A VM network disk has no host map and confirms with
+/// no path once the runtime attach succeeds. A failed check undoes the attach.
+async fn confirm_volume_attach(
+    runtimes: &Runtimes,
+    req: &VolumeAttach,
+) -> ApiResult<VolumeAttached> {
+    if !matches!(req.target, Some(DiskTarget::Rbd { .. })) {
+        host_path_ready(&req.path)?;
+    }
+    let device = runtimes.attach_volume(req).await?;
+    match confirmed_host_path(req).await {
+        Ok(host_path) => Ok(VolumeAttached { device, host_path }),
+        Err(err) => {
+            let undo = VolumeDetach {
+                machine: req.machine.clone(),
+                volume: req.volume.clone(),
+                path: req.path.clone(),
+                device: Some(device),
+                target: req.target.clone(),
+            };
+            if let Err(undo_err) = runtimes.detach_volume(&undo).await {
+                tracing::warn!(
+                    machine = %req.machine,
+                    volume = %req.volume,
+                    error = %undo_err,
+                    "anvil: undoing attach after the host path check failed"
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn confirmed_host_path(req: &VolumeAttach) -> ApiResult<Option<String>> {
+    let recorded = recorded_disk_path(
+        &crate::runtime::youki::state_dir(),
+        &req.machine,
+        &req.volume,
+    );
+    let mapped = match &req.target {
+        Some(DiskTarget::Rbd { pool, image, .. }) if recorded.is_none() => {
+            match crate::runtime::rbdmap::mapped_device(pool, image).await {
+                Ok(path) => path,
+                Err(err) => {
+                    tracing::warn!(
+                        volume = %req.volume,
+                        error = %err,
+                        "anvil: rbd map list failed; confirming without a host path"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    decide_host_path(req, recorded.as_deref(), mapped.as_deref())
+}
+
+/// `recorded` is the path youki stored for this volume. `mapped` is the
+/// device `rbd` listed for the image. Either must exist before it is returned.
+fn decide_host_path(
+    req: &VolumeAttach,
+    recorded: Option<&str>,
+    mapped: Option<&str>,
+) -> ApiResult<Option<String>> {
+    if matches!(req.target, Some(DiskTarget::Rbd { .. })) {
+        if let Some(path) = recorded {
+            if path.is_empty() {
+                return Err(ApiError::unprocessable("rbd mapped device path is missing"));
+            }
+            host_path_ready(path)?;
+            return Ok(Some(path.to_owned()));
+        }
+        if let Some(path) = mapped {
+            if path.is_empty() {
+                return Err(ApiError::unprocessable("rbd mapped device path is missing"));
+            }
+            host_path_ready(path)?;
+            return Ok(Some(path.to_owned()));
+        }
+        return Ok(None);
+    }
+    host_path_ready(&req.path)?;
+    Ok(Some(req.path.clone()))
+}
+
+/// A local file or a device node. A directory is not a volume source.
+fn host_path_ready(path: &str) -> ApiResult<()> {
+    if path.is_empty() {
+        return Err(ApiError::unprocessable("host path is missing"));
+    }
+    let p = std::path::Path::new(path);
+    if path.contains('\0')
+        || !p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ApiError::bad_request(format!(
+            "host path {path} must be an absolute path"
+        )));
+    }
+    match std::fs::metadata(p) {
+        Ok(meta) if meta.is_dir() => Err(ApiError::unprocessable(format!(
+            "host path {path} is a directory"
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(ApiError::unprocessable(
+            format!("host path {path} does not exist"),
+        )),
+        Err(err) => Err(ApiError::internal(format!("host path {path}: {err}"))),
+    }
+}
+
+/// Path youki recorded for this volume in `disks.json`, if the bundle has one.
+fn recorded_disk_path(state: &std::path::Path, machine: &Id, volume: &Id) -> Option<String> {
+    let name = machine.to_string();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let bytes = std::fs::read(state.join(name).join("disks.json")).ok()?;
+    let disks: Vec<serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    let vol = volume.to_string();
+    disks.into_iter().find_map(|disk| {
+        if disk.get("volume").and_then(|v| v.as_str()) != Some(vol.as_str()) {
+            return None;
+        }
+        disk.get("path").and_then(|p| p.as_str()).map(str::to_owned)
+    })
 }
 
 /// Cloud Hypervisor is the VM runtime only when this host selected it.
@@ -1770,5 +1903,107 @@ still here
         };
         queue.ack("node-a", result).unwrap();
         ticket.wait().await.unwrap().into_api_result()
+    }
+
+    fn attach_req(path: &str, target: Option<DiskTarget>) -> VolumeAttach {
+        VolumeAttach {
+            machine: Id::new(pistack_types::kind::MACHINE),
+            volume: Id::new(pistack_types::kind::VOLUME),
+            path: path.to_owned(),
+            device: Some("vdb".into()),
+            read_only: false,
+            target,
+        }
+    }
+
+    #[test]
+    fn host_path_must_exist_before_it_is_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("disk.raw");
+        std::fs::write(&file, b"volume").unwrap();
+        let file = file.to_str().unwrap();
+
+        let local = attach_req(file, None);
+        let confirmed = decide_host_path(&local, None, None).unwrap();
+        assert_eq!(confirmed.as_deref(), Some(file));
+
+        // A device node is a path too. /dev/null is a character device.
+        let node = attach_req("/dev/null", None);
+        assert_eq!(
+            decide_host_path(&node, None, None).unwrap().as_deref(),
+            Some("/dev/null")
+        );
+
+        let missing = dir.path().join("missing");
+        let missing = missing.to_str().unwrap();
+        let err = decide_host_path(&attach_req(missing, None), None, None).unwrap_err();
+        assert!(err.message.contains("does not exist"), "{err}");
+
+        let err = decide_host_path(&attach_req(dir.path().to_str().unwrap(), None), None, None)
+            .unwrap_err();
+        assert!(err.message.contains("directory"), "{err}");
+
+        let err = decide_host_path(&attach_req("rel", None), None, None).unwrap_err();
+        assert!(err.message.contains("absolute"), "{err}");
+        let err = host_path_ready("/tmp/../etc").unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::BadRequest);
+
+        let rbd = attach_req(
+            "",
+            Some(DiskTarget::Rbd {
+                pool: "volumes".into(),
+                image: "vol-1".into(),
+                monitors: vec!["10.1.0.5:6789".into()],
+                user: "pistack".into(),
+                key_secret: None,
+            }),
+        );
+        assert!(decide_host_path(&rbd, None, None).unwrap().is_none());
+        assert_eq!(
+            decide_host_path(&rbd, Some(file), None).unwrap().as_deref(),
+            Some(file)
+        );
+        assert_eq!(
+            decide_host_path(&rbd, None, Some("/dev/null"))
+                .unwrap()
+                .as_deref(),
+            Some("/dev/null")
+        );
+        let err = decide_host_path(&rbd, Some(missing), None).unwrap_err();
+        assert!(err.message.contains("does not exist"), "{err}");
+        let err = decide_host_path(&rbd, Some(""), None).unwrap_err();
+        assert!(err.message.contains("missing"), "{err}");
+
+        let state = dir.path().join("youki");
+        let machine = Id::new(pistack_types::kind::MACHINE);
+        let volume = Id::new(pistack_types::kind::VOLUME);
+        assert!(recorded_disk_path(&state, &machine, &volume).is_none());
+        let bundle = state.join(machine.to_string());
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("disks.json"),
+            serde_json::json!([{
+                "volume": volume.to_string(),
+                "path": file,
+                "device": "vdb"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_disk_path(&state, &machine, &volume).as_deref(),
+            Some(file)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_local_path_is_refused_before_the_runtime_attaches() {
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::default());
+        let missing = attach_req("/var/lib/pistack/missing-volume-path", None);
+        let err = confirm_volume_attach(&Runtimes::all(rt), &missing)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("does not exist"), "{err}");
+        assert!(!err.message.contains("does not attach"), "{err}");
     }
 }

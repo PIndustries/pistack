@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::body::Body;
@@ -23,9 +23,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use pistack_cluster::{
-    accepts_writes, check_advertise, classify, consider_vote, join_membership, scan_targets,
-    seed_membership, sweep, Announce, Ballot, Formation, JoinRequest, Member, Role, VoteRequest,
-    DISCOVER_PORT,
+    accepts_writes, check_advertise, classify, consider_vote, election_seed, election_timeout,
+    follow_candidate, join_membership, scan_targets, seed_membership, should_campaign, sweep,
+    Announce, Ballot, Formation, JoinRequest, Member, Role, VoteRequest, DISCOVER_PORT,
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
@@ -34,6 +34,10 @@ use serde::Deserialize;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+
+const FOLLOW_TICK: Duration = Duration::from_millis(200);
+const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 
 #[derive(Debug)]
 pub struct BootRequest<'a> {
@@ -83,6 +87,10 @@ pub struct ClusterHandle {
     pub announce: watch::Sender<Announce>,
     /// Shared with ModuleContext so controllers idle on followers.
     pub leadership: Leadership,
+    /// Last successful pull, incoming current-term vote, or win.
+    pub last_heard: Mutex<Instant>,
+    /// How long a follower waits after [`Self::last_heard`] before campaigning.
+    pub election_timeout: Mutex<Duration>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -369,6 +377,7 @@ pub fn handle_from(
     };
     let (tx, _rx) = watch::channel(announce);
     leadership.set(established.leader);
+    let timeout = election_timeout(election_seed(&node_id, 0, now_nanos()));
     ClusterHandle {
         node_id,
         self_api,
@@ -382,6 +391,8 @@ pub fn handle_from(
         term: AtomicU64::new(established.term),
         announce: tx,
         leadership,
+        last_heard: Mutex::new(Instant::now()),
+        election_timeout: Mutex::new(timeout),
     }
 }
 
@@ -522,13 +533,19 @@ async fn vote(
     let response = consider_vote(&mut ballot, &req);
     save_ballot(&handle.store, &ballot).map_err(store_err)?;
     handle.term.store(ballot.current_term, Ordering::Relaxed);
+    if req.term >= before {
+        *guard(&handle.last_heard) = Instant::now();
+    }
+    if response.granted {
+        if let Some(api) = follow_candidate(&members_of(&handle.store)?, &req.candidate_id) {
+            *guard(&handle.leader_api) = api;
+            publish(&handle);
+        }
+    }
     if response.term > before && handle.leader.load(Ordering::Relaxed) {
         handle.leader.store(false, Ordering::Relaxed);
         handle.leadership.set(false);
         handle.store.set_record_log(false);
-        if response.granted {
-            *guard(&handle.leader_api) = String::new();
-        }
     }
     Ok(Json(response))
 }
@@ -536,7 +553,7 @@ async fn vote(
 pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
     let after = store.commit_index()?;
     let url = format!("{}/cluster/log?after={after}", leader.trim_end_matches('/'));
-    let entries: Vec<LogEntry> = get_json(&url).await?;
+    let entries: Vec<LogEntry> = rpc_get_json(&url).await?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -544,18 +561,21 @@ pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pull from the current leader. A dead RPC, an unknown address, or a peer
+/// that is not the leader leaves the election timer running. A successful
+/// pull or an incoming current-term vote resets it. Vote RPCs are one-shot
+/// and sent in parallel so a dark peer cannot stall the election.
 async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationToken) {
-    let mut failures = 0u32;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = tokio::time::sleep(FOLLOW_TICK) => {}
         }
         if shutdown.is_cancelled() {
             break;
         }
         if handle.leader.load(Ordering::Relaxed) {
-            failures = 0;
+            *guard(&handle.last_heard) = Instant::now();
             continue;
         }
         let leader = locked(&handle.leader_api);
@@ -565,26 +585,38 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
             refresh(&handle, &leader).await
         };
         match pulled {
-            Ok(()) => failures = 0,
-            Err(err) => {
-                failures += 1;
-                tracing::debug!(error = %err, "replication pull failed");
-            }
+            Ok(()) => *guard(&handle.last_heard) = Instant::now(),
+            Err(err) => tracing::debug!(error = %err, "replication pull failed"),
         }
-        if failures >= 3 {
-            failures = 0;
+        let silent = guard(&handle.last_heard).elapsed();
+        let timeout = *guard(&handle.election_timeout);
+        if should_campaign(silent, timeout) {
             if let Err(err) = campaign(&handle).await {
                 tracing::info!(error = %err, "election did not complete");
             }
+            *guard(&handle.last_heard) = Instant::now();
+            *guard(&handle.election_timeout) = election_timeout(election_seed(
+                &handle.node_id,
+                handle.term.load(Ordering::Relaxed),
+                now_nanos(),
+            ));
         }
     }
 }
 
 async fn refresh(handle: &ClusterHandle, leader: &str) -> anyhow::Result<()> {
     let url = format!("{}/cluster", leader.trim_end_matches('/'));
-    let status: ClusterStatus = get_json(&url).await?;
+    let status: ClusterStatus = rpc_get_json(&url).await?;
+    if !status.leader {
+        anyhow::bail!("peer is not the leader");
+    }
     if !status.leader_api.is_empty() {
         *guard(&handle.leader_api) = status.leader_api.clone();
+    }
+    if !status.leader_id.is_empty() {
+        handle
+            .store
+            .put_meta("cluster_leader_id", &status.leader_id)?;
     }
     if let Some(me) = status
         .members
@@ -631,25 +663,47 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
         last_index,
         last_term,
     };
+    tracing::info!(node = %handle.node_id, term, "starting election");
     let mut grants = 1usize;
+    let mut votes = tokio::task::JoinSet::new();
     for peer in &voters {
         if peer.id == handle.node_id {
             continue;
         }
         let url = format!("{}/cluster/vote", peer.api.trim_end_matches('/'));
-        match post_json::<_, pistack_cluster::VoteResponse>(&url, &request).await {
+        let request = request.clone();
+        votes.spawn(async move {
+            let result: anyhow::Result<pistack_cluster::VoteResponse> =
+                rpc_post_json(&url, &request).await;
+            (url, result)
+        });
+    }
+    while let Some(joined) = votes.join_next().await {
+        let Ok((url, result)) = joined else {
+            continue;
+        };
+        match result {
             Ok(response) if response.granted && response.term == term => grants += 1,
             Ok(response) if response.term > term => {
                 handle.term.store(response.term, Ordering::Relaxed);
                 handle.store.put_meta("cluster_term", &response.term)?;
+                votes.abort_all();
                 return Ok(());
             }
             Ok(_) => {}
-            Err(err) => tracing::debug!(peer = %peer.api, error = %err, "vote request failed"),
+            Err(err) => tracing::debug!(peer = %url, error = %err, "vote request failed"),
         }
     }
     if grants >= majority(voters.len()) && accepts_writes(Role::Voter, true) {
         become_leader(handle, term)?;
+    } else {
+        tracing::info!(
+            node = %handle.node_id,
+            term,
+            grants,
+            voters = voters.len(),
+            "election did not win a majority"
+        );
     }
     Ok(())
 }
@@ -659,6 +713,7 @@ fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     handle.leader.store(true, Ordering::Relaxed);
     handle.leadership.set(true);
     *guard(&handle.leader_api) = handle.self_api.clone();
+    *guard(&handle.last_heard) = Instant::now();
     *guard(&handle.role) = Role::Voter;
     handle.store.set_log_term(term);
     handle.store.set_record_log(true);
@@ -832,8 +887,38 @@ fn with_join(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
-    let response = with_join(http_client().get(url))
+fn rpc_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(RPC_TIMEOUT)
+        .connect_timeout(RPC_CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+async fn rpc_get_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
+    let response = with_join(rpc_client().get(url))
+        .timeout(RPC_TIMEOUT)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json().await?)
+}
+
+async fn rpc_post_json<B, T>(url: &str, body: &B) -> anyhow::Result<T>
+where
+    B: serde::Serialize + ?Sized,
+    T: serde::de::DeserializeOwned,
+{
+    let response = with_join(rpc_client().post(url))
+        .timeout(RPC_TIMEOUT)
+        .json(body)
         .send()
         .await?
         .error_for_status()?;
@@ -1076,6 +1161,166 @@ mod tests {
             .iter()
             .all(|member| member.role == Role::Voter));
         assert!(third.members.iter().any(|member| member.id == "node-b"));
+    }
+
+    struct LiveVoter {
+        handle: Arc<ClusterHandle>,
+        api: String,
+        stop: CancellationToken,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn serve_voter(
+        id: &str,
+        listener: tokio::net::TcpListener,
+        members: &[Member],
+        leader: bool,
+        term: u64,
+        leader_api: &str,
+    ) -> LiveVoter {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = open_store(dir.path());
+        store.put_meta("cluster_id", &"c1".to_string()).unwrap();
+        store.put_meta("node_id", &id.to_string()).unwrap();
+        store.put_meta("members", &members.to_vec()).unwrap();
+        store
+            .put_meta("cluster_leader_id", &"sim".to_string())
+            .unwrap();
+        store.put_meta("cluster_term", &term).unwrap();
+        store
+            .put_meta("cluster_voted_for", &Some("sim".to_string()))
+            .unwrap();
+        store.set_log_term(term);
+        if leader {
+            store.set_record_log(true);
+        }
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let ready = Established {
+            role: Role::Voter,
+            leader,
+            leader_api: leader_api.to_owned(),
+            term,
+            members: members.to_vec(),
+        };
+        let handle = Arc::new(handle_from(
+            id.into(),
+            api.clone(),
+            "c1".into(),
+            store,
+            path,
+            &ready,
+            None,
+            Leadership::new(leader),
+        ));
+        let stop = CancellationToken::new();
+        let app = router(handle.clone())
+            .route("/mutate", axum::routing::post(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                reject_follower_writes,
+            ));
+        let serve_stop = stop.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { serve_stop.cancelled().await })
+                .await
+                .ok();
+        });
+        LiveVoter {
+            handle,
+            api,
+            stop,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn followers_elect_when_the_leader_rpc_goes_dark() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let third = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sim_api = format!("http://{}", first.local_addr().unwrap());
+        let sim2_api = format!("http://{}", second.local_addr().unwrap());
+        let sim3_api = format!("http://{}", third.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &sim_api),
+            Member::voter("sim2", &sim2_api),
+            Member::voter("sim3", &sim3_api),
+        ];
+        let term = 6u64;
+        let sim = serve_voter("sim", first, &members, true, term, &sim_api).await;
+        let sim2 = serve_voter("sim2", second, &members, false, term, &sim_api).await;
+        let sim3 = serve_voter("sim3", third, &members, false, term, &sim_api).await;
+        *guard(&sim2.handle.election_timeout) = Duration::from_millis(80);
+        *guard(&sim3.handle.election_timeout) = Duration::from_millis(700);
+        spawn_background(sim.handle.clone(), None, sim.stop.clone());
+        spawn_background(sim2.handle.clone(), None, sim2.stop.clone());
+        spawn_background(sim3.handle.clone(), None, sim3.stop.clone());
+
+        let client = http_client();
+        let allowed = client
+            .post(format!("{}/mutate", sim.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        sim.stop.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if sim2.handle.leader.load(Ordering::Relaxed)
+                    || sim3.handle.leader.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("followers did not elect after the leader RPC went dark");
+
+        let (winner, winner_api) = if sim2.handle.leader.load(Ordering::Relaxed) {
+            (&sim2, sim2.api.as_str())
+        } else {
+            (&sim3, sim3.api.as_str())
+        };
+        assert!(
+            !(sim2.handle.leader.load(Ordering::Relaxed)
+                && sim3.handle.leader.load(Ordering::Relaxed))
+        );
+        assert!(winner.handle.term.load(Ordering::Relaxed) > term);
+        assert_ne!(winner.handle.node_id, "sim");
+
+        let dead = client.post(format!("{}/mutate", sim.api)).send().await;
+        assert!(
+            dead.is_err() || dead.unwrap().status() != StatusCode::OK,
+            "the stopped leader must not accept writes"
+        );
+
+        let write = client
+            .post(format!("{winner_api}/mutate"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::OK);
+
+        let status: ClusterStatus = client
+            .get(format!("{winner_api}/cluster"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(status.leader);
+        assert_ne!(status.leader_id, "sim");
+        assert_eq!(status.members.len(), 3);
     }
 
     #[test]

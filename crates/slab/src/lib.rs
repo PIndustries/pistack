@@ -7,8 +7,8 @@
 //! * [`backend`] — the `BlockBackend` seam and the `local`, `lvm`, `rbd`
 //!   reference backends.
 //! * [`Client`] — the module core; the only writer of `status`. `forge`
-//!   uses [`Client::attach_info`], [`Client::mark_attached`] and
-//!   [`Client::mark_detached`].
+//!   uses [`Client::attach_info`], [`Client::begin_attach`],
+//!   [`Client::confirm_attach`] and [`Client::mark_detached`].
 //! * [`quota`] — optional extra `QuotaCheck`. Project `volumes` quotas are
 //!   enforced in [`Client`] through `gate`.
 //! * HTTP under `/volume`: `/volumes`, `/snapshots`, `/backups`,
@@ -25,6 +25,7 @@ use std::sync::Arc;
 pub mod backend;
 pub mod client;
 pub mod http;
+mod image;
 mod place;
 pub mod quota;
 pub mod reconcile;
@@ -43,6 +44,9 @@ pub struct Slab {
     backend: Arc<dyn BlockBackend>,
     quota: Arc<dyn QuotaCheck>,
     queue: Option<CommandQueue>,
+    /// Shared with mold when the server wires one store. `None` uses
+    /// [`mold::default_image_dir`].
+    images: Option<Arc<dyn mold::ImageStore>>,
 }
 
 impl Default for Slab {
@@ -52,6 +56,14 @@ impl Default for Slab {
             Arc::new(AllowAll),
         )
     }
+}
+
+/// `$PISTACK_DATA_DIR/slab-spool`, else `./data/slab-spool`.
+pub(crate) fn default_spool_dir() -> PathBuf {
+    std::env::var_os("PISTACK_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./data"))
+        .join("slab-spool")
 }
 
 /// `$PISTACK_SLAB_DIR`, else `$PISTACK_DATA_DIR/volumes`, else `./data/volumes`.
@@ -76,6 +88,7 @@ impl Slab {
             backend,
             quota,
             queue: None,
+            images: None,
         }
     }
 
@@ -90,10 +103,22 @@ impl Slab {
         self
     }
 
+    /// Blob store to read when a volume is created from an image. The
+    /// server passes the same store mold uses.
+    pub fn with_images(mut self, images: Arc<dyn mold::ImageStore>) -> Self {
+        self.images = Some(images);
+        self
+    }
+
     /// A `Client` over `store` using this module's backend and quota hook.
     /// Other modules get theirs from here.
     pub fn client(&self, store: Store) -> Client {
-        Client::new(store, self.backend.clone(), self.quota.clone())
+        let mut client = Client::new(store, self.backend.clone(), self.quota.clone())
+            .with_spool_dir(default_spool_dir());
+        if let Some(images) = &self.images {
+            client = client.with_images(images.clone());
+        }
+        client
     }
 
     fn client_from(&self, ctx: &ModuleContext) -> Client {

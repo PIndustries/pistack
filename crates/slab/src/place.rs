@@ -55,6 +55,14 @@ pub fn node_for_machine(store: &Store, machine: &Id) -> ApiResult<String> {
     Ok(host.spec.node_name)
 }
 
+/// Whether `machine` is still in the store. A deleted machine leaves no row.
+pub(crate) fn machine_exists(store: &Store, machine: &Id) -> ApiResult<bool> {
+    Ok(store
+        .collection::<Resource<MachineSpecView, MachineStatusView>>()
+        .try_get(machine)?
+        .is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

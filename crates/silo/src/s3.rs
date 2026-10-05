@@ -12,16 +12,26 @@
 //! Multipart (query on the object path):
 //! POST   ?uploads                         CreateMultipartUpload
 //! PUT    ?partNumber=N&uploadId=X         UploadPart
+//! PUT    ?partNumber=N&uploadId=X         UploadPartCopy (`x-amz-copy-source`)
+//! PUT    (no multipart query)             CopyObject (`x-amz-copy-source`)
 //! POST   ?uploadId=X  (XML body)          CompleteMultipartUpload
 //! DELETE ?uploadId=X                      AbortMultipartUpload
 //! GET    ?uploadId=X                      ListParts
 //! ```
 //!
 //! Auth: gate bearer `Caller` (request extensions) or AWS Signature
-//! Version 4 ([`crate::sigv4`]) via keep access keys. Header SigV4 and
-//! presigned GET/PUT URLs are supported; `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
-//! (aws-chunked) returns `NotImplemented`. Single-PUT ETag is the content
-//! MD5 hex (quoted); completed multipart ETag is `{md5-of-part-md5s}-{n}`
+//! Version 4 ([`crate::sigv4`]) via keep access keys. Header SigV4,
+//! presigned GET/PUT, and aws-chunked streaming PutObject/UploadPart
+//! (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+//! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) are supported.
+//! **UploadPartCopy** and **CopyObject** (`x-amz-copy-source`) stream from a
+//! source object in a bucket visible to the caller. A foreign-project or
+//! nonexistent copy-source bucket returns `AccessDenied` (existence is not
+//! leaked); a missing key in a visible bucket is still `NoSuchKey`.
+//! Copy-source `versionId` is `NotImplemented`. `x-amz-copy-source-range`
+//! is only valid on UploadPartCopy. Single-PUT ETag is the content MD5
+//! hex (quoted); completed multipart ETag is `{md5-of-part-md5s}-{n}`
 //! (quoted).
 //!
 //! Staging dirs under `.uploads/` are removed on abort and complete, and
@@ -29,8 +39,10 @@
 //! ListMultipartUploads does not support `delimiter` (no CommonPrefixes)
 //! and does not report Initiator/Owner.
 
+use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
-use crate::http::{content_type_header, load_bucket};
+use crate::copy;
+use crate::http::{content_type_header, load_bucket, load_copy_source_bucket};
 use crate::multipart::{self, s3_code_of};
 use crate::sigv4::{self, ExpectedPayloadSha256};
 use crate::types::*;
@@ -41,9 +53,16 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
+use chrono::Utc;
+use futures::StreamExt;
 use pistack_types::{ApiError, ApiResult, Caller};
 use serde::Deserialize;
+use std::io::SeekFrom;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
+
+type DecodedBodyStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, ApiError>> + Send>>;
 
 const S3_MAX_KEYS: usize = 1000;
 const S3_MAX_UPLOADS: usize = 1000;
@@ -105,16 +124,71 @@ async fn put_object_inner(
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
-    let len = content_length(&headers)?;
+    let wire_len = content_length(&headers)?;
     let expected_sha = req
         .extensions()
         .get::<ExpectedPayloadSha256>()
         .map(|e| e.0.clone());
+    let streaming = req.extensions().get::<StreamingAuth>().cloned();
+    if let Some(ref s) = streaming {
+        if s.decoded_content_length > c.max_object_bytes() as u64 {
+            return Err(multipart::s3_err(
+                "EntityTooLarge",
+                format!(
+                    "object exceeds configured max_object_bytes ({})",
+                    c.max_object_bytes()
+                ),
+            ));
+        }
+    }
+    let object_len = streaming
+        .as_ref()
+        .map(|s| Some(s.decoded_content_length))
+        .unwrap_or(wire_len);
+
+    let copy_raw = header_str(&headers, "x-amz-copy-source");
+    if let Some(copy_raw) = copy_raw {
+        match (q.upload_id.as_deref(), q.part_number.as_deref()) {
+            (Some(upload_id), Some(part_raw)) => {
+                return upload_part_copy_inner(
+                    c,
+                    &who,
+                    bucket,
+                    key,
+                    upload_id,
+                    part_raw,
+                    &headers,
+                    copy_raw,
+                    streaming.is_some(),
+                )
+                .await;
+            }
+            (None, None) => {
+                return copy_object_inner(
+                    c,
+                    &who,
+                    bucket,
+                    key,
+                    &headers,
+                    copy_raw,
+                    streaming.is_some(),
+                )
+                .await;
+            }
+            _ => {
+                return Err(multipart::s3_err(
+                    "InvalidArgument",
+                    "UploadPartCopy requires both partNumber and uploadId",
+                ));
+            }
+        }
+    }
+
     if let (Some(upload_id), Some(part_raw)) = (q.upload_id.as_deref(), q.part_number.as_deref()) {
         let part_number: u32 = part_raw
             .parse()
             .map_err(|_| multipart::s3_err("InvalidArgument", "partNumber must be a number"))?;
-        let stream = req.into_body().into_data_stream();
+        let stream = maybe_decode_chunked(req.into_body().into_data_stream(), streaming)?;
         let etag = c
             .upload_part(
                 &bucket.meta.id,
@@ -122,7 +196,7 @@ async fn put_object_inner(
                 upload_id,
                 part_number,
                 stream,
-                len,
+                object_len,
                 expected_sha.as_deref(),
             )
             .await?;
@@ -135,13 +209,13 @@ async fn put_object_inner(
         return Ok(resp);
     }
     let ctype = content_type_header(&headers);
-    let stream = req.into_body().into_data_stream();
+    let stream = maybe_decode_chunked(req.into_body().into_data_stream(), streaming)?;
     let obj = c
         .put_object_stream_sha(
             &bucket.meta.id,
             &key,
             stream,
-            len,
+            object_len,
             ctype,
             expected_sha.as_deref(),
         )
@@ -154,6 +228,271 @@ async fn put_object_inner(
     resp.headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     Ok(resp)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn copy_object_inner(
+    c: Client,
+    who: &Caller,
+    dest_bucket: crate::types::Bucket,
+    key: String,
+    headers: &HeaderMap,
+    copy_raw: &str,
+    streaming: bool,
+) -> ApiResult<Response> {
+    if streaming {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "CopyObject cannot use STREAMING-* payload signing",
+        ));
+    }
+    let wire_len = content_length(headers)?;
+    if wire_len.is_some_and(|n| n > 0) {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "CopyObject must not include a request body",
+        ));
+    }
+    if header_str(headers, "x-amz-copy-source-range").is_some() {
+        return Err(multipart::s3_err(
+            "InvalidArgument",
+            "x-amz-copy-source-range is not valid for CopyObject",
+        ));
+    }
+
+    let src = copy::parse_copy_source(copy_raw)?;
+    if src.version_id.is_some() {
+        return Err(multipart::s3_err(
+            "NotImplemented",
+            "object versioning is not supported for CopyObject",
+        ));
+    }
+
+    // Visibility before any destination write. Foreign or nonexistent
+    // source buckets → AccessDenied (do not leak existence).
+    let src_bucket = load_copy_source_bucket(&c, who, &src.bucket)?;
+
+    let directive = metadata_directive(headers)?;
+    let same_object = src_bucket.meta.id == dest_bucket.meta.id && src.key == key;
+    if same_object && directive == MetadataDirective::Copy {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata",
+        ));
+    }
+
+    let (src_obj, file) = match c.open_object(&src_bucket.meta.id, &src.key).await {
+        Ok(v) => v,
+        Err(e) if e.status() == StatusCode::NOT_FOUND => {
+            return Err(multipart::s3_err(
+                "NoSuchKey",
+                format!(
+                    "The specified key does not exist: {}/{}",
+                    src.bucket, src.key
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+
+    copy::check_copy_source_conditions(
+        &src_obj,
+        header_str(headers, "x-amz-copy-source-if-match"),
+        header_str(headers, "x-amz-copy-source-if-none-match"),
+        header_str(headers, "x-amz-copy-source-if-unmodified-since"),
+        header_str(headers, "x-amz-copy-source-if-modified-since"),
+    )?;
+
+    let len = src_obj.status.size_bytes;
+    if len > c.max_object_bytes() as u64 {
+        return Err(multipart::s3_err(
+            "EntityTooLarge",
+            format!(
+                "object exceeds configured max_object_bytes ({})",
+                c.max_object_bytes()
+            ),
+        ));
+    }
+
+    let ctype = match directive {
+        MetadataDirective::Copy => Some(src_obj.spec.content_type.clone()),
+        MetadataDirective::Replace => Some(crate::types::content_type_or_default(
+            content_type_header(headers),
+        )),
+    };
+
+    // Stream source → temp → atomic rename (same path as PutObject). Safe for
+    // same-key REPLACE: the open File keeps the old inode while we write .tmp-*.
+    let stream = ReaderStream::new(file);
+    let obj = c
+        .put_object_stream_sha(&dest_bucket.meta.id, &key, stream, Some(len), ctype, None)
+        .await?;
+    let etag = if !obj.status.md5.is_empty() {
+        obj.status.md5.clone()
+    } else {
+        obj.status.sha256.clone()
+    };
+    let last_mod = obj.meta.updated_at.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<LastModified>{last_mod}</LastModified>\
+<ETag>&quot;{}&quot;</ETag>\
+</CopyObjectResult>",
+        xml_escape(&etag)
+    );
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        xml,
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    Ok(resp)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataDirective {
+    Copy,
+    Replace,
+}
+
+fn metadata_directive(headers: &HeaderMap) -> ApiResult<MetadataDirective> {
+    match header_str(headers, "x-amz-metadata-directive") {
+        None => Ok(MetadataDirective::Copy),
+        Some(raw) => match raw.to_ascii_uppercase().as_str() {
+            "COPY" => Ok(MetadataDirective::Copy),
+            "REPLACE" => Ok(MetadataDirective::Replace),
+            _ => Err(multipart::s3_err(
+                "InvalidArgument",
+                "x-amz-metadata-directive must be COPY or REPLACE",
+            )),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_part_copy_inner(
+    c: Client,
+    who: &Caller,
+    dest_bucket: crate::types::Bucket,
+    key: String,
+    upload_id: &str,
+    part_raw: &str,
+    headers: &HeaderMap,
+    copy_raw: &str,
+    streaming: bool,
+) -> ApiResult<Response> {
+    if streaming {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "UploadPartCopy cannot use STREAMING-* payload signing",
+        ));
+    }
+    let wire_len = content_length(headers)?;
+    if wire_len.is_some_and(|n| n > 0) {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "UploadPartCopy must not include a request body",
+        ));
+    }
+
+    let src = copy::parse_copy_source(copy_raw)?;
+    if src.version_id.is_some() {
+        return Err(multipart::s3_err(
+            "NotImplemented",
+            "object versioning is not supported for UploadPartCopy",
+        ));
+    }
+    let part_number: u32 = part_raw
+        .parse()
+        .map_err(|_| multipart::s3_err("InvalidArgument", "partNumber must be a number"))?;
+
+    // Visibility before any dest part file is opened/created. Foreign or
+    // nonexistent source buckets → AccessDenied (do not leak existence).
+    let src_bucket = load_copy_source_bucket(&c, who, &src.bucket)?;
+    let (src_obj, mut file) = match c.open_object(&src_bucket.meta.id, &src.key).await {
+        Ok(v) => v,
+        Err(e) if e.status() == StatusCode::NOT_FOUND => {
+            return Err(multipart::s3_err(
+                "NoSuchKey",
+                format!(
+                    "The specified key does not exist: {}/{}",
+                    src.bucket, src.key
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+
+    copy::check_copy_source_conditions(
+        &src_obj,
+        header_str(headers, "x-amz-copy-source-if-match"),
+        header_str(headers, "x-amz-copy-source-if-none-match"),
+        header_str(headers, "x-amz-copy-source-if-unmodified-since"),
+        header_str(headers, "x-amz-copy-source-if-modified-since"),
+    )?;
+
+    let (offset, len) = match header_str(headers, "x-amz-copy-source-range") {
+        Some(raw) => copy::parse_copy_source_range(raw, src_obj.status.size_bytes)?,
+        None => (0, src_obj.status.size_bytes),
+    };
+    if len > c.max_object_bytes() as u64 {
+        return Err(multipart::s3_err(
+            "EntityTooLarge",
+            format!(
+                "copied part exceeds configured max_object_bytes ({})",
+                c.max_object_bytes()
+            ),
+        ));
+    }
+    if offset > 0 || len < src_obj.status.size_bytes {
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(multipart::io_err)?;
+    }
+    let limited = file.take(len);
+    let stream = ReaderStream::new(limited);
+    let etag = c
+        .upload_part(
+            &dest_bucket.meta.id,
+            &key,
+            upload_id,
+            part_number,
+            stream,
+            Some(len),
+            None,
+        )
+        .await?;
+    let last_mod = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<LastModified>{last_mod}</LastModified>\
+<ETag>&quot;{}&quot;</ETag>\
+</CopyPartResult>",
+        xml_escape(&etag)
+    );
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        xml,
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    Ok(resp)
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 pub async fn get_object(
@@ -590,6 +929,26 @@ fn etag_value(obj: &Object) -> Option<HeaderValue> {
         return None;
     };
     HeaderValue::from_str(&format!("\"{hex}\"")).ok()
+}
+
+/// If SigV4 middleware attached [`StreamingAuth`], decode aws-chunked framing
+/// into a plain object/part byte stream (verify-before-write happens inside).
+fn maybe_decode_chunked<S, E>(
+    body: S,
+    streaming: Option<StreamingAuth>,
+) -> ApiResult<DecodedBodyStream>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    Ok(match streaming {
+        Some(auth) => chunked::decode_stream(body, auth).boxed(),
+        None => body
+            .map(|item| {
+                item.map_err(|e| multipart::s3_err("IncompleteBody", format!("reading body: {e}")))
+            })
+            .boxed(),
+    })
 }
 
 fn content_length(headers: &HeaderMap) -> ApiResult<Option<u64>> {

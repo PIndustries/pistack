@@ -75,6 +75,43 @@ async fn call(
     (status, bytes, headers)
 }
 
+async fn call_with_headers(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Vec<u8>>,
+    content_type: &str,
+    caller: Option<&Caller>,
+    extra: &[(&str, &str)],
+) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type);
+    if let Some(c) = caller {
+        req = req.extension(c.clone());
+    }
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    let payload = body.unwrap_or_default();
+    if method == "PUT" || method == "POST" {
+        req = req.header(header::CONTENT_LENGTH, payload.len().to_string());
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(payload)).expect("request"))
+        .await
+        .expect("response");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024 * 1024)
+        .await
+        .expect("body")
+        .to_vec();
+    (status, bytes, headers)
+}
+
 fn app_with_max(max: usize) -> (tempfile::TempDir, Client, Router, Id, Caller) {
     let dir = tempfile::tempdir().expect("tempdir");
     let (events, _rx) = tokio::sync::broadcast::channel(16);
@@ -1460,4 +1497,864 @@ async fn gc_loop_sweeps_on_start_and_stops_on_cancel() {
         .await
         .expect("gc loop exits on cancel")
         .expect("gc loop task");
+}
+
+fn extract_copy_part_etag(xml: &str) -> String {
+    xml.split("<ETag>")
+        .nth(1)
+        .expect("ETag")
+        .split("</ETag>")
+        .next()
+        .unwrap()
+        .replace("&quot;", "")
+        .trim_matches('"')
+        .to_owned()
+}
+
+#[tokio::test]
+async fn upload_part_copy_full_and_ranged_and_mixed_complete() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+    let src_bucket = ensure_bucket(&app, &who, "src").await;
+    let dst_bucket = ensure_bucket(&app, &who, "dst").await;
+    let source = b"ABCDEFGHIJKLMNOP"; // 16 bytes
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{src_bucket}/source.bin"),
+        Some(source.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{dst_bucket}/out.bin?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    // Full copy as part 1.
+    let (status, body, headers) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/out.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{src_bucket}/source.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("CopyPartResult"), "{xml}");
+    assert!(xml.contains("LastModified"), "{xml}");
+    let etag_full = extract_copy_part_etag(&xml);
+    assert_eq!(etag_full, md5_hex(source));
+    assert_eq!(
+        headers
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .trim_matches('"'),
+        etag_full
+    );
+
+    // Abort and start fresh for ranged + mixed.
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &format!("/{dst_bucket}/out.bin?uploadId={upload_id}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{dst_bucket}/mixed.bin?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    // Ranged copy bytes=0-7 as part 1.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/mixed.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{src_bucket}/source.bin")),
+            ("x-amz-copy-source-range", "bytes=0-7"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let etag1 = extract_copy_part_etag(&String::from_utf8_lossy(&body));
+    assert_eq!(etag1, md5_hex(&source[0..8]));
+
+    // Uploaded part 2.
+    let part2 = b"wxyzWXYZ"; // 8
+    let (status, _, headers) = call(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/mixed.bin?partNumber=2&uploadId={upload_id}"),
+        Some(part2.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag2 = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .trim_matches('"')
+        .to_owned();
+
+    // Ranged copy bytes=8-15 as part 3.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/mixed.bin?partNumber=3&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{src_bucket}/source.bin")),
+            ("x-amz-copy-source-range", "bytes=8-15"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let etag3 = extract_copy_part_etag(&String::from_utf8_lossy(&body));
+    assert_eq!(etag3, md5_hex(&source[8..16]));
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{dst_bucket}/mixed.bin?uploadId={upload_id}"),
+        Some(complete_xml(&[(1, &etag1), (2, &etag2), (3, &etag3)])),
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{dst_bucket}/mixed.bin"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut expected = source[0..8].to_vec();
+    expected.extend_from_slice(part2);
+    expected.extend_from_slice(&source[8..16]);
+    assert_eq!(body, expected);
+}
+
+#[tokio::test]
+async fn upload_part_copy_errors() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "upc-err").await;
+    let source = b"0123456789abcdef";
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/src.bin"),
+        Some(source.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/dst.bin?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    // Bad range.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/dst.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{bucket}/src.bin")),
+            ("x-amz-copy-source-range", "bytes=0-99"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRange"
+    );
+
+    // Missing source key.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/dst.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/nope.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "NoSuchKey"
+    );
+
+    // Missing upload.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/dst.bin?partNumber=1&uploadId=does-not-exist"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/src.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "NoSuchUpload"
+    );
+
+    // Body + copy-source rejected.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/dst.bin?partNumber=1&uploadId={upload_id}"),
+        Some(b"nope".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/src.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+
+    // CopyObject (no multipart query) succeeds.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/copied.bin"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/src.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("CopyObjectResult"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // versionId → NotImplemented.
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/dst.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[(
+            "x-amz-copy-source",
+            &format!("/{bucket}/src.bin?versionId=v1"),
+        )],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "NotImplemented"
+    );
+}
+
+#[tokio::test]
+async fn upload_part_copy_cross_project_access_denied() {
+    // Cross-project copy-source must be AccessDenied (not not-found).
+    let (_dir, client, app, _project, who) = app_multipart(64, 4);
+    let other = Id::new(kind::PROJECT);
+    let stranger = project_caller(&other);
+    let src_bucket = ensure_bucket(&app, &stranger, "secret-src").await;
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{src_bucket}/secret.bin"),
+        Some(b"secret-bytes-here".to_vec()),
+        "application/octet-stream",
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_bucket = ensure_bucket(&app, &who, "dst-vis").await;
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{dst_bucket}/out.bin?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/out.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{src_bucket}/secret.bin"))],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+
+    // No part was written; staging has no part files or leftover temps.
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{dst_bucket}/out.bin?uploadId={upload_id}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        !String::from_utf8_lossy(&body).contains("<Part>"),
+        "ListParts must be empty: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let dst = client
+        .list_buckets(Some(&who.project.clone().unwrap()))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == dst_bucket)
+        .unwrap();
+    let staging = staging_dir(&client, &dst.meta.id, &upload_id);
+    assert!(staging.exists(), "upload staging should still exist");
+    let leftovers: Vec<_> = std::fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-") || n.starts_with("part-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no part or .tmp-* files after AccessDenied: {leftovers:?}"
+    );
+}
+
+#[tokio::test]
+async fn upload_part_copy_nonexistent_source_bucket_access_denied() {
+    let (_dir, client, app, _project, who) = app_multipart(64, 4);
+    let dst_bucket = ensure_bucket(&app, &who, "dst-missing-src").await;
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{dst_bucket}/out.bin?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/out.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", "/no-such-bucket-xyz/any-key")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{dst_bucket}/out.bin?uploadId={upload_id}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(!String::from_utf8_lossy(&body).contains("<Part>"));
+    let dst = client
+        .list_buckets(Some(&who.project.clone().unwrap()))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == dst_bucket)
+        .unwrap();
+    let staging = staging_dir(&client, &dst.meta.id, &upload_id);
+    let leftovers: Vec<_> = std::fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-") || n.starts_with("part-"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+}
+
+#[tokio::test]
+async fn copy_object_basic_and_cross_bucket_and_metadata() {
+    let (_dir, _client, app, _project, who) = app_with_max(1024);
+    let src_bucket = ensure_bucket(&app, &who, "copy-src").await;
+    let dst_bucket = ensure_bucket(&app, &who, "copy-dst").await;
+    let payload = b"hello-copy-object";
+    let (status, _, headers) = call(
+        &app,
+        "PUT",
+        &format!("/{src_bucket}/orig.txt"),
+        Some(payload.to_vec()),
+        "text/plain",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let src_etag = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .trim_matches('"')
+        .to_owned();
+
+    let (status, body, headers) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{src_bucket}/copy.txt"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{src_bucket}/orig.txt"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("CopyObjectResult"));
+    assert!(String::from_utf8_lossy(&body).contains("LastModified"));
+    let copy_etag = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .trim_matches('"')
+        .to_owned();
+    assert_eq!(copy_etag, src_etag);
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{src_bucket}/copy.txt"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/from-src.txt"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{src_bucket}/orig.txt")),
+            ("x-amz-metadata-directive", "COPY"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _, headers) = call(
+        &app,
+        "HEAD",
+        &format!("/{dst_bucket}/from-src.txt"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap(),
+        "text/plain"
+    );
+
+    let (status, _, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/replaced.txt"),
+        Some(Vec::new()),
+        "application/json",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{src_bucket}/orig.txt")),
+            ("x-amz-metadata-directive", "REPLACE"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, headers) = call(
+        &app,
+        "HEAD",
+        &format!("/{dst_bucket}/replaced.txt"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap(),
+        "application/json"
+    );
+}
+
+#[tokio::test]
+async fn copy_object_self_copy_copy_vs_replace() {
+    let (_dir, _client, app, _project, who) = app_with_max(1024);
+    let bucket = ensure_bucket(&app, &who, "self-copy").await;
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/me.txt"),
+        Some(b"self".to_vec()),
+        "text/plain",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/me.txt"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/me.txt"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/me.txt"),
+        Some(Vec::new()),
+        "application/json",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{bucket}/me.txt")),
+            ("x-amz-metadata-directive", "REPLACE"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}/me.txt"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"self");
+    let (status, _, headers) = call(
+        &app,
+        "HEAD",
+        &format!("/{bucket}/me.txt"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap(),
+        "application/json"
+    );
+}
+
+#[tokio::test]
+async fn copy_object_access_denied_and_errors() {
+    let (_dir, client, app, _project, who) = app_with_max(64);
+    let bucket = ensure_bucket(&app, &who, "co-err").await;
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/small.bin"),
+        Some(b"0123456789abcdef".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/out.bin"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/missing.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "NoSuchKey"
+    );
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/ranged.bin"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[
+            ("x-amz-copy-source", &format!("/{bucket}/small.bin")),
+            ("x-amz-copy-source-range", "bytes=0-3"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidArgument"
+    );
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/from-ghost.bin"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", "/no-such-bkt/key")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}/from-ghost.bin"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let other = Id::new(kind::PROJECT);
+    let stranger = project_caller(&other);
+    let secret = ensure_bucket(&app, &stranger, "secret-co").await;
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{secret}/hidden.bin"),
+        Some(b"secret".to_vec()),
+        "application/octet-stream",
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{bucket}/stolen.bin"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{secret}/hidden.bin"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}/stolen.bin"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let bkt = client
+        .list_buckets(Some(&who.project.clone().unwrap()))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap();
+    let bucket_dir = client.root().join(bkt.meta.id.to_string());
+    let tmps = walkdir_tmp(&bucket_dir);
+    assert!(tmps.is_empty(), "leftover temps: {tmps:?}");
+}
+
+#[tokio::test]
+async fn copy_object_oversize_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (events, _rx) = tokio::sync::broadcast::channel(16);
+    let store = Store::open(dir.path().join("state.redb"), events).expect("open store");
+    let root = dir.path().join("silo");
+    let big = Client::new(store.clone(), &root).with_max_object_bytes(64);
+    let small = Client::new(store, &root).with_max_object_bytes(8);
+    let app_big = http::router(big);
+    let app_small = http::router(small);
+    let project = Id::new(kind::PROJECT);
+    let who = project_caller(&project);
+    let bucket = ensure_bucket(&app_big, &who, "oversize").await;
+    let payload = b"0123456789abcdef"; // 16 > 8
+    let (status, _, _) = call(
+        &app_big,
+        "PUT",
+        &format!("/{bucket}/big.bin"),
+        Some(payload.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body, _) = call_with_headers(
+        &app_small,
+        "PUT",
+        &format!("/{bucket}/out.bin"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", &format!("/{bucket}/big.bin"))],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "EntityTooLarge"
+    );
+    let (status, _, _) = call(
+        &app_small,
+        "GET",
+        &format!("/{bucket}/out.bin"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+fn walkdir_tmp(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.is_dir() {
+            out.extend(walkdir_tmp(&path));
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".tmp-"))
+        {
+            out.push(path);
+        }
+    }
+    out
 }

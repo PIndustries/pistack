@@ -5,6 +5,7 @@
 //! HTTP handlers, the reconciler, and other modules (`forge` attaches
 //! volumes through it). It is the only writer of `status`.
 
+use mold::ImageStore;
 use pistack_rpc::{
     CommandKind, CommandQueue, DiskTarget, VolumeAttach, VolumeAttached, VolumeDetach,
 };
@@ -13,7 +14,7 @@ use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult, Id, Meta, Phase};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -83,6 +84,10 @@ pub struct Client {
     queue: Option<CommandQueue>,
     /// Directory silo uses for backup object bytes.
     silo_root: PathBuf,
+    /// Mold blob store. Volume create reads an image from here.
+    images: Arc<dyn ImageStore>,
+    /// Temp files for stores that only offer a byte stream.
+    spool_dir: PathBuf,
 }
 
 /// Host path and optional network target for one attach or detach.
@@ -152,6 +157,58 @@ fn queue_detach(
     })
 }
 
+fn validate_device(device: &str) -> ApiResult<()> {
+    if device.is_empty() || device.contains('/') || device.len() > 32 {
+        return Err(ApiError::bad_request(
+            "device must be a bare name like 'vdb'",
+        ));
+    }
+    Ok(())
+}
+
+/// A local file or an LVM device needs a host path. An RBD image can be a
+/// VM network disk with no host map, or a pod device the agent records later.
+fn backend_needs_host_path(backend: &str) -> bool {
+    backend.trim() != "rbd"
+}
+
+fn condition_holds(vol: &Volume, kind: &str) -> bool {
+    vol.status
+        .conditions
+        .iter()
+        .any(|c| c.kind == kind && c.status)
+}
+
+/// `Ok(())` when `path` is an absolute file or device node on this host.
+fn host_path_present(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("host path is missing".to_owned());
+    }
+    let p = Path::new(path);
+    if path.contains('\0')
+        || !p.is_absolute()
+        || p.components().any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!("host path {path} must be an absolute path"));
+    }
+    match std::fs::metadata(p) {
+        Ok(meta) if meta.is_dir() => Err(format!("host path {path} is a directory")),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("host path {path} does not exist"))
+        }
+        Err(err) => Err(format!("host path {path}: {err}")),
+    }
+}
+
+fn is_rbd_host_path(path: &str) -> bool {
+    let p = Path::new(path);
+    path.starts_with("/dev/rbd")
+        && !path.contains('\0')
+        && p.is_absolute()
+        && !p.components().any(|c| matches!(c, Component::ParentDir))
+}
+
 fn validate_name(name: &str) -> ApiResult<()> {
     if name.is_empty() || name.len() > 128 {
         return Err(ApiError::bad_request("name must be 1-128 characters"));
@@ -175,6 +232,8 @@ impl Client {
             quota,
             queue: None,
             silo_root: silo::Silo::data_root(),
+            images: Arc::new(mold::LocalDirStore::new(mold::default_image_dir())),
+            spool_dir: crate::default_spool_dir(),
         }
     }
 
@@ -187,6 +246,22 @@ impl Client {
     pub fn with_silo_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.silo_root = root.into();
         self
+    }
+
+    /// Blob store shared with mold.
+    pub fn with_images(mut self, images: Arc<dyn ImageStore>) -> Self {
+        self.images = images;
+        self
+    }
+
+    /// Directory for a streamed image copy. Removed after the copy.
+    pub fn with_spool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.spool_dir = dir.into();
+        self
+    }
+
+    pub(crate) fn mold(&self) -> mold::Client {
+        mold::Client::new(self.store.clone(), self.images.clone())
     }
 
     pub fn silo_root(&self) -> &Path {
@@ -205,10 +280,12 @@ impl Client {
         let store = Store::in_memory()?;
         Ok(Self::new(
             store,
-            Arc::new(LocalFileBackend::new(dir)),
+            Arc::new(LocalFileBackend::new(dir.clone())),
             Arc::new(AllowAll),
         )
-        .with_silo_root(silo_root))
+        .with_silo_root(silo_root)
+        .with_images(Arc::new(mold::LocalDirStore::new(dir.join("images"))))
+        .with_spool_dir(dir.join("spool")))
     }
 
     pub fn store(&self) -> &Store {
@@ -313,9 +390,6 @@ impl Client {
     pub async fn create_volume(&self, req: Create<VolumeSpec>) -> ApiResult<Volume> {
         validate_name(&req.name)?;
         let mut spec = req.spec;
-        if spec.size_gib == 0 {
-            return Err(ApiError::bad_request("spec.size_gib must be at least 1"));
-        }
         // Normalise the type to its name so renames do not break volumes.
         let vt = self.get_volume_type(&spec.volume_type).map_err(|_| {
             ApiError::bad_request(format!("unknown volume type '{}'", spec.volume_type))
@@ -324,6 +398,14 @@ impl Client {
         // on the file backend. lvm and rbd are checked again when they run.
         known_backend(&vt.spec.backend)?;
         spec.volume_type = vt.meta.name.clone();
+
+        if let VolumeSource::Image(id) = &spec.source {
+            let checked = crate::image::check_image(&self.mold(), id, spec.size_gib).await?;
+            spec.size_gib = checked.size_gib;
+        }
+        if spec.size_gib == 0 {
+            return Err(ApiError::bad_request("spec.size_gib must be at least 1"));
+        }
 
         // Source checks: sizes must not shrink and sources must be ready.
         match &spec.source {
@@ -436,21 +518,30 @@ impl Client {
         Ok(vol)
     }
 
-    /// Record that `machine` holds the volume as `device`. `forge` calls this
-    /// once `anvil` reports the attach done.
+    /// Record that `machine` is the attach target. Same as [`Self::begin_attach`].
+    ///
+    /// Does not report the volume attached. [`Self::confirm_attach`] does
+    /// that after the host path is real.
     pub fn mark_attached(
         &self,
         id: &Id,
         machine: &Id,
         device: Option<String>,
     ) -> ApiResult<Volume> {
+        self.begin_attach(id, machine, device)
+    }
+
+    /// Record the attach request.
+    ///
+    /// Sets `attached_to` and `Attached=false` with reason `Attaching`.
+    /// A second attach is rejected while that is set, including another
+    /// request for the same machine. An attach that is already confirmed
+    /// for `machine` is left as it is.
+    pub fn begin_attach(&self, id: &Id, machine: &Id, device: Option<String>) -> ApiResult<Volume> {
         if let Some(d) = &device {
-            if d.is_empty() || d.contains('/') || d.len() > 32 {
-                return Err(ApiError::bad_request(
-                    "device must be a bare name like 'vdb'",
-                ));
-            }
+            validate_device(d)?;
         }
+        let node = place::node_for_machine(&self.store, machine).ok();
         Ok(self.volumes().modify(id, |v| {
             if v.status.phase != Phase::Ready {
                 return Err(StoreError::Conflict(format!(
@@ -464,9 +555,126 @@ impl Client {
                         "volume {id} is already attached to {cur}"
                     )));
                 }
+                if condition_holds(v, "Attached") {
+                    return Ok(());
+                }
+                return Err(StoreError::Conflict(format!(
+                    "volume {id} is attaching to {cur}"
+                )));
             }
             v.status.attached_to = Some(machine.clone());
             v.status.device = device.clone();
+            v.status.host_path = None;
+            v.status.attach_node = node.clone();
+            set_condition(
+                &mut v.status.conditions,
+                "Attached",
+                false,
+                "Attaching",
+                machine.to_string(),
+            );
+            Ok(())
+        })?)
+    }
+
+    /// Record a confirmed attach.
+    ///
+    /// A non-empty `host_path` must exist on this host (a file or a device
+    /// node). An empty path is `AttachFailed` for a local or LVM volume.
+    /// An RBD volume may confirm with no path: that is a VM network disk.
+    /// A missing path clears `attached_to` and returns the error.
+    pub fn confirm_attach(
+        &self,
+        id: &Id,
+        machine: &Id,
+        device: Option<String>,
+        host_path: Option<&str>,
+    ) -> ApiResult<Volume> {
+        self.ensure_claimed(id, machine)?;
+        if let Some(path) = host_path.filter(|p| !p.is_empty()) {
+            if let Err(msg) = host_path_present(path) {
+                self.record_failure(id, machine, &msg)?;
+                return Err(ApiError::unprocessable(msg));
+            }
+            return self.write_attached(id, machine, device, Some(path.to_owned()));
+        }
+        if self.volume_needs_host_path(id)? {
+            let msg = "host path is missing";
+            self.record_failure(id, machine, msg)?;
+            return Err(ApiError::unprocessable(msg));
+        }
+        self.write_attached(id, machine, device, None)
+    }
+
+    /// Record the path the agent already verified on its own host.
+    ///
+    /// This process may not be able to see an LVM node or an RBD map, so
+    /// the path is stored without a local stat. An empty path is still
+    /// `AttachFailed` when the volume needs a host path.
+    fn confirm_from_agent(&self, id: &Id, machine: &Id, done: VolumeAttached) -> ApiResult<Volume> {
+        self.ensure_claimed(id, machine)?;
+        let path = done.host_path.filter(|p| !p.is_empty());
+        if path.is_none() && self.volume_needs_host_path(id)? {
+            let msg = "host path is missing";
+            self.record_failure(id, machine, msg)?;
+            return Err(ApiError::unprocessable(msg));
+        }
+        let device = if done.device.is_empty() {
+            None
+        } else {
+            Some(done.device)
+        };
+        self.write_attached(id, machine, device, path)
+    }
+
+    fn ensure_claimed(&self, id: &Id, machine: &Id) -> ApiResult<Volume> {
+        let vol = self.volumes().get(id)?;
+        match &vol.status.attached_to {
+            Some(cur) if cur == machine => Ok(vol),
+            Some(cur) => Err(ApiError::conflict(format!(
+                "volume {id} is already attached to {cur}"
+            ))),
+            None => Err(ApiError::conflict(format!("volume {id} is not attaching"))),
+        }
+    }
+
+    fn volume_needs_host_path(&self, id: &Id) -> ApiResult<bool> {
+        let vol = self.volumes().get(id)?;
+        let vt = self.get_volume_type(&vol.spec.volume_type).map_err(|_| {
+            ApiError::unprocessable(format!("unknown volume type '{}'", vol.spec.volume_type))
+        })?;
+        Ok(backend_needs_host_path(&vt.spec.backend))
+    }
+
+    fn write_attached(
+        &self,
+        id: &Id,
+        machine: &Id,
+        device: Option<String>,
+        host_path: Option<String>,
+    ) -> ApiResult<Volume> {
+        if let Some(d) = &device {
+            validate_device(d)?;
+        }
+        Ok(self.volumes().modify(id, |v| {
+            match &v.status.attached_to {
+                Some(cur) if cur == machine => {}
+                Some(cur) => {
+                    return Err(StoreError::Conflict(format!(
+                        "volume {id} is already attached to {cur}"
+                    )))
+                }
+                None => {
+                    return Err(StoreError::Conflict(format!(
+                        "volume {id} is not attaching"
+                    )))
+                }
+            }
+            v.status.attached_to = Some(machine.clone());
+            if device.is_some() {
+                v.status.device = device.clone();
+            }
+            v.status.host_path = host_path.clone();
             set_condition(
                 &mut v.status.conditions,
                 "Attached",
@@ -478,24 +686,79 @@ impl Client {
         })?)
     }
 
+    /// Clear the claim and set `Attached=false` with reason `AttachFailed`.
+    fn record_failure(&self, id: &Id, machine: &Id, message: &str) -> ApiResult<()> {
+        self.volumes().modify(id, |v| {
+            if let Some(cur) = &v.status.attached_to {
+                if cur != machine {
+                    return Err(StoreError::Conflict(format!(
+                        "volume {id} is already attached to {cur}"
+                    )));
+                }
+            }
+            v.status.attached_to = None;
+            v.status.device = None;
+            v.status.host_path = None;
+            v.status.attach_node = None;
+            set_condition(
+                &mut v.status.conditions,
+                "Attached",
+                false,
+                "AttachFailed",
+                message,
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn mark_detached(&self, id: &Id) -> ApiResult<Volume> {
         Ok(self.volumes().modify(id, |v| {
             v.status.attached_to = None;
             v.status.device = None;
+            v.status.host_path = None;
+            v.status.attach_node = None;
             set_condition(&mut v.status.conditions, "Attached", false, "detached", "");
             Ok(())
         })?)
     }
 
+    /// Ask the host that runs `machine` to hotplug this volume.
+    ///
+    /// Records `Attaching` first. The returned volume is `Attached` only
+    /// after the agent confirms, and only with the host path the agent
+    /// checked. A local or LVM volume whose agent result has no path
+    /// becomes `AttachFailed` and the error is returned. With no host
+    /// queue the volume stays `Attaching`.
+    pub async fn attach_volume(
+        &self,
+        id: &Id,
+        machine: &Id,
+        device: Option<String>,
+    ) -> ApiResult<Volume> {
+        let pending = self.begin_attach(id, machine, device.clone())?;
+        if condition_holds(&pending, "Attached") || !self.has_queue() {
+            return Ok(pending);
+        }
+        match self.plug_volume(id, machine, device).await {
+            Ok(done) => self.confirm_from_agent(id, machine, done),
+            Err(err) => {
+                self.record_failure(id, machine, &err.message)?;
+                Err(err)
+            }
+        }
+    }
+
     /// Ask the host that runs `machine` to hotplug this volume. Returns the
-    /// guest device name. A local file or an LVM device is a host path. An
-    /// RBD image is a disk target.
+    /// agent's result. A local file or an LVM device is a host path. An
+    /// RBD image is a disk target. Does not write volume status; [`Self::attach_volume`]
+    /// does.
     pub async fn plug_volume(
         &self,
         id: &Id,
         machine: &Id,
         device: Option<String>,
-    ) -> ApiResult<String> {
+    ) -> ApiResult<VolumeAttached> {
         let queue = self.queue.clone().ok_or_else(|| {
             ApiError::not_implemented("volume attach has no host queue on this process")
         })?;
@@ -509,11 +772,8 @@ impl Client {
         let req = queue_attach(machine.clone(), id.clone(), device, &info)?;
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue.enqueue(&node, CommandKind::AttachVolume, payload)?;
-        let attached: VolumeAttached =
-            serde_json::from_value(ticket.wait().await?.into_api_result()?).map_err(|e| {
-                ApiError::internal(format!("host returned a bad attach result: {e}"))
-            })?;
-        Ok(attached.device)
+        serde_json::from_value(ticket.wait().await?.into_api_result()?)
+            .map_err(|e| ApiError::internal(format!("host returned a bad attach result: {e}")))
     }
 
     /// Ask the host to unplug the volume. A disk that is already gone is success.
@@ -801,34 +1061,7 @@ impl Client {
             return Ok(None);
         };
         match vol.status.phase {
-            Phase::Pending => {
-                let backend = match self.volume_backend(&vol).await {
-                    Ok(backend) => backend,
-                    Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
-                };
-                let vol = col.modify(id, |v| {
-                    v.status.phase = Phase::Creating;
-                    Ok(())
-                })?;
-                match backend.create(&vol).await {
-                    Ok(r) => Ok(Some(col.modify(id, |v| {
-                        v.status.phase = Phase::Ready;
-                        v.status.backend_ref = Some(r.to_string());
-                        set_condition(&mut v.status.conditions, "Provisioned", true, "created", "");
-                        if matches!(v.spec.source, VolumeSource::Image(_)) {
-                            set_condition(
-                                &mut v.status.conditions,
-                                "ImageWritten",
-                                false,
-                                "pending",
-                                "image population happens at first attach",
-                            );
-                        }
-                        Ok(())
-                    })?)),
-                    Err(e) => Ok(Some(self.fail_volume(id, "create", e)?)),
-                }
-            }
+            Phase::Pending => self.provision_volume(id, &vol, &col).await,
             Phase::Updating => {
                 let backend = match self.volume_backend(&vol).await {
                     Ok(backend) => backend,
@@ -869,10 +1102,101 @@ impl Client {
         }
     }
 
+    /// Create the blank volume, then copy an image into it while the phase
+    /// stays `Creating`. A failed copy removes the blank volume.
+    async fn provision_volume(
+        &self,
+        id: &Id,
+        vol: &Volume,
+        col: &Collection<Volume>,
+    ) -> ApiResult<Option<Volume>> {
+        let backend = match self.volume_backend(vol).await {
+            Ok(backend) => backend,
+            Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
+        };
+        let vol = col.modify(id, |v| {
+            v.status.phase = Phase::Creating;
+            Ok(())
+        })?;
+        let image_id = match &vol.spec.source {
+            VolumeSource::Image(image) => Some(image.clone()),
+            _ => None,
+        };
+        let staged = if let Some(image) = &image_id {
+            let mold = self.mold();
+            let checked = match crate::image::check_image(&mold, image, vol.spec.size_gib).await {
+                Ok(checked) => checked,
+                Err(e) => return Ok(Some(self.fail_volume(id, "image", e)?)),
+            };
+            match crate::image::stage_image(&mold, &checked.image, &self.spool_dir).await {
+                Ok(staged) => Some(staged),
+                Err(e) => return Ok(Some(self.fail_volume(id, "image", e)?)),
+            }
+        } else {
+            None
+        };
+        let created = match backend.create(&vol).await {
+            Ok(created) => created,
+            Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
+        };
+        let vol = col.modify(id, |v| {
+            v.status.backend_ref = Some(created.to_string());
+            Ok(())
+        })?;
+        if let (Some(image), Some(staged)) = (&image_id, staged.as_ref()) {
+            if let Err(e) = backend
+                .write_image(&vol, &staged.path, &staged.format)
+                .await
+            {
+                let e = Self::copy_failed(image, e);
+                let clear_ref = match backend.delete(&vol).await {
+                    Ok(()) => true,
+                    Err(del) => {
+                        tracing::warn!(
+                            volume = %id,
+                            error = %del,
+                            "removing a partial volume failed"
+                        );
+                        false
+                    }
+                };
+                return Ok(Some(self.mark_volume_failed(id, "image", e, clear_ref)?));
+            }
+        }
+        drop(staged);
+        Ok(Some(col.modify(id, |v| {
+            v.status.phase = Phase::Ready;
+            set_condition(&mut v.status.conditions, "Provisioned", true, "created", "");
+            if let Some(image) = &image_id {
+                set_condition(
+                    &mut v.status.conditions,
+                    "ImageWritten",
+                    true,
+                    "copied",
+                    image.to_string(),
+                );
+            }
+            Ok(())
+        })?))
+    }
+
     fn fail_volume(&self, id: &Id, op: &str, e: ApiError) -> ApiResult<Volume> {
+        self.mark_volume_failed(id, op, e, false)
+    }
+
+    fn mark_volume_failed(
+        &self,
+        id: &Id,
+        op: &str,
+        e: ApiError,
+        clear_ref: bool,
+    ) -> ApiResult<Volume> {
         tracing::warn!(volume = %id, op, error = %e, "volume reconcile failed");
         Ok(self.volumes().modify(id, |v| {
             v.status.phase = Phase::Error;
+            if clear_ref {
+                v.status.backend_ref = None;
+            }
             set_condition(
                 &mut v.status.conditions,
                 "Provisioned",
@@ -882,6 +1206,11 @@ impl Client {
             );
             Ok(())
         })?)
+    }
+
+    fn copy_failed(image: &Id, mut err: ApiError) -> ApiError {
+        err.message = format!("copying image {image} failed: {}", err.message);
+        err
     }
 
     pub async fn reconcile_snapshot(&self, id: &Id) -> ApiResult<Option<Snapshot>> {
@@ -975,6 +1304,9 @@ impl Client {
     /// Reconcile everything once. Used at start-up and after a lagged event
     /// stream.
     pub async fn reconcile_all(&self) -> ApiResult<()> {
+        if let Err(e) = self.reconcile_stale_attaches().await {
+            tracing::warn!(error = %e, "slab: stale attach reconcile failed");
+        }
         for v in self.volumes().list(None)? {
             if let Err(e) = self.reconcile_volume(&v.meta.id).await {
                 tracing::warn!(volume = %v.meta.id, error = %e, "resync failed");
@@ -991,6 +1323,113 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Drop attaches whose machine record is gone.
+    ///
+    /// An RBD host map on a live agent is unmapped first. When the agent or
+    /// the machine placement is gone, status is cleared without a host call.
+    /// Each clear is logged.
+    pub async fn reconcile_stale_attaches(&self) -> ApiResult<()> {
+        let volumes = self.volumes().list(None)?;
+        for vol in volumes {
+            let Some(machine) = vol.status.attached_to.clone() else {
+                continue;
+            };
+            if place::machine_exists(&self.store, &machine)? {
+                continue;
+            }
+            if let Err(e) = self.detach_stale(&vol, &machine).await {
+                tracing::warn!(
+                    volume = %vol.meta.id,
+                    machine = %machine,
+                    error = %e,
+                    "slab: stale attach reconcile failed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn detach_stale(&self, vol: &Volume, machine: &Id) -> ApiResult<()> {
+        let host_path = vol.status.host_path.clone().unwrap_or_default();
+        let node = vol.status.attach_node.clone();
+        let mut unmapped = false;
+        if is_rbd_host_path(&host_path) {
+            if let (Some(queue), Some(node)) = (self.queue.clone(), node.clone()) {
+                if agent_is_live(&queue, &node) {
+                    match self.unmap_stale(vol, machine, &node).await {
+                        Ok(()) => unmapped = true,
+                        Err(err) => {
+                            tracing::warn!(
+                                volume = %vol.meta.id,
+                                machine = %machine,
+                                node = %node,
+                                error = %err,
+                                "slab: stale rbd unmap failed; will retry"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        self.mark_detached(&vol.meta.id)?;
+        tracing::info!(
+            volume = %vol.meta.id,
+            machine = %machine,
+            host_path = %host_path,
+            unmapped,
+            "slab: cleared stale attach"
+        );
+        Ok(())
+    }
+
+    async fn unmap_stale(&self, vol: &Volume, machine: &Id, node: &str) -> ApiResult<()> {
+        let queue = self.queue.clone().ok_or_else(|| {
+            ApiError::not_implemented("volume detach has no host queue on this process")
+        })?;
+        let req = self.stale_detach_request(vol, machine, node).await?;
+        let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
+        let ticket = queue
+            .enqueue(node, CommandKind::DetachVolume, payload)
+            .map_err(ApiError::from)?;
+        ticket
+            .wait()
+            .await
+            .map_err(ApiError::from)?
+            .into_api_result()?;
+        Ok(())
+    }
+
+    async fn stale_detach_request(
+        &self,
+        vol: &Volume,
+        machine: &Id,
+        node: &str,
+    ) -> ApiResult<VolumeDetach> {
+        let backend = self.volume_backend(vol).await?;
+        if backend.name() == "rbd" {
+            if let Ok(info) = backend.attach_info(vol, node).await {
+                return queue_detach(
+                    machine.clone(),
+                    vol.meta.id.clone(),
+                    vol.status.device.clone(),
+                    &info,
+                );
+            }
+            tracing::warn!(
+                volume = %vol.meta.id,
+                "slab: rbd attach target is unavailable; asking the agent to unmap the recorded device"
+            );
+        }
+        Ok(VolumeDetach {
+            machine: machine.clone(),
+            volume: vol.meta.id.clone(),
+            path: vol.status.host_path.clone().unwrap_or_default(),
+            device: vol.status.device.clone(),
+            target: None,
+        })
     }
 
     fn silo(&self) -> silo::Client {
@@ -1186,6 +1625,12 @@ impl Client {
         }
         Ok(Some(backup))
     }
+}
+
+fn agent_is_live(queue: &CommandQueue, node: &str) -> bool {
+    queue.nodes().into_iter().any(|info| {
+        info.name == node && (info.last_hello.is_some() || info.last_heartbeat.is_some())
+    })
 }
 
 fn known_backend(name: &str) -> ApiResult<()> {
