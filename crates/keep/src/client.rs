@@ -9,8 +9,11 @@ use pistack_store::Store;
 use pistack_types::{Id, Phase};
 use std::collections::BTreeMap;
 
+use crate::access_key::{ACCESS_KEYS, ROLE_ACCESS_KEY};
 use crate::backend::KeyBackend;
-use crate::ca::{open_secret, seal_pem_secret, Ca, Issued, ROLE_LABEL, ROLE_PRIVATE_KEY};
+use crate::ca::{
+    open_secret, seal_pem_secret, Ca, Issued, RESERVED_LABEL_PREFIX, ROLE_LABEL, ROLE_PRIVATE_KEY,
+};
 use crate::crypto::RootKey;
 use crate::error::{KeepError, Result};
 use crate::quota::{self, KeepConfig, CERTIFICATES, SECRETS};
@@ -72,19 +75,21 @@ impl Client {
     }
 
     /// Rows of `resource` in `project` that count against its quota. A
-    /// certificate's key secret counts as part of the certificate.
-    fn count(&self, project: &Id, resource: &str) -> Result<u64> {
+    /// certificate's key secret counts as part of the certificate; an
+    /// access key counts under `access_keys`, not `secrets`.
+    pub(crate) fn count(&self, project: &Id, resource: &str) -> Result<u64> {
         let n = if resource == CERTIFICATES {
             self.store
                 .collection::<Certificate>()
                 .list(Some(project))?
                 .len()
         } else {
+            let want = (resource == ACCESS_KEYS).then_some(ROLE_ACCESS_KEY);
             self.store
                 .collection::<StoredSecret>()
                 .list(Some(project))?
                 .iter()
-                .filter(|s| !is_private_key(&s.meta.labels))
+                .filter(|s| managed_role(&s.meta.labels) == want)
                 .count()
         };
         Ok(n as u64)
@@ -92,20 +97,20 @@ impl Client {
 
     /// Refuse one more `resource` in `project` at its limit. Call with
     /// [`quota::admission`] held when a create follows.
-    fn admit(&self, project: Option<&Id>, resource: &str) -> Result<()> {
+    pub(crate) fn admit(&self, project: Option<&Id>, resource: &str) -> Result<()> {
         let Some(p) = project else {
             return Ok(());
         };
-        let default = if resource == CERTIFICATES {
-            self.limits.max_certificates_per_project
-        } else {
-            self.limits.max_secrets_per_project
+        let default = match resource {
+            CERTIFICATES => self.limits.max_certificates_per_project,
+            ACCESS_KEYS => self.limits.max_access_keys_per_project,
+            _ => self.limits.max_secrets_per_project,
         };
         quota::admit(&self.store, p, resource, self.count(p, resource)?, default)
     }
 
     /// Mirror the current count into the project's usage.
-    fn note_usage(&self, project: Option<&Id>, resource: &str) {
+    pub(crate) fn note_usage(&self, project: Option<&Id>, resource: &str) {
         let Some(p) = project else {
             return;
         };
@@ -168,9 +173,21 @@ impl Client {
 
     // ---- secrets -----------------------------------------------------------
 
-    /// Decrypted payload of a secret.
+    /// Decrypted payload of a secret. An access key's secret is refused:
+    /// it is shown once at creation and otherwise only reaches
+    /// [`lookup_access_key`](Self::lookup_access_key).
     pub fn get_secret_payload(&self, id: &Id) -> Result<Vec<u8>> {
+        let s = self.store.collection::<Secret>().get(id)?;
+        if managed_role(&s.meta.labels) == Some(ROLE_ACCESS_KEY) {
+            return Err(KeepError::Conflict(
+                "an access key's secret is shown only once, when it is created".into(),
+            ));
+        }
         open_secret(&self.store, &self.root_key, id)
+    }
+
+    pub(crate) fn root_key(&self) -> &RootKey {
+        &self.root_key
     }
 
     pub fn get_secret(&self, id: &Id) -> Result<Secret> {
@@ -185,9 +202,14 @@ impl Client {
     pub fn create_secret(&self, mut secret: Secret, payload: &[u8]) -> Result<Secret> {
         check_payload(payload)?;
         check_metadata(&secret)?;
-        if secret.meta.labels.contains_key(ROLE_LABEL) {
+        if let Some(k) = secret
+            .meta
+            .labels
+            .keys()
+            .find(|k| k.starts_with(RESERVED_LABEL_PREFIX))
+        {
             return Err(KeepError::Invalid(format!(
-                "label {ROLE_LABEL} is reserved for keep"
+                "label {k} is reserved for keep ({RESERVED_LABEL_PREFIX}*)"
             )));
         }
         secret.status = SecretStatus {
@@ -216,15 +238,16 @@ impl Client {
     }
 
     /// Replace spec and metadata (not the payload). Honours `If-Match`.
-    /// The same metadata limits as create apply, and the reserved role
-    /// label cannot be added, changed or removed.
+    /// The same metadata limits as create apply, and keep's own labels
+    /// (`keep.pistack.io/*`) cannot be added, changed or removed.
     pub fn update_secret(&self, secret: Secret, expected_revision: Option<u64>) -> Result<Secret> {
         check_metadata(&secret)?;
         let col = self.store.collection::<StoredSecret>();
         let current = col.get(&secret.meta.id)?;
-        if secret.meta.labels.get(ROLE_LABEL) != current.meta.labels.get(ROLE_LABEL) {
+        if reserved_labels(&secret.meta.labels) != reserved_labels(&current.meta.labels) {
             return Err(KeepError::Conflict(format!(
-                "label {ROLE_LABEL} is managed by keep and cannot be changed"
+                "labels {RESERVED_LABEL_PREFIX}* are managed by keep and cannot be changed \
+                 (including {ROLE_LABEL})"
             )));
         }
         let stored = StoredSecret {
@@ -248,10 +271,23 @@ impl Client {
         check_payload(payload)?;
         let col = self.store.collection::<StoredSecret>();
         let mut cur = col.get(id)?;
-        if is_private_key(&cur.meta.labels) {
-            return Err(KeepError::Conflict(
-                "this secret holds a certificate's key; it cannot be rotated on its own".into(),
-            ));
+        match managed_role(&cur.meta.labels) {
+            Some(ROLE_PRIVATE_KEY) => {
+                return Err(KeepError::Conflict(
+                    "this secret holds a certificate's key; it cannot be rotated on its own".into(),
+                ))
+            }
+            Some(ROLE_ACCESS_KEY) => {
+                return Err(KeepError::Conflict(
+                    "an access key cannot be rotated; create a new one and revoke this one".into(),
+                ))
+            }
+            Some(_) => {
+                return Err(KeepError::Conflict(
+                    "this secret is managed by keep and cannot be rotated".into(),
+                ))
+            }
+            None => {}
         }
         if let Some(exp) = expected_revision {
             if exp != cur.meta.revision {
@@ -271,7 +307,13 @@ impl Client {
         Ok(public_secret(col.update(cur, Some(rev))?))
     }
 
+    /// Delete a secret. Deleting an access key's secret revokes the key.
     pub fn delete_secret(&self, id: &Id) -> Result<Secret> {
+        let s = self.store.collection::<Secret>().get(id)?;
+        if managed_role(&s.meta.labels) == Some(ROLE_ACCESS_KEY) {
+            self.revoke_access_key(id)?;
+            return Ok(s);
+        }
         let gone = self.store.collection::<StoredSecret>().delete(id)?;
         self.note_usage(gone.meta.project.as_ref(), SECRETS);
         Ok(public_secret(gone))
@@ -447,7 +489,10 @@ fn check_metadata(secret: &Secret) -> Result<()> {
 }
 
 /// Label and description limits shared by secrets and certificates.
-fn check_meta_fields(labels: &BTreeMap<String, String>, description: &str) -> Result<()> {
+pub(crate) fn check_meta_fields(
+    labels: &BTreeMap<String, String>,
+    description: &str,
+) -> Result<()> {
     if labels.len() > MAX_LABELS {
         return Err(KeepError::Invalid(format!(
             "at most {MAX_LABELS} labels are allowed"
@@ -471,8 +516,16 @@ fn check_meta_fields(labels: &BTreeMap<String, String>, description: &str) -> Re
     Ok(())
 }
 
-pub(crate) fn is_private_key(labels: &BTreeMap<String, String>) -> bool {
-    labels.get(ROLE_LABEL).map(String::as_str) == Some(ROLE_PRIVATE_KEY)
+/// The keep role (`keep.pistack.io/role`) of a secret keep manages itself.
+pub(crate) fn managed_role(labels: &BTreeMap<String, String>) -> Option<&str> {
+    labels.get(ROLE_LABEL).map(String::as_str)
+}
+
+fn reserved_labels(labels: &BTreeMap<String, String>) -> Vec<(&String, &String)> {
+    labels
+        .iter()
+        .filter(|(k, _)| k.starts_with(RESERVED_LABEL_PREFIX))
+        .collect()
 }
 
 /// Turn a CN into something that fits the resource-name rules.

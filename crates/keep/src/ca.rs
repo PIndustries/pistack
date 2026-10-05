@@ -38,6 +38,9 @@ const ROOT_TTL_DAYS: u32 = 3650;
 const ISSUING_TTL_DAYS: u32 = 1826;
 /// Content type given to private-key secrets.
 pub const PEM_CONTENT_TYPE: &str = "application/x-pem-file";
+/// Label prefix reserved for keep: callers cannot set, change or strip
+/// any label under it.
+pub const RESERVED_LABEL_PREFIX: &str = "keep.pistack.io/";
 /// Label `keep` puts on secrets it manages itself; reserved for keep.
 pub const ROLE_LABEL: &str = "keep.pistack.io/role";
 /// [`ROLE_LABEL`] value on a certificate's or CA's private-key secret.
