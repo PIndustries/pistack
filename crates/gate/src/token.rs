@@ -239,9 +239,17 @@ pub async fn require_caller(verifier: &Verifier, parts: &Parts) -> ApiResult<Cal
 /// A present-but-invalid bearer token is rejected with 401. A missing header
 /// passes through untouched so unauthenticated routes (login, discovery)
 /// keep working; handlers that need a caller use `AuthCaller` and get 401
-/// from the extractor.
+/// from the extractor. An `Authorization: AWS4-HMAC-SHA256 …` header is
+/// left for silo's SigV4 verifier (not treated as a gate bearer).
 pub async fn attach_caller(State(verifier): State<Verifier>, req: Request, next: Next) -> Response {
-    if req.headers().contains_key(header::AUTHORIZATION) {
+    if let Some(raw) = req.headers().get(header::AUTHORIZATION) {
+        let is_sigv4 = raw
+            .as_bytes()
+            .get(..16)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"AWS4-HMAC-SHA256"));
+        if is_sigv4 {
+            return next.run(req).await;
+        }
         let (parts, body) = req.into_parts();
         match verifier.caller_from_parts(&parts) {
             Ok(caller) => {

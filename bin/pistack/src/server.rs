@@ -234,6 +234,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     let silo_cfg = silo::SiloConfig::load().context("silo config")?;
     tracing::info!(
         max_object_bytes = silo_cfg.max_object_bytes,
+        region = %silo_cfg.region,
         "silo: max object size"
     );
     let asm = assemble(opts.dev, silo_cfg, &opts.listen);

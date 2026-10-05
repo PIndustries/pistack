@@ -21,15 +21,17 @@
 //! `{*key}` is the object key and may contain `/`; `..`, empty, and absolute
 //! keys are rejected.
 //!
-//! The `Caller` comes from request extensions. Without one, the request
-//! is rejected. AWS SigV4 is not verified; see the crate docs.
+//! The `Caller` comes from request extensions (gate bearer token) or from
+//! AWS SigV4 verification ([`crate::sigv4`]) on S3 routes. Without one, the
+//! request is rejected.
 
 use crate::client::Client;
 use crate::s3;
+use crate::sigv4::{self, SigV4State};
 use crate::types::*;
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Extension, FromRef, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -45,7 +47,38 @@ use tokio_util::io::ReaderStream;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
+/// Router state: silo client plus optional keep client for SigV4.
+#[derive(Clone)]
+pub struct AppState {
+    pub client: Client,
+    pub sigv4: SigV4State,
+}
+
+impl FromRef<AppState> for Client {
+    fn from_ref(s: &AppState) -> Client {
+        s.client.clone()
+    }
+}
+
+impl FromRef<AppState> for SigV4State {
+    fn from_ref(s: &AppState) -> SigV4State {
+        s.sigv4.clone()
+    }
+}
+
+/// Native + S3 routes with bearer auth only (no SigV4). Used by unit tests
+/// that inject a [`Caller`] via request extensions.
 pub fn router(client: Client) -> Router {
+    router_with(client, None, DEFAULT_REGION.to_owned())
+}
+
+/// Full router: bearer token and (when `keep` is set) AWS SigV4 via keep
+/// access keys. `region` is the SigV4 region name ([`SiloConfig::region`]).
+pub fn router_with(client: Client, keep: Option<keep::Client>, region: String) -> Router {
+    let state = AppState {
+        client,
+        sigv4: SigV4State { keep, region },
+    };
     // Object puts enforce the size cap while streaming; disable axum's
     // default 2 MiB buffer limit the same way mold does for image uploads.
     let object_routes = axum::routing::put(put_object)
@@ -68,8 +101,13 @@ pub fn router(client: Client) -> Router {
         .route("/{bucket}", get(s3::list_or_bucket))
         .route("/{bucket}/{*key}", s3_object)
         .fallback(|| async { ApiError::not_found("no such silo endpoint") })
+        // Inner: demand a Caller. Outer: SigV4 may attach one first.
         .layer(middleware::from_fn(require_caller))
-        .with_state(client)
+        .layer(middleware::from_fn_with_state(
+            state.sigv4.clone(),
+            sigv4::middleware,
+        ))
+        .with_state(state)
 }
 
 async fn require_caller(req: Request, next: Next) -> Response {

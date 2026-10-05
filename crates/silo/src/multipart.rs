@@ -557,8 +557,20 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
     let message = message.into();
     let status_code = match code {
         "NoSuchUpload" | "NoSuchKey" | "NoSuchBucket" => ApiError::not_found(message),
-        "EntityTooLarge" | "EntityTooSmall" | "InvalidPart" | "InvalidPartOrder"
-        | "InvalidArgument" | "InvalidRequest" | "MalformedXML" => ApiError::bad_request(message),
+        "EntityTooLarge"
+        | "EntityTooSmall"
+        | "InvalidPart"
+        | "InvalidPartOrder"
+        | "InvalidArgument"
+        | "InvalidRequest"
+        | "MalformedXML"
+        | "AuthorizationHeaderMalformed"
+        | "XAmzContentSHA256Mismatch" => ApiError::bad_request(message),
+        "InvalidAccessKeyId"
+        | "SignatureDoesNotMatch"
+        | "AccessDenied"
+        | "RequestTimeTooSkewed" => ApiError::forbidden(message),
+        "NotImplemented" => ApiError::not_implemented(message),
         _ => ApiError::internal(message),
     };
     status_code.with_detail("s3_code", code)

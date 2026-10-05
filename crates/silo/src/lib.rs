@@ -11,10 +11,11 @@
 //! `[modules.silo] max_object_bytes`.
 //!
 //! Path-style S3 routes (`/{bucket}/{key}`, ListObjectsV2, multipart
-//! upload, ListMultipartUploads) share this module's HTTP router and the
-//! same bearer/`Caller` auth. **AWS Signature Version 4 is not verified**;
-//! clients must present a gate token (or run under the gateway's `--dev`
-//! admin injection).
+//! upload, ListMultipartUploads) share this module's HTTP router. Auth is
+//! gate bearer `Caller` or **AWS Signature Version 4** via keep access keys
+//! ([`sigv4`]): header auth and presigned GET/PUT. Not supported:
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked). Region comes from
+//! `[modules.silo] region` (default `pistack`).
 //!
 //! Multipart staging lives under `{data}/silo/{bucket}/.uploads/{uploadId}/`.
 //! Abort and complete delete that directory. Uploads a client never
@@ -29,6 +30,7 @@
 //! * [`s3`] — path-style S3-compatible handlers on the same router.
 //! * [`multipart`] — Create/Upload/Complete/Abort/List multipart helpers.
 //! * [`gc`] — the abandoned-upload sweep.
+//! * [`sigv4`] — AWS Signature Version 4 verification (in-process via keep).
 
 use async_trait::async_trait;
 use axum::Router;
@@ -41,6 +43,7 @@ pub mod gc;
 pub mod http;
 pub mod multipart;
 pub mod s3;
+pub mod sigv4;
 pub mod types;
 
 pub use client::Client;
@@ -94,7 +97,15 @@ impl Module for Silo {
 
     fn router(&self, ctx: ModuleContext) -> Router {
         let store = ctx.store::<Store>();
-        http::router(self.client((*store).clone()))
+        let client = self.client((*store).clone());
+        let keep = match keep::Client::open(&store) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(error = %e, "silo: keep unavailable; SigV4 disabled");
+                None
+            }
+        };
+        http::router_with(client, keep, self.config.region.clone())
     }
 
     /// Abandoned multipart uploads are swept while this node is leader:
