@@ -168,11 +168,7 @@ pub async fn prepare_store(req: &BootRequest<'_>) -> anyhow::Result<BootKind> {
     }
 }
 
-async fn discover_formation(
-    ip: IpAddr,
-    node_id: &str,
-    api: &str,
-) -> anyhow::Result<Formation> {
+async fn discover_formation(ip: IpAddr, node_id: &str, api: &str) -> anyhow::Result<Formation> {
     let IpAddr::V4(v4) = ip else {
         anyhow::bail!("discovery needs an IPv4 listen address");
     };
@@ -461,10 +457,7 @@ async fn join(
     }
     let current = members_of(&handle.store)?;
     let next = join_membership(&current, node_id, api);
-    handle
-        .store
-        .put_meta("members", &next)
-        .map_err(store_err)?;
+    handle.store.put_meta("members", &next).map_err(store_err)?;
     if let Some(me) = next.iter().find(|member| member.id == handle.node_id) {
         *guard(&handle.role) = me.role;
     }
@@ -479,10 +472,9 @@ async fn snapshot(
     if !handle.leader.load(Ordering::Relaxed) {
         return Err(not_leader(&handle));
     }
-    let dest = handle.db_path.with_file_name(format!(
-        "snapshot-{}.redb",
-        uuid::Uuid::now_v7()
-    ));
+    let dest = handle
+        .db_path
+        .with_file_name(format!("snapshot-{}.redb", uuid::Uuid::now_v7()));
     let _remove = RemoveFile(dest.clone());
     handle
         .store
@@ -502,10 +494,7 @@ async fn log(
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<LogEntry>>, ApiError> {
     enforce_join(&handle.store, &headers)?;
-    let entries = handle
-        .store
-        .read_log(query.after, 64)
-        .map_err(store_err)?;
+    let entries = handle.store.read_log(query.after, 64).map_err(store_err)?;
     Ok(Json(entries))
 }
 
@@ -539,10 +528,7 @@ async fn vote(
 
 pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
     let after = store.commit_index()?;
-    let url = format!(
-        "{}/cluster/log?after={after}",
-        leader.trim_end_matches('/')
-    );
+    let url = format!("{}/cluster/log?after={after}", leader.trim_end_matches('/'));
     let entries: Vec<LogEntry> = get_json(&url).await?;
     if entries.is_empty() {
         return Ok(());
@@ -668,7 +654,9 @@ fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     *guard(&handle.role) = Role::Voter;
     handle.store.set_log_term(term);
     handle.store.set_record_log(true);
-    handle.store.put_meta("cluster_leader_id", &handle.node_id)?;
+    handle
+        .store
+        .put_meta("cluster_leader_id", &handle.node_id)?;
     handle.store.put_meta("cluster_term", &term)?;
     handle
         .store
@@ -737,7 +725,10 @@ fn status_of(handle: &ClusterHandle, members: &[Member]) -> Result<ClusterStatus
 }
 
 fn members_of(store: &Store) -> Result<Vec<Member>, ApiError> {
-    store.get_meta("members").map_err(store_err).map(|v| v.unwrap_or_default())
+    store
+        .get_meta("members")
+        .map_err(store_err)
+        .map(|v| v.unwrap_or_default())
 }
 
 fn load_ballot(store: &Store) -> anyhow::Result<Ballot> {
@@ -893,7 +884,10 @@ async fn fetch_snapshot(api: &str, dest: &Path) -> anyhow::Result<()> {
                 anyhow::bail!("snapshot {url} returned {}", response.status());
             }
             Ok(response) => {
-                last = Some(anyhow::anyhow!("snapshot {url} returned {}", response.status()));
+                last = Some(anyhow::anyhow!(
+                    "snapshot {url} returned {}",
+                    response.status()
+                ));
             }
             Err(err) => last = Some(err.into()),
         }
@@ -1020,20 +1014,12 @@ mod tests {
 
         handle.leader.store(false, Ordering::Relaxed);
         let client = http_client();
-        let refused = client
-            .post(format!("{base}/mutate"))
-            .send()
-            .await
-            .unwrap();
+        let refused = client.post(format!("{base}/mutate")).send().await.unwrap();
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         let body = refused.text().await.unwrap();
         assert!(body.contains("not the leader"));
         handle.leader.store(true, Ordering::Relaxed);
-        let allowed = client
-            .post(format!("{base}/mutate"))
-            .send()
-            .await
-            .unwrap();
+        let allowed = client.post(format!("{base}/mutate")).send().await.unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
 
         let bytes = client
@@ -1076,7 +1062,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.members.len(), 3);
-        assert!(third.members.iter().all(|member| member.role == Role::Voter));
+        assert!(third
+            .members
+            .iter()
+            .all(|member| member.role == Role::Voter));
         assert!(third.members.iter().any(|member| member.id == "node-b"));
     }
 

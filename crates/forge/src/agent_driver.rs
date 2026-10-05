@@ -581,24 +581,25 @@ impl Registrar {
         } else if m.status.host.as_ref() != Some(host) || m.status.phase != Phase::Ready {
             return Ok(());
         } else {
-        let power = r.power.map(power_from_wire);
-        let addrs_differ = !r.addresses.is_empty() && r.addresses != m.status.addresses;
-        let power_differs = power.is_some_and(|p| p != PowerState::Unknown && p != m.status.power);
-        if !addrs_differ && !power_differs {
-            return Ok(());
-        }
-        match col.modify(&m.meta.id, |x| {
-            if addrs_differ {
-                x.status.addresses = r.addresses.clone();
+            let power = r.power.map(power_from_wire);
+            let addrs_differ = !r.addresses.is_empty() && r.addresses != m.status.addresses;
+            let power_differs =
+                power.is_some_and(|p| p != PowerState::Unknown && p != m.status.power);
+            if !addrs_differ && !power_differs {
+                return Ok(());
             }
-            if let (true, Some(p)) = (power_differs, power) {
-                x.status.power = p;
+            match col.modify(&m.meta.id, |x| {
+                if addrs_differ {
+                    x.status.addresses = r.addresses.clone();
+                }
+                if let (true, Some(p)) = (power_differs, power) {
+                    x.status.power = p;
+                }
+                Ok(())
+            }) {
+                Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
+                Err(e) => Err(e.into()),
             }
-            Ok(())
-        }) {
-            Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
         }
     }
 }

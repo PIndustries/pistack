@@ -52,7 +52,10 @@ pub fn assemble(dev: bool) -> Assembly {
     let modules: Vec<Arc<dyn Module>> = vec![
         gate_m.clone(),
         forge_m.clone(),
-        Arc::new(loom::Loom::configured(loom::LoomConfig::production(dev, queue.clone()))),
+        Arc::new(loom::Loom::configured(loom::LoomConfig::production(
+            dev,
+            queue.clone(),
+        ))),
         Arc::new(fabric_module()),
         Arc::new(slab::Slab::default().with_queue(queue.clone())),
         Arc::new(mold::Mold::default()),
@@ -155,7 +158,9 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         Ok(crate::cluster::LocalRole::NeedJoin) => {
             let hint = crate::cluster::leader_hint(&store, &node_id)?
                 .or_else(|| crate::cluster::remembered_leader(&opts.data_dir))
-                .context("store belongs to a cluster and no leader address is known; pass --join URL")?;
+                .context(
+                    "store belongs to a cluster and no leader address is known; pass --join URL",
+                )?;
             match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
                 Ok(ready) => ready,
                 Err(err) => {

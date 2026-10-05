@@ -286,10 +286,11 @@ mod tests {
         let reply = peer.clone();
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 8192];
-            let (_len, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
-                .await
-                .expect("responder timed out")
-                .unwrap();
+            let (_len, from) =
+                tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+                    .await
+                    .expect("responder timed out")
+                    .unwrap();
             let payload = serde_json::to_vec(&reply).unwrap();
             sock.send_to(&payload, from).await.unwrap();
         });

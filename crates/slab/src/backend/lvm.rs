@@ -294,11 +294,7 @@ async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
         .kill_on_drop(true);
     let finished = tokio::time::timeout(TIMEOUT, cmd.output()).await;
     let output = match finished {
-        Err(_) => {
-            return Err(ApiError::unavailable(format!(
-                "{bin} timed out after 30s"
-            )))
-        }
+        Err(_) => return Err(ApiError::unavailable(format!("{bin} timed out after 30s"))),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ApiError::unavailable(format!("{bin} is not available")))
         }
@@ -394,7 +390,11 @@ mod tests {
 
         std::env::set_var(ENV_BIN, dir.path().join("missing-lvm"));
         let err = backend.create(&vol).await.unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -431,14 +431,22 @@ mod tests {
             .create(&volume(1))
             .await
             .unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
         assert!(!log.exists(), "empty vg must not run a command");
 
         let err = LvmBackend::new("vg0", "pistack-thin")
             .create(&volume(1))
             .await
             .unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
         assert!(err.message.contains("not available"), "{err}");
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.contains("--thin"), "{logged}");

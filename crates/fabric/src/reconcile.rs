@@ -267,19 +267,14 @@ impl Client {
             .unwrap_or_default()
             .iter()
             .any(|s| &s.spec.network == &net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24");
-        let hostnat_port = self
-            .ports()
-            .list(None)
-            .unwrap_or_default()
-            .iter()
-            .any(|p| {
-                &p.spec.network == &net.meta.id
-                    && !p.is_router_port()
-                    && p.status
-                        .binding
-                        .as_ref()
-                        .is_some_and(|b| b.vif_type == "hostnat")
-            });
+        let hostnat_port = self.ports().list(None).unwrap_or_default().iter().any(|p| {
+            &p.spec.network == &net.meta.id
+                && !p.is_router_port()
+                && p.status
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| b.vif_type == "hostnat")
+        });
         if shared || hostnat_port || self.backend().name() == "hostnat" {
             return Some("hostnat".into());
         }

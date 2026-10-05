@@ -64,10 +64,7 @@ mod tests {
         let text = Gauge::new()
             .client(Store::in_memory().unwrap())
             .metrics_text();
-        assert!(
-            text.contains("node=\"gauge-shared-ring\""),
-            "{text}"
-        );
+        assert!(text.contains("node=\"gauge-shared-ring\""), "{text}");
     }
 }
 
