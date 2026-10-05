@@ -72,6 +72,17 @@ A pod's liveness and readiness probes run on the host agent. `http_get` and `tcp
 
 `slab` owns volumes; `anvil` attaches them (LVM, Ceph RBD, NVMe-oF). Three reference backends in-tree, a plugin ABI for vendors. `mold` stores images content-addressed in `silo` (S3) or on local disk.
 
+A pod attach turns the volume into a mounted directory under the agent data directory (`<data_dir>/slab/mounts/<volume-id>`) and records that directory as the host path. A local image is attached with `losetup`. An LVM device node and a mapped RBD device are used as they are. `blkid` decides whether to format. A device that already has a filesystem is left alone. A blank device is formatted with `mkfs.ext4` unless the volume type sets `fs_type`. The attach is confirmed only after that directory exists. Detach unmounts, detaches the loop device when one was used, then runs the existing LVM or RBD detach. A VM attach is unchanged: a file or LVM node is the host path, and an RBD image stays a network disk.
+
+A root agent runs `losetup`, `blkid`, `mkfs`, `mount`, and `umount` directly. When the agent is not root and `PISTACK_VOLFS_SUDO` is `1`, `true`, or `yes`, those five binaries run as `sudo -n`. Allow only them:
+
+```
+# /etc/sudoers.d/pistack-volfs
+ubuntu ALL=(root) NOPASSWD: /sbin/losetup, /sbin/blkid, /sbin/mkfs.ext4, /bin/mount, /bin/umount
+```
+
+Replace `ubuntu` and the paths with the agent user and the binaries on the host. A volume type that sets `fs_type` to something other than `ext4` needs that `mkfs` binary on the same line.
+
 ## Security
 
 `keep` is the cloud CA. Every server and agent gets a certificate at join; every API call is mTLS or bearer-token over TLS. `gate` issues signed tokens (verifiable without a store lookup) and evaluates one policy document for the whole cloud.

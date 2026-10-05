@@ -58,11 +58,14 @@ macro_rules! resource_kind {
 // ---- VolumeType -----------------------------------------------------------
 
 /// A volume type names a backend and the parameters it is created with
-/// (pool, replication, QoS). Cloud-scoped: `meta.project` is `None`.
+/// (pool, replication, QoS). `params` key `fs_type` is the filesystem a pod
+/// attach creates when the device has none. Absent or blank means `ext4`.
+/// Cloud-scoped: `meta.project` is `None`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeTypeSpec {
     /// Backend name: "local", "lvm", "rbd".
     pub backend: String,
+    /// Backend settings. `fs_type` defaults to `ext4` when it is absent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
 }
@@ -129,11 +132,11 @@ pub struct VolumeStatus {
     /// Guest device name requested at attach, e.g. `vdb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
-    /// Host file or device node from a confirmed attach.
+    /// Host path from a confirmed attach.
     ///
-    /// A local file, an LVM device node, or an RBD mapped device
-    /// (`/dev/rbdN` or the path the agent recorded). Absent for a VM
-    /// network disk, which has no host map.
+    /// A pod records the directory where the volume is mounted. A VM records
+    /// a local file or an LVM device node. Absent for a VM network disk,
+    /// which has no host map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_path: Option<String>,
     /// Agent node that accepted the attach. Used to unmap an RBD device
