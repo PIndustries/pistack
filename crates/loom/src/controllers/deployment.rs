@@ -9,12 +9,21 @@
 //! `max_unavailable`; `Recreate` scales every old set to zero first. Old
 //! sets at zero replicas are kept for rollback up to
 //! `revision_history_limit`, newest first.
+//!
+//! A rolling update only counts pods that are Running and Ready
+//! ([`super::pod_ready`], i.e. `PodStatus::is_ready`) as available. New
+//! pods still starting, or held back by a readiness probe, keep the old
+//! pods in place: the surge stays used and `max_unavailable` is measured
+//! against ready pods, so the roll moves on only as new pods turn ready.
+//! A pod with no readiness probe is ready once its containers run.
 
-use super::{delete_quietly, owned_by, patch_status, request_delete, Controller};
+use super::{
+    delete_quietly, live_pods, owned_by, patch_status, pod_ready, request_delete, Controller,
+};
 use crate::selector::template_hash;
 use crate::types::{
-    delete_requested, set_condition, Deployment, DeploymentStrategy, ReplicaSet, ReplicaSetSpec,
-    ReplicaSetStatus, OWNER_LABEL, POD_TEMPLATE_HASH, REVISION_ANNOTATION,
+    delete_requested, set_condition, Deployment, DeploymentStrategy, Pod, ReplicaSet,
+    ReplicaSetSpec, ReplicaSetStatus, OWNER_LABEL, POD_TEMPLATE_HASH, REVISION_ANNOTATION,
 };
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::Resource;
@@ -47,6 +56,18 @@ pub fn owned_sets(sets: &[ReplicaSet], d: &Deployment) -> Vec<ReplicaSet> {
     v
 }
 
+/// Pods of `rs` that are Running and Ready, read from the pods themselves
+/// so a roll neither waits on nor runs ahead of a lagging ReplicaSet
+/// status. Clamped to `spec.replicas`: pods a scale-down is about to remove
+/// do not count.
+fn ready_pods(rs: &ReplicaSet, pods: &[Pod]) -> u32 {
+    let n = live_pods(pods, &rs.meta.id)
+        .into_iter()
+        .filter(|p| pod_ready(p))
+        .count() as u32;
+    n.min(rs.spec.replicas)
+}
+
 impl DeploymentController {
     pub fn new(store: Store) -> Self {
         Self { store }
@@ -56,6 +77,9 @@ impl DeploymentController {
     }
     fn deployments(&self) -> Collection<Deployment> {
         self.store.collection::<Deployment>()
+    }
+    fn pods(&self) -> Collection<Pod> {
+        self.store.collection::<Pod>()
     }
 
     fn teardown(&self, d: &Deployment, sets: &[ReplicaSet]) -> anyhow::Result<()> {
@@ -120,7 +144,12 @@ impl DeploymentController {
         Ok(rs)
     }
 
-    fn converge(&self, d: &Deployment, all_sets: &[ReplicaSet]) -> anyhow::Result<()> {
+    fn converge(
+        &self,
+        d: &Deployment,
+        all_sets: &[ReplicaSet],
+        pods: &[Pod],
+    ) -> anyhow::Result<()> {
         let mut owned = owned_sets(all_sets, d);
         let hash = template_hash(&d.spec.template);
         let max_rev = owned.iter().map(revision_of).max().unwrap_or(0);
@@ -186,16 +215,17 @@ impl DeploymentController {
                         new = self.scale_rs(&new, target)?;
                     }
                     // Scale old sets down: unready pods are free to go, ready
-                    // ones only while staying above min_available.
+                    // ones only while staying above min_available. Ready
+                    // means Running and Ready, so a new pod held back by
+                    // its readiness probe frees no old pod.
                     let min_available = replicas.saturating_sub(unavail);
-                    let total_ready: u32 =
-                        old.iter().map(|rs| rs.status.ready).sum::<u32>() + new.status.ready;
+                    let total_ready: u32 = old.iter().map(|rs| ready_pods(rs, pods)).sum::<u32>()
+                        + ready_pods(&new, pods);
                     let mut can_down = total_ready.saturating_sub(min_available);
                     for rs in &old {
-                        // Status may lag spec (ready > replicas right after a
-                        // scale-down), so clamp everything to spec.replicas.
-                        let free = rs.spec.replicas.saturating_sub(rs.status.ready);
-                        let ready_down = rs.status.ready.min(can_down).min(rs.spec.replicas - free);
+                        let ready = ready_pods(rs, pods);
+                        let free = rs.spec.replicas - ready;
+                        let ready_down = ready.min(can_down);
                         can_down -= ready_down;
                         let take = (free + ready_down).min(rs.spec.replicas);
                         if take > 0 {
@@ -276,6 +306,7 @@ impl Controller for DeploymentController {
     }
     fn watches(&self) -> &'static [&'static str] {
         &[
+            crate::types::kinds::POD,
             crate::types::kinds::REPLICA_SET,
             crate::types::kinds::DEPLOYMENT,
         ]
@@ -283,11 +314,12 @@ impl Controller for DeploymentController {
     async fn reconcile_once(&self) -> anyhow::Result<()> {
         let deployments = self.deployments().list(None)?;
         let sets = self.sets().list(None)?;
+        let pods = self.pods().list(None)?;
         for d in &deployments {
             let res = if delete_requested(d) {
                 self.teardown(d, &sets)
             } else {
-                self.converge(d, &sets)
+                self.converge(d, &sets, &pods)
             };
             if let Err(e) = res {
                 tracing::warn!(deploy = %d.meta.id, error = %e, "loom: deployment reconcile failed");

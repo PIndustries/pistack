@@ -28,7 +28,7 @@ pub mod service;
 pub mod statefulset;
 
 use crate::types::{delete_requested, PodTemplate, DELETE_ANNOTATION, OWNER_LABEL};
-use crate::types::{Pod, PodStatus};
+use crate::types::{Pod, PodPhase, PodStatus};
 use async_trait::async_trait;
 use chrono::Utc;
 use pistack_store::{Collection, StoreError};
@@ -175,4 +175,13 @@ pub fn live_pods<'a>(pods: &'a [Pod], owner: &Id) -> Vec<&'a Pod> {
     owned_by(pods, owner)
         .filter(|p| !delete_requested(p) && !p.status.phase.is_terminal())
         .collect()
+}
+
+/// Whether a pod counts as ready for rollouts: `Running` and
+/// [`PodStatus::is_ready`]. A pod with no readiness probe turns ready as
+/// soon as its containers run; one with a readiness probe stays unready
+/// until the probe passes. Services pick their backends with the same
+/// check.
+pub fn pod_ready(pod: &Pod) -> bool {
+    pod.status.phase == PodPhase::Running && pod.status.is_ready()
 }
