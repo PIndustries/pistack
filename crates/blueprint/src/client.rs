@@ -881,6 +881,7 @@ fn realize(store: &Store, project: Option<&Id>, document: &str) -> ApiResult<App
                             connection_limit: doc.connection_limit,
                             admin_up: doc.admin_up,
                             door: None,
+                            routes: Vec::new(),
                         },
                     )
                     .map_err(|e| {

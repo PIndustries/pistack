@@ -33,6 +33,7 @@ pub use client::Client;
 pub use door::{DoorKind, DoorPlan};
 pub use provider::{
     Call, ForwardProvider, LbProvider, MockProvider, OvnProvider, Providers, RelayL7Provider,
+    RouteView,
 };
 pub use types::*;
 

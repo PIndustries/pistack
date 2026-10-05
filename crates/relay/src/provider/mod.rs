@@ -15,7 +15,7 @@
 //! (in-process HTTP, and TLS when `keep` already holds the certificate),
 //! and [`OvnProvider`] (unimplemented).
 
-use crate::types::{Balancer, Listener, Member, Pool, Provider};
+use crate::types::{Balancer, Listener, Member, Pool, Provider, Route};
 use async_trait::async_trait;
 use pistack_types::{ApiResult, Id};
 use std::net::IpAddr;
@@ -52,6 +52,17 @@ pub struct ListenerView {
     /// already has that listener's certificate. Absent means TLS stays
     /// unavailable. The proxy does not generate one.
     pub tls: Option<crate::tls::TlsMaterial>,
+    /// The listener's routes in spec order, each with its pool's active
+    /// members filtered the same way as `pool`.
+    pub routes: Vec<RouteView>,
+}
+
+/// One listener route with its pool already resolved.
+#[derive(Clone, Debug)]
+pub struct RouteView {
+    pub route: Route,
+    pub pool: Pool,
+    pub members: Vec<Member>,
 }
 
 #[async_trait]

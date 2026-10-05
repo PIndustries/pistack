@@ -5,7 +5,7 @@
 //! actually route: L4/L7 balancers via `relay`, or nothing at all in dev mode.
 
 use crate::types::{
-    kinds, Endpoint, Ingress, IngressBackend, IntOrName, Protocol, Service, ServiceKind,
+    kinds, Endpoint, Ingress, IngressBackend, IntOrName, PathType, Protocol, Service, ServiceKind,
     ServicePort,
 };
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use pistack_store::{Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Id, Meta, Phase};
 use relay::{
     Algorithm, BalancerSpec, Client, ForwardProvider, ListenerProtocol, ListenerSpec, MemberSpec,
-    PoolProtocol, PoolSpec, Provider, Providers, RelayL7Provider, MANAGED_LABEL,
+    PathMatch, PoolProtocol, PoolSpec, Provider, Providers, RelayL7Provider, Route, MANAGED_LABEL,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -116,6 +116,7 @@ impl RelayRealizer {
                 PoolProtocol::Tcp,
                 port.port,
                 &members,
+                &[],
             )
             .await?;
             if service.spec.kind == ServiceKind::LoadBalancer {
@@ -131,13 +132,15 @@ impl RelayRealizer {
         delete_labeled(&client, SERVICE_LABEL, &service.meta.id.to_string()).await
     }
 
-    /// One HTTP listener for every backend that has endpoints. A missing
-    /// service, an unknown port, or an empty endpoint set removes the
-    /// listener and stays unavailable.
+    /// One HTTP listener per ingress. The default backend is the
+    /// listener's default pool, and each rule path is its own route and
+    /// pool, so a request reaches only the service its host and path name.
+    /// A missing service, an unknown port, or an empty endpoint set removes
+    /// the listener and stays unavailable.
     pub async fn ensure_ingress(&self, ingress: &Ingress) -> ApiResult<Vec<String>> {
         let client = self.client()?;
-        let members = match ingress_members(&client, ingress) {
-            Ok(members) => members,
+        let (members, routes) = match ingress_plan(&client, ingress) {
+            Ok(plan) => plan,
             Err(e) => {
                 let _ = self.remove_ingress(ingress).await;
                 return Err(e);
@@ -155,6 +158,7 @@ impl RelayRealizer {
             PoolProtocol::Http,
             80,
             &members,
+            &routes,
         )
         .await?;
         Ok(vec![bound])
@@ -228,37 +232,51 @@ fn endpoint_addrs(endpoints: &[Endpoint], port: &ServicePort) -> ApiResult<Vec<S
     Ok(out)
 }
 
-fn ingress_members(client: &Client, ingress: &Ingress) -> ApiResult<Vec<SocketAddr>> {
-    let backends = ingress_backends(ingress);
-    if backends.is_empty() {
-        return Err(ApiError::unavailable("ingress backend is not available"));
-    }
-    let mut out = Vec::new();
-    for backend in backends {
-        let addrs = one_backend(client, ingress, backend)?;
-        for addr in addrs {
-            if !out.contains(&addr) {
-                out.push(addr);
-            }
-        }
-    }
-    if out.is_empty() {
-        return Err(ApiError::unavailable("ingress backend is not available"));
-    }
-    Ok(out)
+/// A route the realizer wants on an ingress listener, before its pool exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RoutePlan {
+    host: Option<String>,
+    path: String,
+    path_match: PathMatch,
+    members: Vec<SocketAddr>,
 }
 
-fn ingress_backends(ingress: &Ingress) -> Vec<&IngressBackend> {
-    let mut out = Vec::new();
-    if let Some(backend) = &ingress.spec.default_backend {
-        out.push(backend);
-    }
+/// Default-backend members and one route per rule path, in spec order.
+fn ingress_plan(
+    client: &Client,
+    ingress: &Ingress,
+) -> ApiResult<(Vec<SocketAddr>, Vec<RoutePlan>)> {
+    let mut routes = Vec::new();
     for rule in &ingress.spec.rules {
+        let host = rule
+            .host
+            .as_deref()
+            .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|h| !h.is_empty());
         for path in &rule.paths {
-            out.push(&path.backend);
+            routes.push(RoutePlan {
+                host: host.clone(),
+                path: if path.path.is_empty() {
+                    "/".into()
+                } else {
+                    path.path.clone()
+                },
+                path_match: match path.path_type {
+                    PathType::Prefix => PathMatch::Prefix,
+                    PathType::Exact => PathMatch::Exact,
+                },
+                members: one_backend(client, ingress, &path.backend)?,
+            });
         }
     }
-    out
+    let default = match &ingress.spec.default_backend {
+        Some(backend) => one_backend(client, ingress, backend)?,
+        None => Vec::new(),
+    };
+    if default.is_empty() && routes.is_empty() {
+        return Err(ApiError::unavailable("ingress backend is not available"));
+    }
+    Ok((default, routes))
 }
 
 fn one_backend(
@@ -323,6 +341,7 @@ async fn ensure_forward(
     pool_protocol: PoolProtocol,
     port: u16,
     members: &[SocketAddr],
+    routes: &[RoutePlan],
 ) -> ApiResult<String> {
     let lb = match client.balancers().get_by_name(project.as_ref(), name) {
         Ok(lb) => {
@@ -348,14 +367,15 @@ async fn ensure_forward(
         Err(e) => return Err(e.into()),
     };
 
-    let pool = match client.pools_of(&lb.meta.id)?.into_iter().next() {
-        Some(pool) => pool,
-        None => client.create_pool(
-            Meta::new(
-                relay::types::kinds::POOL,
-                format!("{name}-pool"),
-                project.clone(),
-            ),
+    let pools = client.pools_of(&lb.meta.id)?;
+    let default_name = format!("{name}-pool");
+    let route_prefix = format!("{name}-route-");
+    let find_or_create = |pool_name: &str| -> ApiResult<relay::Pool> {
+        if let Some(pool) = pools.iter().find(|p| p.meta.name == pool_name) {
+            return Ok(pool.clone());
+        }
+        client.create_pool(
+            Meta::new(relay::types::kinds::POOL, pool_name, project.clone()),
             PoolSpec {
                 balancer: lb.meta.id.clone(),
                 protocol: pool_protocol,
@@ -364,20 +384,45 @@ async fn ensure_forward(
                 health_monitor: None,
                 admin_up: true,
             },
-        )?,
+        )
     };
+    let pool = match pools.iter().find(|p| p.meta.name == default_name) {
+        Some(pool) => pool.clone(),
+        None if routes.is_empty() && pools.len() == 1 => pools[0].clone(),
+        None => find_or_create(&default_name)?,
+    };
+    let mut route_pools = Vec::with_capacity(routes.len());
+    let mut want_routes = Vec::with_capacity(routes.len());
+    for (i, plan) in routes.iter().enumerate() {
+        let route_pool = find_or_create(&format!("{route_prefix}{i}"))?;
+        want_routes.push(Route {
+            host: plan.host.clone(),
+            path: plan.path.clone(),
+            path_match: plan.path_match,
+            pool: route_pool.meta.id.clone(),
+        });
+        route_pools.push(route_pool);
+    }
 
     let listeners = client.listeners_of(&lb.meta.id)?;
     let listener = match listeners
         .into_iter()
         .find(|l| l.spec.default_pool.as_ref() == Some(&pool.meta.id))
     {
-        Some(l) if l.spec.port == port && l.spec.protocol == listener_protocol => l,
+        Some(l)
+            if l.spec.port == port
+                && l.spec.protocol == listener_protocol
+                && l.spec.routes == want_routes =>
+        {
+            l
+        }
         Some(l) => {
             let protocol = listener_protocol.clone();
+            let next_routes = want_routes.clone();
             client.update_listener(&l.meta.id, None, move |row| {
                 row.spec.port = port;
                 row.spec.protocol = protocol;
+                row.spec.routes = next_routes;
                 Ok(())
             })?
         }
@@ -395,36 +440,32 @@ async fn ensure_forward(
                 connection_limit: 0,
                 admin_up: true,
                 door: None,
+                routes: want_routes,
             },
         )?,
     };
 
-    let have = client.members_of(&pool.meta.id)?;
-    let mut changed = false;
-    for member in &have {
-        if !members.contains(&member.addr()) {
-            client.delete_member(&member.meta.id)?;
-            changed = true;
+    // Route pools past the current rule count are no longer referenced.
+    for old in &pools {
+        let Some(index) = old.meta.name.strip_prefix(&route_prefix) else {
+            continue;
+        };
+        if index.parse::<usize>().is_ok_and(|i| i >= routes.len()) {
+            client.delete_pool(&old.meta.id)?;
         }
     }
-    for want in members {
-        if !have.iter().any(|member| member.addr() == *want) {
-            client.create_member(
-                Meta::new(
-                    relay::types::kinds::MEMBER,
-                    format!("{name}-{}", member_slug(want)),
-                    project.clone(),
-                ),
-                MemberSpec {
-                    pool: pool.meta.id.clone(),
-                    address: want.ip(),
-                    port: want.port(),
-                    weight: 1,
-                    backup: false,
-                    admin_up: true,
-                },
-            )?;
-            changed = true;
+
+    let changed = sync_members(client, &project, name, &pool.meta.id, members)?;
+    let mut stale_routes = Vec::new();
+    for (route_pool, plan) in route_pools.iter().zip(routes) {
+        if sync_members(
+            client,
+            &project,
+            &route_pool.meta.name,
+            &route_pool.meta.id,
+            &plan.members,
+        )? {
+            stale_routes.push(route_pool.meta.id.clone());
         }
     }
 
@@ -449,6 +490,12 @@ async fn ensure_forward(
     if changed || !aligned {
         client.touch_pool(&pool.meta.id);
         client.reconcile_pool(&pool.meta.id).await;
+    }
+    for route_pool in &route_pools {
+        if !aligned || stale_routes.contains(&route_pool.meta.id) {
+            client.touch_pool(&route_pool.meta.id);
+            client.reconcile_pool(&route_pool.meta.id).await;
+        }
     }
 
     let lb = client
@@ -479,6 +526,45 @@ async fn ensure_forward(
         return Err(ApiError::unavailable("listener is not available"));
     }
     Ok(addr)
+}
+
+/// Make `pool`'s members exactly `members`. True when anything changed.
+fn sync_members(
+    client: &Client,
+    project: &Option<Id>,
+    prefix: &str,
+    pool: &Id,
+    members: &[SocketAddr],
+) -> ApiResult<bool> {
+    let have = client.members_of(pool)?;
+    let mut changed = false;
+    for member in &have {
+        if !members.contains(&member.addr()) {
+            client.delete_member(&member.meta.id)?;
+            changed = true;
+        }
+    }
+    for want in members {
+        if !have.iter().any(|member| member.addr() == *want) {
+            client.create_member(
+                Meta::new(
+                    relay::types::kinds::MEMBER,
+                    format!("{prefix}-{}", member_slug(want)),
+                    project.clone(),
+                ),
+                MemberSpec {
+                    pool: pool.clone(),
+                    address: want.ip(),
+                    port: want.port(),
+                    weight: 1,
+                    backup: false,
+                    admin_up: true,
+                },
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 fn member_slug(addr: &SocketAddr) -> String {
