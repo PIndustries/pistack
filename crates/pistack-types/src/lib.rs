@@ -3,15 +3,17 @@
 
 //! Shared types for every PiStack module.
 //!
-//! Three things live here and nowhere else:
+//! Four things live here and nowhere else:
 //! * the resource model (ids, metadata, the `Resource` envelope),
 //! * `ApiError`, the one error shape every HTTP handler returns,
-//! * the `Module` contract that `pistack-core` uses to mount each module.
+//! * the `Module` contract that `pistack-core` uses to mount each module,
+//! * node identity: the one stable name agents, hosts and controllers share.
 //!
 //! Modules depend on this crate; this crate depends on no module.
 
 pub mod error;
 pub mod module;
+pub mod node;
 pub mod resource;
 
 pub use error::{ApiError, ApiResult};

@@ -133,6 +133,14 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         }
     };
 
+    // One stable node name for this machine, shared with an agent that uses
+    // the same data dir. Kept in <data_dir>/node.name across restarts.
+    let node =
+        pistack_types::node::resolve_node_name(&opts.data_dir).context("resolving node name")?;
+    if let Some(old) = &node.replaced {
+        tracing::warn!(node = %node.name, previous = %old, "PISTACK_NODE_NAME renamed this node");
+    }
+
     let shutdown = CancellationToken::new();
     // Leadership starts false until establish_local / adopt decides; modules
     // that subscribe will stay idle until set below.
@@ -142,7 +150,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         events: events.clone(),
         shutdown: shutdown.clone(),
         public_url: public_url.clone(),
-        node_name: hostname(),
+        node_name: node.name.clone(),
         leadership: leadership.clone(),
     };
 
@@ -187,6 +195,8 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     tracing::info!(
         %cluster_id,
         %node_id,
+        node_name = %node.name,
+        node_name_source = %node.source,
         leader = established.leader,
         role = ?established.role,
         members = established.members.len(),
@@ -279,35 +289,4 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
         println!("{k}\t{}", String::from_utf8_lossy(&v));
     }
     Ok(())
-}
-
-fn hostname() -> String {
-    if let Ok(name) = std::env::var("PISTACK_NODE_NAME") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_owned();
-        }
-    }
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_else(|_| "localhost".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::hostname;
-
-    #[test]
-    fn hostname_prefers_env() {
-        // Serialise env mutation across tests in this process.
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::set_var("PISTACK_NODE_NAME", "lab-sim3");
-        assert_eq!(hostname(), "lab-sim3");
-        std::env::set_var("PISTACK_NODE_NAME", "  ");
-        let fallback = hostname();
-        assert!(!fallback.is_empty());
-        std::env::remove_var("PISTACK_NODE_NAME");
-    }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

@@ -20,6 +20,10 @@
 //! ([`keep::PeerIdentity`]). Enroll spends a join token once and returns a
 //! CA-signed client certificate for steady-state calls.
 //!
+//! The certificate's common name is the node name it was enrolled under
+//! (see [`pistack_types::node`]). A verified peer may hello, heartbeat,
+//! poll, and report only for that node; any other name gets 403.
+//!
 //! Escape hatch for local HTTP and unit tests: set `PISTACK_RPC_INSECURE=1`
 //! to skip the client-certificate check. Join-token enforcement on every
 //! call stays opt-in via `PISTACK_REQUIRE_JOIN=1` (authorize only; it does
@@ -229,20 +233,34 @@ fn check_client_cert(ext: &axum::http::Extensions) -> Result<(), ApiError> {
 }
 
 fn check_node_name(name: &str) -> ApiResult<()> {
-    if name.is_empty() || name.len() > 253 {
+    if name.is_empty() || name.len() > pistack_types::node::MAX_NODE_NAME {
         return Err(ApiError::bad_request(
             "node_name must be 1..=253 characters",
         ));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
-    {
+    if !pistack_types::node::is_valid_node_name(name) {
         return Err(ApiError::bad_request(
             "node_name may contain only letters, digits, '-', '.' and '_'",
         ));
     }
     Ok(())
+}
+
+/// Bind the node name to the client certificate. Enroll issues the
+/// certificate with the node name as its common name, so a verified peer
+/// may only speak for that node. Without a verified peer (plain HTTP with
+/// `PISTACK_RPC_INSECURE=1`) there is nothing to bind and the name stands.
+fn check_peer_node(ext: &axum::http::Extensions, node: &str) -> ApiResult<()> {
+    let peer = ext
+        .get::<ConnectInfo<PeerIdentity>>()
+        .map(|c| &c.0)
+        .or_else(|| ext.get::<PeerIdentity>());
+    match peer.and_then(|p| p.common_name.as_deref()) {
+        Some(cn) if !cn.is_empty() && cn != node => Err(ApiError::forbidden(format!(
+            "client certificate is for node {cn}, not {node}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 async fn enroll(
@@ -269,17 +287,21 @@ async fn enroll(
 
 async fn hello(
     State(q): State<CommandQueue>,
+    ext: axum::http::Extensions,
     Json(h): Json<AgentHello>,
 ) -> ApiResult<Json<HelloAck>> {
     check_node_name(&h.node_name)?;
+    check_peer_node(&ext, &h.node_name)?;
     Ok(Json(q.hello(&h)))
 }
 
 async fn heartbeat(
     State(q): State<CommandQueue>,
+    ext: axum::http::Extensions,
     Json(hb): Json<Heartbeat>,
 ) -> ApiResult<Json<HeartbeatAck>> {
     check_node_name(&hb.node_name)?;
+    check_peer_node(&ext, &hb.node_name)?;
     Ok(Json(q.heartbeat(&hb)))
 }
 
@@ -296,9 +318,11 @@ pub struct PollQuery {
 async fn commands(
     State(q): State<CommandQueue>,
     Path(node): Path<String>,
+    ext: axum::http::Extensions,
     Query(p): Query<PollQuery>,
 ) -> ApiResult<Json<Vec<Command>>> {
     check_node_name(&node)?;
+    check_peer_node(&ext, &node)?;
     let wait = Duration::from_secs(p.wait.unwrap_or(MAX_LONG_POLL_SECS).min(MAX_LONG_POLL_SECS));
     let max = p.max.unwrap_or(DEFAULT_POLL_BATCH).clamp(1, 256);
     Ok(Json(q.next(&node, wait, max).await))
@@ -307,9 +331,11 @@ async fn commands(
 async fn results(
     State(q): State<CommandQueue>,
     Path(node): Path<String>,
+    ext: axum::http::Extensions,
     Json(results): Json<Vec<CommandResult>>,
 ) -> ApiResult<Json<ReportAck>> {
     check_node_name(&node)?;
+    check_peer_node(&ext, &node)?;
     let mut ack = ReportAck::default();
     for r in results {
         let id = r.id;
@@ -623,7 +649,7 @@ mod tests {
 
         let peer = PeerIdentity {
             addr: None,
-            common_name: Some("agent-n1".into()),
+            common_name: Some("n1".into()),
         };
         let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
         let http = reqwest::Client::new();
@@ -634,6 +660,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_cert_speaks_only_for_its_own_node() {
+        let store = Store::in_memory().unwrap();
+        let peer = PeerIdentity {
+            addr: None,
+            common_name: Some("n1".into()),
+        };
+        let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/agents/hello"))
+            .json(&hello("n2"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("forbidden") && body.contains("for node n1, not n2"),
+            "{body}"
+        );
+
+        let resp = http
+            .post(format!("{base}/agents/heartbeat"))
+            .json(&Heartbeat {
+                node_name: "n2".into(),
+                resources_free: Resources::default(),
+                machines: vec![],
+                at: Utc::now(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        let resp = http
+            .get(format!("{base}/agents/n2/commands?wait=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        let resp = http
+            .post(format!("{base}/agents/n2/results"))
+            .json(&Vec::<CommandResult>::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        // The same certificate works for its own node on every path.
+        let client = AgentClient::new(&base, "n1").unwrap();
+        client.hello(&hello("n1")).await.unwrap();
+        client.next_commands(Duration::ZERO).await.unwrap();
+        client
+            .heartbeat(&Heartbeat {
+                node_name: "n1".into(),
+                resources_free: Resources::default(),
+                machines: vec![],
+                at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        client.report(&[]).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn no_peer_means_no_binding() {
+        // Plain HTTP with PISTACK_RPC_INSECURE=1: no certificate, so the
+        // name in the request stands.
+        let (base, server) = serve_auth(Store::in_memory().unwrap(), RpcAuth::open(), None).await;
+        let client = AgentClient::new(&base, "n7").unwrap();
+        client.hello(&hello("n7")).await.unwrap();
+        client.next_commands(Duration::ZERO).await.unwrap();
         server.abort();
     }
 
