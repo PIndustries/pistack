@@ -13,6 +13,12 @@
 //! one `spec` asks for or the lowest free one in 30000-32767, and two
 //! services never share one. Every change is handed to the
 //! [`ServiceRealizer`].
+//!
+//! Listeners live in the process that programmed them, so the controller
+//! remembers what it handed the realizer itself. A server that becomes
+//! leader, or restarts, realizes every service once even when the stored
+//! status already matches, and a failed realize is retried on the next
+//! pass.
 
 use super::{delete_quietly, patch_status, Controller};
 use crate::realizer::ServiceRealizer;
@@ -23,9 +29,9 @@ use crate::types::{
 use ipnet::IpNet;
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::Id;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Default service CIDR.
 pub const DEFAULT_SERVICE_CIDR: &str = "10.96.0.0/12";
@@ -93,10 +99,15 @@ fn node_ports_for(svc: &Service, taken: &BTreeMap<u16, Id>) -> Result<BTreeMap<u
     Ok(out)
 }
 
+/// What one realize call was given: cluster IP, endpoints and node ports.
+type Programmed = (String, Vec<Endpoint>, BTreeMap<u16, u16>);
+
 pub struct ServiceController {
     store: Store,
     cidr: IpNet,
     realizer: Arc<dyn ServiceRealizer>,
+    /// Per service, what this process last realized successfully.
+    programmed: Mutex<HashMap<Id, Programmed>>,
 }
 
 impl ServiceController {
@@ -105,6 +116,7 @@ impl ServiceController {
             store,
             cidr,
             realizer,
+            programmed: Mutex::new(HashMap::new()),
         }
     }
     fn services(&self) -> Collection<Service> {
@@ -142,7 +154,14 @@ impl ServiceController {
         }
     }
 
+    fn programmed_lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id, Programmed>> {
+        self.programmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     async fn teardown(&self, svc: &Service) -> anyhow::Result<()> {
+        self.programmed_lock().remove(&svc.meta.id);
         if let Err(e) = self.realizer.remove(svc).await {
             tracing::warn!(svc = %svc.meta.id, error = %e, "loom: realizer remove failed; deleting anyway");
         }
@@ -171,9 +190,11 @@ impl ServiceController {
             Ok(ports) => (ports, None),
             Err(why) => (BTreeMap::new(), Some(why)),
         };
+        let want: Programmed = (cluster_ip.clone(), endpoints.clone(), node_ports.clone());
         let changed = svc.status.cluster_ip.as_deref() != Some(cluster_ip.as_str())
             || svc.status.endpoints != endpoints
-            || svc.status.node_ports != node_ports;
+            || svc.status.node_ports != node_ports
+            || self.programmed_lock().get(&svc.meta.id) != Some(&want);
         let mut lb = svc.status.load_balancer.clone();
         let mut realized = true;
         let mut why = String::new();
@@ -182,8 +203,12 @@ impl ServiceController {
             with_ip.status.cluster_ip = Some(cluster_ip.clone());
             with_ip.status.node_ports = node_ports.clone();
             match self.realizer.realize(&with_ip, &endpoints).await {
-                Ok(addrs) => lb = addrs,
+                Ok(addrs) => {
+                    lb = addrs;
+                    self.programmed_lock().insert(svc.meta.id.clone(), want);
+                }
                 Err(e) => {
+                    self.programmed_lock().remove(&svc.meta.id);
                     realized = false;
                     why = e.message.clone();
                     tracing::warn!(svc = %svc.meta.id, error = %e, "loom: service realize failed");
