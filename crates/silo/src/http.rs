@@ -11,8 +11,8 @@
 //! PUT|GET|DELETE  /buckets/{id}/objects/{*key}
 //!
 //! S3 path-style (same router, same auth):
-//! PUT|GET|HEAD|DELETE  /{bucket}/{*key}
-//! GET                  /{bucket}?list-type=2&…
+//! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}  (POST: multipart create/complete)
+//! GET                       /{bucket}?list-type=2&…
 //! ```
 //!
 //! `{id}` is a bucket id or name. Object puts stream the body to disk and
@@ -53,6 +53,7 @@ pub fn router(client: Client) -> Router {
         .layer(DefaultBodyLimit::disable());
     let s3_object = axum::routing::put(s3::put_object)
         .get(s3::get_object)
+        .post(s3::post_object)
         .delete(s3::delete_object)
         .head(s3::head_object)
         .layer(DefaultBodyLimit::disable());

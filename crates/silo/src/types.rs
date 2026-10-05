@@ -21,6 +21,9 @@ pub const KIND_OBJECT: &str = "obj";
 /// max_object_bytes` (see [`SiloConfig`]).
 pub const MAX_OBJECT_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
+/// Default minimum size of every multipart part except the last (5 MiB).
+pub const MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+
 /// Module settings under `[modules.silo]` / `PISTACK__MODULES__SILO__*`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -193,6 +196,9 @@ pub fn validate_key(key: &str) -> ApiResult<()> {
     if key == ".blobs" || key.starts_with(".blobs/") {
         return Err(ApiError::bad_request("object key is reserved"));
     }
+    if key == ".uploads" || key.starts_with(".uploads/") {
+        return Err(ApiError::bad_request("object key is reserved"));
+    }
     for seg in key.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
             return Err(ApiError::bad_request(
@@ -225,6 +231,7 @@ mod tests {
         assert!(validate_key("/etc/passwd").is_err());
         assert!(validate_key("a//b").is_err());
         assert!(validate_key(".blobs/abcd").is_err());
+        assert!(validate_key(".uploads/x").is_err());
         assert!(validate_key(r"foo\bar").is_err());
     }
 
