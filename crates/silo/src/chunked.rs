@@ -16,6 +16,9 @@
 //! 3. `x-amz-decoded-content-length` must equal the decoded byte count.
 //! 4. Each chunk is buffered (capped at [`MAX_CHUNK_BYTES`]), verified, then
 //!    yielded — no bytes reach the temp-file writer before that chunk passes.
+//! 5. Chunk-header lines and trailer sections are length-capped; CRLF search is
+//!    incremental. Trailers wait for a full `\r\n\r\n` before parsing.
+//!    Trailing junk after the final chunk/trailer yields `IncompleteBody`.
 
 use crate::multipart::s3_err;
 use crate::sigv4::EMPTY_PAYLOAD_SHA256;
@@ -34,6 +37,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Hard cap on one aws-chunked data chunk so verify-before-write stays bounded.
 pub const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Cap on a single chunk-header line (`size;chunk-signature=…`) before CRLF.
+pub const MAX_CHUNK_HEADER_BYTES: usize = 128;
+/// Cap on the entire trailing-headers section (including final blank line).
+pub const MAX_TRAILER_BYTES: usize = 4 * 1024;
+/// Cap on trailing header lines (excluding the blank terminator).
+pub const MAX_TRAILER_LINES: usize = 8;
 
 pub const STREAMING_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 pub const STREAMING_UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
@@ -230,6 +239,7 @@ where
         checksum,
         pending: None,
         finished: false,
+        scan_from: 0,
     }
 }
 
@@ -241,6 +251,8 @@ enum Phase {
         chunk_buf: Vec<u8>,
     },
     NeedTrailer,
+    /// Framing complete; any further body bytes are an error.
+    ExpectEof,
     Done,
 }
 
@@ -254,6 +266,8 @@ pub struct DecodedStream {
     checksum: Option<ChecksumState>,
     pending: Option<Bytes>,
     finished: bool,
+    /// Incremental CRLF / trailer-terminator scan offset.
+    scan_from: usize,
 }
 
 impl Stream for DecodedStream {
@@ -269,25 +283,36 @@ impl Stream for DecodedStream {
         }
 
         loop {
-            match this.pump(cx) {
+            match this.pump() {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    // Need more input from body; try pulling.
-                    match this.body.as_mut().poll_next(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(None) => {
-                            return Poll::Ready(Some(Err(this.on_wire_eof())));
-                        }
-                        Poll::Ready(Some(Ok(chunk))) => {
-                            this.buf.extend_from_slice(&chunk);
-                            continue;
-                        }
-                        Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(None) => match this.body.as_mut().poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => {
+                        if matches!(this.phase, Phase::ExpectEof) {
+                            this.phase = Phase::Done;
                             this.finished = true;
-                            return Poll::Ready(Some(Err(e)));
+                            return Poll::Ready(None);
                         }
+                        return Poll::Ready(Some(Err(this.on_wire_eof())));
                     }
-                }
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        if matches!(this.phase, Phase::ExpectEof) && !chunk.is_empty() {
+                            this.finished = true;
+                            return Poll::Ready(Some(Err(s3_err(
+                                "IncompleteBody",
+                                "unexpected bytes after aws-chunked final chunk",
+                            ))));
+                        }
+                        if !chunk.is_empty() {
+                            this.buf.extend_from_slice(&chunk);
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        this.finished = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
                 Poll::Ready(Some(Ok(()))) => {
                     if let Some(b) = this.pending.take() {
                         return Poll::Ready(Some(Ok(b)));
@@ -307,40 +332,56 @@ impl Stream for DecodedStream {
 }
 
 impl DecodedStream {
-    /// Try to make progress on buffered bytes.
     /// `Ready(None)` = need more wire bytes.
-    /// `Ready(Some(Ok(())))` = progressed (maybe set pending / finished).
-    fn pump(&mut self, _cx: &mut Context<'_>) -> Poll<Option<Result<(), ApiError>>> {
+    fn pump(&mut self) -> Poll<Option<Result<(), ApiError>>> {
         match &mut self.phase {
             Phase::Done => {
                 self.finished = true;
                 Poll::Ready(Some(Ok(())))
             }
-            Phase::NeedHeader => match take_line(&mut self.buf) {
-                None => Poll::Ready(None),
-                Some(line) => {
-                    match parse_chunk_header(&line, self.auth.requires_chunk_signatures()) {
-                        Err(e) => Poll::Ready(Some(Err(e))),
-                        Ok((size, sig)) => {
-                            if size > MAX_CHUNK_BYTES {
-                                return Poll::Ready(Some(Err(s3_err(
-                                    "InvalidRequest",
-                                    format!(
-                                        "aws-chunked chunk size {size} exceeds limit {}",
-                                        MAX_CHUNK_BYTES
-                                    ),
-                                ))));
+            Phase::ExpectEof => {
+                if !self.buf.is_empty() {
+                    return Poll::Ready(Some(Err(s3_err(
+                        "IncompleteBody",
+                        "unexpected bytes after aws-chunked final chunk",
+                    ))));
+                }
+                // Wait for body EOF (or more bytes → rejected in poll_next).
+                Poll::Ready(None)
+            }
+            Phase::NeedHeader => {
+                match take_line_capped(
+                    &mut self.buf,
+                    &mut self.scan_from,
+                    MAX_CHUNK_HEADER_BYTES,
+                    "aws-chunked chunk header line too long",
+                ) {
+                    Err(e) => Poll::Ready(Some(Err(e))),
+                    Ok(None) => Poll::Ready(None),
+                    Ok(Some(line)) => {
+                        match parse_chunk_header(&line, self.auth.requires_chunk_signatures()) {
+                            Err(e) => Poll::Ready(Some(Err(e))),
+                            Ok((size, sig)) => {
+                                if size > MAX_CHUNK_BYTES {
+                                    return Poll::Ready(Some(Err(s3_err(
+                                        "InvalidRequest",
+                                        format!(
+                                            "aws-chunked chunk size {size} exceeds limit {}",
+                                            MAX_CHUNK_BYTES
+                                        ),
+                                    ))));
+                                }
+                                self.phase = Phase::NeedData {
+                                    size,
+                                    declared_sig: sig,
+                                    chunk_buf: Vec::with_capacity(size.min(64 * 1024)),
+                                };
+                                Poll::Ready(Some(Ok(())))
                             }
-                            self.phase = Phase::NeedData {
-                                size,
-                                declared_sig: sig,
-                                chunk_buf: Vec::with_capacity(size.min(64 * 1024)),
-                            };
-                            Poll::Ready(Some(Ok(())))
                         }
                     }
                 }
-            },
+            }
             Phase::NeedData {
                 size,
                 declared_sig,
@@ -349,20 +390,12 @@ impl DecodedStream {
                 let size = *size;
                 if size == 0 {
                     // Final chunk: optional empty-data CRLF (AWS signed style).
-                    // Unsigned trailer mode often goes straight to trailers after `0\r\n`.
                     if self.buf.starts_with(b"\r\n") {
                         let _ = self.buf.split_to(2);
+                        self.scan_from = 0;
                     } else if self.buf.is_empty() {
-                        // May still get the optional CRLF, or trailers, or EOF.
-                        // If trailers are expected and we have no bytes yet, wait.
-                        // If no trailer and no CRLF yet, wait for CRLF or treat later EOF.
                         return Poll::Ready(None);
-                    } else if self.auth.trailer_checksum().is_none()
-                        && !self.buf.starts_with(b"\r\n")
-                    {
-                        // Signed-no-trailer requires the empty-data CRLF.
-                        // If we see something else, it's malformed — but only once we
-                        // know it's not a short read of `\r\n`.
+                    } else if self.auth.trailer_checksum().is_none() {
                         if self.buf.len() >= 2 {
                             return Poll::Ready(Some(Err(s3_err(
                                 "InvalidRequest",
@@ -371,30 +404,10 @@ impl DecodedStream {
                         }
                         return Poll::Ready(None);
                     }
-                    // else: trailer mode with non-empty buf that isn't CRLF → trailers.
 
                     let declared = declared_sig.clone();
-                    if self.auth.requires_chunk_signatures() {
-                        let Some(declared) = declared.as_deref() else {
-                            return Poll::Ready(Some(Err(s3_err(
-                                "InvalidRequest",
-                                "aws-chunked chunk missing chunk-signature",
-                            ))));
-                        };
-                        let expected = chunk_signature(
-                            &self.auth.signing_key,
-                            &self.auth.amz_date,
-                            &self.auth.scope,
-                            &self.prev_sig,
-                            b"",
-                        );
-                        if !ct_eq_hex(&expected, &declared.to_ascii_lowercase()) {
-                            return Poll::Ready(Some(Err(s3_err(
-                                "SignatureDoesNotMatch",
-                                "The request signature we calculated does not match the signature you provided.",
-                            ))));
-                        }
-                        self.prev_sig = expected;
+                    if let Err(e) = self.verify_chunk_sig(declared.as_deref(), b"") {
+                        return Poll::Ready(Some(Err(e)));
                     }
                     if self.decoded != self.auth.decoded_content_length {
                         return Poll::Ready(Some(Err(s3_err(
@@ -405,21 +418,28 @@ impl DecodedStream {
                             ),
                         ))));
                     }
+                    self.scan_from = 0;
                     if self.auth.trailer_checksum().is_some() {
                         self.phase = Phase::NeedTrailer;
                         return Poll::Ready(Some(Ok(())));
                     }
-                    self.phase = Phase::Done;
-                    self.finished = true;
+                    if !self.buf.is_empty() {
+                        return Poll::Ready(Some(Err(s3_err(
+                            "IncompleteBody",
+                            "unexpected bytes after aws-chunked final chunk",
+                        ))));
+                    }
+                    self.phase = Phase::ExpectEof;
                     return Poll::Ready(Some(Ok(())));
                 }
 
-                let need_total = size + 2; // data + CRLF
+                let need_total = size + 2;
                 let have = chunk_buf.len() + self.buf.len();
                 if have < need_total {
                     let take = (size - chunk_buf.len()).min(self.buf.len());
                     if take > 0 {
                         chunk_buf.extend_from_slice(&self.buf.split_to(take));
+                        self.scan_from = 0;
                     }
                     return Poll::Ready(None);
                 }
@@ -437,31 +457,12 @@ impl DecodedStream {
                     ))));
                 }
                 let _ = self.buf.split_to(2);
+                self.scan_from = 0;
 
                 let data = std::mem::take(chunk_buf);
                 let declared = declared_sig.clone();
-                // Verify BEFORE yielding / writing.
-                if self.auth.requires_chunk_signatures() {
-                    let Some(declared) = declared.as_deref() else {
-                        return Poll::Ready(Some(Err(s3_err(
-                            "InvalidRequest",
-                            "aws-chunked chunk missing chunk-signature",
-                        ))));
-                    };
-                    let expected = chunk_signature(
-                        &self.auth.signing_key,
-                        &self.auth.amz_date,
-                        &self.auth.scope,
-                        &self.prev_sig,
-                        &data,
-                    );
-                    if !ct_eq_hex(&expected, &declared.to_ascii_lowercase()) {
-                        return Poll::Ready(Some(Err(s3_err(
-                            "SignatureDoesNotMatch",
-                            "The request signature we calculated does not match the signature you provided.",
-                        ))));
-                    }
-                    self.prev_sig = expected;
+                if let Err(e) = self.verify_chunk_sig(declared.as_deref(), &data) {
+                    return Poll::Ready(Some(Err(e)));
                 }
 
                 let next = self.decoded.saturating_add(data.len() as u64);
@@ -485,8 +486,13 @@ impl DecodedStream {
             Phase::NeedTrailer => match finish_trailer(self) {
                 Err(e) => Poll::Ready(Some(Err(e))),
                 Ok(true) => {
-                    self.phase = Phase::Done;
-                    self.finished = true;
+                    if !self.buf.is_empty() {
+                        return Poll::Ready(Some(Err(s3_err(
+                            "IncompleteBody",
+                            "unexpected bytes after aws-chunked trailer",
+                        ))));
+                    }
+                    self.phase = Phase::ExpectEof;
                     Poll::Ready(Some(Ok(())))
                 }
                 Ok(false) => Poll::Ready(None),
@@ -494,10 +500,39 @@ impl DecodedStream {
         }
     }
 
+    fn verify_chunk_sig(&mut self, declared: Option<&str>, data: &[u8]) -> ApiResult<()> {
+        if !self.auth.requires_chunk_signatures() {
+            return Ok(());
+        }
+        let Some(declared) = declared else {
+            return Err(s3_err(
+                "InvalidRequest",
+                "aws-chunked chunk missing chunk-signature",
+            ));
+        };
+        let expected = chunk_signature(
+            &self.auth.signing_key,
+            &self.auth.amz_date,
+            &self.auth.scope,
+            &self.prev_sig,
+            data,
+        );
+        if !ct_eq_hex(&expected, &declared.to_ascii_lowercase()) {
+            return Err(s3_err(
+                "SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided.",
+            ));
+        }
+        self.prev_sig = expected;
+        Ok(())
+    }
+
     fn on_wire_eof(&mut self) -> ApiError {
         self.finished = true;
         match self.phase {
-            Phase::Done => s3_err("IncompleteBody", "unexpected state after body EOF"),
+            Phase::Done | Phase::ExpectEof => {
+                s3_err("IncompleteBody", "unexpected state after body EOF")
+            }
             Phase::NeedHeader | Phase::NeedData { .. } => s3_err(
                 "IncompleteBody",
                 "aws-chunked body ended before the final zero-length chunk",
@@ -510,27 +545,56 @@ impl DecodedStream {
     }
 }
 
-/// Returns `Ok(true)` when trailer fully consumed; `Ok(false)` needs more bytes.
+/// Wait until a full trailer (`…\r\n\r\n`) is buffered, then parse it.
+/// Returns `Ok(true)` when consumed; `Ok(false)` needs more bytes.
 fn finish_trailer(this: &mut DecodedStream) -> ApiResult<bool> {
     let checksum_algo = this
         .auth
         .trailer_checksum()
         .ok_or_else(|| s3_err("InvalidRequest", "internal: trailer phase without checksum"))?;
 
-    // Collect header lines until a blank line.
-    let mut lines: Vec<String> = Vec::new();
-    loop {
-        match take_line(&mut this.buf) {
-            None => return Ok(false),
-            Some(line) if line.is_empty() => break,
-            Some(line) => lines.push(line),
+    if this.buf.len() > MAX_TRAILER_BYTES {
+        return Err(s3_err(
+            "InvalidRequest",
+            "aws-chunked trailing headers exceed size limit",
+        ));
+    }
+
+    let Some(end) = find_double_crlf(&this.buf, this.scan_from) else {
+        // No terminator yet — advance scan cursor (overlap of 3 for `\r\n\r`).
+        this.scan_from = this.buf.len().saturating_sub(3);
+        if this.buf.len() > MAX_TRAILER_BYTES {
+            return Err(s3_err(
+                "InvalidRequest",
+                "aws-chunked trailing headers exceed size limit",
+            ));
         }
+        return Ok(false);
+    };
+
+    let section = this.buf.split_to(end);
+    this.scan_from = 0;
+    // `section` ends with `\r\n\r\n`.
+    let text = String::from_utf8_lossy(&section[..section.len().saturating_sub(4)]);
+    let mut lines: Vec<&str> = text.split("\r\n").collect();
+    // split may leave a trailing empty from final content; drop empties at end only
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.len() > MAX_TRAILER_LINES {
+        return Err(s3_err(
+            "InvalidRequest",
+            "aws-chunked trailing headers exceed line limit",
+        ));
     }
 
     let want_name = checksum_algo.header_name();
     let mut got_value: Option<String> = None;
     let mut trailer_sig: Option<String> = None;
     for line in &lines {
+        if line.is_empty() {
+            continue;
+        }
         let (k, v) = split_header_line(line)?;
         let k = k.to_ascii_lowercase();
         if k == want_name {
@@ -551,7 +615,6 @@ fn finish_trailer(this: &mut DecodedStream) -> ApiResult<bool> {
         )
     })?;
 
-    // Verify trailer signature first when required (uses checksum header line).
     if matches!(this.auth.kind, StreamingKind::SignedTrailer { .. }) {
         let declared = trailer_sig.ok_or_else(|| {
             s3_err(
@@ -601,11 +664,46 @@ fn split_header_line(line: &str) -> ApiResult<(&str, &str)> {
     Ok((k.trim(), v.trim()))
 }
 
-fn take_line(buf: &mut BytesMut) -> Option<String> {
-    let pos = buf.windows(2).position(|w| w == b"\r\n")?;
-    let line = buf.split_to(pos);
-    let _ = buf.split_to(2); // CRLF
-    Some(String::from_utf8_lossy(&line).into_owned())
+/// Find `\r\n\r\n` starting search near `from`; returns end index after terminator.
+fn find_double_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    let start = from.saturating_sub(3);
+    let mut i = start;
+    while i + 3 < buf.len() {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find `\r\n` with incremental start; returns index of `\r`.
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    let start = from.saturating_sub(1);
+    buf[start..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| start + p)
+}
+
+/// Cap line length; scan incrementally via `scan_from`.
+fn take_line_capped(
+    buf: &mut BytesMut,
+    scan_from: &mut usize,
+    max: usize,
+    oversize_msg: &str,
+) -> ApiResult<Option<String>> {
+    if let Some(pos) = find_crlf(buf, *scan_from) {
+        *scan_from = 0;
+        let line = buf.split_to(pos);
+        let _ = buf.split_to(2);
+        return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+    }
+    if buf.len() > max {
+        return Err(s3_err("InvalidRequest", oversize_msg));
+    }
+    *scan_from = buf.len().saturating_sub(1);
+    Ok(None)
 }
 
 fn parse_chunk_header(line: &str, require_sig: bool) -> ApiResult<(usize, Option<String>)> {
@@ -963,6 +1061,185 @@ mod tests {
         assert_eq!(
             e.details.get("s3_code").and_then(|v| v.as_str()),
             Some("InvalidRequest")
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_header_line_rejected() {
+        let auth = StreamingAuth {
+            kind: StreamingKind::Signed,
+            seed_signature: "aa".repeat(32),
+            signing_key: vec![0; 32],
+            amz_date: "20130524T000000Z".into(),
+            scope: "20130524/us-east-1/s3/aws4_request".into(),
+            decoded_content_length: 0,
+        };
+        let line = "a".repeat(MAX_CHUNK_HEADER_BYTES + 1);
+        let stream =
+            futures::stream::once(async move { Ok::<_, String>(Bytes::from(line.into_bytes())) });
+        let mut decoded = decode_stream(stream, auth);
+        let e = decoded.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            e.details.get("s3_code").and_then(|v| v.as_str()),
+            Some("InvalidRequest")
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_trailer_rejected() {
+        let auth = StreamingAuth {
+            kind: StreamingKind::UnsignedTrailer {
+                checksum: TrailerChecksum::Crc32,
+            },
+            seed_signature: String::new(),
+            signing_key: Vec::new(),
+            amz_date: "20130524T000000Z".into(),
+            scope: "20130524/us-east-1/s3/aws4_request".into(),
+            decoded_content_length: 0,
+        };
+        // Final zero chunk then a huge trailer without terminator.
+        let mut body = b"0\r\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', MAX_TRAILER_BYTES + 1));
+        let stream = futures::stream::once(async move { Ok::<_, String>(Bytes::from(body)) });
+        let mut decoded = decode_stream(stream, auth);
+        let e = decoded.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            e.details.get("s3_code").and_then(|v| v.as_str()),
+            Some("InvalidRequest")
+        );
+    }
+
+    #[tokio::test]
+    async fn trailer_split_across_reads_ok() {
+        let payload = b"split-trailer";
+        let framed = frame_unsigned_trailer(payload, 4, TrailerChecksum::Crc32);
+        // Deliver one byte at a time.
+        let pieces: Vec<Result<Bytes, String>> =
+            framed.iter().map(|&b| Ok(Bytes::from(vec![b]))).collect();
+        let auth = StreamingAuth {
+            kind: StreamingKind::UnsignedTrailer {
+                checksum: TrailerChecksum::Crc32,
+            },
+            seed_signature: String::new(),
+            signing_key: Vec::new(),
+            amz_date: "20130524T000000Z".into(),
+            scope: "20130524/us-east-1/s3/aws4_request".into(),
+            decoded_content_length: payload.len() as u64,
+        };
+        let mut decoded = decode_stream(futures::stream::iter(pieces), auth);
+        let mut got = Vec::new();
+        while let Some(item) = decoded.next().await {
+            got.extend_from_slice(&item.expect("ok"));
+        }
+        assert_eq!(&got[..], payload);
+    }
+
+    #[tokio::test]
+    async fn trailing_garbage_after_final_chunk_rejected() {
+        let secret = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let key = derive_signing_key(secret, "20130524", "us-east-1", "s3");
+        let seed = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let amz_date = "20130524T000000Z";
+        let scope = "20130524/us-east-1/s3/aws4_request";
+        let data = b"ok";
+        let (mut framed, _) = frame_signed_chunks(data, 64, &key, amz_date, scope, seed);
+        framed.extend_from_slice(b"GARBAGE");
+        let auth = StreamingAuth {
+            kind: StreamingKind::Signed,
+            seed_signature: seed.into(),
+            signing_key: key,
+            amz_date: amz_date.into(),
+            scope: scope.into(),
+            decoded_content_length: data.len() as u64,
+        };
+        let stream = futures::stream::once(async move { Ok::<_, String>(Bytes::from(framed)) });
+        let mut decoded = decode_stream(stream, auth);
+        let mut err = None;
+        while let Some(item) = decoded.next().await {
+            if let Err(e) = item {
+                err = Some(e);
+                break;
+            }
+        }
+        let e = err.expect("must error");
+        assert_eq!(
+            e.details.get("s3_code").and_then(|v| v.as_str()),
+            Some("IncompleteBody")
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_signature_after_good_chunk() {
+        let secret = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let key = derive_signing_key(secret, "20130524", "us-east-1", "s3");
+        let seed = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let amz_date = "20130524T000000Z";
+        let scope = "20130524/us-east-1/s3/aws4_request";
+        let c1 = b"good-chunk-data!!";
+        let c2 = b"bad-next";
+        let sig1 = chunk_signature(&key, amz_date, scope, seed, c1);
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("{:x};chunk-signature={sig1}\r\n", c1.len()).as_bytes());
+        body.extend_from_slice(c1);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(
+            format!(
+                "{:x};chunk-signature={}\r\n",
+                c2.len(),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(c2);
+        body.extend_from_slice(b"\r\n");
+        let auth = StreamingAuth {
+            kind: StreamingKind::Signed,
+            seed_signature: seed.into(),
+            signing_key: key,
+            amz_date: amz_date.into(),
+            scope: scope.into(),
+            decoded_content_length: (c1.len() + c2.len()) as u64,
+        };
+        let stream = futures::stream::once(async move { Ok::<_, String>(Bytes::from(body)) });
+        let mut decoded = decode_stream(stream, auth);
+        let first = decoded.next().await.expect("good chunk").expect("ok");
+        assert_eq!(&first[..], c1);
+        let second = decoded.next().await.expect("item");
+        assert_eq!(
+            second
+                .unwrap_err()
+                .details
+                .get("s3_code")
+                .and_then(|v| v.as_str()),
+            Some("SignatureDoesNotMatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_body_incomplete() {
+        let secret = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let key = derive_signing_key(secret, "20130524", "us-east-1", "s3");
+        let seed = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let amz_date = "20130524T000000Z";
+        let scope = "20130524/us-east-1/s3/aws4_request";
+        let data = b"truncate-me";
+        let sig = chunk_signature(&key, amz_date, scope, seed, data);
+        // Header only — no data, no final chunk.
+        let body = format!("{:x};chunk-signature={sig}\r\n", data.len()).into_bytes();
+        let auth = StreamingAuth {
+            kind: StreamingKind::Signed,
+            seed_signature: seed.into(),
+            signing_key: key,
+            amz_date: amz_date.into(),
+            scope: scope.into(),
+            decoded_content_length: data.len() as u64,
+        };
+        let stream = futures::stream::once(async move { Ok::<_, String>(Bytes::from(body)) });
+        let mut decoded = decode_stream(stream, auth);
+        let e = decoded.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            e.details.get("s3_code").and_then(|v| v.as_str()),
+            Some("IncompleteBody")
         );
     }
 }

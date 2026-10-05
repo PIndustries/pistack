@@ -156,6 +156,21 @@ fn authenticate(state: &SigV4State, req: &Request) -> ApiResult<Option<AuthOk>> 
     };
 
     let streaming_kind = classify_streaming(&parsed.payload_hash, req.headers())?;
+    if let Some(ref kind) = streaming_kind {
+        if parsed.presigned {
+            return Err(s3_err(
+                "InvalidRequest",
+                "presigned URLs cannot use STREAMING-* payloads",
+            ));
+        }
+        if *req.method() != Method::PUT {
+            return Err(s3_err(
+                "InvalidRequest",
+                "STREAMING-* payload is only valid on PUT (PutObject/UploadPart)",
+            ));
+        }
+        check_streaming_signed_headers(&parsed, kind)?;
+    }
 
     check_region(&parsed.region, &state.region)?;
     check_time_skew(parsed.amz_date, parsed.expires_secs)?;
@@ -270,6 +285,33 @@ fn classify_streaming(payload_hash: &str, headers: &HeaderMap) -> ApiResult<Opti
         ));
     }
     Ok(None)
+}
+
+fn check_streaming_signed_headers(parsed: &ParsedAuth, kind: &StreamingKind) -> ApiResult<()> {
+    let has = |name: &str| {
+        parsed
+            .signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    };
+    if !has("x-amz-decoded-content-length") {
+        return Err(s3_err(
+            "AccessDenied",
+            "x-amz-decoded-content-length must be in SignedHeaders for streaming uploads",
+        ));
+    }
+    match kind {
+        StreamingKind::UnsignedTrailer { .. } | StreamingKind::SignedTrailer { .. } => {
+            if !has("x-amz-trailer") {
+                return Err(s3_err(
+                    "AccessDenied",
+                    "x-amz-trailer must be in SignedHeaders for streaming trailer uploads",
+                ));
+            }
+        }
+        StreamingKind::Signed => {}
+    }
+    Ok(())
 }
 
 fn trailer_from_headers(headers: &HeaderMap) -> ApiResult<TrailerChecksum> {

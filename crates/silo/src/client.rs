@@ -572,6 +572,16 @@ impl IntoBodyReadErr for axum::Error {
     }
 }
 
+/// Best-effort cleanup of a staging path if the future is cancelled or errors
+/// before rename. After a successful rename the path is gone and Drop is a no-op.
+pub(crate) struct TmpGuard(pub(crate) std::path::PathBuf);
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 async fn write_stream_atomic<S>(
     dest: &Path,
     body: S,
@@ -588,6 +598,8 @@ where
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
+    // Drop removes the temp path on cancel/error (rename success → path gone → no-op).
+    let _tmp_guard = TmpGuard(tmp.clone());
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut sha = Sha256::new();

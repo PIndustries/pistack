@@ -644,6 +644,7 @@ where
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
+    let _tmp_guard = crate::client::TmpGuard(tmp.clone());
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut md5 = Md5::new();

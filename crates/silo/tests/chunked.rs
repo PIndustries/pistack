@@ -12,8 +12,8 @@ use chrono::Utc;
 use pistack_store::Store;
 use pistack_types::{kind, Caller, Id, Meta};
 use silo::chunked::{
-    frame_signed_chunks, frame_signed_trailer, frame_unsigned_trailer, TrailerChecksum,
-    STREAMING_PAYLOAD, STREAMING_SIGNED_TRAILER, STREAMING_UNSIGNED_TRAILER,
+    chunk_signature, frame_signed_chunks, frame_signed_trailer, frame_unsigned_trailer,
+    TrailerChecksum, STREAMING_PAYLOAD, STREAMING_SIGNED_TRAILER, STREAMING_UNSIGNED_TRAILER,
 };
 use silo::http;
 use silo::sigv4::{self, derive_signing_key, EMPTY_PAYLOAD_SHA256};
@@ -413,16 +413,24 @@ async fn tampered_chunk_leaves_no_object() {
     let (status, _) = signed_get(&w.app, &path, &w.access_key_id, &w.secret, &w.region).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // No leftover object files under the silo root for this key.
-    let mut found = false;
+    // No leftover object or staging temp files.
+    let mut found_object = false;
+    let mut found_tmp = false;
     if w.silo_root.exists() {
         for entry in walkdir_files(&w.silo_root) {
+            if entry.contains(".tmp-") {
+                found_tmp = true;
+            }
             if entry.contains("tampered") && !entry.contains(".tmp-") {
-                found = true;
+                found_object = true;
             }
         }
     }
-    assert!(!found, "tampered upload must not leave an object");
+    assert!(!found_object, "tampered upload must not leave an object");
+    assert!(
+        !found_tmp,
+        "tampered upload must not leave .tmp-* staging files"
+    );
 }
 
 fn walkdir_files(root: &std::path::Path) -> Vec<String> {
@@ -774,5 +782,232 @@ async fn chunked_upload_part_round_trip() {
         StatusCode::OK,
         "upload part: {}",
         String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn streamed_body_pieces_and_split_trailer() {
+    use bytes::Bytes as B;
+    use futures::stream;
+    let w = world().await;
+    let payload = b"piecewise-trailer-body";
+    let amz_date = amz_now();
+    let path = format!("/{}/pieces.bin", w.bucket);
+    let host = "silo.test";
+    let decoded = payload.len().to_string();
+    let framed = frame_unsigned_trailer(payload, 5, TrailerChecksum::Crc32);
+    let trailer_name = TrailerChecksum::Crc32.header_name();
+
+    // Sign with full framed length.
+    let mut headers = vec![
+        ("content-encoding".into(), "aws-chunked".into()),
+        ("content-length".into(), framed.len().to_string()),
+        ("host".into(), host.into()),
+        (
+            "x-amz-content-sha256".into(),
+            STREAMING_UNSIGNED_TRAILER.into(),
+        ),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-decoded-content-length".into(), decoded.clone()),
+        ("x-amz-trailer".into(), trailer_name.into()),
+    ];
+    headers.sort_by(|a: &(String, String), b| a.0.cmp(&b.0));
+    let sig = sigv4::sign_request(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        STREAMING_UNSIGNED_TRAILER,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders={}, Signature={sig}",
+        w.access_key_id,
+        w.region,
+        headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";")
+    );
+
+    let pieces = framed
+        .chunks(3)
+        .map(|c| Ok::<_, std::io::Error>(B::copy_from_slice(c)))
+        .collect::<Vec<_>>();
+    let body = Body::from_stream(stream::iter(pieces));
+
+    let mut builder = Request::builder().method("PUT").uri(&path);
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    builder = builder.header(header::AUTHORIZATION, auth);
+    let resp = w
+        .app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "streamed trailer put");
+
+    let (status, got) = signed_get(&w.app, &path, &w.access_key_id, &w.secret, &w.region).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&got[..], payload);
+}
+
+#[tokio::test]
+async fn bad_chunk_after_good_chunk_http() {
+    let w = world().await;
+    let amz_date = amz_now();
+    let path = format!("/{}/after-good.txt", w.bucket);
+    let date_stamp = &amz_date[..8];
+    let signing_key = derive_signing_key(&w.secret, date_stamp, &w.region, "s3");
+    let scope = scope(&amz_date, &w.region);
+    let host = "silo.test";
+    let c1 = b"first-ok-chunk!!!!";
+    let c2 = b"second";
+    let decoded = (c1.len() + c2.len()).to_string();
+
+    // Build body with placeholder seed length first.
+    let seed0 = "0".repeat(64);
+    let sig1 = chunk_signature(&signing_key, &amz_date, &scope, &seed0, c1);
+    let mut trial = Vec::new();
+    trial.extend_from_slice(format!("{:x};chunk-signature={sig1}\r\n", c1.len()).as_bytes());
+    trial.extend_from_slice(c1);
+    trial.extend_from_slice(b"\r\n");
+    trial.extend_from_slice(
+        format!(
+            "{:x};chunk-signature={}\r\n",
+            c2.len(),
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        )
+        .as_bytes(),
+    );
+    trial.extend_from_slice(c2);
+    trial.extend_from_slice(b"\r\n");
+
+    let mut headers = vec![
+        ("content-encoding".into(), "aws-chunked".into()),
+        ("content-length".into(), trial.len().to_string()),
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), STREAMING_PAYLOAD.into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-decoded-content-length".into(), decoded.clone()),
+    ];
+    headers.sort_by(|a: &(String, String), b| a.0.cmp(&b.0));
+    let seed = sigv4::sign_request(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        STREAMING_PAYLOAD,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let sig1 = chunk_signature(&signing_key, &amz_date, &scope, &seed, c1);
+    let mut framed = Vec::new();
+    framed.extend_from_slice(format!("{:x};chunk-signature={sig1}\r\n", c1.len()).as_bytes());
+    framed.extend_from_slice(c1);
+    framed.extend_from_slice(b"\r\n");
+    framed.extend_from_slice(
+        format!(
+            "{:x};chunk-signature={}\r\n",
+            c2.len(),
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        )
+        .as_bytes(),
+    );
+    framed.extend_from_slice(c2);
+    framed.extend_from_slice(b"\r\n");
+    assert_eq!(framed.len(), trial.len());
+
+    let (status, body) = signed_put(
+        &w.app,
+        &path,
+        "",
+        &framed,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+        STREAMING_PAYLOAD,
+        host,
+        &[("x-amz-decoded-content-length", &decoded)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "SignatureDoesNotMatch"
+    );
+    let mut found_tmp = false;
+    for entry in walkdir_files(&w.silo_root) {
+        if entry.contains(".tmp-") {
+            found_tmp = true;
+        }
+    }
+    assert!(!found_tmp, "no .tmp-* after bad chunk signature");
+}
+
+#[tokio::test]
+async fn truncated_chunked_body_http() {
+    let w = world().await;
+    let amz_date = amz_now();
+    let path = format!("/{}/trunc.txt", w.bucket);
+    let date_stamp = &amz_date[..8];
+    let signing_key = derive_signing_key(&w.secret, date_stamp, &w.region, "s3");
+    let scope = scope(&amz_date, &w.region);
+    let host = "silo.test";
+    let data = b"hello";
+    let decoded = data.len().to_string();
+
+    // Content-Length matches the truncated wire body (header only).
+    let seed0 = "0".repeat(64);
+    let sig = chunk_signature(&signing_key, &amz_date, &scope, &seed0, data);
+    let trial = format!("{:x};chunk-signature={sig}\r\n", data.len()).into_bytes();
+    let mut headers = vec![
+        ("content-encoding".into(), "aws-chunked".into()),
+        ("content-length".into(), trial.len().to_string()),
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), STREAMING_PAYLOAD.into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-decoded-content-length".into(), decoded.clone()),
+    ];
+    headers.sort_by(|a: &(String, String), b| a.0.cmp(&b.0));
+    let seed = sigv4::sign_request(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        STREAMING_PAYLOAD,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let sig = chunk_signature(&signing_key, &amz_date, &scope, &seed, data);
+    let truncated = format!("{:x};chunk-signature={sig}\r\n", data.len()).into_bytes();
+    assert_eq!(truncated.len(), trial.len());
+
+    let (status, body) = signed_put(
+        &w.app,
+        &path,
+        "",
+        &truncated,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+        STREAMING_PAYLOAD,
+        host,
+        &[("x-amz-decoded-content-length", &decoded)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "IncompleteBody"
     );
 }

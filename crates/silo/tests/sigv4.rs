@@ -788,3 +788,129 @@ async fn bearer_plus_presigned_conflict() {
         "InvalidRequest"
     );
 }
+
+#[tokio::test]
+async fn streaming_rejected_on_non_put() {
+    let w = world().await;
+    let date = amz_now();
+    let path = format!("/{}/nope.txt", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &path,
+        "uploads",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "silo.test",
+        &[("x-amz-decoded-content-length", "0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn streaming_requires_decoded_length_in_signed_headers() {
+    let w = world().await;
+    let amz_date = amz_now();
+    let path = format!("/{}/unsigned-hdr.txt", w.bucket);
+    let host = "silo.test";
+    // Put decoded-content-length on the wire but omit it from SignedHeaders.
+    let headers = vec![
+        ("content-length".into(), "0".into()),
+        ("host".into(), host.into()),
+        (
+            "x-amz-content-sha256".into(),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+        ),
+        ("x-amz-date".into(), amz_date.clone()),
+    ];
+    let sig = sigv4::sign_request(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&path)
+                .header("host", host)
+                .header("content-length", "0")
+                .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-decoded-content-length", "0")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rejected_with_presigned_url() {
+    let w = world().await;
+    let amz_date = amz_now();
+    let path = format!("/{}/presign-stream.txt", w.bucket);
+    let host = "silo.test";
+    let q = sigv4::presign_query(
+        "PUT",
+        &path,
+        host,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+        3600,
+        "X-Amz-Content-Sha256=STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    );
+    // Also send decoded length header (unsigned) so classify would otherwise proceed.
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{path}?{q}"))
+                .header("host", host)
+                .header("x-amz-decoded-content-length", "0")
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
