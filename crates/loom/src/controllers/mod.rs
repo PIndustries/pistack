@@ -49,6 +49,10 @@ pub trait Controller: Send + Sync + 'static {
     fn watches(&self) -> &'static [&'static str];
     /// One idempotent pass over everything this controller owns.
     async fn reconcile_once(&self) -> anyhow::Result<()>;
+    /// This node stopped leading (or is shutting down): let go of anything
+    /// held in this process, such as open listeners. The next term starts
+    /// from nothing.
+    async fn stop_leading(&self) {}
 }
 
 /// Drive `c` only while this node is the cluster leader.
@@ -80,6 +84,7 @@ pub async fn run(c: impl Controller, ctx: ModuleContext) {
                         tracing::warn!(controller = name, error = %e, "loom: reconcile pass failed");
                     }
                 }
+                c.stop_leading().await;
                 tracing::info!(controller = name, "loom: controller stopped");
             }
         })

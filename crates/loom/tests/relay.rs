@@ -618,10 +618,17 @@ async fn ingress_tls_serves_https_with_the_named_certificate() {
     closed(&http).await;
 }
 
+/// A free node port no other test in this run is handed, so tests that
+/// close and reopen a port never race each other for it.
 fn free_node_port() -> u16 {
-    (30000..=32767)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free node port")
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(30000);
+    loop {
+        let p = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(p <= 32767, "no free node port");
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
 }
 
 #[tokio::test]
@@ -660,9 +667,7 @@ async fn node_port_listens_on_the_node_address_and_moves() {
     assert_eq!(ping(&at).await, b"node");
 
     // A new node port replaces the old listener.
-    let second = (first + 1..=32767)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap();
+    let second = free_node_port();
     svc.status.node_ports.insert(80, second);
     relay
         .realize(&svc, &[endpoint(backend_addr)])
@@ -848,4 +853,97 @@ async fn node_port_opens_on_the_new_leader_after_a_handoff() {
         .find(|lb| lb.meta.name.ends_with(&format!("-node-{node_port}")))
         .expect("node port balancer");
     assert_eq!(moved.spec.vip_address, Some("127.0.0.1".parse().unwrap()));
+}
+
+#[tokio::test]
+async fn a_demoted_leader_closes_its_node_port_and_reopens_it_when_promoted() {
+    use loom::controllers::service::{ServiceController, DEFAULT_SERVICE_CIDR};
+    let store = Store::in_memory().unwrap();
+    let node_port = free_node_port();
+    let mut svc = service(
+        "np-demote",
+        ServiceKind::NodePort,
+        80,
+        8080,
+        Protocol::Tcp,
+        vec![],
+    );
+    svc.spec.ports[0].node_port = Some(node_port);
+    store.collection::<Service>().create(svc).unwrap();
+    let at = format!("127.0.0.1:{node_port}");
+    let relay =
+        std::sync::Arc::new(RelayRealizer::new().with_node_address("127.0.0.1".parse().unwrap()));
+    relay.bind_store(store.clone());
+    let controller = ServiceController::new(
+        store.clone(),
+        DEFAULT_SERVICE_CIDR.parse().unwrap(),
+        relay.clone() as std::sync::Arc<dyn ServiceRealizer>,
+    );
+
+    controller.reconcile_once().await.unwrap();
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+
+    // Losing the lead closes the port but keeps the store as it was.
+    let before = store
+        .collection::<relay::Balancer>()
+        .list(None)
+        .unwrap()
+        .len();
+    controller.stop_leading().await;
+    closed(&at).await;
+    assert_eq!(
+        store
+            .collection::<relay::Balancer>()
+            .list(None)
+            .unwrap()
+            .len(),
+        before
+    );
+
+    // Leading again opens it again.
+    controller.reconcile_once().await.unwrap();
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_demoted_leader_closes_its_ingress_listener() {
+    let (store, relay) = realizer();
+    let backend = listen().await;
+    let backend_addr = backend.local_addr().unwrap();
+    spawn_http(backend, b"edge");
+    let svc = service(
+        "web-demote",
+        ServiceKind::ClusterIp,
+        80,
+        backend_addr.port(),
+        Protocol::Tcp,
+        vec![endpoint(backend_addr)],
+    );
+    store.collection::<Service>().create(svc).unwrap();
+    let ing = Ingress {
+        meta: Meta::new(loom::kinds::INGRESS, "edge-demote", None),
+        spec: IngressSpec {
+            default_backend: Some(IngressBackend {
+                service: "web-demote".into(),
+                port: IntOrName::Int(80),
+            }),
+            ..IngressSpec::default()
+        },
+        status: Default::default(),
+    };
+    store.collection::<Ingress>().create(ing).unwrap();
+    let controller = IngressController::new(store.clone(), Some(relay.clone()));
+
+    controller.reconcile_once().await.unwrap();
+    let ing = store.collection::<Ingress>().list(None).unwrap().remove(0);
+    let at = ing.status.load_balancer[0].clone();
+    assert!(String::from_utf8_lossy(&http_get(&at).await).ends_with("edge"));
+
+    controller.stop_leading().await;
+    closed(&at).await;
+
+    controller.reconcile_once().await.unwrap();
+    let ing = store.collection::<Ingress>().list(None).unwrap().remove(0);
+    let again = ing.status.load_balancer[0].clone();
+    assert!(String::from_utf8_lossy(&http_get(&again).await).ends_with("edge"));
 }

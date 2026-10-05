@@ -250,6 +250,10 @@ impl Controller for ServiceController {
     fn watches(&self) -> &'static [&'static str] {
         &[crate::types::kinds::POD, crate::types::kinds::SERVICE]
     }
+    async fn stop_leading(&self) {
+        self.programmed_lock().clear();
+        self.realizer.release().await;
+    }
     async fn reconcile_once(&self) -> anyhow::Result<()> {
         let services = self.services().list(None)?;
         let pods = self.pods().list(None)?;

@@ -66,6 +66,11 @@ impl Controller for IngressController {
     fn watches(&self) -> &'static [&'static str] {
         &[crate::types::kinds::INGRESS, crate::types::kinds::SERVICE]
     }
+    async fn stop_leading(&self) {
+        if let Some(relay) = &self.relay {
+            relay.release_ingresses().await;
+        }
+    }
     async fn reconcile_once(&self) -> anyhow::Result<()> {
         let Some(relay) = &self.relay else {
             for ing in self.ingresses().list(None)? {
