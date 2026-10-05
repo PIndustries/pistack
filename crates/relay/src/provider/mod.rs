@@ -108,6 +108,16 @@ impl Providers {
             })
     }
 
+    /// Stop whatever any provider runs for balancer `id`, without touching
+    /// the store. A provider with nothing for `id` does nothing.
+    pub async fn stop_everywhere(&self, id: &Id) {
+        for p in &self.inner {
+            if let Err(e) = p.delete_balancer(id).await {
+                tracing::warn!(balancer = %id, provider = p.name(), error = %e, "relay: local stop failed");
+            }
+        }
+    }
+
     pub fn names(&self) -> Vec<&'static str> {
         self.inner.iter().map(|p| p.name()).collect()
     }

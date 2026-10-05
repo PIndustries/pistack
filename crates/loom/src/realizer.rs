@@ -15,7 +15,7 @@ use relay::{
     Algorithm, BalancerSpec, Client, ForwardProvider, ListenerProtocol, ListenerSpec, MemberSpec,
     PathMatch, PoolProtocol, PoolSpec, Provider, Providers, RelayL7Provider, Route, MANAGED_LABEL,
 };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -55,6 +55,9 @@ pub trait ServiceRealizer: Send + Sync + 'static {
     async fn realize(&self, service: &Service, endpoints: &[Endpoint]) -> ApiResult<Vec<String>>;
     /// Tear down whatever `realize` built. Unknown services are not an error.
     async fn remove(&self, service: &Service) -> ApiResult<()>;
+    /// This node stopped leading: close every service listener this process
+    /// holds open, leaving the store alone for the next leader.
+    async fn release(&self) {}
 }
 
 /// Records nothing, routes nothing. Dev mode and tests.
@@ -80,7 +83,8 @@ pub struct RelayRealizer {
     /// Balancers this process has programmed. Sockets live in the process
     /// that bound them, so a balancer another server (or an earlier run)
     /// marked ready is programmed here once before it counts as live.
-    local: Mutex<HashSet<Id>>,
+    /// Values are the owner label (service or ingress) each was built for.
+    local: Mutex<HashMap<Id, &'static str>>,
 }
 
 impl RelayRealizer {
@@ -92,7 +96,7 @@ impl RelayRealizer {
                 Arc::new(RelayL7Provider::new()),
             ]),
             node_address: node_port_address(),
-            local: Mutex::new(HashSet::new()),
+            local: Mutex::new(HashMap::new()),
         }
     }
 
@@ -273,6 +277,46 @@ impl RelayRealizer {
         Ok(vec![bound, tls])
     }
 
+    /// Close every listener this process opened for owners of `label`.
+    async fn release_label(&self, label: &str) {
+        let ids: Vec<Id> = {
+            let mut local = self
+                .local
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ids = local
+                .iter()
+                .filter(|(_, owner)| **owner == label)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in &ids {
+                local.remove(id);
+            }
+            ids
+        };
+        if ids.is_empty() {
+            return;
+        }
+        for id in &ids {
+            self.providers.stop_everywhere(id).await;
+        }
+        tracing::info!(
+            count = ids.len(),
+            owner = label,
+            "loom: closed listeners after losing the lead"
+        );
+    }
+
+    /// Close every service listener this process holds open.
+    pub async fn release_services(&self) {
+        self.release_label(SERVICE_LABEL).await;
+    }
+
+    /// Close every ingress listener this process holds open.
+    pub async fn release_ingresses(&self) {
+        self.release_label(INGRESS_LABEL).await;
+    }
+
     pub async fn remove_ingress(&self, ingress: &Ingress) -> ApiResult<()> {
         let client = self.client()?;
         delete_labeled(&client, INGRESS_LABEL, &ingress.meta.id.to_string()).await
@@ -317,6 +361,9 @@ impl ServiceRealizer for RelayRealizer {
     }
     async fn remove(&self, service: &Service) -> ApiResult<()> {
         self.remove_service(service).await
+    }
+    async fn release(&self) {
+        self.release_services().await;
     }
 }
 
@@ -440,11 +487,11 @@ fn projects_match(a: &Option<Id>, b: &Option<Id>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn ensure_forward(
-    local: &Mutex<HashSet<Id>>,
+    local: &Mutex<HashMap<Id, &'static str>>,
     client: &Client,
     project: Option<Id>,
     name: &str,
-    owner_label: &str,
+    owner_label: &'static str,
     owner_id: &str,
     provider: Provider,
     listener_protocol: ListenerProtocol,
@@ -613,7 +660,7 @@ async fn ensure_forward(
     let programmed_here = local
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&lb.meta.id);
+        .contains_key(&lb.meta.id);
     let aligned = programmed_here
         && lb.status.phase == Phase::Ready
         && lb.status.provider_ref.as_deref() == Some(live.provider_ref.as_str())
@@ -655,7 +702,7 @@ async fn ensure_forward(
     local
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(lb.meta.id.clone());
+        .insert(lb.meta.id.clone(), owner_label);
     let addr = listener
         .status
         .provider_ref
