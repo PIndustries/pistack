@@ -3,18 +3,28 @@
 
 //! A stack is a PiStack resource: a document the user wrote (YAML or JSON
 //! text) plus string parameters. Apply creates network, subnet, machine,
-//! router, pod, listener, and record set rows from that document. A kit is
-//! a stored document applied the same way. A workflow applies named stacks
-//! in order and stops on the first error. Apply does not run a reconciler.
+//! router, pod, listener, and record set rows from that document, and
+//! updates the rows an earlier apply of the same stack created. Each
+//! successful stack apply records the spec as a revision; rollback puts an
+//! earlier revision back and applies it. A kit is a stored document applied
+//! the same way. A workflow applies named stacks in order and stops on the
+//! first error. Apply does not run a reconciler.
 
+use chrono::{DateTime, Utc};
 use pistack_types::{kind, ApiError, ApiResult, Resource, Spec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Status text stored when a stack or kit is created. Apply replaces it
-/// with the ids it inserted and any ids that were already present.
+/// with the ids it inserted, updated, or found already present.
 pub const ACCEPTED_MESSAGE: &str =
     "accepted; apply creates network, subnet, machine, router, pod, listener, and record set rows";
+
+/// Status text stored while an apply is realizing the document.
+pub const APPLYING_MESSAGE: &str = "applying the document";
+
+/// Applied stack specs kept for rollback. Older revisions are dropped.
+pub const REVISION_HISTORY_LIMIT: usize = 10;
 
 /// Status text stored when a workflow is created. Apply replaces it with
 /// the stack names it ran.
@@ -41,12 +51,27 @@ impl Spec for StackSpec {
     const KIND: &'static str = kind::STACK;
 }
 
-/// Observed phase. Apply stays at `Accepted`.
+/// Observed phase. `Accepted` until the first apply. Apply moves to
+/// `Applying` while it writes rows, then to `Ready` or `Failed`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StackPhase {
     #[default]
     Accepted,
+    Applying,
+    Ready,
+    Failed,
+}
+
+/// One applied spec. Rollback re-applies `spec` as a new revision.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackRevision {
+    pub revision: u64,
+    pub spec: StackSpec,
+    pub applied_at: DateTime<Utc>,
+    /// Set when a rollback produced this revision: the revision it restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +81,25 @@ pub struct StackStatus {
     /// Ids inserted by the last apply. Already-present names are not listed.
     #[serde(default)]
     pub created: Vec<String>,
+    /// Ids whose spec the last apply changed.
+    #[serde(default)]
+    pub updated: Vec<String>,
+    /// Managed ids the last successful apply's document no longer names.
+    /// They are kept, not deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left: Vec<String>,
+    /// Every id an apply of this resource inserted. Later applies update
+    /// these rows when the document changes; rows it did not insert are
+    /// left as they are.
+    #[serde(default)]
+    pub managed: Vec<String>,
+    /// Revision of the last successful apply. `0` before the first one.
+    #[serde(default)]
+    pub revision: u64,
+    /// Applied specs, oldest first, at most [`REVISION_HISTORY_LIMIT`].
+    /// Only stacks keep history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<StackRevision>,
 }
 
 impl StackStatus {
@@ -64,6 +108,11 @@ impl StackStatus {
             phase: StackPhase::Accepted,
             message: ACCEPTED_MESSAGE.to_owned(),
             created: Vec::new(),
+            updated: Vec::new(),
+            left: Vec::new(),
+            managed: Vec::new(),
+            revision: 0,
+            history: Vec::new(),
         }
     }
 }
@@ -91,7 +140,8 @@ impl Spec for KitSpec {
     const KIND: &'static str = KIT_KIND;
 }
 
-/// Observed phase for a kit. Apply stays at `Accepted`.
+/// Observed phase for a kit. Same phases as a stack; a kit keeps no
+/// revision history.
 pub type KitStatus = StackStatus;
 
 pub type Kit = Resource<KitSpec, KitStatus>;
