@@ -19,6 +19,11 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 sha2.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+pistack-config.workspace = true
+md-5.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

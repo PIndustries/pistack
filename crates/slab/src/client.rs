@@ -1224,16 +1224,19 @@ fn bytes_to_gib(bytes: u64) -> u64 {
 }
 
 fn oversize(len: u64) -> ApiError {
-    ApiError::unavailable(format!("backup is {len} bytes, larger than 1 GiB"))
-        .with_detail("size_bytes", serde_json::Value::from(len))
+    ApiError::unavailable(format!(
+        "backup is {len} bytes, larger than {}",
+        silo::format_byte_limit(silo::MAX_OBJECT_BYTES)
+    ))
+    .with_detail("size_bytes", serde_json::Value::from(len))
 }
 
 fn io_err(err: std::io::Error) -> ApiError {
     ApiError::internal(format!("backup: {err}"))
 }
 
-/// Read the whole file when it is at most 1 GiB. A larger file returns
-/// unavailable with its size and is not returned as a prefix.
+/// Read the whole file when it is at most [`silo::MAX_OBJECT_BYTES`]. A
+/// larger file returns unavailable with its size and is not returned as a prefix.
 async fn read_capped(path: &Path) -> ApiResult<Vec<u8>> {
     let meta = tokio::fs::metadata(path).await.map_err(io_err)?;
     if !meta.is_file() {

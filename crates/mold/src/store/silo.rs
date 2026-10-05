@@ -8,9 +8,9 @@
 //! under the silo data root. The reference mold stores is `sha256:<hex>`.
 //!
 //! `put` reads the whole stream, then calls `silo::Client::put_object`.
-//! The silo client accepts a byte slice, capped at 1 GiB. `open` is
-//! `get_object`. `delete` is `delete_object` and treats a missing object
-//! as success.
+//! The silo client accepts a byte slice, capped at [`silo::MAX_OBJECT_BYTES`]
+//! (default 5 GiB). `open` is `get_object`. `delete` is `delete_object` and
+//! treats a missing object as success.
 
 use async_trait::async_trait;
 use pistack_types::{error::ErrorCode, ApiError, ApiResult, Meta, Spec};
@@ -102,7 +102,9 @@ async fn read_blob(data: &mut ImageData) -> ApiResult<(Vec<u8>, String, u64)> {
         }
         let next = size + n as u64;
         if next > max {
-            return Err(ApiError::bad_request("object is larger than 1 GiB"));
+            return Err(ApiError::bad_request(::silo::object_too_large_message(
+                max as usize,
+            )));
         }
         hasher.update(&buf[..n]);
         out.extend_from_slice(&buf[..n]);

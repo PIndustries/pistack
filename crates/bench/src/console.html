@@ -172,6 +172,9 @@
     <button type="button" data-view="balancers">Load balancers</button>
     <button type="button" data-view="pods">Pods</button>
     <button type="button" data-view="deployments">Deployments</button>
+    <button type="button" data-view="statefulsets">StatefulSets</button>
+    <button type="button" data-view="daemonsets">DaemonSets</button>
+    <button type="button" data-view="autoscalers">Autoscalers</button>
     <button type="button" data-view="services">Services</button>
     <button type="button" data-view="jobs">Jobs</button>
     <button type="button" data-view="ingresses">Ingresses</button>
@@ -395,6 +398,47 @@ const VIEWS = {
       ["Updated", i => num(i.status, "updated")],
       ["Revision", i => num(i.status, "revision")],
       ["Image", i => templateImages(i)],
+    ],
+  },
+  statefulsets: {
+    title: "StatefulSets",
+    path: "/loom/statefulsets",
+    note: "Ready, current, and updated are counts from the StatefulSet status. Service name is optional stable identity.",
+    cols: [
+      ["Name", i => i.name],
+      ["Replicas", i => num(i.spec, "replicas")],
+      ["Ready", i => num(i.status, "ready")],
+      ["Current", i => num(i.status, "current")],
+      ["Updated", i => num(i.status, "updated")],
+      ["Service", i => i.spec && i.spec.service_name],
+      ["Image", i => templateImages(i)],
+    ],
+  },
+  daemonsets: {
+    title: "DaemonSets",
+    path: "/loom/daemonsets",
+    note: "Desired is eligible hosts. Current and ready are owned pods.",
+    cols: [
+      ["Name", i => i.name],
+      ["Desired", i => num(i.status, "desired")],
+      ["Current", i => num(i.status, "current")],
+      ["Ready", i => num(i.status, "ready")],
+      ["Image", i => templateImages(i)],
+    ],
+  },
+  autoscalers: {
+    title: "Autoscalers",
+    path: "/loom/autoscalers",
+    note: "Desired replicas come from the latest gauge sample against the target value, clamped to min and max.",
+    cols: [
+      ["Name", i => i.name],
+      ["Target kind", i => i.spec && i.spec.target_kind],
+      ["Target", i => i.spec && i.spec.target_name],
+      ["Metric", i => i.spec && i.spec.metric],
+      ["Min", i => num(i.spec, "min_replicas")],
+      ["Max", i => num(i.spec, "max_replicas")],
+      ["Desired", i => num(i.status, "desired_replicas")],
+      ["Current", i => num(i.status, "current_replicas")],
     ],
   },
   services: {
@@ -1218,6 +1262,95 @@ function createForm() {
         },
       });
       name.value = ""; container.value = ""; image.value = ""; replicas.value = "1";
+    });
+    return form;
+  }
+  if (current === "statefulsets") {
+    const name = el("input"); name.required = true; name.placeholder = "db";
+    const replicas = el("input"); replicas.type = "number"; replicas.min = "0"; replicas.value = "1"; replicas.required = true;
+    const container = el("input"); container.placeholder = "same as name";
+    const image = el("input"); image.required = true; image.placeholder = "postgres:16";
+    const service = el("input"); service.placeholder = "optional";
+    form.append(el("strong", "New StatefulSet"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Replicas", replicas), field("Container", container), field("Image", image), field("Service", service));
+    form.append(row);
+    const go = el("button", "Create StatefulSet"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const n = name.value.trim();
+      const spec = {
+        replicas: intField(replicas.value, "replicas", 0),
+        template: {
+          labels: { app: n },
+          spec: { containers: [{ name: container.value.trim() || n, image: image.value.trim() }] },
+        },
+      };
+      const svc = service.value.trim();
+      if (svc) spec.service_name = svc;
+      await api("POST", "/loom/statefulsets", { name: n, spec });
+      name.value = ""; container.value = ""; image.value = ""; replicas.value = "1"; service.value = "";
+    });
+    return form;
+  }
+  if (current === "daemonsets") {
+    const name = el("input"); name.required = true; name.placeholder = "agent";
+    const container = el("input"); container.placeholder = "same as name";
+    const image = el("input"); image.required = true; image.placeholder = "busybox";
+    form.append(el("strong", "New DaemonSet"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Container", container), field("Image", image));
+    form.append(row);
+    const go = el("button", "Create DaemonSet"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const n = name.value.trim();
+      await api("POST", "/loom/daemonsets", {
+        name: n,
+        spec: {
+          template: {
+            labels: { app: n },
+            spec: { containers: [{ name: container.value.trim() || n, image: image.value.trim() }] },
+          },
+        },
+      });
+      name.value = ""; container.value = ""; image.value = "";
+    });
+    return form;
+  }
+  if (current === "autoscalers") {
+    const name = el("input"); name.required = true; name.placeholder = "web-scale";
+    const targetKind = el("select");
+    targetKind.append(option("Deployment", "Deployment"), option("StatefulSet", "StatefulSet"));
+    const target = el("input"); target.required = true; target.placeholder = "web";
+    const metric = el("input"); metric.required = true; metric.placeholder = "cpu.usage";
+    const targetValue = el("input"); targetValue.type = "number"; targetValue.step = "any"; targetValue.required = true; targetValue.value = "70";
+    const minR = el("input"); minR.type = "number"; minR.min = "1"; minR.value = "1"; minR.required = true;
+    const maxR = el("input"); maxR.type = "number"; maxR.min = "1"; maxR.value = "5"; maxR.required = true;
+    form.append(el("strong", "New autoscaler"));
+    const row = el("div"); row.className = "row";
+    row.append(field("Name", name), field("Target kind", targetKind), field("Target", target), field("Metric", metric), field("Target value", targetValue), field("Min", minR), field("Max", maxR));
+    form.append(row);
+    const go = el("button", "Create autoscaler"); go.className = "primary"; go.type = "submit";
+    form.append(go);
+    onCreate(form, go, async () => {
+      const t = Number(String(targetValue.value).trim());
+      if (!Number.isFinite(t)) throw new Error("target value must be a finite number");
+      const min = intField(minR.value, "min", 1);
+      const max = intField(maxR.value, "max", 1);
+      if (max < min) throw new Error("max must be at least min");
+      await api("POST", "/loom/autoscalers", {
+        name: name.value.trim(),
+        spec: {
+          target_kind: targetKind.value,
+          target_name: target.value.trim(),
+          metric: metric.value.trim(),
+          target_value: t,
+          min_replicas: min,
+          max_replicas: max,
+        },
+      });
+      name.value = ""; target.value = ""; metric.value = "";
     });
     return form;
   }

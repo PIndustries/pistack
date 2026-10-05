@@ -6,7 +6,9 @@
 //! Cluster IPs come from a CIDR (default `10.96.0.0/12`) through a counter
 //! kept in the store's meta table, so they survive restarts and never
 //! repeat while the counter lasts. Endpoints are the `Running` pods in the
-//! service's project whose labels match `spec.selector`. `NodePort` and
+//! service's project that are ready (see `PodStatus::is_ready`; a pod
+//! without a readiness probe is ready once its containers run) and whose
+//! labels match `spec.selector`. `NodePort` and
 //! `LoadBalancer` services also hold one node port per service port, the
 //! one `spec` asks for or the lowest free one in 30000-32767, and two
 //! services never share one. Every change is handed to the
@@ -163,22 +165,7 @@ impl ServiceController {
                 None => self.allocate_ip(taken)?.to_string(),
             },
         };
-        let mut endpoints: Vec<Endpoint> = pods
-            .iter()
-            .filter(|p| {
-                p.meta.project == svc.meta.project
-                    && !delete_requested(p)
-                    && p.status.phase == PodPhase::Running
-                    && p.status.pod_ip.is_some()
-                    && labels_match(&svc.spec.selector, &p.meta.labels)
-            })
-            .map(|p| Endpoint {
-                ip: p.status.pod_ip.clone().unwrap_or_default(),
-                pod: p.meta.id.clone(),
-                host: p.status.host.clone(),
-            })
-            .collect();
-        endpoints.sort_by(|a, b| a.pod.cmp(&b.pod));
+        let endpoints = endpoints_for(svc, pods);
 
         let (node_ports, port_err) = match node_ports_for(svc, taken_ports) {
             Ok(ports) => (ports, None),
@@ -286,6 +273,31 @@ impl Controller for ServiceController {
     }
 }
 
+/// The pods a service sends traffic to: running and ready pods in the
+/// service's project whose labels match its selector, sorted by pod id.
+/// A pod still starting, or held back by a failing readiness probe, is
+/// left out until it turns ready.
+fn endpoints_for(svc: &Service, pods: &[Pod]) -> Vec<Endpoint> {
+    let mut endpoints: Vec<Endpoint> = pods
+        .iter()
+        .filter(|p| {
+            p.meta.project == svc.meta.project
+                && !delete_requested(p)
+                && p.status.phase == PodPhase::Running
+                && p.status.is_ready()
+                && p.status.pod_ip.is_some()
+                && labels_match(&svc.spec.selector, &p.meta.labels)
+        })
+        .map(|p| Endpoint {
+            ip: p.status.pod_ip.clone().unwrap_or_default(),
+            pod: p.meta.id.clone(),
+            host: p.status.host.clone(),
+        })
+        .collect();
+    endpoints.sort_by(|a, b| a.pod.cmp(&b.pod));
+    endpoints
+}
+
 #[cfg(test)]
 mod node_port_tests {
     use super::*;
@@ -357,5 +369,60 @@ mod node_port_tests {
         let taken = BTreeMap::from([(30000, Id::new(crate::kinds::SERVICE))]);
         let got = node_ports_for(&s, &taken).unwrap();
         assert_eq!(got, BTreeMap::from([(80, 30001)]));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use crate::types::{PodSpec, PodStatus, ServiceSpec, ServiceStatus, POD_READY};
+    use pistack_types::Meta;
+
+    fn svc() -> Service {
+        Service {
+            meta: Meta::new(crate::kinds::SERVICE, "web", None),
+            spec: ServiceSpec {
+                selector: BTreeMap::from([("app".to_string(), "web".to_string())]),
+                ..ServiceSpec::default()
+            },
+            status: ServiceStatus::default(),
+        }
+    }
+
+    fn pod(name: &str, ip: &str, ready: bool) -> Pod {
+        let mut meta = Meta::new(crate::kinds::POD, name, None);
+        meta.labels = BTreeMap::from([("app".to_string(), "web".to_string())]);
+        let mut status = PodStatus {
+            phase: PodPhase::Running,
+            pod_ip: Some(ip.to_string()),
+            ..PodStatus::default()
+        };
+        set_condition(&mut status.conditions, POD_READY, ready, "Test", "");
+        Pod {
+            meta,
+            spec: PodSpec::default(),
+            status,
+        }
+    }
+
+    #[test]
+    fn running_but_not_ready_pod_is_left_out_until_ready() {
+        let s = svc();
+        let mut pods = vec![pod("a", "10.0.0.2", true), pod("b", "10.0.0.3", false)];
+        let ips: Vec<String> = endpoints_for(&s, &pods).into_iter().map(|e| e.ip).collect();
+        assert_eq!(ips, vec!["10.0.0.2".to_string()]);
+
+        set_condition(&mut pods[1].status.conditions, POD_READY, true, "Test", "");
+        let mut ips: Vec<String> = endpoints_for(&s, &pods).into_iter().map(|e| e.ip).collect();
+        ips.sort();
+        assert_eq!(ips, vec!["10.0.0.2".to_string(), "10.0.0.3".to_string()]);
+    }
+
+    #[test]
+    fn pod_with_no_ready_condition_is_left_out() {
+        let s = svc();
+        let mut p = pod("a", "10.0.0.2", true);
+        p.status.conditions.clear();
+        assert!(endpoints_for(&s, &[p]).is_empty());
     }
 }
