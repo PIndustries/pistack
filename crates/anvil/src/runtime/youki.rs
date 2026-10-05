@@ -21,6 +21,13 @@
 //! the probe timeout and a small output cap, and they do not pass an
 //! environment.
 //!
+//! Unpacking a layer keeps the permission bits from each tar header, including
+//! execute. Directory modes are applied after that layer's children are on
+//! disk, so a read-only directory does not block extraction. Setuid and
+//! setgid are kept only when the agent is root or sudo mode is on; otherwise
+//! those two bits are cleared. A symlink whose target resolves outside the
+//! rootfs is not followed.
+//!
 //! `youki create` and `youki start` do not inherit the agent's pipes. With
 //! `process.terminal` false, the container init keeps youki's stdout and
 //! stderr open while it waits for `start`, so waiting on those pipes for EOF
@@ -97,6 +104,7 @@ use pistack_rpc::proto::{DiskTarget, ExecOutput};
 use pistack_types::{kind, ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -1494,6 +1502,7 @@ struct TempPath(PathBuf);
 impl Drop for TempPath {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        chmod_writable(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -1591,10 +1600,17 @@ fn apply_docker(staging: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
         .and_then(|v| v.as_array())
         .ok_or_else(cannot_unpack)?;
     let mut budget = MAX_IMAGE_BYTES;
+    let mut dir_modes = BTreeMap::new();
     for layer in layers {
         let rel = layer.as_str().ok_or_else(cannot_unpack)?;
-        apply_layer(&staging.join(safe_rel(rel)?), rootfs, &mut budget)?;
+        apply_layer(
+            &staging.join(safe_rel(rel)?),
+            rootfs,
+            &mut budget,
+            &mut dir_modes,
+        )?;
     }
+    finish_dir_modes(rootfs, &dir_modes)?;
     Ok(cfg)
 }
 
@@ -1621,6 +1637,7 @@ fn apply_oci(layout: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
         .and_then(|v| v.as_array())
         .ok_or_else(cannot_unpack)?;
     let mut budget = MAX_IMAGE_BYTES;
+    let mut dir_modes = BTreeMap::new();
     for layer in layers {
         if layer
             .get("mediaType")
@@ -1636,8 +1653,14 @@ fn apply_oci(layout: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
             .get("digest")
             .and_then(|d| d.as_str())
             .ok_or_else(cannot_unpack)?;
-        apply_layer(&blob_file(layout, digest)?, rootfs, &mut budget)?;
+        apply_layer(
+            &blob_file(layout, digest)?,
+            rootfs,
+            &mut budget,
+            &mut dir_modes,
+        )?;
     }
+    finish_dir_modes(rootfs, &dir_modes)?;
     Ok(cfg)
 }
 
@@ -1700,14 +1723,26 @@ fn safe_rel(name: &str) -> ApiResult<PathBuf> {
     rel_under(name).ok_or_else(cannot_unpack)
 }
 
-fn apply_layer(path: &Path, rootfs: &Path, budget: &mut u64) -> ApiResult<()> {
+fn apply_layer(
+    path: &Path,
+    rootfs: &Path,
+    budget: &mut u64,
+    dir_modes: &mut BTreeMap<PathBuf, u32>,
+) -> ApiResult<()> {
     let owned = decompress_to_tar(path)?;
-    extract_tar_budget(&owned.path, rootfs, true, budget)
+    extract_tar_budget(&owned.path, rootfs, true, budget, dir_modes)
 }
 
 fn extract_tar(path: &Path, dest: &Path, whiteouts: bool) -> ApiResult<()> {
     let mut budget = MAX_IMAGE_BYTES;
-    extract_tar_budget(path, dest, whiteouts, &mut budget)
+    let mut dir_modes = BTreeMap::new();
+    extract_tar_budget(path, dest, whiteouts, &mut budget, &mut dir_modes)?;
+    // The staging extract (whiteouts off) only classifies the archive.
+    // Leave those directories writable so the temp dir can be removed.
+    if whiteouts {
+        finish_dir_modes(dest, &dir_modes)?;
+    }
+    Ok(())
 }
 
 fn extract_tar_budget(
@@ -1715,13 +1750,16 @@ fn extract_tar_budget(
     dest: &Path,
     whiteouts: bool,
     budget: &mut u64,
+    dir_modes: &mut BTreeMap<PathBuf, u32>,
 ) -> ApiResult<()> {
+    let anchor = Anchor::open(dest)?;
     let file = std::fs::File::open(path).map_err(|_| cannot_unpack())?;
     let mut tar = TarReader {
         inner: file,
         pending_name: None,
         pending_link: None,
     };
+    let privileged = keep_setid();
     while let Some(ent) = tar.next_entry()? {
         let rel = match rel_under(&ent.name) {
             Some(rel) => rel,
@@ -1731,31 +1769,37 @@ fn extract_tar_budget(
             }
             None => return Err(cannot_unpack()),
         };
-        if whiteouts && apply_whiteout(dest, &rel)? {
+        let mode = mask_mode(ent.mode, privileged);
+        if whiteouts && apply_whiteout(&anchor, &rel, dir_modes)? {
             tar.discard(ent.size)?;
             continue;
         }
         match ent.flag {
             b'5' => {
                 tar.discard(ent.size)?;
-                std::fs::create_dir_all(dest.join(&rel)).map_err(|_| cannot_unpack())?;
+                anchor.ensure_dir(&rel)?;
+                let key = anchor.logical_full(&rel)?;
+                if key != rel {
+                    dir_modes.remove(&rel);
+                }
+                dir_modes.insert(key, mode);
             }
             b'2' => {
                 tar.discard(ent.size)?;
-                place_symlink(dest, &rel, &ent.link)?;
+                forget_tree(dir_modes, &anchor, &rel);
+                place_symlink_in(&anchor, &rel, &ent.link)?;
             }
             b'1' => {
                 tar.discard(ent.size)?;
-                place_hardlink(dest, &rel, &ent.link)?;
+                forget_tree(dir_modes, &anchor, &rel);
+                place_hardlink(&anchor, &rel, &ent.link)?;
             }
             b'0' | 0 => {
-                let dest_file = dest.join(&rel);
-                if let Some(parent) = dest_file.parent() {
-                    std::fs::create_dir_all(parent).map_err(|_| cannot_unpack())?;
-                }
-                remove_path(&dest_file)?;
-                let out = std::fs::File::create(&dest_file).map_err(|_| cannot_unpack())?;
-                tar.copy_entry(ent.size, out, budget)?;
+                forget_tree(dir_modes, &anchor, &rel);
+                let dest_file = anchor.prepare_file(&rel)?;
+                let mut out = open_nofollow_new(&dest_file)?;
+                tar.copy_entry(ent.size, &mut out, budget)?;
+                set_file_mode(&out, mode)?;
             }
             _ => tar.discard(ent.size)?,
         }
@@ -1763,21 +1807,340 @@ fn extract_tar_budget(
     Ok(())
 }
 
-fn apply_whiteout(root: &Path, rel: &Path) -> ApiResult<bool> {
+/// Setuid and setgid stay when this agent is root or sudo mode is on.
+/// Rootless unpack clears them so a layer cannot plant a privileged binary.
+fn keep_setid() -> bool {
+    let (uid, _) = agent_ids();
+    uid == 0 || env_flag(SUDO_ENV)
+}
+
+fn mask_mode(mode: u32, keep_setid: bool) -> u32 {
+    let mode = mode & 0o7777;
+    if keep_setid {
+        mode
+    } else {
+        mode & !0o6000
+    }
+}
+
+fn finish_dir_modes(dest: &Path, dir_modes: &BTreeMap<PathBuf, u32>) -> ApiResult<()> {
+    if dir_modes.is_empty() {
+        return Ok(());
+    }
+    let anchor = Anchor::open(dest)?;
+    let mut entries: Vec<(&Path, u32)> = dir_modes.iter().map(|(p, m)| (p.as_path(), *m)).collect();
+    // Deepest first, while parent directories are still searchable.
+    entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (rel, mode) in entries {
+        let Some(path) = anchor.existing(rel)? else {
+            continue;
+        };
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| cannot_unpack())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        set_mode_nofollow(&path, mode)?;
+    }
+    Ok(())
+}
+
+fn forget_tree(modes: &mut BTreeMap<PathBuf, u32>, anchor: &Anchor, rel: &Path) {
+    if let Ok(key) = anchor.logical_full(rel) {
+        forget_path(modes, &key);
+    }
+    forget_path(modes, rel);
+}
+
+fn forget_path(modes: &mut BTreeMap<PathBuf, u32>, rel: &Path) {
+    modes.retain(|path, _| path != rel && !path.starts_with(rel));
+}
+
+fn forget_children(modes: &mut BTreeMap<PathBuf, u32>, rel: &Path) {
+    if rel.as_os_str().is_empty() {
+        modes.clear();
+        return;
+    }
+    modes.retain(|path, _| path == rel || !path.starts_with(rel));
+}
+
+/// Rootfs directory. Paths are resolved against the canonical root so a
+/// symlink cannot point an extract at a host path outside it.
+struct Anchor {
+    root: PathBuf,
+}
+
+impl Anchor {
+    fn open(dest: &Path) -> ApiResult<Self> {
+        match std::fs::symlink_metadata(dest) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(cannot_unpack());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dest).map_err(|_| cannot_unpack())?;
+            }
+            Err(_) => return Err(cannot_unpack()),
+        }
+        let root = dest.canonicalize().map_err(|_| cannot_unpack())?;
+        Ok(Self { root })
+    }
+
+    fn abs(&self, logical: &Path) -> PathBuf {
+        self.root.join(logical)
+    }
+
+    /// Parent relative to the root, plus the final component.
+    /// `create` makes missing parent directories writable (mode `0o755`).
+    fn split(&self, rel: &Path, create: bool) -> ApiResult<Option<(PathBuf, OsString)>> {
+        let mut parts = normal_parts(rel);
+        let Some(name) = parts.pop() else {
+            return Err(cannot_unpack());
+        };
+        let Some(logical) = self.walk(&parts, create)? else {
+            return Ok(None);
+        };
+        Ok(Some((logical, name)))
+    }
+
+    fn logical_full(&self, rel: &Path) -> ApiResult<PathBuf> {
+        let (logical, name) = self.split(rel, false)?.ok_or_else(cannot_unpack)?;
+        Ok(logical.join(name))
+    }
+
+    fn existing(&self, rel: &Path) -> ApiResult<Option<PathBuf>> {
+        let Some((logical, name)) = self.split(rel, false)? else {
+            return Ok(None);
+        };
+        let full = self.abs(&logical).join(name);
+        match std::fs::symlink_metadata(&full) {
+            Ok(_) => Ok(Some(full)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(cannot_unpack()),
+        }
+    }
+
+    fn prepare_file(&self, rel: &Path) -> ApiResult<PathBuf> {
+        let (logical, name) = self.split(rel, true)?.ok_or_else(cannot_unpack)?;
+        let dest = self.abs(&logical).join(name);
+        remove_path(&dest)?;
+        Ok(dest)
+    }
+
+    fn ensure_dir(&self, rel: &Path) -> ApiResult<()> {
+        let (logical, name) = self.split(rel, true)?.ok_or_else(cannot_unpack)?;
+        let dest = self.abs(&logical).join(name);
+        match std::fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => loosen_dir(&dest)?,
+            Ok(_) => {
+                remove_path(&dest)?;
+                make_writable_dir(&dest)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => make_writable_dir(&dest)?,
+            Err(_) => return Err(cannot_unpack()),
+        }
+        Ok(())
+    }
+
+    /// Walk `parts`, following symlinks that stay inside the root.
+    /// An absolute link, or a relative link that climbs out, is an error.
+    fn walk(&self, parts: &[OsString], create: bool) -> ApiResult<Option<PathBuf>> {
+        let mut logical = PathBuf::new();
+        let mut pending = parts.to_vec();
+        let mut index = 0usize;
+        let mut hops = 0u32;
+        while index < pending.len() {
+            let name = pending[index].clone();
+            if name.is_empty() || name == "." || name == ".." {
+                return Err(cannot_unpack());
+            }
+            let full = self.abs(&logical).join(&name);
+            match std::fs::symlink_metadata(&full) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    hops += 1;
+                    if hops > 40 {
+                        return Err(cannot_unpack());
+                    }
+                    let target = std::fs::read_link(&full).map_err(|_| cannot_unpack())?;
+                    let Some(linked) = join_logical(&logical, &target) else {
+                        return Err(cannot_unpack());
+                    };
+                    let mut next = normal_parts(&linked);
+                    next.extend(pending[index + 1..].iter().cloned());
+                    pending = next;
+                    logical = PathBuf::new();
+                    index = 0;
+                }
+                Ok(meta) if meta.is_dir() => {
+                    logical.push(&name);
+                    index += 1;
+                }
+                Ok(_) => return Err(cannot_unpack()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if !create {
+                        return Ok(None);
+                    }
+                    make_writable_dir(&full)?;
+                    logical.push(&name);
+                    index += 1;
+                }
+                Err(_) => return Err(cannot_unpack()),
+            }
+        }
+        Ok(Some(logical))
+    }
+}
+
+fn normal_parts(path: &Path) -> Vec<OsString> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `base` is relative to the root. `target` is the symlink text.
+/// `None` means the link leaves the rootfs.
+fn join_logical(base: &Path, target: &Path) -> Option<PathBuf> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut parts: Vec<OsString> = normal_parts(base);
+    for comp in target.components() {
+        match comp {
+            Component::Normal(part) => {
+                let text = part.to_string_lossy();
+                if text.is_empty() || text == ".." || text.contains('/') {
+                    return None;
+                }
+                parts.push(part.to_os_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            _ => return None,
+        }
+    }
+    let mut out = PathBuf::new();
+    for part in parts {
+        out.push(part);
+    }
+    Some(out)
+}
+
+fn make_writable_dir(path: &Path) -> ApiResult<()> {
+    std::fs::create_dir(path).map_err(|_| cannot_unpack())?;
+    set_mode_nofollow(path, 0o755)
+}
+
+fn loosen_dir(path: &Path) -> ApiResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(path).map_err(|_| cannot_unpack())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(cannot_unpack());
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            set_mode_nofollow(path, (mode | 0o700) & 0o7777)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn open_nofollow_new(path: &Path) -> ApiResult<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path).map_err(|_| cannot_unpack())
+}
+
+fn set_file_mode(file: &std::fs::File, mode: u32) -> ApiResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata().map_err(|_| cannot_unpack())?.permissions();
+        perms.set_mode(mode & 0o7777);
+        file.set_permissions(perms).map_err(|_| cannot_unpack())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, mode);
+    }
+    Ok(())
+}
+
+fn set_mode_nofollow(path: &Path, mode: u32) -> ApiResult<()> {
+    let meta = std::fs::symlink_metadata(path).map_err(|_| cannot_unpack())?;
+    // chmod follows a final symlink. Refuse that rather than changing a
+    // target that may sit outside the rootfs. Callers pass a path whose
+    // parents were already resolved inside the root.
+    if meta.file_type().is_symlink() {
+        return Err(cannot_unpack());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = meta.permissions();
+        perms.set_mode(mode & 0o7777);
+        std::fs::set_permissions(path, perms).map_err(|_| cannot_unpack())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    Ok(())
+}
+
+fn apply_whiteout(
+    anchor: &Anchor,
+    rel: &Path,
+    dir_modes: &mut BTreeMap<PathBuf, u32>,
+) -> ApiResult<bool> {
     let Some(name) = rel.file_name().and_then(|s| s.to_str()) else {
         return Ok(false);
     };
     if name == ".wh..wh..opq" {
-        let dir = root.join(rel.parent().unwrap_or(Path::new("")));
-        clear_children(&dir)?;
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        if parent_rel.as_os_str().is_empty() {
+            clear_children(&anchor.root)?;
+            dir_modes.clear();
+        } else if let Some(dir) = anchor.existing(parent_rel)? {
+            clear_children(&dir)?;
+            if let Ok(logical) = dir.strip_prefix(&anchor.root) {
+                forget_children(dir_modes, logical);
+            }
+            forget_children(dir_modes, parent_rel);
+        }
         return Ok(true);
     }
     if let Some(rest) = name.strip_prefix(".wh.") {
         if rest.is_empty() || rest.contains('/') || rest == ".." {
             return Err(cannot_unpack());
         }
-        let target = root.join(rel.parent().unwrap_or(Path::new(""))).join(rest);
-        remove_path(&target)?;
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        let target_rel = if parent_rel.as_os_str().is_empty() {
+            PathBuf::from(rest)
+        } else {
+            parent_rel.join(rest)
+        };
+        if let Some(path) = anchor.existing(&target_rel)? {
+            remove_path(&path)?;
+        }
+        if let Ok(key) = anchor.logical_full(&target_rel) {
+            forget_path(dir_modes, &key);
+        }
+        forget_path(dir_modes, &target_rel);
         return Ok(true);
     }
     Ok(false)
@@ -1805,19 +2168,77 @@ fn remove_path(path: &Path) -> ApiResult<()> {
     let result = if meta.file_type().is_symlink() || !meta.is_dir() {
         std::fs::remove_file(path)
     } else {
+        // A layer may have left the directory without owner write.
+        chmod_writable(path);
         std::fs::remove_dir_all(path)
     };
     result.map_err(|_| cannot_unpack())
 }
 
+/// Loosen a directory this process can already access so `remove_dir_all`
+/// can unlink its children. Mode 000 is left unchanged: there is no owner
+/// bit to extend, and sudo mode hands that tree to the cleanup helper.
+/// Symlinks are not followed. A chmod that fails (the directory is not
+/// ours) is ignored.
+fn chmod_deletable(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0 && mode & 0o700 != 0o700 {
+            let _ = set_mode_nofollow(path, (mode | 0o700) & 0o7777);
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        chmod_deletable(&ent.path());
+    }
+}
+
+/// Add owner read, write, and execute so a read-only unpacked directory can
+/// still be deleted. Symlinks are not followed.
+fn chmod_writable(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = set_mode_nofollow(path, (mode | 0o700) & 0o7777);
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        chmod_writable(&ent.path());
+    }
+}
+
 fn place_symlink(root: &Path, rel: &Path, target: &str) -> ApiResult<()> {
+    let anchor = Anchor::open(root)?;
+    place_symlink_in(&anchor, rel, target)
+}
+
+fn place_symlink_in(anchor: &Anchor, rel: &Path, target: &str) -> ApiResult<()> {
     if !symlink_stays(rel, target) {
         return Err(cannot_unpack());
     }
-    let dest = root.join(rel);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| cannot_unpack())?;
-    }
+    let (logical, name) = anchor.split(rel, true)?.ok_or_else(cannot_unpack)?;
+    let dest = anchor.abs(&logical).join(name);
     remove_path(&dest)?;
     #[cfg(unix)]
     {
@@ -1857,14 +2278,41 @@ fn symlink_stays(link_rel: &Path, target: &str) -> bool {
     true
 }
 
-fn place_hardlink(root: &Path, rel: &Path, target: &str) -> ApiResult<()> {
+fn place_hardlink(anchor: &Anchor, rel: &Path, target: &str) -> ApiResult<()> {
     let target_rel = rel_under(target).ok_or_else(cannot_unpack)?;
-    let dest = root.join(rel);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| cannot_unpack())?;
+    let Some(src) = anchor.existing(&target_rel)? else {
+        return Err(cannot_unpack());
+    };
+    if !chain_stays(anchor, &src)? {
+        return Err(cannot_unpack());
     }
+    let (logical, name) = anchor.split(rel, true)?.ok_or_else(cannot_unpack)?;
+    let dest = anchor.abs(&logical).join(name);
     remove_path(&dest)?;
-    std::fs::hard_link(root.join(target_rel), dest).map_err(|_| cannot_unpack())
+    std::fs::hard_link(src, dest).map_err(|_| cannot_unpack())
+}
+
+/// True when `path` and every symlink it names stay inside the root.
+fn chain_stays(anchor: &Anchor, path: &Path) -> ApiResult<bool> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let meta = std::fs::symlink_metadata(&current).map_err(|_| cannot_unpack())?;
+        if !meta.file_type().is_symlink() {
+            return Ok(current.starts_with(&anchor.root));
+        }
+        let target = std::fs::read_link(&current).map_err(|_| cannot_unpack())?;
+        let Some(parent) = current.parent() else {
+            return Ok(false);
+        };
+        let Ok(parent_rel) = parent.strip_prefix(&anchor.root) else {
+            return Ok(false);
+        };
+        let Some(next_rel) = join_logical(parent_rel, &target) else {
+            return Ok(false);
+        };
+        current = anchor.abs(&next_rel);
+    }
+    Ok(false)
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> ApiResult<()> {
@@ -1923,6 +2371,7 @@ struct TarEntry {
     link: String,
     size: u64,
     flag: u8,
+    mode: u32,
 }
 
 impl<R: Read> TarReader<R> {
@@ -1941,6 +2390,8 @@ impl<R: Read> TarReader<R> {
                 return Err(cannot_unpack());
             }
             let flag = header[156];
+            let mode = parse_number(&header[100..108]).ok_or_else(cannot_unpack)?;
+            let mode = u32::try_from(mode & 0o7777).unwrap_or(0);
             let size = parse_number(&header[124..136]).ok_or_else(cannot_unpack)?;
             if size > MAX_IMAGE_BYTES {
                 return Err(cannot_unpack());
@@ -1980,6 +2431,7 @@ impl<R: Read> TarReader<R> {
                 link,
                 size,
                 flag,
+                mode,
             }));
         }
     }
@@ -2204,6 +2656,11 @@ fn remove_unprivileged(path: &Path) -> std::io::Result<()> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
         std::fs::remove_file(path)
     } else {
+        // A layer directory such as 0555 is still ours to delete when this
+        // uid can already access it. Mode 000 stays locked, and a directory
+        // we do not own is unchanged when chmod fails. Sudo mode removes
+        // those through the cleanup helper.
+        chmod_deletable(path);
         std::fs::remove_dir_all(path)
     }
 }
@@ -3887,6 +4344,12 @@ mod tests {
             std::env::remove_var(key);
             Self { key, prev }
         }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
     }
 
     impl Drop for EnvSlot {
@@ -4031,6 +4494,14 @@ fi
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    fn mode_bits(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
     fn ns_path(cfg: &serde_json::Value, kind: &str) -> Option<String> {
         cfg["linux"]["namespaces"]
             .as_array()
@@ -4078,10 +4549,18 @@ fi
     }
 
     fn tar_header(name: &str, size: u64, flag: u8) -> [u8; 512] {
+        tar_header_full(name, size, flag, 0o644, "")
+    }
+
+    fn tar_header_full(name: &str, size: u64, flag: u8, mode: u32, link: &str) -> [u8; 512] {
         let mut header = [0u8; 512];
         assert!(name.len() < 100, "{name}");
+        assert!(link.len() < 100, "{link}");
         header[..name.len()].copy_from_slice(name.as_bytes());
-        put_octal(&mut header[100..108], 0o644);
+        if !link.is_empty() {
+            header[157..157 + link.len()].copy_from_slice(link.as_bytes());
+        }
+        put_octal(&mut header[100..108], u64::from(mode));
         put_octal(&mut header[108..116], 0);
         put_octal(&mut header[116..124], 0);
         put_octal(&mut header[124..136], size);
@@ -4097,6 +4576,24 @@ fi
         header[154] = 0;
         header[155] = b' ';
         header
+    }
+
+    fn tar_nodes(entries: &[(&str, &[u8], u8, u32, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (name, data, flag, mode, link) in entries {
+            buf.extend_from_slice(&tar_header_full(
+                name,
+                data.len() as u64,
+                *flag,
+                *mode,
+                link,
+            ));
+            buf.extend_from_slice(data);
+            let pad = (512 - (data.len() % 512)) % 512;
+            buf.extend(std::iter::repeat_n(0u8, pad));
+        }
+        buf.extend(std::iter::repeat_n(0u8, 1024));
+        buf
     }
 
     fn tar_file(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -4493,6 +4990,180 @@ fi
             ErrorCode::NotFound
         );
         assert!(rt.list().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn setid_bits_follow_root_and_sudo() {
+        assert_eq!(mask_mode(0o4755, false), 0o755);
+        assert_eq!(mask_mode(0o2755, false), 0o755);
+        assert_eq!(mask_mode(0o6755, false), 0o755);
+        assert_eq!(mask_mode(0o1755, false), 0o1755);
+        assert_eq!(mask_mode(0o4755, true), 0o4755);
+        assert_eq!(mask_mode(0o2755, true), 0o2755);
+        assert_eq!(mask_mode(0o1777, true), 0o1777);
+    }
+
+    #[tokio::test]
+    async fn unpack_keeps_layer_file_modes() {
+        let _guard = env_lock().lock().await;
+        let _euid = EnvSlot::set("PISTACK_YOUKI_TEST_EUID", "1000");
+        let _sudo = EnvSlot::clear(SUDO_ENV);
+        assert!(!keep_setid());
+
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-modes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = TreeGuard(tmp.clone());
+
+        let layer = tar_nodes(&[
+            ("rodir", b"", b'5', 0o555, ""),
+            ("rodir/inside", b"in", b'0', 0o644, ""),
+            ("bin/httpd", b"httpd", b'0', 0o755, ""),
+            ("etc/config", b"cfg", b'0', 0o644, ""),
+            ("bin/suid", b"s", b'0', 0o4755, ""),
+            ("usr/bin/tool", b"tool", b'0', 0o755, ""),
+            ("linkbin", b"", b'2', 0o777, "usr/bin"),
+            ("linkbin/extra", b"ex", b'0', 0o644, ""),
+            ("bin/httpd-hl", b"", b'1', 0o755, "bin/httpd"),
+        ]);
+
+        let tar_path = tmp.join("layer.tar");
+        std::fs::write(&tar_path, &layer).unwrap();
+        let root = tmp.join("root");
+        std::fs::create_dir(&root).unwrap();
+        unpack_image(&tar_path, &root).unwrap();
+        assert_layer_modes(&root);
+
+        let oci = tmp.join("oci");
+        let blobs = oci.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let manifest = "aa".repeat(32);
+        let config = "bb".repeat(32);
+        let layer_hex = "cc".repeat(32);
+        std::fs::write(
+            oci.join("oci-layout"),
+            b"{\"imageLayoutVersion\":\"1.0.0\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            oci.join("index.json"),
+            format!(r#"{{"manifests":[{{"digest":"sha256:{manifest}"}}]}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            blobs.join(&manifest),
+            format!(
+                r#"{{"config":{{"digest":"sha256:{config}"}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{layer_hex}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            blobs.join(&config),
+            br#"{"config":{"Entrypoint":["/bin/httpd"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(blobs.join(&layer_hex), &layer).unwrap();
+        let oci_root = tmp.join("oci-root");
+        std::fs::create_dir(&oci_root).unwrap();
+        let cfg = unpack_image(&oci, &oci_root).unwrap();
+        assert_eq!(cfg.entrypoint, vec!["/bin/httpd".to_string()]);
+        assert_layer_modes(&oci_root);
+
+        // A rootless agent owns these directories, including mode 0555, and
+        // must be able to remove them without the cleanup helper.
+        let rootless = Privilege::Rootless {
+            uid: 1000,
+            gid: 1000,
+        };
+        delete_path(&root, &rootless).unwrap();
+        assert!(!root.exists());
+        delete_path(&oci_root, &rootless).unwrap();
+        assert!(!oci_root.exists());
+
+        let outside = PathBuf::from(format!(
+            "/tmp/yk-out-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let _outside = TreeGuard(outside.clone());
+        let link = outside.to_str().unwrap();
+        assert!(link.len() < 100, "{link}");
+        assert!(link.starts_with('/'));
+        assert!(!link.contains(".."));
+        let bad = tar_nodes(&[
+            ("jump", b"", b'2', 0o777, link),
+            ("jump/pwned", b"pwned", b'0', 0o644, ""),
+        ]);
+        let bad_tar = tmp.join("escape.tar");
+        std::fs::write(&bad_tar, bad).unwrap();
+        let bad_root = tmp.join("escape-root");
+        std::fs::create_dir(&bad_root).unwrap();
+        let err = unpack_image(&bad_tar, &bad_root).unwrap_err();
+        assert!(err.message.contains("image cannot be unpacked"), "{err}");
+        assert!(!outside.join("pwned").exists());
+        assert!(!bad_root.join("jump").join("pwned").exists());
+
+        std::env::set_var(SUDO_ENV, "1");
+        assert!(keep_setid());
+        std::env::remove_var(SUDO_ENV);
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "0");
+        assert!(keep_setid());
+    }
+
+    fn assert_layer_modes(root: &Path) {
+        assert_eq!(mode_of(&root.join("bin").join("httpd")), 0o755);
+        assert_eq!(
+            std::fs::read(root.join("bin").join("httpd")).unwrap(),
+            b"httpd"
+        );
+        assert_eq!(mode_of(&root.join("etc").join("config")), 0o644);
+        assert_eq!(
+            std::fs::read(root.join("etc").join("config")).unwrap(),
+            b"cfg"
+        );
+        assert_eq!(mode_of(&root.join("rodir")), 0o555);
+        assert_eq!(mode_of(&root.join("rodir").join("inside")), 0o644);
+        assert_eq!(
+            std::fs::read(root.join("rodir").join("inside")).unwrap(),
+            b"in"
+        );
+        assert_eq!(mode_bits(&root.join("bin").join("suid")), 0o755);
+        assert!(std::fs::symlink_metadata(root.join("linkbin"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(root.join("linkbin")).unwrap(),
+            Path::new("usr/bin")
+        );
+        assert_eq!(
+            std::fs::read(root.join("usr").join("bin").join("extra")).unwrap(),
+            b"ex"
+        );
+        assert_eq!(mode_of(&root.join("usr").join("bin").join("extra")), 0o644);
+        assert_eq!(
+            std::fs::read(root.join("bin").join("httpd-hl")).unwrap(),
+            b"httpd"
+        );
+        assert_eq!(mode_of(&root.join("bin").join("httpd-hl")), 0o755);
+    }
+
+    struct TreeGuard(PathBuf);
+    impl Drop for TreeGuard {
+        fn drop(&mut self) {
+            chmod_writable(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[tokio::test]
