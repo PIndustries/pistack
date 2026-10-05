@@ -110,7 +110,7 @@ impl RelayRealizer {
                 &name,
                 SERVICE_LABEL,
                 &service.meta.id.to_string(),
-                Provider::Ovn,
+                Provider::Forward,
                 ListenerProtocol::Tcp,
                 PoolProtocol::Tcp,
                 port.port,

@@ -68,9 +68,11 @@ pub const MANAGED_LABEL: &str = "pistack.io/managed-by";
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
-    /// L4 TCP. The in-process forwarder serves this value. The default.
+    /// L4 TCP and UDP. The in-process forwarder serves this value. The default.
+    /// Older rows and documents that say `ovn` read as this value.
     #[default]
-    Ovn,
+    #[serde(alias = "ovn")]
+    Forward,
     /// HTTP. The in-process reverse proxy serves this value.
     Relay,
 }
@@ -101,7 +103,7 @@ impl Default for BalancerSpec {
             vip_network: String::new(),
             vip_address: None,
             floating_ip: None,
-            provider: Provider::Ovn,
+            provider: Provider::Forward,
             admin_up: true,
         }
     }

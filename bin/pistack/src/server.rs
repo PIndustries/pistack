@@ -59,13 +59,7 @@ pub fn assemble(dev: bool) -> Assembly {
         Arc::new(silo::Silo),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),
-        Arc::new(
-            match std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref() {
-                Some("forward") => relay::Relay::forward(),
-                _ => relay::Relay::default(),
-            }
-            .with_queue(queue.clone()),
-        ),
+        Arc::new(relay_module().with_queue(queue.clone())),
         Arc::new(keep::Keep::default()),
         Arc::new(blueprint::Blueprint),
         Arc::new(gauge::Gauge),
@@ -83,6 +77,18 @@ pub fn assemble(dev: bool) -> Assembly {
 /// `PISTACK_FABRIC_BACKEND=overlay` is the VXLAN segment datapath. The agent
 /// applies that plan. Anything else, including an unset variable, keeps the
 /// mock backend so tests and a laptop server never touch interfaces.
+/// `PISTACK_RELAY_BACKEND=forward` mounts the in-process forwarder and HTTP
+/// proxy. Unset or `mock` keeps the mock. `run` refuses any other value
+/// before it gets here.
+fn relay_module() -> relay::Relay {
+    let backend = relay::RelayBackend::from_env().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "relay: falling back to the mock backend");
+        relay::RelayBackend::Mock
+    });
+    tracing::info!(backend = backend.name(), "relay: backend");
+    relay::Relay::for_backend(backend)
+}
+
 fn fabric_module() -> fabric::Fabric {
     match std::env::var("PISTACK_FABRIC_BACKEND").ok().as_deref() {
         Some("hostnat") => fabric::Fabric::hostnat(),
@@ -201,6 +207,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         );
     }
 
+    relay::RelayBackend::from_env().map_err(anyhow::Error::msg)?;
     let asm = assemble(opts.dev);
 
     // Start modules first so gate has generated its signing key before the

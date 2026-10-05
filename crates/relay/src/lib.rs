@@ -43,6 +43,43 @@ use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Which providers the relay module mounts, chosen by `PISTACK_RELAY_BACKEND`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RelayBackend {
+    /// Records balancers as ready without moving traffic. Tests and laptops.
+    #[default]
+    Mock,
+    /// In-process L4 forwarder plus the HTTP reverse proxy.
+    Forward,
+}
+
+impl RelayBackend {
+    /// Unset or empty is `Mock`. Anything other than `mock` or `forward`
+    /// (any case, surrounding spaces ignored) is an error, so a typo never
+    /// leaves balancers on the mock without anyone noticing.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("mock") => Ok(Self::Mock),
+            Some("forward") => Ok(Self::Forward),
+            Some(other) => Err(format!(
+                "PISTACK_RELAY_BACKEND={other:?} is not a relay backend; use mock or forward"
+            )),
+        }
+    }
+
+    /// Read `PISTACK_RELAY_BACKEND`.
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref())
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Forward => "forward",
+        }
+    }
+}
+
 /// How often the reconciler retries resources that are not `Ready`.
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -81,6 +118,14 @@ impl Relay {
             Arc::new(ForwardProvider::new()),
             Arc::new(RelayL7Provider::new()),
         ])
+    }
+
+    /// The module for `backend`.
+    pub fn for_backend(backend: RelayBackend) -> Self {
+        match backend {
+            RelayBackend::Mock => Self::default(),
+            RelayBackend::Forward => Self::forward(),
+        }
     }
 
     /// A `Client` over the context's store and this module's providers.
@@ -141,5 +186,37 @@ impl Module for Relay {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn backend_choice_is_explicit() {
+        assert_eq!(RelayBackend::parse(None), Ok(RelayBackend::Mock));
+        assert_eq!(RelayBackend::parse(Some("")), Ok(RelayBackend::Mock));
+        assert_eq!(RelayBackend::parse(Some("mock")), Ok(RelayBackend::Mock));
+        assert_eq!(RelayBackend::parse(Some("forward")), Ok(RelayBackend::Forward));
+        assert_eq!(RelayBackend::parse(Some(" Forward\n")), Ok(RelayBackend::Forward));
+        assert!(RelayBackend::parse(Some("fwd")).is_err());
+        assert!(RelayBackend::parse(Some("ovn")).is_err());
+    }
+
+    #[test]
+    fn forward_backend_serves_l4_and_http() {
+        let relay = Relay::for_backend(RelayBackend::Forward);
+        let names = relay.providers.names();
+        assert!(names.contains(&ForwardProvider::new().name()), "{names:?}");
+        assert!(!names.contains(&"mock"), "{names:?}");
+    }
+
+    #[test]
+    fn old_ovn_rows_read_as_forward() {
+        let p: Provider = serde_json::from_str("\"ovn\"").unwrap();
+        assert_eq!(p, Provider::Forward);
+        assert_eq!(serde_json::to_string(&p).unwrap(), "\"forward\"");
+        assert!(!OvnProvider::default().serves(Provider::Forward));
     }
 }
