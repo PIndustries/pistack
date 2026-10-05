@@ -46,6 +46,7 @@ Unset, the bare command name is used so PATH can supply it.
 from __future__ import annotations
 
 import argparse
+import copy
 import ipaddress
 import io
 import json
@@ -354,6 +355,23 @@ class Dnat:
 
 
 @dataclass
+class ServiceBackend:
+    address: str
+    port: int
+
+
+@dataclass
+class ServiceRule:
+    """A service address the router answers. IPv4, tcp or udp."""
+
+    id: str
+    address: str
+    protocol: str
+    port: int
+    backends: list[ServiceBackend]
+
+
+@dataclass
 class Floating:
     id: str
     floating: str
@@ -382,6 +400,7 @@ class Router:
     snat: bool
     dnat: list[Dnat]
     metadata: bool
+    services: list[ServiceRule] = field(default_factory=list)
 
 
 @dataclass
@@ -578,6 +597,37 @@ def parse_dnat(item: object) -> Dnat:
     )
 
 
+def _check_v4(value: object, what: str) -> str:
+    address = check_addr(value, what)
+    if addr_version(address) != 4:
+        die(f"{what} {address} is not ipv4")
+    return address
+
+
+def parse_service(item: object) -> ServiceRule:
+    raw = require_mapping(item, "service")
+    sid = check_id(raw.get("id"), "service id")
+    protocol = expect_str(raw.get("protocol"), "service protocol")
+    if protocol not in ("tcp", "udp"):
+        die(f"service {sid} protocol {protocol!r} is not tcp or udp")
+    backends = []
+    for entry in require_list(raw.get("backends", []), "service backends"):
+        b = require_mapping(entry, "service backend")
+        backends.append(
+            ServiceBackend(
+                address=_check_v4(b.get("address"), "service backend"),
+                port=expect_int(b.get("port"), "service backend port", 1, 65535),
+            )
+        )
+    return ServiceRule(
+        id=sid,
+        address=_check_v4(raw.get("address"), "service address"),
+        protocol=protocol,
+        port=expect_int(raw.get("port"), "service port", 1, 65535),
+        backends=backends,
+    )
+
+
 def parse_optional_ip(value: object, what: str) -> Optional[str]:
     if value is None:
         return None
@@ -607,6 +657,7 @@ def parse_router(item: object) -> Router:
         snat=expect_bool(raw.get("snat"), "snat"),
         dnat=[parse_dnat(rule) for rule in require_list(raw.get("dnat"), "dnat")],
         metadata=expect_bool(raw.get("metadata"), "metadata"),
+        services=[parse_service(rule) for rule in require_list(raw.get("services", []), "services")],
     )
     if router.external_ip is None and (router.snat or router.dnat):
         die(f"router {router.id} snat or dnat needs external_ip")
@@ -1264,6 +1315,9 @@ def build_desired(plan: Plan, comment_v4: bool, comment_v6: bool) -> Desired:
     meta: list[str] = []
     seen_fdb: set[tuple[str, str, str]] = set()
     seen_meta: set[str] = set()
+    # One entry per address, protocol, and port in each router namespace.
+    # Every leg lists its own backends; the namespace sends to all of them.
+    services: dict[tuple[str, str, str, int], ServiceRule] = {}
 
     def marked(address: str, ident: str) -> Optional[str]:
         on = comment_v6 if addr_version(address) == 6 else comment_v4
@@ -1323,6 +1377,17 @@ def build_desired(plan: Plan, comment_v4: bool, comment_v6: bool) -> Desired:
                 )
             )
         for router in net.routers:
+            for svc in router.services:
+                key = (router.netns, svc.address, svc.protocol, svc.port)
+                have = services.get(key)
+                if have is None:
+                    services[key] = ServiceRule(
+                        svc.id, svc.address, svc.protocol, svc.port, list(svc.backends)
+                    )
+                    continue
+                for backend in svc.backends:
+                    if backend not in have.backends:
+                        have.backends.append(backend)
             for iface in router.interfaces:
                 veths.append((iface.veth_bridge, iface.veth_ns, router.netns))
                 home = plan.by_id(iface.network_id)
@@ -1364,7 +1429,70 @@ def build_desired(plan: Plan, comment_v4: bool, comment_v6: bool) -> Desired:
                             ),
                         )
                     )
+    for (netns, _addr, _proto, _port), svc in services.items():
+        rules.extend(service_rules(netns, svc, marked(svc.address, svc.id)))
     return Desired(fdb, routes, veths, rules, meta, addrs)
+
+
+def service_rules(
+    netns: str, svc: ServiceRule, mark: Optional[str]
+) -> list[tuple[str, str, str, tuple[str, ...]]]:
+    """Answer a service address inside the router namespace.
+
+    New connections are spread evenly across the backends: rule i of n
+    matches with probability 1/(n-i), the last always. The reply has to come
+    back through the router, so the source becomes the router leg. With no
+    backends the connection is refused instead of left to hang.
+    """
+    dest = ["-d", host_cidr(svc.address), "-p", svc.protocol, "-m", svc.protocol, "--dport", str(svc.port)]
+    out: list[tuple[str, str, str, tuple[str, ...]]] = []
+    if not svc.backends:
+        reject = "tcp-reset" if svc.protocol == "tcp" else "icmp-port-unreachable"
+        out.append(
+            (netns, "filter", "FORWARD", finish_spec(dest, mark, ["-j", "REJECT", "--reject-with", reject]))
+        )
+        return out
+    count = len(svc.backends)
+    for i, backend in enumerate(svc.backends):
+        match = list(dest)
+        if i < count - 1:
+            match += ["-m", "statistic", "--mode", "random", "--probability", f"{1 / (count - i):.8f}"]
+        out.append(
+            (
+                netns,
+                "nat",
+                "PREROUTING",
+                finish_spec(
+                    match,
+                    mark,
+                    ["-j", "DNAT", "--to-destination", f"{backend.address}:{backend.port}"],
+                ),
+            )
+        )
+    out.append(
+        (
+            netns,
+            "nat",
+            "POSTROUTING",
+            finish_spec(
+                [
+                    "-p",
+                    svc.protocol,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "DNAT",
+                    "--ctorigdst",
+                    host_cidr(svc.address),
+                    "--ctorigdstport",
+                    str(svc.port),
+                ],
+                mark,
+                ["-j", "MASQUERADE"],
+            ),
+        )
+    )
+    return out
 
 
 def ensure_link(runner: Runner, created: set[str], name: str, argv: list[str]) -> bool:
@@ -1678,6 +1806,23 @@ def ensure_router(runner: Runner, plan: Plan, known_ns: set[str], created: set[s
     for iface in router.interfaces:
         ensure_iface(runner, plan, created, router, iface)
     ensure_external(runner, created, router)
+    if router.services:
+        # Service traffic leaves on the leg it came in on. Without this the
+        # router would tell the client to skip it, and the reply would miss
+        # the address rewrite.
+        _forward(runner, router.netns, 4)
+        for dev in ["all", "default", *[iface.veth_ns for iface in router.interfaces]]:
+            runner.mutate(
+                [
+                    runner.ip,
+                    "netns",
+                    "exec",
+                    router.netns,
+                    runner.sysctl,
+                    "-w",
+                    f"net.ipv4.conf.{dev}.send_redirects=0",
+                ]
+            )
     # external_dev is intentionally unused here.
 
 
@@ -2971,6 +3116,74 @@ def _check_delete_and_v6(td: str, log_path: str) -> None:
     os.environ["PISTACK_OVERLAY_DNSMASQ"] = os.path.join(bindir, "dnsmasq")
 
 
+def _check_services(td: str, log_path: str) -> None:
+    """Service addresses: spread, rewrite the source, refuse with no backend."""
+    doc = sample_plan(False)
+    router = doc["networks"][0]["routers"][0]
+    router["services"] = [
+        {
+            "id": "svc-web",
+            "address": "10.96.0.10",
+            "protocol": "tcp",
+            "port": 80,
+            "backends": [
+                {"address": "10.90.0.5", "port": 8080},
+                {"address": "10.90.0.6", "port": 8080},
+            ],
+        },
+        {"id": "svc-idle", "address": "10.96.0.11", "protocol": "udp", "port": 53, "backends": []},
+    ]
+    plan = parse_plan(doc)
+    # A second leg of the same namespace adds its own backend.
+    leg = copy.deepcopy(plan.networks[0].routers[0])
+    leg.services = [
+        ServiceRule("svc-web", "10.96.0.10", "tcp", 80, [ServiceBackend("10.90.0.7", 8080)]),
+    ]
+    plan.networks[1].routers.append(leg)
+    rules = build_desired(plan, True, True).rules
+    ns = router["netns"]
+    dnat = [spec for netns, table, chain, spec in rules if netns == ns and table == "nat" and chain == "PREROUTING" and "10.96.0.10/32" in spec]
+    _assert(len(dnat) == 3, "one rewrite per backend across legs")
+    _assert("0.33333333" in dnat[0] and "0.50000000" in dnat[1], "even spread")
+    _assert("statistic" not in dnat[2], "last backend always matches")
+    _assert(dnat[2][-1] == "10.90.0.7:8080", "second leg backend joined")
+    masq = [spec for netns, table, chain, spec in rules if netns == ns and chain == "POSTROUTING" and "MASQUERADE" in spec]
+    _assert(len(masq) == 1 and "10.96.0.10/32" in masq[0], "one source rewrite per service port")
+    refuse = [spec for netns, table, chain, spec in rules if netns == ns and table == "filter" and chain == "FORWARD"]
+    _assert(len(refuse) == 1 and "icmp-port-unreachable" in refuse[0], "idle udp service refused")
+    _assert(not any("10.96.0.11/32" in spec for _n, t, _c, spec in rules if t == "nat"), "idle service not rewritten")
+    for bad in (
+        {"protocol": "sctp"},
+        {"address": "fd00::10"},
+        {"port": 0},
+        {"backends": [{"address": "10.90.0.5", "port": 0}]},
+    ):
+        broken = copy.deepcopy(doc)
+        broken["networks"][0]["routers"][0]["services"][0].update(bad)
+        held = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            parse_plan(broken)
+        except SystemExit:
+            pass
+        else:
+            fail(f"self-test: bad service {bad} was accepted")
+        finally:
+            sys.stderr = held
+    os.environ["PISTACK_OVERLAY_STATE"] = os.path.join(td, "state-svc")
+    before = len(_load_log(log_path))
+    apply_text(json.dumps(doc), False)
+    applied = _load_log(log_path)[before:]
+    _assert(
+        any(_has(argv, "net.ipv4.conf.all.send_redirects=0") for argv in applied),
+        "router stops redirects",
+    )
+    _assert(
+        any(_has(argv, "DNAT", "10.90.0.5:8080") for argv in applied),
+        "service rewrite installed",
+    )
+
+
 def self_test() -> None:
     """Apply a two-network plan through fake ip/bridge/iptables/sysctl."""
     keys = (
@@ -3016,6 +3229,7 @@ def self_test() -> None:
         _check_log(mark, full[len(mark) :])
         _check_floating(mid[before:], end[len(mid) :])
         _check_delete_and_v6(td, log_path)
+        _check_services(td, log_path)
         confs = [
             name
             for name in os.listdir(os.path.join(td, "state"))
