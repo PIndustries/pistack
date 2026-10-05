@@ -9,6 +9,7 @@
 //! * [`Client`] — validation and writes; the library API other modules use
 //!   ([`Client::upsert_record`], [`Client::remove_record`]).
 //! * [`server`] — the hickory request handler and UDP/TCP listener.
+//! * [`xfer`] — secondary AXFR pull from configured primaries.
 //! * [`auto`] — `<machine>.<zone>` records for zones labelled
 //!   `pistack.io/auto=true`.
 //! * `api` — HTTP, mounted at `/dns`.
@@ -22,6 +23,7 @@ pub mod auto;
 pub mod client;
 pub mod server;
 pub mod types;
+pub mod xfer;
 
 pub use client::Client;
 pub use types::*;
@@ -81,6 +83,7 @@ impl Module for Beacon {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
+        let secondaries = server::SecondaryCache::new();
 
         let listen = match self.listen {
             Some(a) => a,
@@ -91,9 +94,43 @@ impl Module for Beacon {
             listen,
             ctx.events.clone(),
             ctx.shutdown.clone(),
+            secondaries.clone(),
         )
         .await?;
         let _ = self.bound.set(bound);
+
+        // Secondary AXFR pull runs on every node that serves DNS so the local
+        // secondary cache stays warm even when this node is not the leader.
+        {
+            let client = client.clone();
+            let secondaries = secondaries.clone();
+            let events = ctx.events.clone();
+            let shutdown = ctx.shutdown.clone();
+            tokio::spawn(async move {
+                transfer_secondaries(&client, &secondaries).await;
+                let mut rx = events.subscribe();
+                let mut tick = tokio::time::interval(RETRY_INTERVAL);
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        ev = rx.recv() => match ev {
+                            Ok(ev) if ev.kind == pistack_types::kind::ZONE => {
+                                transfer_secondaries(&client, &secondaries).await;
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                transfer_secondaries(&client, &secondaries).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = tick.tick() => {
+                            transfer_secondaries(&client, &secondaries).await;
+                        }
+                    }
+                }
+            });
+        }
 
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
@@ -149,4 +186,39 @@ impl Module for Beacon {
         });
         Ok(())
     }
+}
+
+/// AXFR-pull every secondary zone; refresh the in-memory cache and status.
+async fn transfer_secondaries(client: &Client, cache: &server::SecondaryCache) {
+    let zones = match client.secondary_zones() {
+        Ok(z) => z,
+        Err(e) => {
+            tracing::warn!(error = %e, "beacon: list secondaries");
+            return;
+        }
+    };
+    let mut keep = std::collections::HashSet::new();
+    for z in zones {
+        keep.insert(z.spec.name.clone());
+        let ZoneKind::Secondary { primaries } = &z.spec.kind else {
+            continue;
+        };
+        match xfer::pull_from_primaries(primaries, &z.spec.name).await {
+            Ok((serial, data, from)) => {
+                let records = data.record_count();
+                let digest = format!("{from}:{serial}:{records}");
+                cache.insert(data);
+                if let Err(e) = client.secondary_ready(&z.meta.id, serial, records, digest, &from) {
+                    tracing::warn!(zone = %z.spec.name, error = %e, "beacon: secondary Ready");
+                } else {
+                    tracing::info!(zone = %z.spec.name, serial, primary = %from, "beacon: secondary transferred");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(zone = %z.spec.name, error = %e, "beacon: secondary transfer failed");
+                let _ = client.secondary_failed(&z.meta.id, &e.to_string());
+            }
+        }
+    }
+    cache.retain_apices(&keep);
 }

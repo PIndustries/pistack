@@ -332,6 +332,136 @@ async fn auto_records_follow_machines() {
     h.ctx.shutdown.cancel();
 }
 
+#[tokio::test]
+async fn secondary_axfr_from_local_primary() {
+    let primary = harness().await;
+
+    let (st, zone) = primary
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "primary",
+                "spec": {
+                    "name": "xfer.cloud.",
+                    "email": "ops@xfer.cloud",
+                    "nameservers": ["ns1.xfer.cloud."]
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{zone}");
+    let zone_id = zone["id"].as_str().unwrap().to_owned();
+    primary.wait_serial(&zone_id, |s| s >= 1).await;
+    let (st, _) = primary
+        .call(
+            "POST",
+            "/recordsets",
+            Some(json!({
+                "name": "web-a",
+                "spec": {
+                    "zone": zone_id,
+                    "name": "web",
+                    "type": "A",
+                    "records": ["10.9.8.7"]
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    primary.wait_serial(&zone_id, |s| s >= 2).await;
+
+    // Second beacon with its own store: secondary-only zone pulled over AXFR.
+    let store2 = Store::in_memory().unwrap();
+    let module2 = Beacon::with_listen("127.0.0.1:0".parse().unwrap());
+    let ctx2 = ModuleContext {
+        store: Arc::new(store2.clone()),
+        events: store2.events(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        public_url: "http://test2".into(),
+        node_name: "test2".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    module2.start(ctx2.clone()).await.unwrap();
+    let dns2 = module2.bound_addr().unwrap();
+    let router2 = module2.router(ctx2.clone());
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/zones")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "name": "secondary",
+                "spec": {
+                    "name": "xfer.cloud.",
+                    "kind": {
+                        "type": "secondary",
+                        "primaries": [primary.dns.to_string()]
+                    },
+                    "email": "ops@xfer.cloud",
+                    "nameservers": ["ns1.xfer.cloud."]
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    req.extensions_mut().insert(admin_caller());
+    let res = router2.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let sec: Value = serde_json::from_slice(&bytes).unwrap();
+    let sec_id = sec["id"].as_str().unwrap().to_owned();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("/zones/{sec_id}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(admin_caller());
+        let res = router2.clone().oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let z: Value = serde_json::from_slice(&bytes).unwrap();
+        if z["status"]["phase"] == "ready" {
+            assert!(z["status"]["serial"].as_u64().unwrap() >= 2, "{z}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "secondary not ready: {z}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let conn = UdpClientStream::builder(dns2, TokioRuntimeProvider::default()).build();
+    let (mut client, bg) = DnsClient::<TokioRuntimeProvider>::from_sender(conn);
+    tokio::spawn(bg);
+    let resp = client
+        .query(
+            Name::from_str("web.xfer.cloud.").unwrap(),
+            DNSClass::IN,
+            Rt::A,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    let ip = resp.answers.iter().find_map(|r| match &r.data {
+        RData::A(a) => Some(a.0.to_string()),
+        _ => None,
+    });
+    assert_eq!(ip.as_deref(), Some("10.9.8.7"));
+
+    ctx2.shutdown.cancel();
+    primary.ctx.shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
 /// Stand-in for forge's `Machine`, sharing its wire shape and store key.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct RawMachine {
