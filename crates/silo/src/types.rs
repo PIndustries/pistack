@@ -263,6 +263,7 @@ mod tests {
         assert!(validate_key(".blobs/abcd").is_err());
         assert!(validate_key(".uploads/x").is_err());
         assert!(validate_key(r"foo\bar").is_err());
+        assert!(validate_key("a/").is_err());
     }
 
     #[test]

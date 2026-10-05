@@ -2483,3 +2483,213 @@ async fn list_multipart_uploads_delimiter_pagination() {
     assert_eq!(listed_uploads(&xml)[0].0, "b.bin");
     assert_eq!(xml_tag(&xml, "NextKeyMarker").as_deref(), Some("b.bin"));
 }
+
+// ---- ListObjectsV2 delimiter ---------------------------------------------------
+
+fn listed_contents_keys(xml: &str) -> Vec<String> {
+    xml.split("<Contents>")
+        .skip(1)
+        .filter_map(|block| {
+            let block = block.split("</Contents>").next()?;
+            xml_tag(block, "Key")
+        })
+        .collect()
+}
+
+async fn list_objects_v2(app: &Router, who: &Caller, uri: &str) -> String {
+    let (status, body, headers) = call(app, "GET", uri, None, "", Some(who)).await;
+    let xml = String::from_utf8_lossy(&body).into_owned();
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/xml"
+    );
+    assert!(xml.contains("<ListBucketResult"), "{xml}");
+    xml
+}
+
+async fn put_key(app: &Router, who: &Caller, bucket: &str, key: &str, body: &[u8]) {
+    let (status, resp, _) = call(
+        app,
+        "PUT",
+        &format!("/{bucket}/{key}"),
+        Some(body.to_vec()),
+        "application/octet-stream",
+        Some(who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{key}: {}",
+        String::from_utf8_lossy(&resp)
+    );
+}
+
+#[tokio::test]
+async fn list_objects_v2_delimiter_grouping() {
+    let (_dir, _client, app, _project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "ls-delim").await;
+
+    put_key(&app, &who, &bucket, "logs/a.bin", b"a").await;
+    put_key(&app, &who, &bucket, "logs/2024/x.bin", b"x").await;
+    put_key(&app, &who, &bucket, "logs/2024/y.bin", b"y").await;
+    put_key(&app, &who, &bucket, "readme.txt", b"r").await;
+    put_key(&app, &who, &bucket, "other/z.bin", b"z").await;
+
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2&delimiter=/")).await;
+    assert_eq!(xml_tag(&xml, "Delimiter").as_deref(), Some("/"));
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
+    assert_eq!(xml_tag(&xml, "KeyCount").as_deref(), Some("3"));
+    assert_eq!(
+        listed_common_prefixes(&xml),
+        vec!["logs/".to_owned(), "other/".to_owned()]
+    );
+    assert_eq!(listed_contents_keys(&xml), vec!["readme.txt".to_owned()]);
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&prefix=logs/&delimiter=/"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "Prefix").as_deref(), Some("logs/"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["logs/2024/".to_owned()]);
+    assert_eq!(listed_contents_keys(&xml), vec!["logs/a.bin".to_owned()]);
+
+    // Empty delimiter = no grouping.
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2&delimiter=")).await;
+    assert!(xml_tag(&xml, "Delimiter").is_none());
+    assert!(listed_common_prefixes(&xml).is_empty());
+    assert_eq!(listed_contents_keys(&xml).len(), 5);
+
+    // Non-'/' delimiter.
+    let bucket2 = ensure_bucket(&app, &who, "ls-delim2").await;
+    put_key(&app, &who, &bucket2, "foo::bar::c", b"1").await;
+    put_key(&app, &who, &bucket2, "foo::bar::d", b"2").await;
+    put_key(&app, &who, &bucket2, "plain", b"3").await;
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket2}?list-type=2&delimiter=::")).await;
+    assert_eq!(xml_tag(&xml, "Delimiter").as_deref(), Some("::"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["foo::".to_owned()]);
+    assert_eq!(listed_contents_keys(&xml), vec!["plain".to_owned()]);
+}
+
+#[tokio::test]
+async fn list_objects_v2_delimiter_pagination() {
+    let (_dir, _client, app, _project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "ls-page").await;
+    put_key(&app, &who, &bucket, "a/1", b"1").await;
+    put_key(&app, &who, &bucket, "a/2", b"2").await;
+    put_key(&app, &who, &bucket, "b.bin", b"b").await;
+    put_key(&app, &who, &bucket, "c/x", b"c").await;
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=1"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
+    assert_eq!(xml_tag(&xml, "KeyCount").as_deref(), Some("1"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
+    assert!(listed_contents_keys(&xml).is_empty());
+    assert_eq!(
+        xml_tag(&xml, "NextContinuationToken").as_deref(),
+        Some("a/")
+    );
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=1&continuation-token=a/"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
+    assert_eq!(listed_contents_keys(&xml), vec!["b.bin".to_owned()]);
+    assert!(listed_common_prefixes(&xml).is_empty());
+
+    // start-after across the same boundary.
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=2&start-after=a/"),
+    )
+    .await;
+    assert_eq!(listed_contents_keys(&xml), vec!["b.bin".to_owned()]);
+    assert_eq!(listed_common_prefixes(&xml), vec!["c/".to_owned()]);
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=2"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
+    assert_eq!(listed_contents_keys(&xml), vec!["b.bin".to_owned()]);
+    assert_eq!(
+        xml_tag(&xml, "NextContinuationToken").as_deref(),
+        Some("b.bin")
+    );
+}
+
+/// Trailing-slash keys stay rejected (directory placeholders are a
+/// separate change that needs a reserved-name storage guard).
+#[tokio::test]
+async fn trailing_slash_key_rejected_on_put_and_create_multipart() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "no-trail").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    let err = client
+        .put_object(&bucket_id, "a/", b"dir", None)
+        .await
+        .expect_err("put a/ must fail");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{err}");
+
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/a/"),
+        Some(b"dir".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let err = client
+        .create_multipart_upload(&bucket_id, "a/", None)
+        .await
+        .expect_err("create multipart a/ must fail");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{err}");
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/a/?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
