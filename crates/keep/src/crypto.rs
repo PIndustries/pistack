@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Encryption at rest: the software key backend.
+//! Encryption at rest.
 //!
 //! Every secret payload and every private key `keep` stores is sealed with
-//! AES-256-GCM under one root key. The root key is generated on first start
-//! and kept in the store's `meta` table under [`META_ROOT_KEY`], which means
-//! an attacker with the store file has the key too. This is the *software*
-//! backend: it makes the on-disk format and the API right so a PKCS#11 HSM
-//! or Vault transit backend can replace [`RootKey`] later without touching
-//! the resource model. Do not mistake it for an HSM.
+//! AES-256-GCM under one root key, [`RootKey`]. Where that key lives between
+//! restarts is the [`KeyBackend`](crate::backend::KeyBackend)'s job: the
+//! default *software* backend keeps it base64 in the store's `meta` table
+//! under [`META_ROOT_KEY`] (so an attacker with the store file has the key
+//! too; do not mistake it for an HSM), the Vault backend keeps only a
+//! Transit-wrapped copy, and PKCS#11 is parked. See `backend.rs`.
 //!
 //! The associated data of each seal is the owning resource's id, so a blob
 //! copied from one secret onto another fails to open.
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::error::{KeepError, Result};
 
-/// Store meta key holding the base64 root key.
+/// Store meta key holding the base64 root key (software backend).
 pub const META_ROOT_KEY: &str = "keep/root_key";
 const ALG: &str = "aes-256-gcm";
 
@@ -65,30 +65,22 @@ impl RootKey {
         Self::from_bytes(b)
     }
 
-    /// Read the root key when one is already stored. Does not create a key.
+    /// Read the root key through the process's configured backend
+    /// ([`backend::configured`](crate::backend::configured)) when one is
+    /// already stored. Does not create a key.
     pub fn load_existing(store: &Store) -> Result<Option<Self>> {
-        let Some(b64) = store.get_meta::<String>(META_ROOT_KEY)? else {
-            return Ok(None);
-        };
-        let raw = B64
-            .decode(b64.trim())
-            .map_err(|e| KeepError::Crypto(format!("root key is not base64: {e}")))?;
-        let bytes: [u8; 32] = raw
-            .try_into()
-            .map_err(|_| KeepError::Crypto("root key must be 32 bytes".into()))?;
-        Ok(Some(Self::from_bytes(bytes)))
+        crate::backend::configured()?.load_existing(store)
     }
 
-    /// Read the root key from the store, generating and persisting one on
-    /// first start.
+    /// Read the root key through the configured backend, generating and
+    /// persisting one on first start.
     pub fn load_or_create(store: &Store) -> Result<Self> {
-        if let Some(key) = Self::load_existing(store)? {
-            return Ok(key);
-        }
-        let key = Self::generate();
-        store.put_meta(META_ROOT_KEY, &B64.encode(*key.bytes))?;
-        tracing::info!("keep: generated root key (software backend)");
-        Ok(key)
+        crate::backend::configured()?.load_or_create(store)
+    }
+
+    /// The raw key, for a backend to persist or wrap.
+    pub(crate) fn bytes(&self) -> &[u8; 32] {
+        &self.bytes
     }
 
     fn cipher(&self) -> Result<Aes256Gcm> {

@@ -12,6 +12,10 @@ Each phase ends at a gate an outside tool decides.
 - [x] `pistack-rpc`: host command queue (HTTP long-poll) and event bus
 - [x] `gate`: projects, principals, roles, tokens, API keys, quotas; auth layer on the gateway; `--dev` mode
 - [x] `keep`: cloud CA (root + issuing), encrypted secrets, certificates, join tokens, rustls server/client configs (gateway TLS wiring pending)
+- `keep` root-key backends, chosen with `PISTACK_KEEP_BACKEND` (an unknown or parked value refuses to start; there is no fallback between backends):
+  - [x] `software` (default): the AES-256-GCM root key is base64 in store meta `keep/root_key`.
+  - [ ] Partial: `vault`. The root key is wrapped and unwrapped with a Vault Transit key over HTTP (`PISTACK_KEEP_VAULT_ADDR`, `_TOKEN` or `_TOKEN_FILE`, `_KEY`, optional `_MOUNT`, `_NAMESPACE`, `_CACERT`); only the ciphertext is stored, in `keep/root_key_wrapped`. Tested against a mock Transit server. Not done: moving an existing software key into Vault (refused with an error), re-wrapping after a Transit key rotation, a lab run against real Vault.
+  - [ ] Parked: `pkcs11`. Refused with an error; not implemented.
 - [x] `forge`: Host/Size/Machine, scheduler, reconciler, mock driver, RpcDriver + agent registrar
 - [x] `anvil`: host facts, runtime trait with mock, real `pistack agent --join` loop
 - [x] `loom`: Pod/ReplicaSet/Deployment/Service/ConfigMap/Job/CronJob/Ingress with six controllers on top of forge
