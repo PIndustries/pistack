@@ -19,6 +19,8 @@
 //! | extend          | `lvextend --size {new_size_gib}G {vg}/{vol_id}` |
 //! | attach_info     | same host: `Local { path: /dev/{vg}/{vol_id} }` |
 //! | image           | `qemu-img convert -O raw -f <fmt> -n <src> /dev/{vg}/{vol_id}` |
+//! | backup          | read `/dev/{vg}/{vol_id}` |
+//! | backup restore  | write `/dev/{vg}/{vol_id}` from byte 0 |
 //!
 //! Image bytes are written onto the logical volume after `lvcreate`.
 //! `-n` tells `qemu-img` the device already exists.
@@ -39,7 +41,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
+use super::{AttachInfo, AttachTarget, BackendRef, BackupStream, BlockBackend, RestoreStream};
 use crate::types::{Snapshot, Volume};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -111,6 +113,41 @@ impl LvmBackend {
         }
         ident("vg", &self.vg)?;
         Ok(&self.vg)
+    }
+
+    fn device_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf> {
+        let vg = self.vg()?;
+        let id = vol_id(vol)?;
+        Ok(std::path::PathBuf::from(format!("/dev/{vg}/{id}")))
+    }
+
+    async fn open_device(&self, vol: &Volume, write: bool) -> ApiResult<tokio::fs::File> {
+        self.require_available().await?;
+        let path = self.device_path(vol)?;
+        let mut options = tokio::fs::OpenOptions::new();
+        if write {
+            options.write(true);
+        } else {
+            options.read(true);
+        }
+        match options.open(&path).await {
+            Ok(mut file) => {
+                if write {
+                    use tokio::io::AsyncSeekExt;
+                    file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| {
+                        ApiError::internal(format!("lvm device {}: {e}", path.display()))
+                    })?;
+                }
+                Ok(file)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ApiError::unavailable(
+                format!("lvm device {} is not available", path.display()),
+            )),
+            Err(e) => Err(ApiError::internal(format!(
+                "lvm device {}: {e}",
+                path.display()
+            ))),
+        }
     }
 
     fn pool(&self) -> ApiResult<&str> {
@@ -269,6 +306,14 @@ impl BlockBackend for LvmBackend {
     async fn bytes_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf> {
         let _ = vol;
         Err(ApiError::unavailable("lvm backup is not available"))
+    }
+
+    async fn open_backup(&self, vol: &Volume) -> ApiResult<BackupStream> {
+        Ok(BackupStream::file(self.open_device(vol, false).await?))
+    }
+
+    async fn open_restore(&self, vol: &Volume) -> ApiResult<RestoreStream> {
+        Ok(RestoreStream::file(self.open_device(vol, true).await?))
     }
 }
 
@@ -523,5 +568,32 @@ mod tests {
             logged,
             args.iter().map(|a| format!("{a}\n")).collect::<String>()
         );
+    }
+
+    #[tokio::test]
+    async fn backup_opens_the_logical_volume_device() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("lvm");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+
+        let backend = LvmBackend::new("vg0", "pistack-thin");
+        let vol = volume(1);
+        let id = vol.meta.id.to_string();
+        let err = backend.open_backup(&vol).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable);
+        assert!(err.message.contains(&format!("/dev/vg0/{id}")), "{err}");
+        let err = backend.open_restore(&vol).await.unwrap_err();
+        assert!(err.message.contains(&format!("/dev/vg0/{id}")), "{err}");
     }
 }

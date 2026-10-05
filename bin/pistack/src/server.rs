@@ -63,6 +63,7 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
         Arc::new(fabric_module()),
         Arc::new(
             slab::Slab::default()
+                .with_silo_limits(silo_cfg.max_object_bytes, silo::MIN_PART_BYTES)
                 .with_queue(queue.clone())
                 .with_images(images.clone()),
         ),

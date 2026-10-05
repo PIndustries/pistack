@@ -1139,6 +1139,12 @@ async fn backup_round_trip_and_oversize_refusal() {
         .expect("upload")
         .expect("exists");
     assert_eq!(bak.status.phase, Phase::Ready, "{bak:?}");
+    assert_eq!(bak.status.size_bytes, payload.len() as u64);
+    assert!(bak.status.part_count >= 1, "{bak:?}");
+    assert_eq!(
+        bak.status.sha256.as_deref(),
+        Some(sha256_hex(payload).as_str())
+    );
     let key = bak.status.object_ref.clone().expect("object");
     let bucket = silo::Client::new(c.store().clone(), c.silo_root())
         .get_bucket(Some(&project), "backups")
@@ -1149,6 +1155,7 @@ async fn backup_round_trip_and_oversize_refusal() {
         .expect("object bytes");
     assert_eq!(bytes, payload);
     assert_eq!(obj.status.size_bytes, payload.len() as u64);
+    assert_eq!(obj.status.sha256, bak.status.sha256.clone().unwrap());
 
     let restored = c.restore_backup(&bak.meta.id).await.expect("restore");
     assert_eq!(restored.status.phase, Phase::Ready);
@@ -1157,48 +1164,6 @@ async fn backup_round_trip_and_oversize_refusal() {
     let mut got = vec![0u8; payload.len()];
     std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got).unwrap();
     assert_eq!(got, payload);
-
-    let huge = silo::MAX_OBJECT_BYTES as u64 + 1;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(huge)
-        .unwrap();
-    let big = c
-        .create_backup(Create {
-            name: "too-big".into(),
-            description: String::new(),
-            labels: Default::default(),
-            annotations: Default::default(),
-            project: None,
-            spec: slab::BackupSpec {
-                volume: vol.meta.id.clone(),
-                target: "backups".into(),
-            },
-        })
-        .await
-        .expect("big backup");
-    let err = c
-        .reconcile_backup(&big.meta.id)
-        .await
-        .expect_err("oversize");
-    assert_eq!(
-        err.code,
-        pistack_types::error::ErrorCode::Unavailable,
-        "{err}"
-    );
-    assert!(err.message.contains(&huge.to_string()), "{err}");
-    let big = c.backups().get(&big.meta.id).expect("big");
-    assert_ne!(big.status.phase, Phase::Ready);
-    assert!(big.status.object_ref.is_none());
-    let objects = silo::Client::new(c.store().clone(), c.silo_root())
-        .list_objects(&bucket.meta.id)
-        .expect("list");
-    assert!(
-        objects.iter().all(|o| o.spec.key == key),
-        "oversize backup must not write an object: {objects:?}"
-    );
 
     let blocked = dir.path().join("not-a-dir");
     std::fs::write(&blocked, b"x").unwrap();
@@ -1307,6 +1272,308 @@ async fn refs_outside_the_slab_dir_are_not_removed() {
         .expect("volume record stays");
     assert_eq!(vol.status.phase, Phase::Error);
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let dig = Sha256::digest(data);
+    let mut s = String::with_capacity(dig.len() * 2);
+    for b in dig {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn backup_spec(volume: Id) -> slab::BackupSpec {
+    slab::BackupSpec {
+        volume,
+        target: "backups".into(),
+    }
+}
+
+fn put_source(dir: &tempfile::TempDir, vol: &slab::Volume, bytes: &[u8]) -> std::path::PathBuf {
+    let path = LocalFileBackend::new(dir.path()).volume_path(vol);
+    std::fs::write(&path, bytes).expect("source bytes");
+    path
+}
+
+#[tokio::test]
+async fn multipart_backup_exceeds_tiny_max_and_round_trips() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = Client::local(dir.path())
+        .expect("client")
+        .with_silo_limits(32, 8);
+    c.seed_defaults().expect("seed");
+    let vol = c
+        .create_volume(create("src", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let payload: Vec<u8> = (0..100).collect();
+    assert!(payload.len() > 32);
+    let path = put_source(&dir, &vol, &payload);
+    let before = std::fs::read(&path).unwrap();
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+
+    let bak = c
+        .create_backup(Create {
+            name: "wide".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: backup_spec(vol.meta.id.clone()),
+        })
+        .await
+        .expect("backup");
+    let bak = c
+        .reconcile_backup(&bak.meta.id)
+        .await
+        .expect("upload")
+        .expect("exists");
+    assert_eq!(bak.status.phase, Phase::Ready, "{bak:?}");
+    assert_eq!(bak.status.size_bytes, payload.len() as u64);
+    assert_eq!(bak.status.part_count, 4, "32+32+32+4");
+    assert_eq!(
+        bak.status.sha256.as_deref(),
+        Some(sha256_hex(&payload).as_str())
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "backup must not write the volume"
+    );
+
+    let key = bak.status.object_ref.clone().expect("object");
+    let bucket = silo::Client::new(c.store().clone(), c.silo_root())
+        .get_bucket(Some(&project), "backups")
+        .expect("bucket");
+    let (obj, bytes) = silo::Client::new(c.store().clone(), c.silo_root())
+        .get_object(&bucket.meta.id, &key)
+        .await
+        .expect("object");
+    assert_eq!(bytes, payload);
+    assert_eq!(obj.status.sha256, sha256_hex(&payload));
+    let (uploads, _) = silo::Client::new(c.store().clone(), c.silo_root())
+        .list_multipart_uploads(&bucket.meta.id, None, None, None, 100, None)
+        .await
+        .expect("uploads");
+    assert!(uploads.is_empty(), "complete removes staging: {uploads:?}");
+
+    let restored = c.restore_backup(&bak.meta.id).await.expect("restore");
+    assert_eq!(restored.status.phase, Phase::Ready);
+    let restored_path = LocalFileBackend::new(dir.path()).volume_path(&restored);
+    let mut got = vec![0u8; payload.len()];
+    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got).unwrap();
+    assert_eq!(got, payload);
+    assert_eq!(sha256_hex(&got), bak.status.sha256.unwrap());
+}
+
+#[tokio::test]
+async fn multipart_failure_aborts_and_leaves_no_object() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = Client::local(dir.path())
+        .expect("client")
+        .with_silo_limits(32, 8)
+        .fail_backup_after_parts(1);
+    c.seed_defaults().expect("seed");
+    let vol = c
+        .create_volume(create("src", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let payload: Vec<u8> = (0..80).collect();
+    let path = put_source(&dir, &vol, &payload);
+    let before = std::fs::read(&path).unwrap();
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+    let bak = c
+        .create_backup(Create {
+            name: "boom".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: backup_spec(vol.meta.id.clone()),
+        })
+        .await
+        .expect("backup");
+    let bak = c
+        .reconcile_backup(&bak.meta.id)
+        .await
+        .expect("failed upload returns the record")
+        .expect("exists");
+    assert_eq!(bak.status.phase, Phase::Error, "{bak:?}");
+    assert!(bak.status.object_ref.is_none(), "{bak:?}");
+    let uploaded = bak
+        .status
+        .conditions
+        .iter()
+        .find(|cnd| cnd.kind == "Uploaded")
+        .expect("condition");
+    assert!(!uploaded.status);
+    assert!(uploaded.message.contains("after 1"), "{uploaded:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        c.volumes().get(&vol.meta.id).unwrap().status.phase,
+        Phase::Ready
+    );
+
+    let bucket = silo::Client::new(c.store().clone(), c.silo_root())
+        .get_bucket(Some(&project), "backups")
+        .expect("bucket");
+    let silo = silo::Client::new(c.store().clone(), c.silo_root());
+    let objects = silo.list_objects(&bucket.meta.id).expect("objects");
+    assert!(objects.is_empty(), "{objects:?}");
+    let (uploads, _) = silo
+        .list_multipart_uploads(&bucket.meta.id, None, None, None, 100, None)
+        .await
+        .expect("uploads");
+    assert!(uploads.is_empty(), "abort removes staging: {uploads:?}");
+}
+
+#[tokio::test]
+async fn old_single_object_backup_still_restores() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    let vol = c
+        .create_volume(create("src", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+    let payload = b"legacy-single-object";
+    let bak = c
+        .create_backup(Create {
+            name: "legacy".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: backup_spec(vol.meta.id.clone()),
+        })
+        .await
+        .expect("backup");
+    let key = format!("backups/{}", bak.meta.id);
+    let bucket = silo::Client::new(c.store().clone(), c.silo_root())
+        .get_bucket(Some(&project), "backups")
+        .expect("bucket");
+    silo::Client::new(c.store().clone(), c.silo_root())
+        .put_object(
+            &bucket.meta.id,
+            &key,
+            payload,
+            Some("application/octet-stream".into()),
+        )
+        .await
+        .expect("put");
+    c.backups()
+        .modify(&bak.meta.id, |b| {
+            b.status.phase = Phase::Ready;
+            b.status.object_ref = Some(key.clone());
+            b.status.size_bytes = 0;
+            b.status.part_count = 0;
+            b.status.sha256 = None;
+            Ok(())
+        })
+        .expect("mark ready");
+
+    let restored = c.restore_backup(&bak.meta.id).await.expect("restore");
+    assert_eq!(restored.status.phase, Phase::Ready);
+    let restored_path = LocalFileBackend::new(dir.path()).volume_path(&restored);
+    let mut got = vec![0u8; payload.len()];
+    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got).unwrap();
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn restore_into_smaller_volume_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir);
+    let vol = c
+        .create_volume(create("src", spec(1)))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let payload = b"abcdefghij";
+    put_source(&dir, &vol, payload);
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+    let bak = c
+        .create_backup(Create {
+            name: "nightly".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: backup_spec(vol.meta.id.clone()),
+        })
+        .await
+        .expect("backup");
+    let bak = c
+        .reconcile_backup(&bak.meta.id)
+        .await
+        .expect("upload")
+        .expect("exists");
+    assert_eq!(bak.status.phase, Phase::Ready, "{bak:?}");
+
+    let mut small_req = create("small", spec(1));
+    small_req.project = vol.meta.project.clone();
+    let small = c.create_volume(small_req).await.expect("small");
+    let small = c
+        .reconcile_volume(&small.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let small_path = LocalFileBackend::new(dir.path()).volume_path(&small);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&small_path)
+        .unwrap()
+        .set_len(4)
+        .unwrap();
+    let before = std::fs::read(&small_path).unwrap();
+    assert_eq!(before.len(), 4);
+
+    let err = c
+        .restore_backup_into(&bak.meta.id, Some(small.meta.id.clone()))
+        .await
+        .expect_err("too small");
+    assert_eq!(
+        err.code,
+        pistack_types::error::ErrorCode::Unprocessable,
+        "{err}"
+    );
+    assert!(err.message.contains("smaller"), "{err}");
+    assert_eq!(std::fs::read(&small_path).unwrap(), before);
+    let small = c.volumes().get(&small.meta.id).unwrap();
+    assert_eq!(small.status.phase, Phase::Ready);
+    assert!(
+        small
+            .status
+            .conditions
+            .iter()
+            .all(|cnd| cnd.kind != "Restored"),
+        "{small:?}"
+    );
 }
 
 fn admin_caller() -> Caller {

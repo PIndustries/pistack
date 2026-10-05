@@ -14,6 +14,7 @@ use pistack_types::{ApiError, ApiResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::types::{Snapshot, Volume};
 
@@ -165,9 +166,175 @@ pub trait BlockBackend: Send + Sync + 'static {
     /// How `host` should attach `vol`.
     async fn attach_info(&self, vol: &Volume, host: &str) -> ApiResult<AttachInfo>;
 
-    /// File that holds the volume bytes for a backup. Backends without a
-    /// file in the slab directory are unavailable.
+    /// File that holds the volume bytes for a backup, when the backend has
+    /// one inside its own directory. LVM and RBD do not. Streaming backup
+    /// uses [`BlockBackend::open_backup`].
     async fn bytes_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf>;
+
+    /// Open `vol` for a streaming backup read. Local files and LVM devices
+    /// are opened directly. RBD runs `rbd export <pool>/<id> -`.
+    async fn open_backup(&self, vol: &Volume) -> ApiResult<BackupStream>;
+
+    /// Open `vol` for a streaming restore write, positioned at byte 0.
+    async fn open_restore(&self, vol: &Volume) -> ApiResult<RestoreStream>;
+}
+
+/// Read handle for one backup. Dropping it stops an in-progress export.
+pub struct BackupStream {
+    kind: ReadKind,
+}
+
+impl std::fmt::Debug for BackupStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            ReadKind::File(_) => f.write_str("BackupStream::File"),
+            ReadKind::Child { label, .. } => write!(f, "BackupStream::Child({label})"),
+        }
+    }
+}
+
+enum ReadKind {
+    File(tokio::fs::File),
+    Child {
+        stdout: tokio::process::ChildStdout,
+        child: tokio::process::Child,
+        stderr: tokio::sync::oneshot::Receiver<String>,
+        label: &'static str,
+    },
+}
+
+impl BackupStream {
+    pub(crate) fn file(file: tokio::fs::File) -> Self {
+        Self {
+            kind: ReadKind::File(file),
+        }
+    }
+
+    /// Spawn `bin args…` and read its stdout. Stderr is drained so a noisy
+    /// command cannot fill the pipe and stall the export.
+    pub(crate) fn spawn(bin: &str, args: &[String], label: &'static str) -> ApiResult<Self> {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::unavailable(format!("{label} is not available"))
+            } else {
+                ApiError::internal(format!("{label}: {e}"))
+            }
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ApiError::internal(format!("{label} has no stdout")))?;
+        let stderr = child.stderr.take();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let detail = drain_stderr(stderr).await;
+                let _ = tx.send(detail);
+            });
+        } else {
+            let _ = tx.send(String::new());
+        }
+        Ok(Self {
+            kind: ReadKind::Child {
+                stdout,
+                child,
+                stderr: rx,
+                label,
+            },
+        })
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) -> ApiResult<usize> {
+        let result = match &mut self.kind {
+            ReadKind::File(file) => file.read(buf).await,
+            ReadKind::Child { stdout, .. } => stdout.read(buf).await,
+        };
+        result.map_err(|e| ApiError::internal(format!("backup read: {e}")))
+    }
+
+    /// Wait for an export command to exit. A file has nothing to wait for.
+    pub async fn finish(self) -> ApiResult<()> {
+        match self.kind {
+            ReadKind::File(_) => Ok(()),
+            ReadKind::Child {
+                stdout,
+                mut child,
+                stderr,
+                label,
+            } => {
+                drop(stdout);
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| ApiError::internal(format!("{label}: {e}")))?;
+                let detail = stderr.await.unwrap_or_default();
+                if status.success() {
+                    return Ok(());
+                }
+                let code = status.code().unwrap_or(-1);
+                let detail = if detail.is_empty() {
+                    format!("exit {code}")
+                } else {
+                    format!("exit {code}: {detail}")
+                };
+                Err(ApiError::internal(format!("{label} failed: {detail}")))
+            }
+        }
+    }
+}
+
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 512];
+    loop {
+        match stderr.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() > 400 {
+                    buf.drain(..buf.len() - 400);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).trim().to_owned()
+}
+
+/// Write handle for a restore. The caller writes the object from byte 0.
+#[derive(Debug)]
+pub struct RestoreStream {
+    file: tokio::fs::File,
+}
+
+impl RestoreStream {
+    pub(crate) fn file(file: tokio::fs::File) -> Self {
+        Self { file }
+    }
+
+    pub async fn write_all(&mut self, buf: &[u8]) -> ApiResult<()> {
+        self.file
+            .write_all(buf)
+            .await
+            .map_err(|e| ApiError::internal(format!("backup restore: {e}")))
+    }
+
+    pub async fn finish(mut self) -> ApiResult<()> {
+        self.file
+            .flush()
+            .await
+            .map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
+        self.file
+            .sync_all()
+            .await
+            .map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
+        Ok(())
+    }
 }
 
 pub(crate) fn gib_to_bytes(gib: u64) -> u64 {

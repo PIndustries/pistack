@@ -17,7 +17,7 @@ use axum::{
 use pistack_types::{ApiError, ApiResult, Caller, Id, Kind, ListQuery, Page};
 use serde::Deserialize;
 
-use crate::client::{Client, Create, UpdateMeta};
+use crate::client::{Client, Create, RestoreRequest, UpdateMeta};
 use crate::types::*;
 
 pub fn router(client: Client) -> Router {
@@ -416,7 +416,31 @@ async fn restore_backup(
     State(c): State<Client>,
     ext: Option<Extension<Caller>>,
     Path(id): Path<String>,
+    req: Request,
 ) -> ApiResult<Json<Volume>> {
-    let b = load_backup(&c, &caller(ext)?, &id)?;
-    Ok(Json(c.restore_backup(&b.meta.id).await?))
+    let caller = caller(ext)?;
+    let b = load_backup(&c, &caller, &id)?;
+    let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+    let target = if bytes.is_empty() {
+        None
+    } else {
+        let body: RestoreRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::bad_request(format!("restore body: {e}")))?;
+        match body
+            .volume
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(name) => {
+                let vol = c.get_volume(scope(&caller).as_ref(), name)?;
+                check_visible(&caller, &vol)?;
+                Some(vol.meta.id)
+            }
+        }
+    };
+    Ok(Json(c.restore_backup_into(&b.meta.id, target).await?))
 }
