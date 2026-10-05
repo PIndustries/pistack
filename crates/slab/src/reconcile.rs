@@ -2,14 +2,20 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Event-driven reconciler: every write to a slab kind wakes it, it looks
-//! at `status.phase` and asks the backend to make it true.
+//! at `status.phase` and asks the backend to make it true. A pass also
+//! drops attaches whose machine record is gone.
 
-use pistack_types::{Event, EventAction};
+use pistack_types::{kind, Event, EventAction};
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
 use crate::types::{KIND_BACKUP, KIND_SNAPSHOT, KIND_VOLUME};
+
+/// How often to drop attaches whose machine no longer exists, even when
+/// no machine-delete event arrived.
+const STALE_ATTACH_EVERY: Duration = Duration::from_secs(30);
 
 pub async fn run(
     client: Client,
@@ -29,11 +35,20 @@ pub async fn run(
                     tracing::warn!(error = %e, "slab: initial resync failed");
                 }
                 let mut events = events.subscribe();
+                let mut tick = tokio::time::interval(STALE_ATTACH_EVERY);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // `interval` completes once immediately. Startup already reconciled.
+                tick.tick().await;
                 loop {
                     tokio::select! {
                         _ = active.cancelled() => {
                             tracing::debug!("slab reconciler stopping");
                             return;
+                        }
+                        _ = tick.tick() => {
+                            if let Err(e) = client.reconcile_stale_attaches().await {
+                                tracing::warn!(error = %e, "slab: stale attach reconcile failed");
+                            }
                         }
                         ev = events.recv() => match ev {
                             Ok(ev) => handle(&client, ev).await,
@@ -54,6 +69,15 @@ pub async fn run(
 
 async fn handle(client: &Client, ev: Event) {
     if ev.action == EventAction::Deleted {
+        if ev.kind == kind::MACHINE {
+            if let Err(e) = client.reconcile_stale_attaches().await {
+                tracing::warn!(
+                    machine = %ev.id,
+                    error = %e,
+                    "slab: stale attach reconcile failed"
+                );
+            }
+        }
         return;
     }
     let res = match ev.kind.as_str() {
