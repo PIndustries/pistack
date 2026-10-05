@@ -268,7 +268,7 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
         .unwrap()
         .iter()
         .all(|lb| lb.status.phase != pistack_types::Phase::Ready
-            || lb.meta.labels.get("loom.pistack.io/ingress").is_none()));
+            || !lb.meta.labels.contains_key("loom.pistack.io/ingress")));
 
     let backend = listen().await;
     let backend_addr = backend.local_addr().unwrap();

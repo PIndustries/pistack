@@ -1056,6 +1056,7 @@ mod tests {
         serde_json::from_value(value.clone()).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn tenant(
         client: &Client,
         store: &Store,
@@ -1107,8 +1108,10 @@ mod tests {
             .next()
             .unwrap();
 
-        let mut ext_spec = NetworkSpec::default();
-        ext_spec.external = true;
+        let ext_spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let ext = client
             .create_network(
                 Meta::new(kind::NETWORK, format!("{name}-ext"), Some(project.clone())),
@@ -1344,8 +1347,10 @@ mod tests {
             .next()
             .unwrap();
 
-        let mut ext_spec = NetworkSpec::default();
-        ext_spec.external = true;
+        let mut ext_spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         ext_spec.kind = NetworkKind::Provider {
             physnet: "eno1".into(),
             vlan: Some(20),
