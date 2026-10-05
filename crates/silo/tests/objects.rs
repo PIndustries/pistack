@@ -624,3 +624,408 @@ async fn s3_put_get_list_prefix_and_pagination() {
             || String::from_utf8_lossy(&body).contains("not found")
     );
 }
+
+fn app_multipart(max: usize, min_part: usize) -> (tempfile::TempDir, Client, Router, Id, Caller) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (events, _rx) = tokio::sync::broadcast::channel(16);
+    let store = Store::open(dir.path().join("state.redb"), events).expect("open store");
+    let root = dir.path().join("silo");
+    let client = Client::new(store, &root)
+        .with_max_object_bytes(max)
+        .with_min_part_bytes(min_part);
+    let app = http::router(client.clone());
+    let project = Id::new(kind::PROJECT);
+    let who = project_caller(&project);
+    (dir, client, app, project, who)
+}
+
+async fn ensure_bucket(app: &Router, who: &Caller, name: &str) -> String {
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/buckets",
+        Some(
+            json!({
+                "name": name,
+                "spec": { "versioning": false }
+            })
+            .to_string()
+            .into_bytes(),
+        ),
+        "application/json",
+        Some(who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let bucket: Value = serde_json::from_slice(&body).expect("bucket json");
+    bucket["name"].as_str().unwrap().to_owned()
+}
+
+fn extract_upload_id(xml: &str) -> String {
+    xml.split("<UploadId>")
+        .nth(1)
+        .expect("UploadId")
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn extract_error_code(xml: &str) -> String {
+    xml.split("<Code>")
+        .nth(1)
+        .unwrap_or("")
+        .split("</Code>")
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn complete_xml(parts: &[(u32, &str)]) -> Vec<u8> {
+    let mut xml =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUpload>");
+    for (n, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>\"{etag}\"</ETag></Part>"
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml.into_bytes()
+}
+
+#[tokio::test]
+async fn multipart_create_upload_complete_round_trip() {
+    // Small min part (8 bytes) and max (64) so tests stay tiny.
+    let (dir, _client, app, _project, who) = app_multipart(64, 8);
+    let bucket = ensure_bucket(&app, &who, "mpu").await;
+    let key = "big.bin";
+    let part1 = b"abcdefgh"; // 8
+    let part2 = b"ijklmnop"; // 8
+    let expected: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("InitiateMultipartUploadResult"), "{xml}");
+    let upload_id = extract_upload_id(&xml);
+
+    let (status, _, headers) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/{key}?partNumber=1&uploadId={upload_id}"),
+        Some(part1.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag1 = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .trim_matches('"')
+        .to_owned();
+    assert_eq!(etag1, md5_hex(part1));
+
+    let (status, _, headers) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/{key}?partNumber=2&uploadId={upload_id}"),
+        Some(part2.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag2 = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .trim_matches('"')
+        .to_owned();
+
+    let (status, body, headers) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+        Some(complete_xml(&[(1, &etag1), (2, &etag2)])),
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("CompleteMultipartUploadResult"), "{xml}");
+    let etag = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert!(etag.contains('-'), "{etag}");
+    assert!(etag.ends_with("-2\"") || etag.ends_with("-2"), "{etag}");
+
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}/{key}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, expected);
+
+    // Staging cleaned.
+    let uploads = dir.path().join("silo");
+    let found = std::fs::read_dir(&uploads).unwrap().any(|e| {
+        let p = e.unwrap().path();
+        p.join(".uploads").exists()
+            && std::fs::read_dir(p.join(".uploads"))
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+    });
+    assert!(!found, "staging dir should be empty after complete");
+}
+
+#[tokio::test]
+async fn multipart_wrong_etag_is_invalid_part() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "bad-etag").await;
+    let key = "x.bin";
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    let part = b"data";
+    let (status, _, headers) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/{key}?partNumber=1&uploadId={upload_id}"),
+        Some(part.to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let _real = headers.get(header::ETAG).unwrap();
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+        Some(complete_xml(&[(1, "00000000000000000000000000000000")])),
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidPart"
+    );
+}
+
+#[tokio::test]
+async fn multipart_out_of_order_is_invalid_part_order() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "order").await;
+    let key = "y.bin";
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+    assert_eq!(status, StatusCode::OK);
+
+    let mut etags = Vec::new();
+    for (n, bytes) in [(1u32, b"aaaa" as &[u8]), (2, b"bbbb")] {
+        let (status, _, headers) = call(
+            &app,
+            "PUT",
+            &format!("/{bucket}/{key}?partNumber={n}&uploadId={upload_id}"),
+            Some(bytes.to_vec()),
+            "application/octet-stream",
+            Some(&who),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        etags.push(
+            headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_matches('"')
+                .to_owned(),
+        );
+    }
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+        Some(complete_xml(&[(2, &etags[1]), (1, &etags[0])])),
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidPartOrder"
+    );
+}
+
+#[tokio::test]
+async fn multipart_abort_cleans_staging() {
+    let (dir, client, app, _project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "abort").await;
+    let key = "z.bin";
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/{key}?partNumber=1&uploadId={upload_id}"),
+        Some(b"part".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Staging exists before abort.
+    let bkt = client
+        .list_buckets(Some(&who.project.clone().unwrap()))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap();
+    let staging = dir
+        .path()
+        .join("silo")
+        .join(bkt.meta.id.to_string())
+        .join(".uploads")
+        .join(&upload_id);
+    assert!(staging.exists(), "{}", staging.display());
+
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!staging.exists(), "staging should be gone after abort");
+}
+
+#[tokio::test]
+async fn multipart_oversize_total_rejected() {
+    // max 12 bytes; two 8-byte parts = 16 > 12.
+    let (_dir, _client, app, _project, who) = app_multipart(12, 4);
+    let bucket = ensure_bucket(&app, &who, "oversize").await;
+    let key = "too-big.bin";
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+    assert_eq!(status, StatusCode::OK);
+
+    let mut etags = Vec::new();
+    for (n, bytes) in [(1u32, b"12345678" as &[u8]), (2, b"abcdefgh")] {
+        let (status, _, headers) = call(
+            &app,
+            "PUT",
+            &format!("/{bucket}/{key}?partNumber={n}&uploadId={upload_id}"),
+            Some(bytes.to_vec()),
+            "application/octet-stream",
+            Some(&who),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "part {n}");
+        etags.push(
+            headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_matches('"')
+                .to_owned(),
+        );
+    }
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+        Some(complete_xml(&[(1, &etags[0]), (2, &etags[1])])),
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "EntityTooLarge"
+    );
+}

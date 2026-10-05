@@ -10,15 +10,20 @@
 //! ([`MAX_OBJECT_BYTES`]), overridable via [`SiloConfig`] /
 //! `[modules.silo] max_object_bytes`.
 //!
-//! Path-style S3 routes (`/{bucket}/{key}`, ListObjectsV2) share this
-//! module's HTTP router and the same bearer/`Caller` auth. **AWS Signature
-//! Version 4 is not verified**; clients must present a gate token (or run
-//! under the gateway's `--dev` admin injection).
+//! Path-style S3 routes (`/{bucket}/{key}`, ListObjectsV2, multipart
+//! upload) share this module's HTTP router and the same bearer/`Caller`
+//! auth. **AWS Signature Version 4 is not verified**; clients must present
+//! a gate token (or run under the gateway's `--dev` admin injection).
+//!
+//! Multipart staging lives under `{data}/silo/{bucket}/.uploads/{uploadId}/`.
+//! Abort and complete delete that directory; **stale uploads are not GC'd**
+//! yet if a client disappears mid-upload.
 //!
 //! * [`types`] — `Bucket`, `Object`, [`SiloConfig`].
 //! * [`Client`] — the library API.
 //! * [`http`] — native routes mounted at `/silo`.
 //! * [`s3`] — path-style S3-compatible handlers on the same router.
+//! * [`multipart`] — Create/Upload/Complete/Abort multipart helpers.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -28,6 +33,7 @@ use std::path::PathBuf;
 
 pub mod client;
 pub mod http;
+pub mod multipart;
 pub mod s3;
 pub mod types;
 
