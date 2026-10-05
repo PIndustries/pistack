@@ -1280,7 +1280,7 @@ async fn staged_upload(client: &Client, bucket: &Id, key: &str) -> String {
         .expect("create upload");
     let body = futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from("part")) });
     client
-        .upload_part(bucket, key, &id, 1, body, Some(4))
+        .upload_part(bucket, key, &id, 1, body, Some(4), None)
         .await
         .expect("upload part");
     id

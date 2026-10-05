@@ -24,7 +24,12 @@ futures.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 pistack-config.workspace = true
 md-5.workspace = true
+keep.workspace = true
+hmac.workspace = true
+percent-encoding.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
+gate.workspace = true
