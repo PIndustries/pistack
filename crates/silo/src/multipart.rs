@@ -430,19 +430,34 @@ impl Client {
                 })
             })
             .filter(|u| prefix_filter.is_none_or(|p| u.key.starts_with(p)))
+            .filter(|u| {
+                crate::delimiter::upload_after_markers(
+                    &u.key,
+                    &u.upload_id,
+                    key_marker,
+                    upload_id_marker,
+                    delimiter,
+                )
+            })
             .collect();
         uploads.sort_by(|a, b| a.key.cmp(&b.key).then(a.upload_id.cmp(&b.upload_id)));
 
-        let entries = match delimiter {
-            Some(d) => collapse_uploads_with_delimiter(&uploads, &prefix, d),
+        let entries: Vec<ListUploadEntry> = match delimiter {
+            Some(d) => {
+                crate::delimiter::collapse_with_delimiter(uploads, &prefix, d, |u| u.key.as_str())
+                    .into_iter()
+                    .map(|e| match e {
+                        crate::delimiter::Delimited::Item(u) => ListUploadEntry::Upload(u),
+                        crate::delimiter::Delimited::CommonPrefix(cp) => {
+                            ListUploadEntry::CommonPrefix(cp)
+                        }
+                    })
+                    .collect()
+            }
             None => uploads.into_iter().map(ListUploadEntry::Upload).collect(),
         };
-        let filtered: Vec<ListUploadEntry> = entries
-            .into_iter()
-            .filter(|e| entry_after_marker(e, key_marker, upload_id_marker))
-            .collect();
-        let truncated = filtered.len() > max_uploads;
-        let page = filtered.into_iter().take(max_uploads).collect();
+        let truncated = entries.len() > max_uploads;
+        let page = entries.into_iter().take(max_uploads).collect();
         Ok((page, truncated))
     }
 
@@ -477,61 +492,6 @@ impl Client {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io_err(e)),
         }
-    }
-}
-
-/// After `prefix`, if `delimiter` appears, the rolled-up common prefix
-/// (including the delimiter). `None` means the key is listed as an upload.
-pub(crate) fn common_prefix_after(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
-    if !key.starts_with(prefix) {
-        return None;
-    }
-    let rest = &key[prefix.len()..];
-    rest.find(delimiter).map(|i| {
-        let end = i + delimiter.len();
-        format!("{}{}", prefix, &rest[..end])
-    })
-}
-
-/// Collapse sorted uploads into Upload / CommonPrefix entries (S3 delimiter).
-pub(crate) fn collapse_uploads_with_delimiter(
-    uploads: &[UploadSummary],
-    prefix: &str,
-    delimiter: &str,
-) -> Vec<ListUploadEntry> {
-    let mut out = Vec::new();
-    let mut last_cp: Option<String> = None;
-    for u in uploads {
-        match common_prefix_after(&u.key, prefix, delimiter) {
-            Some(cp) => {
-                if last_cp.as_ref() != Some(&cp) {
-                    out.push(ListUploadEntry::CommonPrefix(cp.clone()));
-                    last_cp = Some(cp);
-                }
-            }
-            None => {
-                last_cp = None;
-                out.push(ListUploadEntry::Upload(u.clone()));
-            }
-        }
-    }
-    out
-}
-
-fn entry_after_marker(
-    entry: &ListUploadEntry,
-    key_marker: Option<&str>,
-    upload_id_marker: Option<&str>,
-) -> bool {
-    let Some(km) = key_marker else {
-        return true;
-    };
-    match entry {
-        ListUploadEntry::CommonPrefix(cp) => cp.as_str() > km,
-        ListUploadEntry::Upload(u) => match upload_id_marker {
-            None => u.key.as_str() > km,
-            Some(um) => u.key.as_str() > km || (u.key == km && u.upload_id.as_str() > um),
-        },
     }
 }
 
@@ -858,16 +818,14 @@ mod tests {
     }
 
     #[test]
-    fn common_prefix_and_collapse() {
-        assert_eq!(
-            common_prefix_after("logs/a/b", "logs/", "/"),
-            Some("logs/a/".into())
-        );
-        assert_eq!(common_prefix_after("logs/a.bin", "logs/", "/"), None);
-        assert_eq!(common_prefix_after("a::b::c", "", "::"), Some("a::".into()));
-
+    fn collapse_uploads_via_shared_delimiter() {
         let now = Utc::now();
         let uploads = vec![
+            UploadSummary {
+                key: "a/".into(),
+                upload_id: "u0".into(),
+                initiated: now,
+            },
             UploadSummary {
                 key: "a/1".into(),
                 upload_id: "u1".into(),
@@ -889,12 +847,21 @@ mod tests {
                 initiated: now,
             },
         ];
-        let entries = collapse_uploads_with_delimiter(&uploads, "", "/");
+        let entries: Vec<_> =
+            crate::delimiter::collapse_with_delimiter(uploads.clone(), "", "/", |u| u.key.as_str())
+                .into_iter()
+                .map(|e| match e {
+                    crate::delimiter::Delimited::Item(u) => ListUploadEntry::Upload(u),
+                    crate::delimiter::Delimited::CommonPrefix(cp) => {
+                        ListUploadEntry::CommonPrefix(cp)
+                    }
+                })
+                .collect();
         assert_eq!(
             entries,
             vec![
                 ListUploadEntry::CommonPrefix("a/".into()),
-                ListUploadEntry::Upload(uploads[2].clone()),
+                ListUploadEntry::Upload(uploads[3].clone()),
                 ListUploadEntry::CommonPrefix("c/".into()),
             ]
         );

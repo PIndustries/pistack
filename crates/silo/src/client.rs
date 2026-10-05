@@ -127,7 +127,13 @@ impl Client {
     pub fn key_path(&self, bucket: &Id, key: &str) -> ApiResult<PathBuf> {
         validate_key(key)?;
         let dir = self.bucket_dir(bucket);
-        let path = dir.join(key);
+        // Trailing-slash keys are S3 directory placeholders; store bytes under
+        // an internal leaf so the path is a regular file, not a directory.
+        let path = if key.ends_with('/') {
+            dir.join(key).join(".silo_dir_object")
+        } else {
+            dir.join(key)
+        };
         if !path.starts_with(&dir) {
             return Err(ApiError::bad_request("object key escapes the bucket"));
         }
@@ -354,12 +360,26 @@ impl Client {
 
     /// Latest generation of each key in the bucket, ordered by key.
     pub fn list_objects(&self, bucket_id: &Id) -> ApiResult<Vec<Object>> {
-        self.list_objects_filtered(bucket_id, None, None, usize::MAX)
-            .map(|(items, _)| items)
+        self.list_objects_filtered(bucket_id, None, None, usize::MAX, None)
+            .map(|(items, _)| {
+                items
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        ListObjectEntry::Object(o) => Some(*o),
+                        ListObjectEntry::CommonPrefix(_) => None,
+                    })
+                    .collect()
+            })
     }
 
     /// Latest generation of each key, optionally filtered by `prefix` and
     /// starting after `after_key` (exclusive), capped at `limit`.
+    ///
+    /// Non-empty `delimiter` rolls keys into [`ListObjectEntry::CommonPrefix`]
+    /// (each counts once toward `limit`, and toward ListObjectsV2 KeyCount).
+    /// When `after_key` is a common-prefix marker (ends with the delimiter),
+    /// every key under that prefix is skipped so pagination does not
+    /// re-emit the same CommonPrefix.
     /// Returns `(page, truncated)`.
     pub fn list_objects_filtered(
         &self,
@@ -367,28 +387,46 @@ impl Client {
         prefix: Option<&str>,
         after_key: Option<&str>,
         limit: usize,
-    ) -> ApiResult<(Vec<Object>, bool)> {
+        delimiter: Option<&str>,
+    ) -> ApiResult<(Vec<ListObjectEntry>, bool)> {
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
         let all = self.objects_for_bucket(&bucket)?;
+        let prefix = prefix.unwrap_or("");
+        let delimiter = delimiter.filter(|d| !d.is_empty());
         let mut keys: Vec<String> = all.iter().map(|o| o.spec.key.clone()).collect();
         keys.sort();
         keys.dedup();
-        if let Some(p) = prefix {
-            keys.retain(|k| k.starts_with(p));
+        if !prefix.is_empty() {
+            keys.retain(|k| k.starts_with(prefix));
         }
-        if let Some(after) = after_key {
-            keys.retain(|k| k.as_str() > after);
+        if let Some(after) = after_key.filter(|a| !a.is_empty()) {
+            keys.retain(|k| crate::delimiter::key_after_marker(k, after, delimiter));
         }
-        let mut out = Vec::new();
-        for key in keys {
-            let matches = all.iter().filter(|o| o.spec.key == key).cloned().collect();
-            if let Some(cur) = pick_current(matches) {
-                out.push(cur);
-            }
-        }
-        let truncated = out.len() > limit;
-        out.truncate(limit);
-        Ok((out, truncated))
+        let objects: Vec<Object> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let matches = all.iter().filter(|o| o.spec.key == key).cloned().collect();
+                pick_current(matches)
+            })
+            .collect();
+        let entries: Vec<ListObjectEntry> = match delimiter {
+            Some(d) => crate::delimiter::collapse_with_delimiter(objects, prefix, d, |o| {
+                o.spec.key.as_str()
+            })
+            .into_iter()
+            .map(|e| match e {
+                crate::delimiter::Delimited::Item(o) => ListObjectEntry::Object(Box::new(o)),
+                crate::delimiter::Delimited::CommonPrefix(cp) => ListObjectEntry::CommonPrefix(cp),
+            })
+            .collect(),
+            None => objects
+                .into_iter()
+                .map(|o| ListObjectEntry::Object(Box::new(o)))
+                .collect(),
+        };
+        let truncated = entries.len() > limit;
+        let page = entries.into_iter().take(limit).collect();
+        Ok((page, truncated))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -461,6 +499,22 @@ impl Client {
         }
         tokio::fs::copy(src, &dest).await.map_err(io_err)?;
         Ok(())
+    }
+}
+
+/// One row in a ListObjectsV2 page (object or rolled-up prefix).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ListObjectEntry {
+    Object(Box<Object>),
+    CommonPrefix(String),
+}
+
+impl ListObjectEntry {
+    pub fn sort_key(&self) -> &str {
+        match self {
+            Self::Object(o) => o.spec.key.as_str(),
+            Self::CommonPrefix(p) => p.as_str(),
+        }
     }
 }
 

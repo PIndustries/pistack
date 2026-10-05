@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}
-//! GET                       /{bucket}?list-type=2&prefix=&continuation-token=&max-keys=
+//! GET                       /{bucket}?list-type=2&prefix=&delimiter=&continuation-token=&start-after=&max-keys=
 //! GET                       /{bucket}?uploads&prefix=&delimiter=&key-marker=&upload-id-marker=&max-uploads=
 //!                                     ListMultipartUploads
 //!
@@ -36,9 +36,10 @@
 //!
 //! Staging dirs under `.uploads/` are removed on abort and complete, and
 //! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
-//! ListMultipartUploads supports `delimiter` / `CommonPrefixes` (any
-//! non-empty delimiter). `encoding-type` is not supported (same as
-//! ListObjectsV2). Initiator/Owner are not reported.
+//! ListObjectsV2 and ListMultipartUploads support `delimiter` /
+//! `CommonPrefixes` (any non-empty delimiter; shared helpers in
+//! [`crate::delimiter`]). `encoding-type` is not supported. `fetch-owner`
+//! is ignored. Initiator/Owner are not reported.
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
@@ -747,21 +748,28 @@ async fn list_or_bucket_inner(
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket_name)?;
     let max_keys = parse_max_keys(q.max_keys.as_deref())?;
-    let after = q.continuation_token.as_deref().or(q.start_after.as_deref());
+    let prefix = q.prefix.as_deref().unwrap_or("");
+    let after = q
+        .continuation_token
+        .as_deref()
+        .or(q.start_after.as_deref())
+        .filter(|s| !s.is_empty());
+    let delimiter = q.delimiter.as_deref().filter(|d| !d.is_empty());
     let (items, truncated) =
-        c.list_objects_filtered(&bucket.meta.id, q.prefix.as_deref(), after, max_keys)?;
+        c.list_objects_filtered(&bucket.meta.id, Some(prefix), after, max_keys, delimiter)?;
     let next = truncated
-        .then(|| items.last().map(|o| o.spec.key.clone()))
+        .then(|| items.last().map(|e| e.sort_key().to_owned()))
         .flatten();
-    let xml = list_bucket_xml(
-        &bucket.meta.name,
-        q.prefix.as_deref().unwrap_or(""),
+    let xml = list_bucket_xml(&ListBucketPage {
+        bucket: &bucket.meta.name,
+        prefix,
+        delimiter: delimiter.unwrap_or(""),
         max_keys,
-        &items,
+        entries: &items,
         truncated,
-        next.as_deref(),
-        q.continuation_token.as_deref(),
-    );
+        next_token: next.as_deref(),
+        continuation: q.continuation_token.as_deref(),
+    });
     let mut resp = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/xml")],
@@ -1011,56 +1019,75 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-fn list_bucket_xml(
-    bucket: &str,
-    prefix: &str,
+struct ListBucketPage<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
+    delimiter: &'a str,
     max_keys: usize,
-    items: &[Object],
+    entries: &'a [crate::client::ListObjectEntry],
     truncated: bool,
-    next_token: Option<&str>,
-    continuation: Option<&str>,
-) -> String {
+    next_token: Option<&'a str>,
+    continuation: Option<&'a str>,
+}
+
+fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     body.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-    body.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
-    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
-    body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    body.push_str(&format!("<Name>{}</Name>", xml_escape(page.bucket)));
+    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(page.prefix)));
+    if !page.delimiter.is_empty() {
+        body.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            xml_escape(page.delimiter)
+        ));
+    }
+    body.push_str(&format!("<MaxKeys>{}</MaxKeys>", page.max_keys));
     body.push_str(&format!(
         "<IsTruncated>{}</IsTruncated>",
-        if truncated { "true" } else { "false" }
+        if page.truncated { "true" } else { "false" }
     ));
     body.push_str("<KeyCount>");
-    body.push_str(&items.len().to_string());
+    body.push_str(&page.entries.len().to_string());
     body.push_str("</KeyCount>");
-    if let Some(t) = continuation {
+    if let Some(t) = page.continuation {
         body.push_str(&format!(
             "<ContinuationToken>{}</ContinuationToken>",
             xml_escape(t)
         ));
     }
-    if let Some(t) = next_token {
+    if let Some(t) = page.next_token {
         body.push_str(&format!(
             "<NextContinuationToken>{}</NextContinuationToken>",
             xml_escape(t)
         ));
     }
-    for obj in items {
-        let etag = if !obj.status.md5.is_empty() {
-            &obj.status.md5
-        } else {
-            &obj.status.sha256
-        };
-        body.push_str("<Contents>");
-        body.push_str(&format!("<Key>{}</Key>", xml_escape(&obj.spec.key)));
-        body.push_str(&format!("<Size>{}</Size>", obj.status.size_bytes));
-        body.push_str(&format!("<ETag>&quot;{}&quot;</ETag>", xml_escape(etag)));
-        body.push_str(&format!(
-            "<LastModified>{}</LastModified>",
-            obj.meta.updated_at.format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        ));
-        body.push_str("<StorageClass>STANDARD</StorageClass>");
-        body.push_str("</Contents>");
+    for e in page.entries {
+        match e {
+            crate::client::ListObjectEntry::Object(obj) => {
+                let obj = obj.as_ref();
+                let etag = if !obj.status.md5.is_empty() {
+                    &obj.status.md5
+                } else {
+                    &obj.status.sha256
+                };
+                body.push_str("<Contents>");
+                body.push_str(&format!("<Key>{}</Key>", xml_escape(&obj.spec.key)));
+                body.push_str(&format!("<Size>{}</Size>", obj.status.size_bytes));
+                body.push_str(&format!("<ETag>&quot;{}&quot;</ETag>", xml_escape(etag)));
+                body.push_str(&format!(
+                    "<LastModified>{}</LastModified>",
+                    obj.meta.updated_at.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                ));
+                body.push_str("<StorageClass>STANDARD</StorageClass>");
+                body.push_str("</Contents>");
+            }
+            crate::client::ListObjectEntry::CommonPrefix(cp) => {
+                body.push_str("<CommonPrefixes><Prefix>");
+                body.push_str(&xml_escape(cp));
+                body.push_str("</Prefix></CommonPrefixes>");
+            }
+        }
     }
     body.push_str("</ListBucketResult>");
     body

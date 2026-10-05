@@ -229,11 +229,22 @@ pub fn validate_key(key: &str) -> ApiResult<()> {
     if key == ".uploads" || key.starts_with(".uploads/") {
         return Err(ApiError::bad_request("object key is reserved"));
     }
-    for seg in key.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
+    // Allow a single trailing slash (S3 directory-placeholder keys like
+    // `a/`); still reject empty middle segments (`a//b`) and `.` / `..`.
+    let segments: Vec<&str> = key.split('/').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        if *seg == "." || *seg == ".." {
             return Err(ApiError::bad_request(
                 "object key must be a relative path without '.' or '..'",
             ));
+        }
+        if seg.is_empty() {
+            let trailing = i + 1 == segments.len() && i > 0;
+            if !trailing {
+                return Err(ApiError::bad_request(
+                    "object key must be a relative path without '.' or '..'",
+                ));
+            }
         }
     }
     Ok(())
@@ -263,6 +274,8 @@ mod tests {
         assert!(validate_key(".blobs/abcd").is_err());
         assert!(validate_key(".uploads/x").is_err());
         assert!(validate_key(r"foo\bar").is_err());
+        assert!(validate_key("a/").is_ok());
+        assert!(validate_key("a//b").is_err());
     }
 
     #[test]

@@ -35,6 +35,7 @@
 //! * [`gc`] — the abandoned-upload sweep.
 //! * [`sigv4`] — AWS Signature Version 4 verification (in-process via keep).
 //! * [`copy`] — UploadPartCopy source/range/conditional helpers.
+//! * [`delimiter`] — shared ListObjectsV2 / ListMultipartUploads delimiter helpers.
 //! * [`chunked`] — aws-chunked body decode (signed chunks and trailers).
 
 use async_trait::async_trait;
@@ -46,6 +47,7 @@ use std::path::PathBuf;
 pub mod chunked;
 pub mod client;
 pub mod copy;
+pub mod delimiter;
 pub mod gc;
 pub mod http;
 pub mod multipart;
