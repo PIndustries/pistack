@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use blueprint::{Blueprint, ACCEPTED_MESSAGE, WORKFLOW_ACCEPTED_MESSAGE};
 use pistack_store::Store;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext};
+use pistack_types::{kind, Caller, Id, Leadership, Module, ModuleContext};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -21,6 +21,7 @@ fn router(dir: &std::path::Path) -> axum::Router {
         shutdown: pistack_types::module::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     let module = Blueprint;
     assert_eq!(module.info().name, "blueprint");

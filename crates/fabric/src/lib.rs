@@ -38,7 +38,7 @@ pub use types::*;
 
 use async_trait::async_trait;
 use pistack_store::Store;
-use pistack_types::{kind, ApiResult, Id, Module, ModuleContext, ModuleInfo};
+use pistack_types::{kind, ApiResult, Id, Leadership, Module, ModuleContext, ModuleInfo};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,39 +107,59 @@ impl Module for Fabric {
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
         client.ensure_default_template()?;
-        tracing::info!(backend = self.backend.name(), "fabric: initial reconcile");
-        client.reconcile_all().await;
-        run_auto_fips(&client);
+        if ctx.is_leader() {
+            tracing::info!(backend = self.backend.name(), "fabric: initial reconcile");
+            client.reconcile_all().await;
+            run_auto_fips(&client);
+        } else {
+            tracing::info!(
+                backend = self.backend.name(),
+                "fabric: reconciler idle (not leader)"
+            );
+        }
 
         let mut rx = ctx.events.subscribe();
         let shutdown = ctx.shutdown.clone();
+        let leadership = ctx.leadership.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(RETRY_INTERVAL);
             tick.tick().await; // the first tick fires immediately; we just did a pass
+            let mut was_leader = leadership.is_leader();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
                         tracing::debug!("fabric reconciler stopping");
                         break;
                     }
-                    ev = rx.recv() => match ev {
-                        Ok(ev) => {
-                            if ev.kind == kind::MACHINE {
-                                run_auto_fips(&client);
+                    ev = rx.recv() => {
+                        if !take_lead(&leadership, &mut was_leader, &client).await {
+                            continue;
+                        }
+                        match ev {
+                            Ok(ev) => {
+                                if ev.kind == kind::MACHINE {
+                                    run_auto_fips(&client);
+                                }
+                                client.handle_event(&ev).await;
                             }
-                            client.handle_event(&ev).await;
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(missed = n, "fabric reconciler lagged; full pass");
+                                run_auto_fips(&client);
+                                client.reconcile_pending().await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "fabric reconciler lagged; full pass");
-                            run_auto_fips(&client);
-                            client.reconcile_pending().await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
+                    }
                     _ = tick.tick() => {
+                        if !take_lead(&leadership, &mut was_leader, &client).await {
+                            continue;
+                        }
                         run_auto_fips(&client);
                         client.reconcile_pending().await;
-                    },
+                    }
+                    _ = leadership.changed() => {
+                        let _ = take_lead(&leadership, &mut was_leader, &client).await;
+                    }
                 }
             }
         });
@@ -151,4 +171,19 @@ fn run_auto_fips(client: &Client) {
     if let Err(e) = client.sync_auto_floating_ips() {
         tracing::warn!(error = %e, "fabric auto-fip pass failed");
     }
+}
+
+/// Run a full pass the first time this node is leader, then report whether
+/// work should continue. A follower stays idle.
+async fn take_lead(leadership: &Leadership, was_leader: &mut bool, client: &Client) -> bool {
+    let now = leadership.is_leader();
+    if now && !*was_leader {
+        tracing::info!("fabric: this node is leader; starting reconcile");
+        client.reconcile_all().await;
+        run_auto_fips(client);
+    } else if !now && *was_leader {
+        tracing::info!("fabric: no longer leader; reconciler idle");
+    }
+    *was_leader = now;
+    now
 }

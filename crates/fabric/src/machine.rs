@@ -314,9 +314,12 @@ mod tests {
     use super::*;
     use crate::types::*;
     use crate::Client;
+    use crate::Fabric;
     use crate::MockBackend;
     use pistack_types::error::ErrorCode;
+    use pistack_types::{Leadership, Module, ModuleContext};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn client() -> (Store, Client, Id) {
         let store = Store::in_memory().unwrap();
@@ -741,5 +744,54 @@ mod tests {
         let _machine = put_machine(&store, "web", &project, vec!["10.88.0.50".into()]);
         client.sync_auto_floating_ips().unwrap();
         assert!(client.floating_ips().list(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_fip_loop_stays_idle_until_leader() {
+        let (store, client, project) = client();
+        guest(&client, &project);
+        let _fleet = external(&client, &project, "fleet", "10.66.66.80/28", "10.66.66.81");
+        let _web = put_machine(&store, "web", &project, vec!["10.88.0.50".into()]);
+
+        let leadership = Leadership::new(false);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ctx = ModuleContext {
+            store: Arc::new(store.clone()),
+            events: store.events(),
+            shutdown: shutdown.clone(),
+            public_url: "http://test".into(),
+            node_name: "test".into(),
+            leadership: leadership.clone(),
+        };
+        Fabric::with_backend(Arc::new(MockBackend::new()))
+            .start(ctx)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            client.floating_ips().list(None).unwrap().is_empty(),
+            "follower must not create floating ips"
+        );
+
+        leadership.set(true);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let found = client
+                .floating_ips()
+                .list(None)
+                .unwrap()
+                .into_iter()
+                .any(|f| f.meta.labels.get(AUTO_FIP_LABEL).map(String::as_str) == Some("true"));
+            if found {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "leader never created an auto floating ip"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown.cancel();
     }
 }

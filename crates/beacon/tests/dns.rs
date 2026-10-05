@@ -13,7 +13,7 @@ use hickory_server::net::udp::UdpClientStream;
 use hickory_server::proto::op::ResponseCode;
 use hickory_server::proto::rr::{DNSClass, Name, RData, RecordType as Rt};
 use pistack_store::Store;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext};
+use pistack_types::{kind, Caller, Id, Leadership, Module, ModuleContext};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -37,6 +37,7 @@ async fn harness() -> Harness {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     module.start(ctx.clone()).await.unwrap();
     let dns = module.bound_addr().unwrap();
@@ -358,6 +359,7 @@ async fn missing_caller_is_unauthorized() {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     let app = Beacon::default().router(ctx);
     let res = app

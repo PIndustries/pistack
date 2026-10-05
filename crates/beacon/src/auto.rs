@@ -19,7 +19,7 @@
 use crate::client::Client;
 use crate::types::{normalize_name, RecordType, Zone, ZoneKind, AUTO_LABEL, MANAGED_LABEL};
 use pistack_types::module::CancellationToken;
-use pistack_types::{kind, ApiResult, Event, Id, Meta};
+use pistack_types::{kind, ApiResult, Event, Id, Leadership, Meta};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -219,10 +219,17 @@ fn sync_zone(client: &Client, zone: &Zone, machines: &[(Meta, Vec<IpAddr>)]) -> 
 }
 
 /// Run `sync_all` now, then on every triggering event and every `RESYNC`,
-/// until `shutdown` fires.
-pub fn start(client: Client, mut rx: broadcast::Receiver<Event>, shutdown: CancellationToken) {
+/// until `shutdown` fires. A follower stays idle.
+pub fn start(
+    client: Client,
+    mut rx: broadcast::Receiver<Event>,
+    shutdown: CancellationToken,
+    leadership: Leadership,
+) {
     tokio::spawn(async move {
-        run_pass(&client);
+        if leadership.is_leader() {
+            run_pass(&client);
+        }
         let mut tick = tokio::time::interval(RESYNC);
         tick.tick().await;
         loop {
@@ -231,13 +238,27 @@ pub fn start(client: Client, mut rx: broadcast::Receiver<Event>, shutdown: Cance
                     tracing::debug!("beacon auto-records stopping");
                     break;
                 }
-                ev = rx.recv() => match ev {
-                    Ok(ev) if TRIGGERS.contains(&ev.kind.as_str()) => run_pass(&client),
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => run_pass(&client),
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                _ = tick.tick() => run_pass(&client),
+                _ = leadership.changed() => {
+                    if leadership.is_leader() {
+                        run_pass(&client);
+                    }
+                }
+                ev = rx.recv() => {
+                    if !leadership.is_leader() {
+                        continue;
+                    }
+                    match ev {
+                        Ok(ev) if TRIGGERS.contains(&ev.kind.as_str()) => run_pass(&client),
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => run_pass(&client),
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = tick.tick() => {
+                    if leadership.is_leader() {
+                        run_pass(&client);
+                    }
+                }
             }
         }
     });

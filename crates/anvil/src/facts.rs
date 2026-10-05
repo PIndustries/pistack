@@ -47,10 +47,16 @@ pub fn gather_at(data_dir: &Path) -> HostFacts {
 }
 
 pub fn node_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
+    std::env::var("PISTACK_NODE_NAME")
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "localhost".to_owned())
 }
@@ -171,4 +177,20 @@ mod tests {
         assert!(f.resources.vcpus >= 1);
         assert!(!f.node_name.is_empty());
     }
+
+    #[test]
+    fn node_name_honors_env() {
+        let _lock = NODE_NAME_LOCK.lock().unwrap();
+        let prev = std::env::var_os("PISTACK_NODE_NAME");
+        std::env::set_var("PISTACK_NODE_NAME", "edge-2");
+        assert_eq!(node_name(), "edge-2");
+        std::env::set_var("PISTACK_NODE_NAME", "  ");
+        assert!(!node_name().is_empty());
+        match prev {
+            Some(v) => std::env::set_var("PISTACK_NODE_NAME", v),
+            None => std::env::remove_var("PISTACK_NODE_NAME"),
+        }
+    }
+
+    static NODE_NAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

@@ -15,7 +15,7 @@ use axum::{
 use keep::{redeem_join_token, Keep};
 use pistack_store::Store;
 use pistack_types::module::CancellationToken;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext};
+use pistack_types::{kind, Caller, Id, Leadership, Module, ModuleContext};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -82,6 +82,7 @@ async fn boot() -> (Router, Store) {
         shutdown: CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     let keep = Keep::default();
     keep.start(ctx.clone()).await.unwrap();

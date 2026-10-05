@@ -4,7 +4,7 @@
 
 One binary, two roles.
 
-- `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. One process is already a one-voter cluster and announces itself on its private address. A new process with an empty data directory discovers that cluster and adopts it, or `--join URL` names it. `--init` founds a cluster even if peers answer. An existing store never joins away. The second server replicates as a learner. The third makes all three voters. Later servers stay learners until promoted. Writes are accepted by the leader. A learner does not become leader.
+- `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. One process is already a one-voter cluster and announces itself on its private address. A new process with an empty data directory discovers that cluster and adopts it, or `--join URL` names it. `--init` founds a cluster even if peers answer. An existing store never joins away. The second server replicates as a learner. The third makes all three voters. Later servers stay learners until promoted. Writes are accepted by the leader. Controllers and reconcile loops stay idle on a non-leader and run only while that node is leader. A learner does not become leader.
 - `pistack agent` — a host. Runs `anvil`: VMs (libvirt/KVM or Cloud Hypervisor), pods (youki), bare metal (same binary as the provisioning ramdisk), OVN chassis, volume attach, metrics.
 
 Everything a user touches enters the gateway (`bin/pistack/src/gateway.rs`) and is routed to a module by prefix. Modules talk to each other in-process and to hosts through `pistack-rpc`, a typed command queue with JSON-over-HTTP long-poll today (agents call in; no inbound ports on hosts). State changes publish `Event`s on an in-process broadcast bus that reconcilers subscribe to.
@@ -32,11 +32,11 @@ Names are unique per project per kind. `Collection::resolve` accepts a name or a
 pub trait Module {
     fn info(&self) -> ModuleInfo;              // name, prefix, summary
     fn router(&self, ctx: ModuleContext) -> Router;  // mounted at /{prefix}
-    async fn start(&self, ctx: ModuleContext) -> Result<()>; // reconcilers
+    async fn start(&self, ctx: ModuleContext) -> Result<()>; // reconcilers; idle unless leader
 }
 ```
 
-`ModuleContext` carries the store, the event bus, a shutdown token, the public URL and the node name. Modules never bind ports or open files themselves.
+`ModuleContext` carries the store, the event bus, a shutdown token, the public URL, the node name, and leadership. Modules never bind ports or open files themselves. Reconcilers stay idle unless this node is the leader.
 
 ## Who owns what
 

@@ -4,7 +4,7 @@
 //! Event-driven reconciler: every write to a slab kind wakes it, it looks
 //! at `status.phase` and asks the backend to make it true.
 
-use pistack_types::{Event, EventAction};
+use pistack_types::{Event, EventAction, Leadership};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -15,9 +15,14 @@ pub async fn run(
     client: Client,
     mut events: broadcast::Receiver<Event>,
     shutdown: CancellationToken,
+    leadership: Leadership,
 ) {
-    if let Err(e) = client.reconcile_all().await {
-        tracing::warn!(error = %e, "slab: initial resync failed");
+    if leadership.is_leader() {
+        if let Err(e) = client.reconcile_all().await {
+            tracing::warn!(error = %e, "slab: initial resync failed");
+        }
+    } else {
+        tracing::info!("slab: reconciler idle (not leader)");
     }
     loop {
         tokio::select! {
@@ -25,15 +30,27 @@ pub async fn run(
                 tracing::debug!("slab reconciler stopping");
                 return;
             }
-            ev = events.recv() => match ev {
-                Ok(ev) => handle(&client, ev).await,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(missed = n, "slab: event stream lagged; resyncing");
+            _ = leadership.changed() => {
+                if leadership.is_leader() {
                     if let Err(e) = client.reconcile_all().await {
                         tracing::warn!(error = %e, "slab: resync failed");
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
+            }
+            ev = events.recv() => {
+                if !leadership.is_leader() {
+                    continue;
+                }
+                match ev {
+                    Ok(ev) => handle(&client, ev).await,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "slab: event stream lagged; resyncing");
+                        if let Err(e) = client.reconcile_all().await {
+                            tracing::warn!(error = %e, "slab: resync failed");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
             }
         }
     }

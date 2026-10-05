@@ -156,13 +156,21 @@ impl Module for Relay {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
-        tracing::info!(providers = ?self.providers.names(), "relay: initial reconcile");
-        client.reconcile_all().await;
+        if ctx.is_leader() {
+            tracing::info!(providers = ?self.providers.names(), "relay: initial reconcile");
+            client.reconcile_all().await;
+        } else {
+            tracing::info!(
+                providers = ?self.providers.names(),
+                "relay: reconciler idle (not leader)"
+            );
+        }
 
-        health::start(client.clone(), ctx.shutdown.clone());
+        health::start(client.clone(), ctx.shutdown.clone(), ctx.leadership.clone());
 
         let mut rx = ctx.events.subscribe();
         let shutdown = ctx.shutdown.clone();
+        let leadership = ctx.leadership.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(RETRY_INTERVAL);
             tick.tick().await; // the first tick fires immediately; we just did a pass
@@ -172,16 +180,30 @@ impl Module for Relay {
                         tracing::debug!("relay reconciler stopping");
                         break;
                     }
-                    ev = rx.recv() => match ev {
-                        Ok(ev) if KINDS.contains(&ev.kind.as_str()) => client.handle_event(&ev).await,
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "relay reconciler lagged; full pass");
+                    _ = leadership.changed() => {
+                        if leadership.is_leader() {
+                            client.reconcile_all().await;
+                        }
+                    }
+                    ev = rx.recv() => {
+                        if !leadership.is_leader() {
+                            continue;
+                        }
+                        match ev {
+                            Ok(ev) if KINDS.contains(&ev.kind.as_str()) => client.handle_event(&ev).await,
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(missed = n, "relay reconciler lagged; full pass");
+                                client.reconcile_pending().await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = tick.tick() => {
+                        if leadership.is_leader() {
                             client.reconcile_pending().await;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    _ = tick.tick() => client.reconcile_pending().await,
+                    }
                 }
             }
         });

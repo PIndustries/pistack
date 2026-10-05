@@ -14,10 +14,54 @@
 use async_trait::async_trait;
 use axum::Router;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 pub use tokio_util::sync::CancellationToken;
 
 use crate::resource::Event;
+
+/// Whether this control-plane process currently holds leadership.
+///
+/// Controllers and reconcile loops stay idle unless [`Leadership::is_leader`]
+/// is true. They start working again if this node later wins.
+#[derive(Clone)]
+pub struct Leadership {
+    tx: Arc<watch::Sender<bool>>,
+    rx: watch::Receiver<bool>,
+}
+
+impl Leadership {
+    /// A watch that starts as `leader`. Tests and a one-node server use `true`.
+    pub fn new(leader: bool) -> Self {
+        let (tx, rx) = watch::channel(leader);
+        Self {
+            tx: Arc::new(tx),
+            rx,
+        }
+    }
+
+    /// True when this process should run controllers and reconcilers.
+    pub fn is_leader(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    /// Record the current leadership. Watchers wake even when the value
+    /// is unchanged, so a reconciler can re-check immediately.
+    pub fn set(&self, leader: bool) {
+        self.tx.send_replace(leader);
+    }
+
+    /// Wait until leadership is written again.
+    pub async fn changed(&self) {
+        let mut rx = self.rx.clone();
+        let _ = rx.changed().await;
+    }
+}
+
+impl Default for Leadership {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 /// Static description of a module.
 #[derive(Clone, Debug)]
@@ -46,6 +90,9 @@ pub struct ModuleContext {
     pub public_url: String,
     /// Node name of the server running this module.
     pub node_name: String,
+    /// Leadership of this process. Reconcilers stay idle unless this node
+    /// is the leader, and they run again if it later wins.
+    pub leadership: Leadership,
 }
 
 impl ModuleContext {
@@ -59,6 +106,11 @@ impl ModuleContext {
         // A closed channel just means nobody is listening; not an error.
         let _ = self.events.send(ev);
     }
+
+    /// True when this process should run controllers and reconcilers.
+    pub fn is_leader(&self) -> bool {
+        self.leadership.is_leader()
+    }
 }
 
 #[async_trait]
@@ -68,7 +120,26 @@ pub trait Module: Send + Sync + 'static {
     /// request-id layers; modules add nothing global.
     fn router(&self, ctx: ModuleContext) -> Router;
     /// Spawn long-running tasks. Default: nothing.
+    ///
+    /// Reconcilers and controllers must stay idle unless
+    /// [`ModuleContext::is_leader`] is true, and only run while it stays true.
     async fn start(&self, _ctx: ModuleContext) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leadership_starts_and_flips() {
+        let lead = Leadership::new(false);
+        assert!(!lead.is_leader());
+        lead.set(true);
+        assert!(lead.is_leader());
+        lead.set(false);
+        assert!(!lead.is_leader());
+        assert!(Leadership::default().is_leader());
     }
 }

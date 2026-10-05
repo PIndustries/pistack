@@ -556,7 +556,12 @@ async fn reconciler_loop_drives_volume_to_ready() {
     let c = client(&dir);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let rx = c.store().events().subscribe();
-    let task = tokio::spawn(slab::reconcile::run(c.clone(), rx, shutdown.clone()));
+    let task = tokio::spawn(slab::reconcile::run(
+        c.clone(),
+        rx,
+        shutdown.clone(),
+        pistack_types::Leadership::default(),
+    ));
 
     let vol = c
         .create_volume(create("looped", spec(1)))

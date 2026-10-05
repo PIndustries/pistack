@@ -6,7 +6,7 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use pistack_store::Store;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext};
+use pistack_types::{kind, Caller, Id, Leadership, Module, ModuleContext};
 use serde_json::{json, Value};
 use shelf::Shelf;
 use std::sync::{Arc, OnceLock};
@@ -51,6 +51,7 @@ fn router(store: Store) -> axum::Router {
         shutdown: pistack_types::module::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     Shelf.router(ctx)
 }

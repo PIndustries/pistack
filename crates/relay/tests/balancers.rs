@@ -6,7 +6,7 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use pistack_store::Store;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext, Phase};
+use pistack_types::{kind, Caller, Id, Leadership, Module, ModuleContext, Phase};
 use relay::health::Checker;
 use relay::*;
 use serde_json::{json, Value};
@@ -32,6 +32,7 @@ async fn harness() -> Harness {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     assert_eq!(module.info().prefix, "balancers");
     module.start(ctx.clone()).await.unwrap();
@@ -683,6 +684,7 @@ async fn missing_caller_is_unauthorized() {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     let app = Relay::default().router(ctx);
     let res = app

@@ -9,7 +9,7 @@ use fabric::backend::Call;
 use fabric::*;
 use pistack_store::Store;
 use pistack_types::error::ErrorCode;
-use pistack_types::{kind, Caller, Id, Meta, Module, ModuleContext, Phase};
+use pistack_types::{kind, Caller, Id, Leadership, Meta, Module, ModuleContext, Phase};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -693,6 +693,7 @@ async fn module_start_reconciles_on_events_and_stops_on_shutdown() {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     assert_eq!(module.info().prefix, "network");
     module.start(ctx.clone()).await.unwrap();

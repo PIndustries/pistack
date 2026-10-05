@@ -12,7 +12,7 @@ use axum::{
 use forge::{Forge, Host, Machine, Size};
 use http_body_util::BodyExt;
 use pistack_store::Store;
-use pistack_types::{Module, ModuleContext, Page, Phase};
+use pistack_types::{Leadership, Module, ModuleContext, Page, Phase};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +39,7 @@ async fn harness() -> Harness {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "testbox".into(),
+        leadership: Leadership::default(),
     };
     let forge = Forge::default();
     let app = forge.router(ctx.clone());

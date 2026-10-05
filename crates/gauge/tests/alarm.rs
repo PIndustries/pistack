@@ -8,7 +8,7 @@ use axum::http::{header, Request, StatusCode};
 use gauge::Gauge;
 use pistack_store::Store;
 use pistack_types::module::CancellationToken;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext};
+use pistack_types::{kind, Caller, Id, Leadership, Module, ModuleContext};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -26,6 +26,7 @@ fn harness() -> Harness {
         shutdown: CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     assert_eq!(gauge.info().name, "gauge");
     assert_eq!(gauge.info().prefix, "gauge");

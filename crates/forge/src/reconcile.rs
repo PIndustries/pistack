@@ -66,16 +66,23 @@ impl Reconciler {
         let mut rx = self.store.events().subscribe();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        if !ctx.is_leader() {
+            tracing::info!("forge: reconciler idle (not leader)");
+        }
         loop {
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => break,
                 _ = tick.tick() => {}
+                _ = ctx.leadership.changed() => {}
                 ev = rx.recv() => match ev {
                     Ok(e) if e.kind == kind::MACHINE => {}
                     Ok(_) => continue,
                     Err(RecvError::Lagged(n)) => tracing::debug!(skipped = n, "forge: event bus lagged"),
                     Err(RecvError::Closed) => break,
                 },
+            }
+            if !ctx.is_leader() {
+                continue;
             }
             if let Err(e) = self.reconcile_once().await {
                 tracing::warn!(error = %e, "forge: reconcile pass failed");

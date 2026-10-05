@@ -207,8 +207,8 @@ impl Checker {
     }
 }
 
-/// Run the checker until `shutdown` fires.
-pub fn start(client: Client, shutdown: CancellationToken) {
+/// Run the checker until `shutdown` fires. A follower stays idle.
+pub fn start(client: Client, shutdown: CancellationToken, leadership: pistack_types::Leadership) {
     tokio::spawn(async move {
         let mut checker = Checker::new(client);
         let mut tick = tokio::time::interval(TICK);
@@ -218,8 +218,11 @@ pub fn start(client: Client, shutdown: CancellationToken) {
                     tracing::debug!("relay health checker stopping");
                     break;
                 }
+                _ = leadership.changed() => {}
                 _ = tick.tick() => {
-                    checker.tick(false).await;
+                    if leadership.is_leader() {
+                        checker.tick(false).await;
+                    }
                 }
             }
         }

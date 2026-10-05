@@ -8,8 +8,8 @@
 //! away whenever a `zone` or `rec` event arrives, so an answer is never
 //! staler than the last store write. SOA and apex NS records are synthesised
 //! from the zone spec and its reconciled serial. UDP and TCP share one port,
-//! `PISTACK_DNS_LISTEN` (default `0.0.0.0:5353`; set `:53` in production,
-//! where the binary needs `CAP_NET_BIND_SERVICE`).
+//! `PISTACK_DNS_LISTEN` (default `127.0.0.1:5353`; set `0.0.0.0:53` in
+//! production, where the binary needs `CAP_NET_BIND_SERVICE`).
 //!
 //! Only queries are served: updates, notifies and zone transfers get NOTIMP.
 
@@ -35,8 +35,9 @@ use tokio::sync::broadcast;
 
 /// Environment variable naming the listen address.
 pub const LISTEN_ENV: &str = "PISTACK_DNS_LISTEN";
-/// Unprivileged default for development; production uses port 53.
-pub const DEFAULT_LISTEN: &str = "0.0.0.0:5353";
+/// Loopback default so an unset variable does not bind every interface.
+/// Production sets `PISTACK_DNS_LISTEN` to a specific address on port 53.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:5353";
 /// How long an idle TCP client may hold a connection.
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest CNAME chain followed inside one zone.
@@ -376,8 +377,15 @@ impl Handler {
 
 /// The listen address from the environment, or the development default.
 pub fn listen_addr() -> anyhow::Result<SocketAddr> {
-    let s = std::env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.into());
-    SocketAddr::from_str(&s).map_err(|e| anyhow::anyhow!("{LISTEN_ENV}={s}: {e}"))
+    parse_listen(std::env::var(LISTEN_ENV).ok().as_deref())
+}
+
+fn parse_listen(override_addr: Option<&str>) -> anyhow::Result<SocketAddr> {
+    let s = override_addr
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_LISTEN);
+    SocketAddr::from_str(s).map_err(|e| anyhow::anyhow!("{LISTEN_ENV}={s}: {e}"))
 }
 
 /// Bind UDP and TCP on `listen` and serve until `shutdown` fires. Returns the
@@ -505,6 +513,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(mx.answers.len(), 1);
+
+        assert_eq!(DEFAULT_LISTEN, "127.0.0.1:5353");
+        assert_eq!(
+            parse_listen(None).unwrap(),
+            SocketAddr::from_str(DEFAULT_LISTEN).unwrap()
+        );
+        assert_eq!(
+            parse_listen(Some("10.0.0.1:53")).unwrap(),
+            SocketAddr::from_str("10.0.0.1:53").unwrap()
+        );
+        assert!(parse_listen(Some("not-an-addr")).is_err());
 
         assert!(h
             .resolve(&n("other.tld."), RecordType::A)

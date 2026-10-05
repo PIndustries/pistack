@@ -128,6 +128,7 @@ impl Module for Slab {
             client,
             ctx.events.subscribe(),
             ctx.shutdown.clone(),
+            ctx.leadership.clone(),
         ));
         Ok(())
     }

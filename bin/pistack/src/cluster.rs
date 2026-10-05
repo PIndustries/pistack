@@ -29,7 +29,7 @@ use pistack_cluster::{
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
-use pistack_types::ApiError;
+use pistack_types::{ApiError, Leadership};
 use serde::Deserialize;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -81,6 +81,15 @@ pub struct ClusterHandle {
     pub leader_api: Mutex<String>,
     pub term: AtomicU64,
     pub announce: watch::Sender<Announce>,
+    /// Watchable copy of [`ClusterHandle::leader`] for module reconcilers.
+    pub leadership: Leadership,
+}
+
+impl ClusterHandle {
+    fn set_leader(&self, leader: bool) {
+        self.leader.store(leader, Ordering::Relaxed);
+        self.leadership.set(leader);
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -376,6 +385,7 @@ pub fn handle_from(
         leader_api: Mutex::new(established.leader_api.clone()),
         term: AtomicU64::new(established.term),
         announce: tx,
+        leadership: Leadership::new(established.leader),
     }
 }
 
@@ -517,7 +527,7 @@ async fn vote(
     save_ballot(&handle.store, &ballot).map_err(store_err)?;
     handle.term.store(ballot.current_term, Ordering::Relaxed);
     if response.term > before && handle.leader.load(Ordering::Relaxed) {
-        handle.leader.store(false, Ordering::Relaxed);
+        handle.set_leader(false);
         handle.store.set_record_log(false);
         if response.granted {
             *guard(&handle.leader_api) = String::new();
@@ -649,7 +659,7 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
 
 fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     handle.term.store(term, Ordering::Relaxed);
-    handle.leader.store(true, Ordering::Relaxed);
+    handle.set_leader(true);
     *guard(&handle.leader_api) = handle.self_api.clone();
     *guard(&handle.role) = Role::Voter;
     handle.store.set_log_term(term);
@@ -1012,13 +1022,13 @@ mod tests {
         let base = format!("http://{addr}");
         *guard(&handle.leader_api) = base.clone();
 
-        handle.leader.store(false, Ordering::Relaxed);
+        handle.set_leader(false);
         let client = http_client();
         let refused = client.post(format!("{base}/mutate")).send().await.unwrap();
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         let body = refused.text().await.unwrap();
         assert!(body.contains("not the leader"));
-        handle.leader.store(true, Ordering::Relaxed);
+        handle.set_leader(true);
         let allowed = client.post(format!("{base}/mutate")).send().await.unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
 

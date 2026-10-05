@@ -17,7 +17,7 @@ use loom::{
     MACHINE_POD_LABEL, POD_TEMPLATE_HASH,
 };
 use pistack_store::Store;
-use pistack_types::{kind, Caller, Id, Meta, Module, ModuleContext, Page, Phase};
+use pistack_types::{kind, Caller, Id, Leadership, Meta, Module, ModuleContext, Page, Phase};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +45,7 @@ async fn harness() -> Harness {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "testbox".into(),
+        leadership: Leadership::default(),
     };
     forge::Forge::default().start(ctx.clone()).await.unwrap();
     // The dev host advertises this box's cores; give the tests room.

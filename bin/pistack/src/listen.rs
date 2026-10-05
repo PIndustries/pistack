@@ -208,7 +208,7 @@ fn restrict_key(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use axum::routing::get;
-    use pistack_types::{Module, ModuleContext};
+    use pistack_types::{Leadership, Module, ModuleContext};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -239,6 +239,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             public_url: "http://127.0.0.1".into(),
             node_name: "test".into(),
+            leadership: Leadership::default(),
         };
         let app = axum::Router::new()
             .route("/healthz", get(|| async { "ok" }))

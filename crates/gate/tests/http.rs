@@ -12,7 +12,7 @@ use axum::{
 use gate::{Gate, ADMIN_PASSWORD_ENV};
 use pistack_store::Store;
 use pistack_types::module::CancellationToken;
-use pistack_types::{Module, ModuleContext};
+use pistack_types::{Leadership, Module, ModuleContext};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -26,6 +26,7 @@ async fn boot() -> Router {
         shutdown: CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: Leadership::default(),
     };
     let gate = Gate::default();
     gate.start(ctx.clone()).await.unwrap();

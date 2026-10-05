@@ -134,13 +134,6 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     };
 
     let shutdown = CancellationToken::new();
-    let ctx = ModuleContext {
-        store: Arc::new(store.clone()),
-        events: events.clone(),
-        shutdown: shutdown.clone(),
-        public_url: public_url.clone(),
-        node_name: hostname(),
-    };
 
     if store.get_meta::<String>("cluster_id")?.is_none() {
         if matches!(boot, crate::cluster::BootKind::Joined) {
@@ -197,6 +190,14 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         &established,
         crate::cluster::advertise_ip(&opts.listen),
     ));
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: events.clone(),
+        shutdown: shutdown.clone(),
+        public_url: public_url.clone(),
+        node_name: resolve_node_name(),
+        leadership: cluster.leadership.clone(),
+    };
     crate::cluster::spawn_background(
         cluster.clone(),
         crate::cluster::advertise_ip(&opts.listen),
@@ -271,8 +272,40 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `PISTACK_NODE_NAME` when set and non-empty, otherwise the hostname.
+pub(crate) fn resolve_node_name() -> String {
+    std::env::var("PISTACK_NODE_NAME")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(hostname)
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
+        .ok()
         .map(|s| s.trim().to_owned())
-        .unwrap_or_else(|_| "localhost".into())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_name_honors_env() {
+        let _lock = NODE_NAME_LOCK.lock().unwrap();
+        let prev = std::env::var_os("PISTACK_NODE_NAME");
+        std::env::set_var("PISTACK_NODE_NAME", "edge-1");
+        assert_eq!(resolve_node_name(), "edge-1");
+        std::env::set_var("PISTACK_NODE_NAME", "  ");
+        assert!(!resolve_node_name().is_empty());
+        match prev {
+            Some(v) => std::env::set_var("PISTACK_NODE_NAME", v),
+            None => std::env::remove_var("PISTACK_NODE_NAME"),
+        }
+    }
+
+    static NODE_NAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

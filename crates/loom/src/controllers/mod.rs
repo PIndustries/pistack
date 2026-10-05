@@ -6,7 +6,8 @@
 //! Every controller implements [`Controller`]: it names the store kinds
 //! whose events wake it and provides one idempotent `reconcile_once` pass.
 //! [`run`] drives it until shutdown, waking on those events and on a
-//! [`TICK`] so nothing depends on an event being seen.
+//! [`TICK`] so nothing depends on an event being seen. The loop stays idle
+//! unless this node is the leader.
 //!
 //! Rules shared by every controller:
 //! * `status` is written only through [`patch_status`], which re-reads the
@@ -47,22 +48,30 @@ pub trait Controller: Send + Sync + 'static {
     async fn reconcile_once(&self) -> anyhow::Result<()>;
 }
 
-/// Drive `c` until `ctx.shutdown` fires.
+/// Drive `c` until `ctx.shutdown` fires. The loop stays idle unless this
+/// node is the leader.
 pub async fn run(c: impl Controller, ctx: ModuleContext) {
     let mut rx = ctx.events.subscribe();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let name = c.name();
+    if !ctx.is_leader() {
+        tracing::info!(controller = name, "loom: controller idle (not leader)");
+    }
     loop {
         tokio::select! {
             _ = ctx.shutdown.cancelled() => break,
             _ = tick.tick() => {}
+            _ = ctx.leadership.changed() => {}
             ev = rx.recv() => match ev {
                 Ok(e) if c.watches().contains(&e.kind.as_str()) => {}
                 Ok(_) => continue,
                 Err(RecvError::Lagged(n)) => tracing::debug!(controller = name, skipped = n, "loom: event bus lagged"),
                 Err(RecvError::Closed) => break,
             },
+        }
+        if !ctx.is_leader() {
+            continue;
         }
         if let Err(e) = c.reconcile_once().await {
             tracing::warn!(controller = name, error = %e, "loom: reconcile pass failed");
@@ -160,4 +169,61 @@ pub fn live_pods<'a>(pods: &'a [Pod], owner: &Id) -> Vec<&'a Pod> {
     owned_by(pods, owner)
         .filter(|p| !delete_requested(p) && !p.status.phase.is_terminal())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pistack_types::{Leadership, ModuleContext};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    struct Counter {
+        n: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Controller for Counter {
+        fn name(&self) -> &'static str {
+            "counter"
+        }
+        fn watches(&self) -> &'static [&'static str] {
+            &[]
+        }
+        async fn reconcile_once(&self) -> anyhow::Result<()> {
+            self.n.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_stays_idle_until_leader() {
+        let leadership = Leadership::new(false);
+        let shutdown = pistack_types::module::CancellationToken::new();
+        let (events, _) = broadcast::channel(8);
+        let ctx = ModuleContext {
+            store: Arc::new(()),
+            events,
+            shutdown: shutdown.clone(),
+            public_url: "http://test".into(),
+            node_name: "test".into(),
+            leadership: leadership.clone(),
+        };
+        let n = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run(Counter { n: n.clone() }, ctx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(n.load(Ordering::SeqCst), 0, "follower must not reconcile");
+        leadership.set(true);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while n.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "leader never reconciled"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
 }

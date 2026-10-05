@@ -14,7 +14,7 @@ use axum::Router;
 use forge::{DriverRegistry, Forge, Host, Machine};
 use pistack_rpc::{AgentClient, CommandQueue, QueueConfig};
 use pistack_store::Store;
-use pistack_types::{Module, ModuleContext, Phase};
+use pistack_types::{Leadership, Module, ModuleContext, Phase};
 use tokio_util::sync::CancellationToken;
 
 const NODE: &str = "agent-1";
@@ -32,6 +32,7 @@ async fn machine_runs_on_a_joined_agent() {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "control".into(),
+        leadership: Leadership::default(),
     };
     let queue = CommandQueue::new(QueueConfig {
         command_timeout: Duration::from_secs(10),
