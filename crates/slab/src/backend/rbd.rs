@@ -17,6 +17,8 @@
 //! | extend          | `rbd resize --size {new_size_gib}G {pool}/{vol_id}` |
 //! | attach_info     | `Rbd { pool, image: vol_id, monitors, user }` |
 //! | image           | `qemu-img convert -O raw -f <fmt> -n <src> rbd:{pool}/{vol_id}` |
+//! | backup          | `rbd export {pool}/{vol_id} -` (stdout is the byte stream) |
+//! | backup restore  | unavailable; an existing image has no stdin import |
 //!
 //! The image is created with `rbd create` first. `qemu-img convert -n`
 //! then writes raw bytes into that image (`-n` is qemu-img's "do not
@@ -40,7 +42,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
+use super::{AttachInfo, AttachTarget, BackendRef, BackupStream, BlockBackend, RestoreStream};
 use crate::types::{Snapshot, Volume};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -278,6 +280,20 @@ impl BlockBackend for RbdBackend {
     async fn bytes_path(&self, vol: &Volume) -> ApiResult<std::path::PathBuf> {
         let _ = vol;
         Err(ApiError::unavailable("rbd backup is not available"))
+    }
+
+    async fn open_backup(&self, vol: &Volume) -> ApiResult<BackupStream> {
+        self.require_available().await?;
+        let pool = self.pool()?.to_owned();
+        let id = vol_id(vol)?;
+        let spec = format!("{pool}/{id}");
+        let bin = super::configured_bin(ENV_BIN, "rbd");
+        BackupStream::spawn(&bin, &["export".into(), spec, "-".into()], "rbd export")
+    }
+
+    async fn open_restore(&self, vol: &Volume) -> ApiResult<RestoreStream> {
+        let _ = vol;
+        Err(ApiError::unavailable("rbd backup restore is not available"))
     }
 }
 
@@ -519,5 +535,49 @@ mod tests {
             logged,
             args.iter().map(|a| format!("{a}\n")).collect::<String>()
         );
+    }
+
+    #[tokio::test]
+    async fn backup_export_streams_stdout() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("rbd");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\n\
+                 if [ \"$1\" = \"export\" ]; then printf 'xyz'; fi\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let vol = volume(2);
+        let id = vol.meta.id.to_string();
+        let mut stream = backend.open_backup(&vol).await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"xyz");
+        stream.finish().await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("export"), "{logged}");
+        assert!(logged.contains(&format!("volumes/{id}")), "{logged}");
+        assert!(logged.lines().any(|line| line == "-"), "{logged}");
+
+        let err = backend.open_restore(&vol).await.unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable);
+        assert!(err.message.contains("restore"), "{err}");
     }
 }

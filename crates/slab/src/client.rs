@@ -5,6 +5,7 @@
 //! HTTP handlers, the reconciler, and other modules (`forge` attaches
 //! volumes through it). It is the only writer of `status`.
 
+use bytes::Bytes;
 use mold::ImageStore;
 use pistack_rpc::{
     CommandKind, CommandQueue, DiskTarget, VolumeAttach, VolumeAttached, VolumeDetach,
@@ -13,11 +14,13 @@ use pistack_store::{Collection, Store, StoreError};
 use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult, Id, Meta, Phase};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use silo::multipart::{CompletedPart, MAX_PART_NUMBER};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use crate::backend::{
     AttachInfo, AttachTarget, BlockBackend, LocalFileBackend, LvmBackend, RbdBackend,
@@ -41,6 +44,14 @@ pub struct Create<S> {
     #[serde(default)]
     pub project: Option<Id>,
     pub spec: S,
+}
+
+/// Body of `POST /backups/{id}/restore`. An empty body creates a new volume.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RestoreRequest {
+    /// Existing volume to write, by name or id. Empty creates a new volume.
+    #[serde(default)]
+    pub volume: Option<String>,
 }
 
 /// Body of `PUT /<kind>/{id}`: metadata only. `spec` changes have their
@@ -88,6 +99,14 @@ pub struct Client {
     images: Arc<dyn ImageStore>,
     /// Temp files for stores that only offer a byte stream.
     spool_dir: PathBuf,
+    /// Silo single-object cap. Multipart parts stay within it. The assembled
+    /// backup may be larger; see [`Client::silo_for_complete`].
+    max_object_bytes: usize,
+    /// Silo minimum size of every multipart part except the last.
+    min_part_bytes: usize,
+    /// Test seam. After this many parts land, the upload returns an error
+    /// and the multipart upload is aborted. `None` disables it.
+    backup_fail_after_parts: Option<u32>,
 }
 
 /// Host path and optional network target for one attach or detach.
@@ -234,7 +253,25 @@ impl Client {
             silo_root: silo::Silo::data_root(),
             images: Arc::new(mold::LocalDirStore::new(mold::default_image_dir())),
             spool_dir: crate::default_spool_dir(),
+            max_object_bytes: silo::MAX_OBJECT_BYTES,
+            min_part_bytes: silo::MIN_PART_BYTES,
+            backup_fail_after_parts: None,
         }
+    }
+
+    /// Silo limits backups honor. Parts are at most `max_object_bytes` and,
+    /// except the last, at least `min_part_bytes`.
+    pub fn with_silo_limits(mut self, max_object_bytes: usize, min_part_bytes: usize) -> Self {
+        self.max_object_bytes = max_object_bytes;
+        self.min_part_bytes = min_part_bytes;
+        self
+    }
+
+    /// Fail a backup upload after `parts` successful parts and abort it.
+    /// Used to prove a mid-upload failure leaves no object.
+    pub fn fail_backup_after_parts(mut self, parts: u32) -> Self {
+        self.backup_fail_after_parts = Some(parts);
+        self
     }
 
     pub fn with_queue(mut self, queue: CommandQueue) -> Self {
@@ -963,6 +1000,15 @@ impl Client {
     /// The new volume is returned only after its bytes match the object.
     /// A backup that is not ready, or whose object is missing, is not restored.
     pub async fn restore_backup(&self, id: &Id) -> ApiResult<Volume> {
+        self.restore_backup_into(id, None).await
+    }
+
+    /// Restore `id` into `target` when set, or into a new volume.
+    ///
+    /// Size and a recorded checksum are checked before any byte is written.
+    /// A target smaller than the backup is rejected and left unchanged.
+    /// Bytes are streamed from the object; the whole volume is not buffered.
+    pub async fn restore_backup_into(&self, id: &Id, target: Option<Id>) -> ApiResult<Volume> {
         let backup = self.backups().get(id)?;
         if backup.status.phase != Phase::Ready {
             return Err(ApiError::conflict(format!(
@@ -973,72 +1019,113 @@ impl Client {
         let key = backup
             .status
             .object_ref
-            .as_deref()
+            .clone()
             .ok_or_else(|| ApiError::conflict(format!("backup {id} has no stored object")))?;
         let bucket = self.backup_bucket(&backup)?;
-        let (obj, bytes) = self.silo().get_object(&bucket.meta.id, key).await?;
-        if bytes.len() as u64 != obj.status.size_bytes || obj.status.sha256.is_empty() {
+        let obj = self.silo().head_object(&bucket.meta.id, &key)?;
+        let need = obj.status.size_bytes;
+        if obj.status.sha256.is_empty() {
             return Err(ApiError::conflict(format!(
                 "backup {id} bytes are not stored"
             )));
         }
-        if bytes.len() > silo::MAX_OBJECT_BYTES {
-            return Err(oversize(bytes.len() as u64));
-        }
-        let src = self.volumes().get(&backup.spec.volume)?;
-        let backend_name = self.volume_backend(&src).await?.name();
-        if backend_name != "local" {
-            return Err(ApiError::unavailable(format!(
-                "{backend_name} backup restore is not available"
-            )));
-        }
-        let size_gib = src
-            .spec
-            .size_gib
-            .max(backup.status.size_gib)
-            .max(bytes_to_gib(bytes.len() as u64));
-        let created = self
-            .create_volume(Create {
-                name: restore_volume_name(&backup),
-                description: format!("restored from {}", backup.meta.name),
-                labels: backup.meta.labels.clone(),
-                annotations: backup.meta.annotations.clone(),
-                project: backup.meta.project.clone(),
-                spec: VolumeSpec {
-                    size_gib,
-                    volume_type: src.spec.volume_type.clone(),
-                    source: VolumeSource::None,
-                    bootable: src.spec.bootable,
-                    encrypted: src.spec.encrypted,
-                },
-            })
-            .await?;
-        let created = self
-            .reconcile_volume(&created.meta.id)
-            .await?
-            .ok_or_else(|| ApiError::internal("restored volume disappeared"))?;
-        if created.status.phase != Phase::Ready {
+        if backup.status.size_bytes > 0 && backup.status.size_bytes != need {
             return Err(ApiError::conflict(format!(
-                "restored volume {} is {:?}, not ready",
-                created.meta.id, created.status.phase
+                "backup {id} records {} bytes but the object is {need}",
+                backup.status.size_bytes
             )));
         }
+        if let Some(sum) = backup.status.sha256.as_deref().filter(|s| !s.is_empty()) {
+            if sum != obj.status.sha256 {
+                return Err(ApiError::conflict(format!(
+                    "backup {id} checksum does not match the stored object"
+                )));
+            }
+        }
+        let expect_sha = obj.status.sha256.clone();
+
+        let dest = if let Some(target_id) = target {
+            let vol = self.volumes().get(&target_id)?;
+            if vol.status.phase != Phase::Ready {
+                return Err(ApiError::conflict(format!(
+                    "volume {target_id} is {:?}, not ready",
+                    vol.status.phase
+                )));
+            }
+            if vol.meta.project != backup.meta.project {
+                return Err(ApiError::unprocessable(
+                    "volume is not in the backup's project",
+                ));
+            }
+            let backend_name = self.volume_backend(&vol).await?.name();
+            if !restore_supported(backend_name) {
+                return Err(ApiError::unavailable(format!(
+                    "{backend_name} backup restore is not available"
+                )));
+            }
+            // Reject before opening the volume for write.
+            self.ensure_capacity(&vol, need).await?;
+            vol
+        } else {
+            let src = self.volumes().get(&backup.spec.volume)?;
+            let backend_name = self.volume_backend(&src).await?.name();
+            if !restore_supported(backend_name) {
+                return Err(ApiError::unavailable(format!(
+                    "{backend_name} backup restore is not available"
+                )));
+            }
+            let size_gib = src
+                .spec
+                .size_gib
+                .max(backup.status.size_gib)
+                .max(bytes_to_gib(need));
+            let created = self
+                .create_volume(Create {
+                    name: restore_volume_name(&backup),
+                    description: format!("restored from {}", backup.meta.name),
+                    labels: backup.meta.labels.clone(),
+                    annotations: backup.meta.annotations.clone(),
+                    project: backup.meta.project.clone(),
+                    spec: VolumeSpec {
+                        size_gib,
+                        volume_type: src.spec.volume_type.clone(),
+                        source: VolumeSource::None,
+                        bootable: src.spec.bootable,
+                        encrypted: src.spec.encrypted,
+                    },
+                })
+                .await?;
+            let created = self
+                .reconcile_volume(&created.meta.id)
+                .await?
+                .ok_or_else(|| ApiError::internal("restored volume disappeared"))?;
+            if created.status.phase != Phase::Ready {
+                return Err(ApiError::conflict(format!(
+                    "restored volume {} is {:?}, not ready",
+                    created.meta.id, created.status.phase
+                )));
+            }
+            if let Err(e) = self.ensure_capacity(&created, need).await {
+                let _ = self.fail_volume(&created.meta.id, "restore", e.clone());
+                return Err(e);
+            }
+            created
+        };
+
         // The blank file is not the restored volume. Stay off Ready until
-        // the backup bytes are on the file and read back.
-        self.volumes().modify(&created.meta.id, |v| {
+        // the backup bytes are on the volume and read back.
+        self.volumes().modify(&dest.meta.id, |v| {
             v.status.phase = Phase::Creating;
             Ok(())
         })?;
-        let path = self.volume_file(&created).await?;
-        if let Err(e) = write_prefix(&path, &bytes).await {
-            let _ = self.fail_volume(&created.meta.id, "restore", e.clone());
+        if let Err(e) = self
+            .write_backup_bytes(&dest, &bucket.meta.id, &key, &expect_sha, need)
+            .await
+        {
+            let _ = self.fail_volume(&dest.meta.id, "restore", e.clone());
             return Err(e);
         }
-        if let Err(e) = read_prefix(&path, &bytes).await {
-            let _ = self.fail_volume(&created.meta.id, "restore", e.clone());
-            return Err(e);
-        }
-        Ok(self.volumes().modify(&created.meta.id, |v| {
+        Ok(self.volumes().modify(&dest.meta.id, |v| {
             v.status.phase = Phase::Ready;
             set_condition(
                 &mut v.status.conditions,
@@ -1049,6 +1136,84 @@ impl Client {
             );
             Ok(())
         })?)
+    }
+
+    /// Byte capacity available to a restore. A local file reports its length
+    /// so a shrunk file is rejected. Other backends use `size_gib`.
+    async fn ensure_capacity(&self, vol: &Volume, need: u64) -> ApiResult<()> {
+        let backend = self.volume_backend(vol).await?;
+        let len = match backend.bytes_path(vol).await {
+            Ok(path) => tokio::fs::metadata(&path).await.map_err(io_err)?.len(),
+            Err(_) => crate::backend::gib_to_bytes(vol.spec.size_gib),
+        };
+        if need > len {
+            return Err(ApiError::unprocessable(format!(
+                "volume {} is {len} bytes, smaller than backup ({need} bytes)",
+                vol.meta.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stream the object onto `vol`, hashing as the bytes land, then read
+    /// the prefix back and hash it again. Neither pass holds the volume.
+    async fn write_backup_bytes(
+        &self,
+        vol: &Volume,
+        bucket: &Id,
+        key: &str,
+        expect_sha: &str,
+        expect_len: u64,
+    ) -> ApiResult<()> {
+        let backend = self.volume_backend(vol).await?;
+        let mut writer = backend.open_restore(vol).await?;
+        let (_obj, mut file) = self.silo().open_object(bucket, key).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut got = 0u64;
+        loop {
+            let n = file.read(&mut buf).await.map_err(io_err)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            writer.write_all(&buf[..n]).await?;
+            got += n as u64;
+        }
+        writer.finish().await?;
+        if got != expect_len {
+            return Err(ApiError::internal(format!(
+                "restored {got} bytes, object is {expect_len}"
+            )));
+        }
+        let hex = hex_encode(hasher.finalize().as_slice());
+        if hex != expect_sha {
+            return Err(ApiError::internal(
+                "restored bytes do not match the backup checksum",
+            ));
+        }
+        let mut reader = backend.open_backup(vol).await?;
+        let mut check = Sha256::new();
+        let mut left = got;
+        while left > 0 {
+            let want = (buf.len() as u64).min(left) as usize;
+            let n = reader.read(&mut buf[..want]).await?;
+            if n == 0 {
+                return Err(ApiError::internal(
+                    "restored volume is shorter than the backup",
+                ));
+            }
+            check.update(&buf[..n]);
+            left -= n as u64;
+        }
+        reader.finish().await?;
+        let hex2 = hex_encode(check.finalize().as_slice());
+        if hex2 != expect_sha {
+            return Err(ApiError::internal(
+                "restored volume bytes do not match the backup",
+            ));
+        }
+        Ok(())
     }
 
     // ---- reconciliation ---------------------------------------------------
@@ -1284,11 +1449,12 @@ impl Client {
         })?)
     }
 
-    /// Copy the volume file into the backup's silo bucket.
+    /// Stream the volume into the backup's silo bucket as one multipart object.
     ///
-    /// Ready is set only after the object reads back as the same bytes.
-    /// A failed write leaves the backup `Pending` or `Error`. A volume
-    /// larger than 1 GiB is unavailable, names the size, and is not truncated.
+    /// Ready is set only after silo reports the same size and checksum.
+    /// A failed upload aborts the multipart upload, leaves no object, and
+    /// marks the backup `Error` (or `Pending` while the volume is still
+    /// being created). The volume itself is only read.
     pub async fn reconcile_backup(&self, id: &Id) -> ApiResult<Option<Backup>> {
         let col = self.backups();
         let Some(b) = col.try_get(id)? else {
@@ -1434,6 +1600,21 @@ impl Client {
 
     fn silo(&self) -> silo::Client {
         silo::Client::new(self.store.clone(), self.silo_root.clone())
+            .with_max_object_bytes(self.max_object_bytes)
+            .with_min_part_bytes(self.min_part_bytes)
+    }
+
+    /// Client used only to finish a multipart upload.
+    ///
+    /// `complete_multipart_upload` rejects an assembled object larger than
+    /// the client's `max_object_bytes` (the single-PUT cap; silo tests this
+    /// in `multipart_oversize_total_rejected`). Parts already obey that cap.
+    /// Raising it to the streamed length lets one backup object exceed the
+    /// single-object limit. Staging and the final object share this root.
+    fn silo_for_complete(&self, total: u64) -> silo::Client {
+        let need = usize::try_from(total).unwrap_or(usize::MAX);
+        let cap = need.max(self.max_object_bytes).max(1);
+        self.silo().with_max_object_bytes(cap)
     }
 
     /// Empty or `local` uses the configured file backend. `lvm` and `rbd`
@@ -1465,10 +1646,6 @@ impl Client {
         }
     }
 
-    async fn volume_file(&self, vol: &Volume) -> ApiResult<PathBuf> {
-        self.volume_backend(vol).await?.bytes_path(vol).await
-    }
-
     async fn upload_backup(&self, id: &Id) -> ApiResult<Option<Backup>> {
         let backup = self.backups().get(id)?;
         let vol = match self.ready_volume(&backup.spec.volume).await {
@@ -1488,66 +1665,147 @@ impl Client {
                 return self.mark_backup(id, phase, &e, true);
             }
         };
-        let path = match self.volume_file(&vol).await {
-            Ok(path) => path,
-            Err(e) => return self.mark_backup(id, Phase::Error, &e, true),
-        };
-        let bytes = match read_capped(&path).await {
-            Ok(bytes) => bytes,
-            Err(e) => return self.mark_backup(id, Phase::Error, &e, true),
-        };
-        let key = backup_key(id);
         let bucket = match self.backup_bucket(&backup) {
             Ok(bucket) => bucket,
             Err(e) => return self.mark_backup(id, Phase::Error, &e, true),
         };
-        if let Err(e) = self
-            .silo()
-            .put_object(
+        let key = backup_key(id);
+        let silo = self.silo();
+        let upload_id = match silo
+            .create_multipart_upload(
                 &bucket.meta.id,
                 &key,
-                &bytes,
                 Some("application/octet-stream".into()),
             )
             .await
         {
-            return self.mark_backup(id, Phase::Error, &e, true);
-        }
-        if let Err(e) = self.confirm_object(&bucket, &key, &bytes).await {
-            let _ = self.silo().delete_object(&bucket.meta.id, &key).await;
-            return self.mark_backup(id, Phase::Error, &e, true);
-        }
-        Ok(Some(self.backups().modify(id, |b| {
-            b.status.phase = Phase::Ready;
-            b.status.object_ref = Some(key.clone());
-            set_condition(
-                &mut b.status.conditions,
-                "Uploaded",
-                true,
-                "stored",
-                format!("{} bytes", bytes.len()),
-            );
+            Ok(upload_id) => upload_id,
+            Err(e) => return self.mark_backup(id, Phase::Error, &e, true),
+        };
+        let _ = self.backups().modify(id, |b| {
+            b.status.phase = Phase::Creating;
             Ok(())
-        })?))
+        });
+        match self
+            .stream_backup(&silo, &bucket.meta.id, &key, &upload_id, &vol)
+            .await
+        {
+            Ok(uploaded) => Ok(Some(self.backups().modify(id, |b| {
+                b.status.phase = Phase::Ready;
+                b.status.object_ref = Some(key.clone());
+                b.status.size_bytes = uploaded.total;
+                b.status.part_count = uploaded.part_count;
+                b.status.sha256 = Some(uploaded.sha256.clone());
+                set_condition(
+                    &mut b.status.conditions,
+                    "Uploaded",
+                    true,
+                    "stored",
+                    format!("{} bytes in {} parts", uploaded.total, uploaded.part_count),
+                );
+                Ok(())
+            })?)),
+            Err(e) => {
+                abort_upload(&silo, &bucket.meta.id, &key, &upload_id).await;
+                if let Err(del) = silo.delete_object(&bucket.meta.id, &key).await {
+                    if del.code != ErrorCode::NotFound {
+                        tracing::warn!(
+                            backup = %id,
+                            error = %del,
+                            "removing a partial backup object failed"
+                        );
+                    }
+                }
+                self.mark_backup(id, Phase::Error, &e, true)
+            }
+        }
     }
 
-    async fn confirm_object(
+    /// Read the volume in fixed-size parts and upload each one. At most two
+    /// parts are resident: the part being uploaded and the lookahead that
+    /// tells whether it is the last part.
+    async fn stream_backup(
         &self,
-        bucket: &silo::Bucket,
+        silo: &silo::Client,
+        bucket: &Id,
         key: &str,
-        bytes: &[u8],
-    ) -> ApiResult<()> {
-        let (obj, got) = self.silo().get_object(&bucket.meta.id, key).await?;
-        if got != bytes
-            || obj.status.size_bytes != bytes.len() as u64
-            || obj.status.sha256.is_empty()
-        {
+        upload_id: &str,
+        vol: &Volume,
+    ) -> ApiResult<UploadedBackup> {
+        let part_size = backup_part_size(self.min_part_bytes, self.max_object_bytes)?;
+        let backend = self.volume_backend(vol).await?;
+        let mut reader = backend.open_backup(vol).await?;
+        let mut hasher = Sha256::new();
+        let mut parts: Vec<CompletedPart> = Vec::new();
+        let mut total: u64 = 0;
+
+        let first = read_part(&mut reader, part_size).await?;
+        if first.is_empty() {
+            let etag = upload_one(silo, bucket, key, upload_id, 1, Bytes::new()).await?;
+            parts.push(CompletedPart {
+                part_number: 1,
+                etag,
+            });
+        } else {
+            let mut current = first;
+            loop {
+                let next = read_part(&mut reader, part_size).await?;
+                let last = next.is_empty();
+                if !last && current.len() < self.min_part_bytes {
+                    return Err(ApiError::unavailable(format!(
+                        "backup part is {} bytes, below silo's minimum part size of {}; max_object_bytes is {}",
+                        current.len(),
+                        self.min_part_bytes,
+                        self.max_object_bytes
+                    )));
+                }
+                if parts.len() as u32 == MAX_PART_NUMBER {
+                    return Err(ApiError::unavailable(format!(
+                        "backup needs more than {MAX_PART_NUMBER} parts"
+                    )));
+                }
+                let n = current.len() as u64;
+                hasher.update(&current);
+                let part_number = parts.len() as u32 + 1;
+                let etag = upload_one(
+                    silo,
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    Bytes::from(current),
+                )
+                .await?;
+                parts.push(CompletedPart { part_number, etag });
+                total += n;
+                if self.backup_fail_after_parts == Some(parts.len() as u32) {
+                    return Err(ApiError::internal(format!(
+                        "backup failed after {} parts",
+                        parts.len()
+                    )));
+                }
+                if last {
+                    break;
+                }
+                current = next;
+            }
+        }
+        reader.finish().await?;
+
+        let sha256 = hex_encode(hasher.finalize().as_slice());
+        let part_count = parts.len() as u32;
+        let (obj, _etag) = self
+            .silo_for_complete(total)
+            .complete_multipart_upload(bucket, key, upload_id, &parts)
+            .await?;
+        if obj.status.size_bytes != total || obj.status.sha256 != sha256 || sha256.is_empty() {
             return Err(ApiError::internal("backup bytes were not stored"));
         }
-        if got.len() > silo::MAX_OBJECT_BYTES {
-            return Err(oversize(got.len() as u64));
-        }
-        Ok(())
+        Ok(UploadedBackup {
+            total,
+            part_count,
+            sha256,
+        })
     }
 
     async fn remove_backup(&self, id: &Id) -> ApiResult<Option<Backup>> {
@@ -1668,82 +1926,86 @@ fn bytes_to_gib(bytes: u64) -> u64 {
     bytes.div_ceil(gib).max(1)
 }
 
-fn oversize(len: u64) -> ApiError {
-    ApiError::unavailable(format!(
-        "backup is {len} bytes, larger than {}",
-        silo::format_byte_limit(silo::MAX_OBJECT_BYTES)
-    ))
-    .with_detail("size_bytes", serde_json::Value::from(len))
-}
-
 fn io_err(err: std::io::Error) -> ApiError {
     ApiError::internal(format!("backup: {err}"))
 }
 
-/// Read the whole file when it is at most [`silo::MAX_OBJECT_BYTES`]. A
-/// larger file returns unavailable with its size and is not returned as a prefix.
-async fn read_capped(path: &Path) -> ApiResult<Vec<u8>> {
-    let meta = tokio::fs::metadata(path).await.map_err(io_err)?;
-    if !meta.is_file() {
-        return Err(ApiError::unprocessable("backup source is not a file"));
+fn restore_supported(backend: &str) -> bool {
+    matches!(backend, "local" | "lvm")
+}
+
+struct UploadedBackup {
+    total: u64,
+    part_count: u32,
+    sha256: String,
+}
+
+/// Preferred part size is 64 MiB, raised to silo's minimum when that still
+/// fits in `max_object_bytes`. Otherwise the part size is the cap itself so
+/// a volume larger than the single-object limit can be split.
+fn backup_part_size(min_part: usize, max_object: usize) -> ApiResult<usize> {
+    if max_object == 0 {
+        return Err(ApiError::unavailable("silo max_object_bytes is 0"));
     }
-    let len = meta.len();
-    if len > silo::MAX_OBJECT_BYTES as u64 {
-        return Err(oversize(len));
+    let preferred = BACKUP_PART_BYTES.max(min_part);
+    if preferred <= max_object {
+        Ok(preferred)
+    } else {
+        Ok(max_object)
     }
-    let mut file = tokio::fs::File::open(path).await.map_err(io_err)?;
-    let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut chunk).await.map_err(io_err)?;
+}
+
+const BACKUP_PART_BYTES: usize = 64 * 1024 * 1024;
+
+async fn read_part(
+    reader: &mut crate::backend::BackupStream,
+    part_size: usize,
+) -> ApiResult<Vec<u8>> {
+    let mut buf = vec![0u8; part_size];
+    let mut filled = 0;
+    while filled < part_size {
+        let n = reader.read(&mut buf[filled..]).await?;
         if n == 0 {
             break;
         }
-        if buf.len().saturating_add(n) > silo::MAX_OBJECT_BYTES {
-            let grown = tokio::fs::metadata(path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or((buf.len() + n) as u64);
-            return Err(oversize(grown));
-        }
-        buf.extend_from_slice(&chunk[..n]);
+        filled += n;
     }
+    buf.truncate(filled);
     Ok(buf)
 }
 
-async fn write_prefix(path: &Path, bytes: &[u8]) -> ApiResult<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
+async fn upload_one(
+    silo: &silo::Client,
+    bucket: &Id,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    bytes: Bytes,
+) -> ApiResult<String> {
+    let len = bytes.len() as u64;
+    let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(bytes) });
+    silo.upload_part(bucket, key, upload_id, part_number, stream, Some(len), None)
         .await
-        .map_err(io_err)?;
-    file.seek(std::io::SeekFrom::Start(0))
-        .await
-        .map_err(io_err)?;
-    file.write_all(bytes).await.map_err(io_err)?;
-    let len = file.metadata().await.map_err(io_err)?.len();
-    if (bytes.len() as u64) > len {
-        file.set_len(bytes.len() as u64).await.map_err(io_err)?;
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(io_err)?;
-        file.write_all(bytes).await.map_err(io_err)?;
-    }
-    file.flush().await.map_err(io_err)?;
-    file.sync_all().await.map_err(io_err)?;
-    Ok(())
 }
 
-async fn read_prefix(path: &Path, bytes: &[u8]) -> ApiResult<()> {
-    let mut file = tokio::fs::File::open(path).await.map_err(io_err)?;
-    let mut got = vec![0u8; bytes.len()];
-    file.read_exact(&mut got).await.map_err(io_err)?;
-    if got != bytes {
-        return Err(ApiError::internal(
-            "restored volume bytes do not match the backup",
-        ));
+async fn abort_upload(silo: &silo::Client, bucket: &Id, key: &str, upload_id: &str) {
+    if let Err(e) = silo.abort_multipart_upload(bucket, key, upload_id).await {
+        let gone = e.code == ErrorCode::NotFound
+            || silo::multipart::s3_code_of(&e) == Some("NoSuchUpload");
+        if !gone {
+            tracing::warn!(error = %e, "aborting backup multipart upload failed");
+        }
     }
-    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
 }
 
 #[cfg(test)]

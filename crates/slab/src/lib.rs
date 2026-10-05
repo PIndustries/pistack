@@ -33,7 +33,7 @@ pub mod types;
 mod usage;
 
 pub use backend::{AttachInfo, AttachTarget, BackendRef, BlockBackend, LocalFileBackend, Protocol};
-pub use client::{Client, Create, UpdateMeta};
+pub use client::{Client, Create, RestoreRequest, UpdateMeta};
 pub use quota::{AllowAll, QuotaCheck, QuotaRequest};
 pub use types::*;
 
@@ -47,6 +47,10 @@ pub struct Slab {
     /// Shared with mold when the server wires one store. `None` uses
     /// [`mold::default_image_dir`].
     images: Option<Arc<dyn mold::ImageStore>>,
+    /// Same cap silo uses for a single PUT. Backup parts stay within it.
+    max_object_bytes: usize,
+    /// Minimum size of every backup part except the last.
+    min_part_bytes: usize,
 }
 
 impl Default for Slab {
@@ -89,7 +93,16 @@ impl Slab {
             quota,
             queue: None,
             images: None,
+            max_object_bytes: silo::MAX_OBJECT_BYTES,
+            min_part_bytes: silo::MIN_PART_BYTES,
         }
+    }
+
+    /// Use the same object cap and minimum part size as the silo module.
+    pub fn with_silo_limits(mut self, max_object_bytes: usize, min_part_bytes: usize) -> Self {
+        self.max_object_bytes = max_object_bytes;
+        self.min_part_bytes = min_part_bytes;
+        self
     }
 
     pub fn with_quota(mut self, quota: Arc<dyn QuotaCheck>) -> Self {
@@ -114,7 +127,8 @@ impl Slab {
     /// Other modules get theirs from here.
     pub fn client(&self, store: Store) -> Client {
         let mut client = Client::new(store, self.backend.clone(), self.quota.clone())
-            .with_spool_dir(default_spool_dir());
+            .with_spool_dir(default_spool_dir())
+            .with_silo_limits(self.max_object_bytes, self.min_part_bytes);
         if let Some(images) = &self.images {
             client = client.with_images(images.clone());
         }

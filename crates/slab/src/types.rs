@@ -206,6 +206,17 @@ pub struct BackupStatus {
     pub phase: Phase,
     #[serde(default)]
     pub size_gib: u64,
+    /// Byte length of the stored object. `0` on backups written as a single
+    /// object before streaming uploads; restore then uses the object record.
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Parts in the multipart upload. `0` means a single-object backup.
+    #[serde(default)]
+    pub part_count: u32,
+    /// SHA-256 of the stored bytes, lowercase hex. Absent on older backups;
+    /// restore then checks the object record's checksum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -241,4 +252,22 @@ pub fn set_condition(
         message,
         last_transition: Utc::now(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_backup_status_without_multipart_fields_decodes() {
+        let raw = r#"{"phase":"ready","size_gib":1,"object_ref":"backups/bak-old"}"#;
+        let status: BackupStatus = serde_json::from_str(raw).unwrap();
+        assert_eq!(status.phase, Phase::Ready);
+        assert_eq!(status.size_gib, 1);
+        assert_eq!(status.object_ref.as_deref(), Some("backups/bak-old"));
+        assert_eq!(status.size_bytes, 0);
+        assert_eq!(status.part_count, 0);
+        assert!(status.sha256.is_none());
+        assert!(status.conditions.is_empty());
+    }
 }

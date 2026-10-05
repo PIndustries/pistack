@@ -15,6 +15,7 @@ use pistack_types::{ApiError, ApiResult};
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncSeekExt;
 
 use super::{gib_to_bytes, AttachInfo, AttachTarget, BackendRef, BlockBackend};
 use crate::types::{Snapshot, Volume, VolumeSource};
@@ -255,6 +256,23 @@ impl BlockBackend for LocalFileBackend {
 
     async fn bytes_path(&self, vol: &Volume) -> ApiResult<PathBuf> {
         self.confine(&self.vol_ref_path(vol)).await
+    }
+
+    async fn open_backup(&self, vol: &Volume) -> ApiResult<super::BackupStream> {
+        let path = self.bytes_path(vol).await?;
+        let file = fs::File::open(&path).await.map_err(io_err)?;
+        Ok(super::BackupStream::file(file))
+    }
+
+    async fn open_restore(&self, vol: &Volume) -> ApiResult<super::RestoreStream> {
+        let path = self.bytes_path(vol).await?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(io_err)?;
+        file.seek(io::SeekFrom::Start(0)).await.map_err(io_err)?;
+        Ok(super::RestoreStream::file(file))
     }
 }
 
