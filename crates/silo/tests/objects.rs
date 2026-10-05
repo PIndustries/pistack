@@ -2593,15 +2593,14 @@ async fn list_objects_v2_delimiter_pagination() {
     assert_eq!(xml_tag(&xml, "KeyCount").as_deref(), Some("1"));
     assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
     assert!(listed_contents_keys(&xml).is_empty());
-    assert_eq!(
-        xml_tag(&xml, "NextContinuationToken").as_deref(),
-        Some("a/")
-    );
+    let token = xml_tag(&xml, "NextContinuationToken").expect("token");
+    // Opaque URL-safe base64 of resume key "a/".
+    assert_eq!(token, "YS8");
 
     let xml = list_objects_v2(
         &app,
         &who,
-        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=1&continuation-token=a/"),
+        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=1&continuation-token={token}"),
     )
     .await;
     assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
@@ -2630,7 +2629,7 @@ async fn list_objects_v2_delimiter_pagination() {
     assert_eq!(listed_contents_keys(&xml), vec!["b.bin".to_owned()]);
     assert_eq!(
         xml_tag(&xml, "NextContinuationToken").as_deref(),
-        Some("b.bin")
+        Some("Yi5iaW4") // base64url of "b.bin"
     );
 }
 
@@ -2883,28 +2882,30 @@ async fn encoding_type_url_delimiter_paging_round_trip() {
     assert_eq!(xml_tag(&xml, "EncodingType").as_deref(), Some("url"));
     assert_eq!(listed_common_prefixes(&xml), vec!["a%20b/".to_owned()]);
     let token = xml_tag(&xml, "NextContinuationToken").expect("token");
-    // Opaque continuation token stays unencoded (literal space + slash).
-    assert_eq!(token, "a b/");
+    // Opaque base64 of resume key "a b/" (not the percent-encoded CP).
+    assert_eq!(token, "YSBiLw");
     let xml = list_objects_v2(
         &app,
         &who,
         &format!(
-            "/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=1&continuation-token={}",
-            query_escape(&token)
+            "/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=1&continuation-token={token}"
         ),
     )
     .await;
+    assert_eq!(
+        xml_tag(&xml, "ContinuationToken").as_deref(),
+        Some(token.as_str())
+    );
     assert_eq!(listed_common_prefixes(&xml), vec!["a%2Bb/".to_owned()]);
     let token2 = xml_tag(&xml, "NextContinuationToken").expect("token2");
-    assert_eq!(token2, "a+b/");
+    assert_eq!(token2, "YStiLw"); // base64url of "a+b/"
 
     // Finish pages: plain then x%2Fy/
     let xml = list_objects_v2(
         &app,
         &who,
         &format!(
-            "/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=2&continuation-token={}",
-            query_escape(&token2)
+            "/{bucket}?list-type=2&delimiter=/&encoding-type=url&max-keys=2&continuation-token={token2}"
         ),
     )
     .await;
@@ -2957,4 +2958,99 @@ async fn encoding_type_url_delimiter_paging_round_trip() {
     assert_eq!(s3_unquote(&marker2), "a+b/");
     // Echoed KeyMarker on the follow-up page is also encoded.
     assert_eq!(xml_tag(&xml, "KeyMarker").as_deref(), Some("a%20b/"));
+}
+
+#[tokio::test]
+async fn opaque_continuation_token_control_char_and_errors() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "tok-ctrl").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    let ctrl_key = "a\u{1}";
+    client
+        .put_object(&bucket_id, ctrl_key, b"1", None)
+        .await
+        .expect("put ctrl");
+    client
+        .put_object(&bucket_id, "z-next", b"2", None)
+        .await
+        .expect("put z");
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&encoding-type=url&max-keys=1"),
+    )
+    .await;
+    // Well-formed XML: key is percent-encoded; token is base64 (no raw \x01).
+    assert!(!xml.contains('\u{1}'), "{xml}");
+    assert!(xml.contains("<ListBucketResult"), "{xml}");
+    assert_eq!(xml_tag(&xml, "EncodingType").as_deref(), Some("url"));
+    let keys = listed_contents_keys(&xml);
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    assert!(keys[0].contains("%01") || keys[0] == "a%01", "{keys:?}");
+    let token = xml_tag(&xml, "NextContinuationToken").expect("token");
+    assert!(!token.is_empty());
+    assert!(!token.chars().any(|c| c.is_control()), "{token}");
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&encoding-type=url&max-keys=1&continuation-token={token}"),
+    )
+    .await;
+    assert_eq!(listed_contents_keys(&xml), vec!["z-next".to_owned()]);
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
+
+    // Garbage token -> 400 (on a visible bucket).
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}?list-type=2&continuation-token=!!!not-base64!!!"),
+        None,
+        "",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err = String::from_utf8_lossy(&body);
+    assert!(
+        err.contains("InvalidArgument") || err.contains("continuation-token"),
+        "{err}"
+    );
+    // Must not echo raw garbage as an unescaped control/binary dump.
+    assert!(!err.contains('\u{0}'));
+
+    // Foreign/invisible bucket + garbage token: visibility error first
+    // (NoSuchBucket today), never InvalidArgument from token decode.
+    let stranger = project_caller(&Id::new(kind::PROJECT));
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}?list-type=2&continuation-token=!!!not-base64!!!"),
+        None,
+        "",
+        Some(&stranger),
+    )
+    .await;
+    let err = String::from_utf8_lossy(&body);
+    assert_ne!(
+        extract_error_code(&err),
+        "InvalidArgument",
+        "token must not be decoded before bucket visibility: {err}"
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+    assert_eq!(extract_error_code(&err), "NoSuchBucket");
 }

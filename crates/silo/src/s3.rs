@@ -57,6 +57,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use futures::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
@@ -751,20 +752,34 @@ async fn list_or_bucket_inner(
         ));
     }
     let who = caller(ext)?;
+    // Auth / visibility first so a garbage token on a foreign bucket is still
+    // AccessDenied, not InvalidArgument.
     let bucket = load_bucket(&c, &who, &bucket_name)?;
     let encode_url = parse_encoding_type(q.encoding_type.as_deref())?;
     let max_keys = parse_max_keys(q.max_keys.as_deref())?;
     let prefix = q.prefix.as_deref().unwrap_or("");
-    let after = q
-        .continuation_token
-        .as_deref()
-        .or(q.start_after.as_deref())
-        .filter(|s| !s.is_empty());
+    let after_owned = if let Some(tok) = q.continuation_token.as_deref().filter(|s| !s.is_empty()) {
+        Some(decode_continuation_token(tok)?)
+    } else {
+        q.start_after
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+    };
     let delimiter = q.delimiter.as_deref().filter(|d| !d.is_empty());
-    let (items, truncated) =
-        c.list_objects_filtered(&bucket.meta.id, Some(prefix), after, max_keys, delimiter)?;
+    let (items, truncated) = c.list_objects_filtered(
+        &bucket.meta.id,
+        Some(prefix),
+        after_owned.as_deref(),
+        max_keys,
+        delimiter,
+    )?;
     let next = truncated
-        .then(|| items.last().map(|e| e.sort_key().to_owned()))
+        .then(|| {
+            items
+                .last()
+                .map(|e| encode_continuation_token(e.sort_key()))
+        })
         .flatten();
     let xml = list_bucket_xml(&ListBucketPage {
         bucket: &bucket.meta.name,
@@ -1059,6 +1074,19 @@ fn xml_list_value(s: &str, encode_url: bool) -> String {
     }
 }
 
+/// URL-safe base64 (no padding) of the resume key for ListObjectsV2.
+fn encode_continuation_token(key: &str) -> String {
+    URL_SAFE_NO_PAD.encode(key.as_bytes())
+}
+
+/// Decode an opaque continuation token. Errors must not echo raw bytes.
+fn decode_continuation_token(raw: &str) -> ApiResult<String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|_| ApiError::bad_request("continuation-token is invalid"))?;
+    String::from_utf8(bytes).map_err(|_| ApiError::bad_request("continuation-token is invalid"))
+}
+
 /// `None`/empty → no encoding; `url` → encode; anything else → 400.
 fn parse_encoding_type(raw: Option<&str>) -> ApiResult<bool> {
     match raw {
@@ -1111,7 +1139,7 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
         body.push_str("<EncodingType>url</EncodingType>");
     }
     if let Some(t) = page.continuation {
-        // Continuation tokens stay opaque (not percent-encoded).
+        // Echo the client-supplied token as sent (already opaque base64).
         body.push_str(&format!(
             "<ContinuationToken>{}</ContinuationToken>",
             xml_escape(t)
@@ -1124,7 +1152,7 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
         ));
     }
     if let Some(t) = page.next_token {
-        // Opaque, like ContinuationToken.
+        // Opaque URL-safe base64 of the resume key (already encoded).
         body.push_str(&format!(
             "<NextContinuationToken>{}</NextContinuationToken>",
             xml_escape(t)
@@ -1193,6 +1221,18 @@ fn s3_error(err: ApiError) -> Response {
 #[cfg(test)]
 mod encoding_tests {
     use super::*;
+
+    #[test]
+    fn continuation_token_round_trip_and_rejects_garbage() {
+        let tok = encode_continuation_token("a b/");
+        assert!(!tok.contains('/'), "{tok}");
+        assert!(!tok.contains('+'), "{tok}");
+        assert_eq!(decode_continuation_token(&tok).unwrap(), "a b/");
+        let ctrl = encode_continuation_token("a\u{1}");
+        assert_eq!(decode_continuation_token(&ctrl).unwrap(), "a\u{1}");
+        assert!(decode_continuation_token("!!!").is_err());
+        assert!(decode_continuation_token("====").is_err());
+    }
 
     #[test]
     fn s3_url_encode_matches_botocore_quote_safe_slash() {
