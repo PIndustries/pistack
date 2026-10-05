@@ -579,7 +579,7 @@ impl Registrar {
                 Ok(())
             }
         } else if m.status.host.as_ref() != Some(host) || m.status.phase != Phase::Ready {
-            return Ok(());
+            Ok(())
         } else {
             let power = r.power.map(power_from_wire);
             let addrs_differ = !r.addresses.is_empty() && r.addresses != m.status.addresses;

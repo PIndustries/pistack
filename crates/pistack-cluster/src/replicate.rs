@@ -112,6 +112,7 @@ pub struct VoteResponse {
 ///   are equal and req.last_index >= local.last_index.
 /// - Grant only when the log is acceptable AND voted_for is None or already
 ///   this candidate. On grant, set voted_for to the candidate.
+///
 /// Response.term is local.current_term after the update.
 pub fn consider_vote(local: &mut Ballot, req: &VoteRequest) -> VoteResponse {
     if req.term < local.current_term {

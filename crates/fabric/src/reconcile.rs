@@ -266,9 +266,9 @@ impl Client {
             .list(None)
             .unwrap_or_default()
             .iter()
-            .any(|s| &s.spec.network == &net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24");
+            .any(|s| s.spec.network == net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24");
         let hostnat_port = self.ports().list(None).unwrap_or_default().iter().any(|p| {
-            &p.spec.network == &net.meta.id
+            p.spec.network == net.meta.id
                 && !p.is_router_port()
                 && p.status
                     .binding

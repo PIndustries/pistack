@@ -280,8 +280,8 @@ mod tests {
         let mut a = Node::voter("a");
         a.leader = true;
         a.term = 1;
-        let mut b = Node::voter("b");
-        let mut c = Node::voter("c");
+        let b = Node::voter("b");
+        let c = Node::voter("c");
         propose(&mut a, &mut [b, c], b"one".to_vec()).unwrap();
         let mut b = Node::voter("b");
         let mut c = Node::voter("c");

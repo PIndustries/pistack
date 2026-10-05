@@ -148,32 +148,28 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
     let node_id = crate::cluster::load_or_create_node_id(&opts.data_dir)?;
     let allow_seed = !matches!(boot, crate::cluster::BootKind::Joined);
-    let established = match crate::cluster::establish_local(
-        &store,
-        &node_id,
-        &public_url,
-        allow_seed,
-    ) {
-        Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
-        Ok(crate::cluster::LocalRole::NeedJoin) => {
-            let hint = crate::cluster::leader_hint(&store, &node_id)?
+    let established =
+        match crate::cluster::establish_local(&store, &node_id, &public_url, allow_seed) {
+            Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
+            Ok(crate::cluster::LocalRole::NeedJoin) => {
+                let hint = crate::cluster::leader_hint(&store, &node_id)?
                 .or_else(|| crate::cluster::remembered_leader(&opts.data_dir))
                 .context(
                     "store belongs to a cluster and no leader address is known; pass --join URL",
                 )?;
-            match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
-                Ok(ready) => ready,
-                Err(err) => {
-                    if matches!(boot, crate::cluster::BootKind::Joined) {
-                        drop(store);
-                        let _ = std::fs::remove_file(&store_path);
+                match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
+                    Ok(ready) => ready,
+                    Err(err) => {
+                        if matches!(boot, crate::cluster::BootKind::Joined) {
+                            drop(store);
+                            let _ = std::fs::remove_file(&store_path);
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
             }
-        }
-        Err(err) => return Err(err),
-    };
+            Err(err) => return Err(err),
+        };
     crate::cluster::clear_remembered_leader(&opts.data_dir);
     let cluster_id: String = store
         .get_meta("cluster_id")?

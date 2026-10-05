@@ -297,9 +297,8 @@ pub async fn apply(
                     return Ok(plan);
                 }
                 if let Some(child) = slot.child.as_mut() {
-                    match child.try_wait() {
-                        Ok(None) => return Ok(plan),
-                        Ok(Some(_)) | Err(_) => {}
+                    if let Ok(None) = child.try_wait() {
+                        return Ok(plan);
                     }
                 }
             }

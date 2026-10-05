@@ -53,21 +53,6 @@ pub fn samples() -> Arc<Mutex<Vec<Sample>>> {
         .clone()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use client::record_host;
-
-    #[test]
-    fn two_gauge_values_share_one_ring() {
-        record_host(Gauge.buffer().as_ref(), "gauge-shared-ring", 7, 1);
-        let text = Gauge::new()
-            .client(Store::in_memory().unwrap())
-            .metrics_text();
-        assert!(text.contains("node=\"gauge-shared-ring\""), "{text}");
-    }
-}
-
 #[async_trait]
 impl Module for Gauge {
     fn info(&self) -> ModuleInfo {
@@ -82,5 +67,20 @@ impl Module for Gauge {
     fn router(&self, ctx: ModuleContext) -> Router {
         let store = ctx.store::<Store>();
         api::router(self.client((*store).clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use client::record_host;
+
+    #[test]
+    fn two_gauge_values_share_one_ring() {
+        record_host(Gauge.buffer().as_ref(), "gauge-shared-ring", 7, 1);
+        let text = Gauge::new()
+            .client(Store::in_memory().unwrap())
+            .metrics_text();
+        assert!(text.contains("node=\"gauge-shared-ring\""), "{text}");
     }
 }

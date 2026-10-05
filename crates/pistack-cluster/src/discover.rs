@@ -48,7 +48,7 @@ pub fn check_advertise(ip: IpAddr) -> Result<(), DiscoverError> {
 /// Hosts in `ip/prefix`, skipping the network, the broadcast, and `ip`.
 /// Prefixes shorter than /24 are refused. /32 returns an empty list.
 pub fn scan_targets(ip: Ipv4Addr, prefix: u8) -> Result<Vec<Ipv4Addr>, DiscoverError> {
-    if prefix < 24 || prefix > 32 {
+    if !(24..=32).contains(&prefix) {
         return Err(DiscoverError::Prefix(prefix));
     }
     if prefix == 32 {

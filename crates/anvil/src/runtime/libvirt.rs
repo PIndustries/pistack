@@ -2229,8 +2229,8 @@ exit 0
         let _ = std::fs::remove_file(root.join("missing"));
         let _ = std::fs::remove_file(root.join("calls"));
 
-        let plugged = plug_port(&port_req("10.88.0.10", Some(4))).await.unwrap();
-        let _ = plugged;
+        plug_port(&port_req("10.88.0.10", Some(4))).await.unwrap();
+        ();
         let xml = std::fs::read_to_string(root.join("device.xml")).unwrap();
         assert!(xml.contains("<source bridge='po01a102de3f33'/>"));
         assert!(!xml.contains("pistack0"));

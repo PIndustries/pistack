@@ -19,7 +19,7 @@ struct Harness {
 
 fn harness() -> Harness {
     let store = Store::in_memory().unwrap();
-    let gauge = Gauge::default();
+    let gauge = Gauge;
     let ctx = ModuleContext {
         store: Arc::new(store.clone()),
         events: store.events(),
