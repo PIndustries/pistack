@@ -1965,7 +1965,7 @@ mod tests {
         );
     }
 
-    static VIRSH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static VIRSH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn virsh_script(dir: &std::path::Path, code: i32) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
@@ -1991,7 +1991,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_records_virsh_argv_and_surfaces_failure() {
-        let _lock = VIRSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = VIRSH_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!("pistack-virsh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ok = virsh_script(&root.join("ok"), 0);
@@ -2202,7 +2202,7 @@ exit 0
 
     #[tokio::test]
     async fn plug_and_unplug_use_the_overlay_bridge_and_a_missing_domain_is_unavailable() {
-        let _lock = VIRSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = VIRSH_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!(
             "pistack-plug-{}-{}",
             std::process::id(),
@@ -2230,7 +2230,6 @@ exit 0
         let _ = std::fs::remove_file(root.join("calls"));
 
         plug_port(&port_req("10.88.0.10", Some(4))).await.unwrap();
-        ();
         let xml = std::fs::read_to_string(root.join("device.xml")).unwrap();
         assert!(xml.contains("<source bridge='po01a102de3f33'/>"));
         assert!(!xml.contains("pistack0"));
@@ -2300,7 +2299,7 @@ exit 0
 
     #[tokio::test]
     async fn rbd_attach_uses_the_tool_and_a_missing_tool_is_unavailable() {
-        let _lock = VIRSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = VIRSH_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!(
             "pistack-rbd-{}-{}",
             std::process::id(),

@@ -450,14 +450,14 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
     async fn fleet_starts_other_does_not_and_selects_metal() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let dir: PathBuf = std::env::temp_dir().join(format!(
             "pistack-metal-{}-{}",
             std::process::id(),
@@ -519,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_chassis_uses_ipmitool_and_this_host_does_not() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!(
             "pistack-ipmi-{}-{}",
             std::process::id(),
