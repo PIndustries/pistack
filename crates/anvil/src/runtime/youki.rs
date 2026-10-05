@@ -3,20 +3,35 @@
 
 //! youki (OCI) container runtime.
 //!
-//! One directory per machine under `$PISTACK_YOUKI_STATE` (default
-//! `/var/lib/pistack/youki`). A pod is a sandbox bundle plus one bundle per
-//! container, in spec order. The sandbox holds the pid, network, ipc and uts
-//! namespaces; each container joins those and keeps its own mount namespace
-//! so it has its own rootfs. `config.json` is the OCI spec, `rootfs` is the
-//! unpacked image or the sandbox pause program, and `state.json` is written
-//! after a successful start. The binary is `$PISTACK_YOUKI_BIN` when that is
-//! set, otherwise `youki` on `PATH`. `user_data` and ssh keys are not logged
-//! and are not placed on the youki argv. A missing youki binary, an image
-//! that cannot be unpacked, or an empty rootfs is unavailable and is not
-//! recorded as running. `exec` runs `youki exec` in one container of a pod
-//! sandbox and returns that command's exit code, stdout, and stderr.
-//! Command probes call that same helper, with the probe timeout and a small
-//! output cap, and they do not pass an environment.
+//! One directory per machine under `$PISTACK_YOUKI_STATE`. When that is
+//! unset, the directory is `$PISTACK_DATA_DIR/youki` if `PISTACK_DATA_DIR`
+//! is set, otherwise `/var/lib/pistack/youki`. The agent user must be able
+//! to create and write that directory. A pod is a sandbox bundle plus one
+//! bundle per container, in spec order. The sandbox holds the pid, network,
+//! ipc and uts namespaces; each container joins those and keeps its own
+//! mount namespace so it has its own rootfs. `config.json` is the OCI spec,
+//! `rootfs` is the unpacked image or the sandbox pause program, and
+//! `state.json` is written after a successful start. The binary is
+//! `$PISTACK_YOUKI_BIN` when that is set, otherwise `youki` on `PATH`.
+//! `user_data` and ssh keys are not logged and are not placed on the youki
+//! argv. A missing youki binary, an image that cannot be unpacked, or an
+//! empty rootfs is unavailable and is not recorded as running. `exec` runs
+//! `youki exec` in one container of a pod sandbox and returns that command's
+//! exit code, stdout, and stderr. Command probes call that same helper, with
+//! the probe timeout and a small output cap, and they do not pass an
+//! environment.
+//!
+//! `youki create` and `youki start` do not inherit the agent's pipes. With
+//! `process.terminal` false, the container init keeps youki's stdout and
+//! stderr open while it waits for `start`, so waiting on those pipes for EOF
+//! never returns. A workload container's stdout and stderr are an
+//! agent-opened `log` file in that container's bundle (the file machine logs
+//! are read from). The sandbox pause process uses `/dev/null`. youki's own
+//! text goes to `--log` on a file the agent creates, and stderr is read back
+//! after youki exits. The wait is only on youki's exit status. A create that
+//! times out or fails runs `youki delete --force` and removes the bundle.
+//! Before create, a container `youki state` still knows about, and that this
+//! agent does not have recorded as running, is removed the same way.
 //!
 //! Privilege. A root agent keeps this root OCI config and runs `youki`
 //! directly. `PISTACK_YOUKI_SUDO` does not change that.
@@ -65,7 +80,19 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// Milliseconds. Tests set this so a hung `create` fails without waiting 30s.
+const TIMEOUT_ENV: &str = "PISTACK_YOUKI_TIMEOUT_MS";
 const DEFAULT_STATE: &str = "/var/lib/pistack/youki";
+
+fn youki_timeout() -> Duration {
+    match std::env::var(TIMEOUT_ENV) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => TIMEOUT,
+        },
+        Err(_) => TIMEOUT,
+    }
+}
 /// Most bytes of stdout or stderr the agent keeps from one exec.
 pub const EXEC_OUTPUT_CAP: usize = 256 * 1024;
 
@@ -102,6 +129,9 @@ impl MachineRuntime for YoukiRuntime {
     async fn start(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
         let _guard = lock().lock().await;
         let bin = resolve_youki()?;
+        // Reject an unusable state directory before reading a bundle under it.
+        // A path that is not a directory otherwise surfaces as a read error.
+        ensure_state_dir()?;
         let id = req.id.clone();
         let bundle = bundle_dir(&id)?;
         let prior = read_state(&bundle).await?;
@@ -135,23 +165,17 @@ impl MachineRuntime for YoukiRuntime {
             return Err(e);
         }
         let id_str = id.to_string();
-        let bundle_str = path_arg(&bundle);
+        let io = workload_stdio(&bundle);
         if prior.is_none() {
-            exec_youki(
-                &bin,
-                &mode,
-                &["create", "--bundle", &bundle_str, &id_str],
-                None,
-            )
-            .await?;
-            if let Err(e) = exec_youki(&bin, &mode, &["start", &id_str], None).await {
+            create_container(&bin, &mode, &bundle, &id_str, None, &io, Some(&bundle)).await?;
+            if let Err(e) = exec_detach(&bin, &mode, &["start", &id_str], None, &io).await {
                 // Create succeeded and start did not. Drop the container so a
                 // retry can create it again, and do not record it as running.
-                let _ = exec_youki(&bin, &mode, &["delete", &id_str], None).await;
+                forget_failed_create(&bin, &mode, &id_str, Some(&bundle)).await;
                 return Err(e);
             }
         } else {
-            exec_youki(&bin, &mode, &["start", &id_str], None).await?;
+            exec_detach(&bin, &mode, &["start", &id_str], None, &io).await?;
         }
         let addresses = nic_addresses(req);
         write_state(
@@ -432,11 +456,47 @@ impl YoukiRuntime {
     }
 }
 
-fn state_dir() -> PathBuf {
-    match std::env::var_os("PISTACK_YOUKI_STATE") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => PathBuf::from(DEFAULT_STATE),
+/// `$PISTACK_YOUKI_STATE`, else `$PISTACK_DATA_DIR/youki`, else
+/// `/var/lib/pistack/youki`. An empty variable is treated as unset.
+pub(crate) fn state_dir() -> PathBuf {
+    if let Some(v) = std::env::var_os("PISTACK_YOUKI_STATE") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
     }
+    if let Some(v) = std::env::var_os("PISTACK_DATA_DIR") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join("youki");
+        }
+    }
+    PathBuf::from(DEFAULT_STATE)
+}
+
+fn ensure_state_dir() -> ApiResult<PathBuf> {
+    let dir = state_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(state_dir_error(&dir, &e));
+    }
+    let probe = dir.join(".pistack-writable");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(dir)
+        }
+        Err(e) => Err(state_dir_error(&dir, &e)),
+    }
+}
+
+fn state_dir_error(dir: &Path, err: &std::io::Error) -> ApiError {
+    ApiError::unavailable(format!(
+        "youki runtime: cannot write state directory {}: {err}. Set PISTACK_YOUKI_STATE or PISTACK_DATA_DIR to a directory the agent user owns",
+        dir.display()
+    ))
 }
 
 fn bundle_dir(id: &Id) -> ApiResult<PathBuf> {
@@ -2790,26 +2850,15 @@ async fn start_pod(
         }
     };
     let id_str = id.to_string();
-    let bundle_str = path_arg(bundle);
+    let pause = pause_stdio(bundle);
     if !prior {
-        if let Err(e) = exec_youki(
-            bin,
-            mode,
-            &["create", "--bundle", &bundle_str, &id_str],
-            None,
-        )
-        .await
-        {
-            let _ = remove_bundle(bundle).await;
-            return Err(e);
-        }
-        if let Err(e) = exec_youki(bin, mode, &["start", &id_str], None).await {
-            let _ = exec_youki(bin, mode, &["delete", &id_str], None).await;
-            let _ = remove_bundle(bundle).await;
+        create_container(bin, mode, bundle, &id_str, None, &pause, Some(bundle)).await?;
+        if let Err(e) = exec_detach(bin, mode, &["start", &id_str], None, &pause).await {
+            forget_failed_create(bin, mode, &id_str, Some(bundle)).await;
             return Err(e);
         }
     } else {
-        exec_youki(bin, mode, &["start", &id_str], None).await?;
+        exec_detach(bin, mode, &["start", &id_str], None, &pause).await?;
     }
     let state = match run_youki(bin, mode, &["state", &id_str], None).await {
         Ok(output) => output,
@@ -2856,23 +2905,19 @@ async fn start_pod(
     let mut started = Vec::new();
     for index in 0..plan.containers.len() {
         let cid = container_youki_id(&id, index);
-        let cdir = path_arg(&container_dir(bundle, index));
-        if let Err(e) = exec_youki(
-            bin,
-            mode,
-            &["create", "--bundle", &cdir, &cid],
-            user_ns.as_deref(),
-        )
-        .await
+        let cpath = container_dir(bundle, index);
+        let io = workload_stdio(&cpath);
+        if let Err(e) =
+            create_container(bin, mode, &cpath, &cid, user_ns.as_deref(), &io, None).await
         {
             if !prior {
                 abort_new_pod(bin, mode, bundle, &id_str, &started).await;
             }
             return Err(e);
         }
-        if let Err(e) = exec_youki(bin, mode, &["start", &cid], user_ns.as_deref()).await {
+        if let Err(e) = exec_detach(bin, mode, &["start", &cid], user_ns.as_deref(), &io).await {
             if !prior {
-                let _ = exec_youki(bin, mode, &["delete", &cid], None).await;
+                let _ = exec_youki(bin, mode, &["delete", "--force", &cid], None).await;
                 abort_new_pod(bin, mode, bundle, &id_str, &started).await;
             }
             return Err(e);
@@ -2906,9 +2951,9 @@ async fn abort_new_pod(
     created: &[String],
 ) {
     for cid in created.iter().rev() {
-        let _ = exec_youki(bin, mode, &["delete", cid], None).await;
+        let _ = exec_youki(bin, mode, &["delete", "--force", cid], None).await;
     }
-    let _ = exec_youki(bin, mode, &["delete", sandbox_id], None).await;
+    let _ = exec_youki(bin, mode, &["delete", "--force", sandbox_id], None).await;
     let _ = remove_bundle(bundle).await;
 }
 
@@ -3206,6 +3251,207 @@ async fn exec_youki(
     run_youki(bin, mode, args, join_user_ns).await.map(|_| ())
 }
 
+/// Stdio for `create` and `start`. The container init inherits these fds, so
+/// none of them is a pipe. `None` is `/dev/null` (the sandbox pause process).
+struct DetachIo {
+    stdout: Option<PathBuf>,
+    stderr: Option<PathBuf>,
+    /// Agent-created file passed as `youki --log`. Read after youki exits.
+    youki_log: PathBuf,
+}
+
+fn workload_stdio(bundle: &Path) -> DetachIo {
+    let log = bundle.join("log");
+    DetachIo {
+        stdout: Some(log.clone()),
+        stderr: Some(log),
+        youki_log: bundle.join("youki.log"),
+    }
+}
+
+fn pause_stdio(bundle: &Path) -> DetachIo {
+    DetachIo {
+        stdout: None,
+        stderr: None,
+        youki_log: bundle.join("youki.log"),
+    }
+}
+
+/// `youki state` shows a container this agent has no `state.json` record of
+/// as running. Remove it so `create` does not fail with "already exists".
+async fn clear_leftover(bin: &Path, mode: &RunMode, id: &str) -> ApiResult<()> {
+    match run_youki(bin, mode, &["state", id], None).await {
+        Ok(_) => exec_youki(bin, mode, &["delete", "--force", id], None).await,
+        Err(e) if container_missing(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn forget_failed_create(bin: &Path, mode: &RunMode, id: &str, bundle: Option<&Path>) {
+    let _ = exec_youki(bin, mode, &["delete", "--force", id], None).await;
+    if let Some(bundle) = bundle {
+        let _ = remove_bundle(bundle).await;
+    }
+}
+
+async fn create_container(
+    bin: &Path,
+    mode: &RunMode,
+    bundle: &Path,
+    id: &str,
+    join_user_ns: Option<&Path>,
+    io: &DetachIo,
+    drop_bundle: Option<&Path>,
+) -> ApiResult<()> {
+    if let Err(e) = clear_leftover(bin, mode, id).await {
+        if let Some(root) = drop_bundle {
+            let _ = remove_bundle(root).await;
+        }
+        return Err(e);
+    }
+    let bundle_arg = path_arg(bundle);
+    if let Err(e) = exec_detach(
+        bin,
+        mode,
+        &["create", "--bundle", &bundle_arg, id],
+        join_user_ns,
+        io,
+    )
+    .await
+    {
+        forget_failed_create(bin, mode, id, drop_bundle).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn exec_detach(
+    bin: &Path,
+    mode: &RunMode,
+    args: &[&str],
+    join_user_ns: Option<&Path>,
+    io: &DetachIo,
+) -> ApiResult<()> {
+    run_detach(bin, mode, args, join_user_ns, io)
+        .await
+        .map(|_| ())
+}
+
+/// `create` / `start`. Stdout and stderr are files or `/dev/null`, opened
+/// here so a sudo'd youki still writes through the agent's credentials.
+/// youki's own errors are `--log` plus that stderr file, read after exit.
+async fn run_detach(
+    bin: &Path,
+    mode: &RunMode,
+    args: &[&str],
+    join_user_ns: Option<&Path>,
+    io: &DetachIo,
+) -> ApiResult<std::process::Output> {
+    // Create the log as the agent. Root (sudo) then appends to an existing
+    // file instead of making a root-owned one the agent cannot read.
+    let _created = open_append(&io.youki_log)?;
+    let mut cmd_args = Vec::with_capacity(args.len() + 2);
+    cmd_args.push("--log".to_string());
+    cmd_args.push(path_arg(&io.youki_log));
+    cmd_args.extend(args.iter().copied().map(str::to_string));
+
+    let mut cmd = youki_command(bin, &mode.privilege);
+    cmd.args(&cmd_args)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(stdio_target(io.stdout.as_deref())?)
+        .stderr(stdio_target(io.stderr.as_deref())?);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    arm_user_ns_join(&mut cmd, join_user_ns);
+    let program = command_program(bin, mode);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
+    let mut group = GroupKill::arm(child.id());
+    let timeout = youki_timeout();
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            group.disarm();
+            status
+        }
+        Ok(Err(e)) => {
+            drop(group);
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: {}: {e}",
+                bin.display()
+            )));
+        }
+        Err(_) => {
+            drop(group);
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let op = args.first().copied().unwrap_or("youki");
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: {op} timed out after {}",
+                timeout_label(timeout)
+            )));
+        }
+    };
+    let output = std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: detach_stderr(io),
+    };
+    if output.status.success() {
+        return Ok(output);
+    }
+    let op = args.first().copied().unwrap_or("youki");
+    Err(ApiError::unavailable(format!(
+        "youki runtime: {op} failed: {}",
+        stderr_tail(&output.stderr, output.status)
+    )))
+}
+
+fn detach_stderr(io: &DetachIo) -> Vec<u8> {
+    if let Some(path) = io.stderr.as_deref() {
+        if let Ok(bytes) = std::fs::read(path) {
+            if !bytes.is_empty() {
+                return bytes;
+            }
+        }
+    }
+    std::fs::read(&io.youki_log).unwrap_or_default()
+}
+
+fn stdio_target(path: Option<&Path>) -> ApiResult<Stdio> {
+    match path {
+        None => Ok(Stdio::null()),
+        Some(path) => Ok(Stdio::from(open_append(path)?)),
+    }
+}
+
+fn open_append(path: &Path) -> ApiResult<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ApiError::unavailable(format!("youki runtime: creating {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            ApiError::unavailable(format!("youki runtime: opening {}: {e}", path.display()))
+        })
+}
+
+fn command_program(bin: &Path, mode: &RunMode) -> String {
+    match &mode.privilege {
+        Privilege::Sudo { sudo } => sudo.display().to_string(),
+        Privilege::Root | Privilege::Rootless { .. } => bin.display().to_string(),
+    }
+}
+
 async fn run_youki(
     bin: &Path,
     mode: &RunMode,
@@ -3219,26 +3465,25 @@ async fn run_youki(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     arm_user_ns_join(&mut cmd, join_user_ns);
-    let program = match &mode.privilege {
-        Privilege::Sudo { sudo } => sudo.display().to_string(),
-        Privilege::Root | Privilege::Rootless { .. } => bin.display().to_string(),
-    };
+    let program = command_program(bin, mode);
     let child = cmd
         .spawn()
         .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
-    let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+    let timeout = youki_timeout();
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
             return Err(ApiError::unavailable(format!(
                 "youki runtime: {}: {e}",
                 bin.display()
-            )))
+            )));
         }
         Err(_) => {
+            let op = args.first().copied().unwrap_or("youki");
             return Err(ApiError::unavailable(format!(
-                "youki runtime: {} timed out after 30s",
-                args.first().copied().unwrap_or("youki")
-            )))
+                "youki runtime: {op} timed out after {}",
+                timeout_label(timeout)
+            )));
         }
     };
     if output.status.success() {
@@ -3360,6 +3605,7 @@ mod tests {
             let keys = [
                 "PISTACK_YOUKI_BIN",
                 "PISTACK_YOUKI_STATE",
+                TIMEOUT_ENV,
                 SUDO_ENV,
                 SUDO_BIN_ENV,
                 NETNS_ENV,
@@ -3380,6 +3626,7 @@ mod tests {
             std::env::set_var("PISTACK_YOUKI_STATE", state);
             std::env::set_var("PISTACK_YOUKI_TEST_EUID", "0");
             for key in [
+                TIMEOUT_ENV,
                 SUDO_ENV,
                 SUDO_BIN_ENV,
                 NETNS_ENV,
@@ -3431,20 +3678,73 @@ mod tests {
         }
     }
 
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    fn write_exe(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Fake youki. `state` reports a container only after `create` (or when
+    /// the test pre-seeds `youki-ids/<id>`). Missing containers say
+    /// "does not exist" so a pre-create check does not delete them.
     fn write_script(path: &Path, log: &Path, exit_code: i32) {
-        let quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
+        let quoted = shell_quote(log);
+        let track = shell_quote(&log.parent().unwrap().join("youki-ids"));
         let stderr = if exit_code == 0 {
             String::new()
         } else {
             "echo 'youki exploded' >&2\n".to_owned()
         };
         let body = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {quoted}\nprintf '\\n' >> {quoted}\nif [ \"$1\" = state ]; then\n  printf '%s\\n' '{{\"pid\":4242,\"status\":\"running\"}}'\nfi\n{stderr}exit {exit_code}\n"
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> {quoted}
+printf '\n' >> {quoted}
+mkdir -p {track}
+cmd=
+id=
+skip=0
+for arg in "$@"; do
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
+  case "$arg" in
+    --log|--bundle|--cwd|--env)
+      skip=1
+      ;;
+    --*)
+      ;;
+    *)
+      if [ -z "$cmd" ]; then
+        cmd=$arg
+      fi
+      id=$arg
+      ;;
+  esac
+done
+if [ "$cmd" = state ]; then
+  if [ -f {track}/"$id" ]; then
+    printf '%s\n' '{{"pid":4242,"status":"running"}}'
+    exit 0
+  fi
+  echo "container $id does not exist" >&2
+  exit 1
+fi
+if [ "$cmd" = create ]; then
+  : > {track}/"$id"
+fi
+if [ "$cmd" = delete ]; then
+  rm -f {track}/"$id"
+fi
+{stderr}exit {exit_code}
+"#
         );
-        std::fs::write(path, body).unwrap();
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
+        write_exe(path, &body);
     }
 
     fn req(name: &str, image: &str, address: &str) -> MachineRequest {
@@ -3806,7 +4106,8 @@ mod tests {
         let lines = arg_lines(&after_first);
         assert_eq!(count_arg(&lines, "create"), 3);
         assert_eq!(count_arg(&lines, "start"), 3);
-        assert_eq!(count_arg(&lines, "state"), 1);
+        // One state per create (leftover check) plus the sandbox pid query.
+        assert_eq!(count_arg(&lines, "state"), 4);
         assert_eq!(count_arg(&lines, "kill"), 0);
         let bundle_arg = bundle.to_string_lossy().into_owned();
         let id_arg = request.id.to_string();
@@ -4559,10 +4860,6 @@ mod tests {
         })
         .await
         .unwrap();
-    }
-
-    fn shell_quote(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 
     fn write_executable(path: &Path, body: &str) {
@@ -5399,12 +5696,16 @@ exit 1
     }
 
     fn assert_sudo_op(lines: &[String], youki: &str, op: &str) {
-        assert!(
-            lines
-                .windows(3)
-                .any(|w| w[0] == "-n" && w[1] == youki && w[2] == op),
-            "missing sudo {op}: {lines:?}"
-        );
+        let found = lines.windows(2).enumerate().any(|(i, w)| {
+            if w[0] != "-n" || w[1] != youki {
+                return false;
+            }
+            lines[i + 2..]
+                .iter()
+                .take_while(|line| line.as_str() != "-n")
+                .any(|line| line == op)
+        });
+        assert!(found, "missing sudo {op}: {lines:?}");
     }
 
     #[tokio::test]
@@ -5591,6 +5892,250 @@ exit 1
         assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
         assert!(err.message.contains("NOPASSWD"), "{err}");
         assert!(!err.message.contains("unset"), "{err}");
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    fn plain_rootfs(tmp: &Path) -> MachineRequest {
+        let image = tmp.join("rootfs");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("marker"), b"keep").unwrap();
+        req("web", image.to_str().unwrap(), "10.4.0.1")
+    }
+
+    /// Skip youki's global `--log <file>` so the subcommand is `$1`.
+    fn fake_shift_log() -> &'static str {
+        r#"
+cmd=$1
+if [ "$1" = --log ]; then
+  cmd=$3
+fi
+"#
+    }
+
+    #[tokio::test]
+    async fn create_returns_while_a_child_holds_stdout() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("stdio");
+        let _dir = scopeguard_dir(&tmp);
+        let log = tmp.join("youki.log");
+        let bin = tmp.join("youki");
+        let sleeper = tmp.join("sleeper");
+        let quoted = shell_quote(&log);
+        let sleeper_q = shell_quote(&sleeper);
+        let shift = fake_shift_log();
+        write_exe(
+            &bin,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" >> {quoted}
+printf '\n' >> {quoted}
+{shift}
+if [ "$cmd" = state ]; then
+  echo "container $2 does not exist" >&2
+  exit 1
+fi
+if [ "$cmd" = create ]; then
+  sleep 60 &
+  echo $! > {sleeper_q}
+  exit 0
+fi
+exit 0
+"#
+            ),
+        );
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&bin, &state);
+        let rt = YoukiRuntime;
+        let request = plain_rootfs(&tmp);
+        let started = std::time::Instant::now();
+        let running = rt.start(&request).await.unwrap();
+        let elapsed = started.elapsed();
+        if let Ok(text) = std::fs::read_to_string(&sleeper) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                if pid > 0 {
+                    // SAFETY: `pid` is the positive pid this test spawned. A
+                    // negative or zero pid would signal a process group.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        assert_eq!(running.power, PowerState::On);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "create waited for inherited stdout: {elapsed:?}"
+        );
+        let bundle = state.join(request.id.to_string());
+        assert!(
+            bundle.join("log").is_file(),
+            "container stdio is the bundle log"
+        );
+        assert!(bundle.join("state.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn create_timeout_and_failure_delete_force_and_drop_the_bundle() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("cleanup");
+        let _dir = scopeguard_dir(&tmp);
+        let log = tmp.join("youki.log");
+        let bin = tmp.join("youki");
+        let quoted = shell_quote(&log);
+        let shift = fake_shift_log();
+        write_exe(
+            &bin,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" >> {quoted}
+printf '\n' >> {quoted}
+{shift}
+if [ "$cmd" = state ]; then
+  echo "container $2 does not exist" >&2
+  exit 1
+fi
+if [ "$cmd" = create ]; then
+  sleep 30
+  exit 0
+fi
+exit 0
+"#
+            ),
+        );
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&bin, &state);
+        std::env::set_var(TIMEOUT_ENV, "400");
+        let rt = YoukiRuntime;
+        let request = plain_rootfs(&tmp);
+        let started = std::time::Instant::now();
+        let err = rt.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout took {:?}",
+            started.elapsed()
+        );
+        let lines = arg_lines(&std::fs::read_to_string(&log).unwrap());
+        assert!(
+            lines
+                .windows(2)
+                .any(|w| w[0] == "delete" && w[1] == "--force"),
+            "{lines:?}"
+        );
+        assert!(!state.join(request.id.to_string()).exists());
+
+        write_exe(
+            &bin,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" >> {quoted}
+printf '\n' >> {quoted}
+{shift}
+if [ "$cmd" = state ]; then
+  echo "container $2 does not exist" >&2
+  exit 1
+fi
+if [ "$cmd" = create ]; then
+  echo 'youki exploded' >&2
+  exit 1
+fi
+exit 0
+"#
+            ),
+        );
+        let before = std::fs::read_to_string(&log).unwrap().len();
+        let again = plain_rootfs(&tmp);
+        let err = rt.start(&again).await.unwrap_err();
+        assert!(err.message.contains("youki exploded"), "{err}");
+        let lines = arg_lines(&std::fs::read_to_string(&log).unwrap()[before..]);
+        assert!(
+            lines
+                .windows(2)
+                .any(|w| w[0] == "delete" && w[1] == "--force"),
+            "{lines:?}"
+        );
+        assert!(!state.join(again.id.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn create_deletes_a_leftover_container_before_create() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("leftover");
+        let _dir = scopeguard_dir(&tmp);
+        let log = tmp.join("youki.log");
+        let bin = tmp.join("youki");
+        write_script(&bin, &log, 0);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&bin, &state);
+        let rt = YoukiRuntime;
+        let request = plain_rootfs(&tmp);
+        let track = tmp.join("youki-ids");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join(request.id.to_string()), b"").unwrap();
+        rt.start(&request).await.unwrap();
+        let lines = arg_lines(&std::fs::read_to_string(&log).unwrap());
+        let delete_at = lines
+            .windows(2)
+            .position(|w| w[0] == "delete" && w[1] == "--force");
+        let create_at = lines.iter().position(|line| line == "create");
+        assert!(
+            delete_at.is_some() && create_at.is_some() && delete_at.unwrap() < create_at.unwrap(),
+            "{lines:?}"
+        );
+        assert!(state
+            .join(request.id.to_string())
+            .join("state.json")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn state_dir_follows_data_dir_and_names_an_unwritable_path() {
+        let _guard = env_lock().lock().await;
+        let _state = EnvSlot::clear("PISTACK_YOUKI_STATE");
+        let _data = EnvSlot::clear("PISTACK_DATA_DIR");
+        assert_eq!(state_dir(), PathBuf::from(DEFAULT_STATE));
+        let data = PathBuf::from("/tmp/pistack-data-example");
+        std::env::set_var("PISTACK_DATA_DIR", &data);
+        assert_eq!(state_dir(), data.join("youki"));
+        std::env::set_var("PISTACK_YOUKI_STATE", "");
+        assert_eq!(state_dir(), data.join("youki"));
+        std::env::set_var("PISTACK_YOUKI_STATE", "/var/lib/custom-youki");
+        assert_eq!(state_dir(), PathBuf::from("/var/lib/custom-youki"));
+
+        let tmp = temp_dir("statedir");
+        let _dir = scopeguard_dir(&tmp);
+        let log = tmp.join("youki.log");
+        let bin = tmp.join("youki");
+        write_script(&bin, &log, 0);
+        let blocker = tmp.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let _env = EnvGuard::set(&bin, &blocker);
+        let rt = YoukiRuntime;
+        let request = plain_rootfs(&tmp);
+        let err = rt.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(
+            err.message.contains(&blocker.display().to_string()),
+            "{err}"
+        );
+        assert!(err.message.contains("PISTACK_YOUKI_STATE"), "{err}");
+        assert!(err.message.contains("PISTACK_DATA_DIR"), "{err}");
+        assert!(err.message.contains("agent user owns"), "{err}");
+        assert!(
+            std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+            "a rejected state dir must not call youki"
+        );
     }
 
     struct DirGuard(PathBuf);
