@@ -439,7 +439,7 @@ const VIEWS = {
   stacks: {
     title: "Stacks",
     path: "/blueprint/stacks",
-    note: "Apply creates missing rows from the document and updates the rows an earlier apply of the stack created. The phase is applying, then ready or failed. Roll back re-applies the previous revision.",
+    note: "Apply creates missing rows from the document, updates the rows an earlier apply of the stack created, and deletes managed rows the document no longer names. The phase is applying, then ready or failed. Roll back re-applies the previous revision.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],

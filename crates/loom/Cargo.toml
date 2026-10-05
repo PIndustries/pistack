@@ -25,9 +25,9 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 ipnet.workspace = true
+fabric.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
 http-body-util = "0.1"
 tokio-util.workspace = true
-fabric.workspace = true
