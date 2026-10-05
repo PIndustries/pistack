@@ -15,6 +15,11 @@
 //!
 //! ECDSA / SigV4A streaming variants return `NotImplemented`.
 //!
+//! When `x-amz-copy-source` is present (UploadPartCopy today; CopyObject
+//! later), it and any present `x-amz-copy-source-*` condition/range headers
+//! must appear in SignedHeaders (header auth and presigned), matching the
+//! streaming `x-amz-decoded-content-length` rule — otherwise `AccessDenied`.
+//!
 //! On success the keep access-key's project-scoped [`Caller`] is attached
 //! to the request. Keep lookup failures and signature mismatches map to
 //! S3 XML error codes without distinguishing "why" beyond what S3 itself
@@ -171,6 +176,7 @@ fn authenticate(state: &SigV4State, req: &Request) -> ApiResult<Option<AuthOk>> 
         }
         check_streaming_signed_headers(&parsed, kind)?;
     }
+    check_copy_source_signed_headers(&parsed, req.headers())?;
 
     check_region(&parsed.region, &state.region)?;
     check_time_skew(parsed.amz_date, parsed.expires_secs)?;
@@ -310,6 +316,45 @@ fn check_streaming_signed_headers(parsed: &ParsedAuth, kind: &StreamingKind) -> 
             }
         }
         StreamingKind::Signed => {}
+    }
+    Ok(())
+}
+
+/// Headers that must be signed when present alongside `x-amz-copy-source`.
+/// Shared by UploadPartCopy and a future CopyObject.
+const COPY_SOURCE_DEPENDENT_HEADERS: &[&str] = &[
+    "x-amz-copy-source-range",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+];
+
+/// Require copy-source (and present dependents) in SignedHeaders so a
+/// captured signature cannot be replayed with a swapped source.
+fn check_copy_source_signed_headers(parsed: &ParsedAuth, headers: &HeaderMap) -> ApiResult<()> {
+    if header_str(headers, "x-amz-copy-source").is_none() {
+        return Ok(());
+    }
+    let has = |name: &str| {
+        parsed
+            .signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    };
+    if !has("x-amz-copy-source") {
+        return Err(s3_err(
+            "AccessDenied",
+            "x-amz-copy-source must be in SignedHeaders",
+        ));
+    }
+    for name in COPY_SOURCE_DEPENDENT_HEADERS {
+        if header_str(headers, name).is_some() && !has(name) {
+            return Err(s3_err(
+                "AccessDenied",
+                format!("{name} must be in SignedHeaders when present"),
+            ));
+        }
     }
     Ok(())
 }
@@ -965,6 +1010,87 @@ pub fn presign_query(
         region: region.to_owned(),
         amz_date: parse_amz_date(amz_date).expect("amz_date"),
         signed_headers: vec!["host".into()],
+        signature: String::new(),
+        payload_hash: UNSIGNED_PAYLOAD.to_owned(),
+        expires_secs: Some(expires),
+        presigned: true,
+    };
+    let sts = build_string_to_sign(&auth, &canonical);
+    let key = derive_signing_key(secret, &date_stamp, region, "s3");
+    let sig = hmac_sha256_hex(&key, sts.as_bytes());
+    format!("{canonical_qs}&X-Amz-Signature={sig}")
+}
+
+/// Like [`presign_query`], but signs additional request headers (lowercase
+/// names → values) and lists them in `X-Amz-SignedHeaders`. Used when a
+/// presigned PUT carries `x-amz-copy-source` (and dependents).
+#[allow(clippy::too_many_arguments)]
+pub fn presign_query_with_headers(
+    method: &str,
+    path: &str,
+    host: &str,
+    access_key_id: &str,
+    secret: &[u8],
+    region: &str,
+    amz_date: &str,
+    expires: i64,
+    extra_query: &str,
+    extra_headers: &[(String, String)],
+) -> String {
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let credential = format!("{access_key_id}/{date_stamp}/{region}/s3/aws4_request");
+    let mut header_map: BTreeMap<String, String> = BTreeMap::new();
+    header_map.insert("host".into(), collapse_ws(host));
+    for (k, v) in extra_headers {
+        header_map.insert(k.to_ascii_lowercase(), collapse_ws(v));
+    }
+    let signed: Vec<String> = header_map.keys().cloned().collect();
+    let signed_headers_param = signed.join(";");
+    let mut params: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+        ("X-Amz-Credential".into(), credential),
+        ("X-Amz-Date".into(), amz_date.to_owned()),
+        ("X-Amz-Expires".into(), expires.to_string()),
+        ("X-Amz-SignedHeaders".into(), signed_headers_param.clone()),
+    ];
+    for (k, v) in form_urlencoded_iter(extra_query) {
+        params.push((k, v));
+    }
+    params.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let canonical_qs = params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                utf8_percent_encode(k, QUERY_VALUE),
+                utf8_percent_encode(v, QUERY_VALUE)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut canonical = String::new();
+    canonical.push_str(method);
+    canonical.push('\n');
+    canonical.push_str(&canonical_uri(path));
+    canonical.push('\n');
+    canonical.push_str(&canonical_qs);
+    canonical.push('\n');
+    for name in &signed {
+        canonical.push_str(name);
+        canonical.push(':');
+        canonical.push_str(header_map.get(name).map(String::as_str).unwrap_or(""));
+        canonical.push('\n');
+    }
+    canonical.push('\n');
+    canonical.push_str(&signed_headers_param);
+    canonical.push('\n');
+    canonical.push_str(UNSIGNED_PAYLOAD);
+    let auth = ParsedAuth {
+        access_key_id: access_key_id.to_owned(),
+        date_stamp: date_stamp.clone(),
+        region: region.to_owned(),
+        amz_date: parse_amz_date(amz_date).expect("amz_date"),
+        signed_headers: signed,
         signature: String::new(),
         payload_hash: UNSIGNED_PAYLOAD.to_owned(),
         expires_secs: Some(expires),
