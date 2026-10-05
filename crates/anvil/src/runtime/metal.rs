@@ -5,10 +5,17 @@
 //!
 //! A machine whose name is `PISTACK_NODE_NAME` is this host. `start`
 //! records it and `stop` does not power it off. Any other machine is a
-//! remote chassis: `start` runs `ipmitool chassis power on` when the
-//! binary, a BMC address, and a password file are present, and stays
-//! unavailable when they are not. The password file is
-//! `$PISTACK_IPMI_DIR/<machine-id>` and is never read into a log.
+//! remote chassis: `start` sets `chassis bootdev pxe`, then runs
+//! `ipmitool chassis power on`, when the binary, a BMC address, and a
+//! password file are present, and stays unavailable when they are not.
+//! The requested image name is stored in metal state for later
+//! provisioning work; this runtime does not fetch or write disk images
+//! itself. On `delete`, a remote chassis is powered off and, when
+//! `$PISTACK_METAL_CLEAN` names an executable, that helper runs with the
+//! machine id, BMC address, BMC user, and password file path. With the
+//! variable unset, delete does not pretend disks were wiped. The
+//! password file is `$PISTACK_IPMI_DIR/<machine-id>` and is never read
+//! into a log.
 
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
@@ -59,6 +66,14 @@ struct MetalRecord {
     bmc_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bmc_user: Option<String>,
+    /// Image name from the start request. Empty when the caller did not
+    /// ask for one. Recorded so a later provisioner can use it; metal
+    /// does not pull the bytes itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    image: String,
+    /// True after a successful `chassis bootdev pxe` for this chassis.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pxe: bool,
 }
 
 fn read_record(path: &Path) -> ApiResult<Option<MetalRecord>> {
@@ -220,7 +235,7 @@ fn clip(s: &str) -> String {
     }
 }
 
-async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+async fn ipmi(address: &str, user: &str, pass: &Path, words: &[&str], what: &str) -> ApiResult<()> {
     let bin = ipmitool_bin()?;
     let (host, port) = bmc_host(address)?;
     let user = bmc_user(user)?;
@@ -239,7 +254,9 @@ async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResu
         args.push("-p".into());
         args.push(port.to_string());
     }
-    args.extend(["chassis".into(), "power".into(), power.to_owned()]);
+    for w in words {
+        args.push((*w).to_owned());
+    }
     let output = tokio::process::Command::new(&bin)
         .args(&args)
         .stdin(std::process::Stdio::null())
@@ -259,12 +276,84 @@ async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResu
     }
     let detail = clip(&String::from_utf8_lossy(&output.stderr));
     if detail.is_empty() {
-        Err(ApiError::unavailable(format!(
-            "ipmitool chassis power {power} failed"
-        )))
+        Err(ApiError::unavailable(format!("ipmitool {what} failed")))
     } else {
         Err(ApiError::unavailable(format!(
-            "ipmitool chassis power {power} failed: {detail}"
+            "ipmitool {what} failed: {detail}"
+        )))
+    }
+}
+
+async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    ipmi(
+        address,
+        user,
+        pass,
+        &["chassis", "power", power],
+        &format!("chassis power {power}"),
+    )
+    .await
+}
+
+/// Next boot from the network. Does not install an image; it only points
+/// the chassis at PXE so a provisioner can take over.
+async fn bootdev_pxe(address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    ipmi(
+        address,
+        user,
+        pass,
+        &["chassis", "bootdev", "pxe"],
+        "chassis bootdev pxe",
+    )
+    .await
+}
+
+fn clean_bin() -> Option<PathBuf> {
+    match std::env::var_os("PISTACK_METAL_CLEAN") {
+        Some(v) if !v.is_empty() => {
+            let path = PathBuf::from(v);
+            if path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Optional cleaning helper. Absent `$PISTACK_METAL_CLEAN` means delete
+/// only powers off; we do not claim disks were wiped.
+async fn clean_remote(id: &Id, address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    let Some(bin) = clean_bin() else {
+        return Ok(());
+    };
+    let output = tokio::process::Command::new(&bin)
+        .arg(id.to_string())
+        .arg(address)
+        .arg(user)
+        .arg(pass.as_os_str())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::unavailable("metal clean helper is missing")
+            } else {
+                ApiError::unavailable(format!("metal clean helper failed to start: {e}"))
+            }
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = clip(&String::from_utf8_lossy(&output.stderr));
+    if detail.is_empty() {
+        Err(ApiError::unavailable("metal clean helper failed"))
+    } else {
+        Err(ApiError::unavailable(format!(
+            "metal clean helper failed: {detail}"
         )))
     }
 }
@@ -288,6 +377,8 @@ impl MachineRuntime for MetalRuntime {
                 local: true,
                 bmc_address: None,
                 bmc_user: None,
+                image: req.image.clone(),
+                pxe: false,
             })?;
             return Ok(running);
         }
@@ -302,12 +393,15 @@ impl MachineRuntime for MetalRuntime {
         };
         ipmitool_bin()?;
         let pass = pass_file(&req.id)?;
+        bootdev_pxe(address, user, &pass).await?;
         chassis("on", address, user, &pass).await?;
         write_state(&MetalRecord {
             machine: running.clone(),
             local: false,
             bmc_address: Some(address.to_owned()),
             bmc_user: Some(user.to_owned()),
+            image: req.image.clone(),
+            pxe: true,
         })?;
         Ok(running)
     }
@@ -350,6 +444,7 @@ impl MachineRuntime for MetalRuntime {
                     ipmitool_bin()?;
                     let pass = pass_file(id)?;
                     chassis("off", address, user, &pass).await?;
+                    clean_remote(id, address, user, &pass).await?;
                 }
             }
             forget_state(&path)?;
@@ -586,6 +681,8 @@ mod tests {
         let running = rt.start(&remote).await.unwrap();
         assert_eq!(running.power, PowerState::On);
         let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("bootdev"), "{text}");
+        assert!(text.contains("pxe"), "{text}");
         assert!(text.contains("chassis"), "{text}");
         assert!(text.contains("power"), "{text}");
         assert!(text.contains("on"), "{text}");
@@ -595,6 +692,9 @@ mod tests {
         assert!(text.contains("root"), "{text}");
         assert!(text.contains("-f"), "{text}");
         assert!(!text.contains("s3cret-do-not-log"), "{text}");
+        let record = super::read_state(&remote.id).unwrap().unwrap();
+        assert!(record.pxe);
+        assert_eq!(record.image, "bare");
 
         rt.stop(&remote.id).await.unwrap();
         let text = std::fs::read_to_string(&log).unwrap();
@@ -611,6 +711,76 @@ mod tests {
         rt.delete(&local.id).await.unwrap();
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(!text.contains("s3cret-do-not-log"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_delete_runs_clean_helper_when_configured() {
+        let _guard = env_lock().lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "pistack-metal-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state");
+        let passes = dir.join("pass");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&passes).unwrap();
+        let log = dir.join("ipmi.log");
+        let clean_log = dir.join("clean.log");
+        let tool = dir.join("ipmitool");
+        let clean = dir.join("clean.sh");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_IPMI_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &clean,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_METAL_CLEAN_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&tool, &clean] {
+                let mut perms = std::fs::metadata(path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(path, perms).unwrap();
+            }
+        }
+        let _state = Var::set("PISTACK_METAL_STATE", state.to_str().unwrap());
+        let _node = Var::set("PISTACK_NODE_NAME", "fleet");
+        let _tool = Var::set("PISTACK_IPMITOOL", tool.to_str().unwrap());
+        let _dir = Var::set("PISTACK_IPMI_DIR", passes.to_str().unwrap());
+        let _log = Var::set("PISTACK_IPMI_LOG", log.to_str().unwrap());
+        let _clean = Var::set("PISTACK_METAL_CLEAN", clean.to_str().unwrap());
+        let _clog = Var::set("PISTACK_METAL_CLEAN_LOG", clean_log.to_str().unwrap());
+
+        let rt = MetalRuntime;
+        let mut remote = req("shelf");
+        remote.image = "install.iso".into();
+        remote.bmc_address = Some("10.9.1.8".into());
+        remote.bmc_user = Some("root".into());
+        let pass = passes.join(remote.id.to_string());
+        std::fs::write(&pass, "s3cret-do-not-log\n").unwrap();
+        let running = rt.start(&remote).await.unwrap();
+        let record = super::read_state(&running.id).unwrap().unwrap();
+        assert_eq!(record.image, "install.iso");
+        assert!(record.pxe);
+
+        rt.delete(&running.id).await.unwrap();
+        let cleaned = std::fs::read_to_string(&clean_log).unwrap();
+        assert!(cleaned.contains(&running.id.to_string()), "{cleaned}");
+        assert!(cleaned.contains("10.9.1.8"), "{cleaned}");
+        assert!(cleaned.contains("root"), "{cleaned}");
+        assert!(cleaned.contains(pass.to_str().unwrap()), "{cleaned}");
+        assert!(!cleaned.contains("s3cret-do-not-log"), "{cleaned}");
+        assert!(super::read_state(&running.id).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
