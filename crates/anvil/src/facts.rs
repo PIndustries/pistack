@@ -46,13 +46,10 @@ pub fn gather_at(data_dir: &Path) -> HostFacts {
     }
 }
 
+/// The host name, as a node name. The agent itself runs under the stable
+/// name from [`pistack_types::node`]; this is only the first-start default.
 pub fn node_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "localhost".to_owned())
+    pistack_types::node::system_hostname().unwrap_or_else(|| "localhost".to_owned())
 }
 
 pub fn cpus() -> u32 {
