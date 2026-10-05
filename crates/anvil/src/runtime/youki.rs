@@ -2242,8 +2242,8 @@ async fn start_pod(
             let _ = remove_bundle(bundle).await;
             return Err(e);
         }
-    } else if let Err(e) = exec_youki(bin, &["start", &id_str]).await {
-        return Err(e);
+    } else {
+        exec_youki(bin, &["start", &id_str]).await?;
     }
     let state = match run_youki(bin, &["state", &id_str]).await {
         Ok(output) => output,

@@ -439,7 +439,7 @@ impl Reconciler {
         let want_restart = m.spec.restarts > m.status.restarts;
         let want_off = m.spec.power == DesiredPower::Off;
         let is_on = m.status.power == PowerState::On;
-        if !want_restart && want_off == !is_on {
+        if !want_restart && want_off != is_on {
             return Ok(());
         }
         let (_, driver) = match self.driver_for(&m) {
