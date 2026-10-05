@@ -5,6 +5,7 @@
 //! HTTP handlers, the reconciler, and other modules (`forge` attaches
 //! volumes through it). It is the only writer of `status`.
 
+use mold::ImageStore;
 use pistack_rpc::{
     CommandKind, CommandQueue, DiskTarget, VolumeAttach, VolumeAttached, VolumeDetach,
 };
@@ -83,6 +84,10 @@ pub struct Client {
     queue: Option<CommandQueue>,
     /// Directory silo uses for backup object bytes.
     silo_root: PathBuf,
+    /// Mold blob store. Volume create reads an image from here.
+    images: Arc<dyn ImageStore>,
+    /// Temp files for stores that only offer a byte stream.
+    spool_dir: PathBuf,
 }
 
 /// Host path and optional network target for one attach or detach.
@@ -227,6 +232,8 @@ impl Client {
             quota,
             queue: None,
             silo_root: silo::Silo::data_root(),
+            images: Arc::new(mold::LocalDirStore::new(mold::default_image_dir())),
+            spool_dir: crate::default_spool_dir(),
         }
     }
 
@@ -239,6 +246,22 @@ impl Client {
     pub fn with_silo_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.silo_root = root.into();
         self
+    }
+
+    /// Blob store shared with mold.
+    pub fn with_images(mut self, images: Arc<dyn ImageStore>) -> Self {
+        self.images = images;
+        self
+    }
+
+    /// Directory for a streamed image copy. Removed after the copy.
+    pub fn with_spool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.spool_dir = dir.into();
+        self
+    }
+
+    pub(crate) fn mold(&self) -> mold::Client {
+        mold::Client::new(self.store.clone(), self.images.clone())
     }
 
     pub fn silo_root(&self) -> &Path {
@@ -257,10 +280,12 @@ impl Client {
         let store = Store::in_memory()?;
         Ok(Self::new(
             store,
-            Arc::new(LocalFileBackend::new(dir)),
+            Arc::new(LocalFileBackend::new(dir.clone())),
             Arc::new(AllowAll),
         )
-        .with_silo_root(silo_root))
+        .with_silo_root(silo_root)
+        .with_images(Arc::new(mold::LocalDirStore::new(dir.join("images"))))
+        .with_spool_dir(dir.join("spool")))
     }
 
     pub fn store(&self) -> &Store {
@@ -365,9 +390,6 @@ impl Client {
     pub async fn create_volume(&self, req: Create<VolumeSpec>) -> ApiResult<Volume> {
         validate_name(&req.name)?;
         let mut spec = req.spec;
-        if spec.size_gib == 0 {
-            return Err(ApiError::bad_request("spec.size_gib must be at least 1"));
-        }
         // Normalise the type to its name so renames do not break volumes.
         let vt = self.get_volume_type(&spec.volume_type).map_err(|_| {
             ApiError::bad_request(format!("unknown volume type '{}'", spec.volume_type))
@@ -376,6 +398,14 @@ impl Client {
         // on the file backend. lvm and rbd are checked again when they run.
         known_backend(&vt.spec.backend)?;
         spec.volume_type = vt.meta.name.clone();
+
+        if let VolumeSource::Image(id) = &spec.source {
+            let checked = crate::image::check_image(&self.mold(), id, spec.size_gib).await?;
+            spec.size_gib = checked.size_gib;
+        }
+        if spec.size_gib == 0 {
+            return Err(ApiError::bad_request("spec.size_gib must be at least 1"));
+        }
 
         // Source checks: sizes must not shrink and sources must be ready.
         match &spec.source {
@@ -1031,34 +1061,7 @@ impl Client {
             return Ok(None);
         };
         match vol.status.phase {
-            Phase::Pending => {
-                let backend = match self.volume_backend(&vol).await {
-                    Ok(backend) => backend,
-                    Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
-                };
-                let vol = col.modify(id, |v| {
-                    v.status.phase = Phase::Creating;
-                    Ok(())
-                })?;
-                match backend.create(&vol).await {
-                    Ok(r) => Ok(Some(col.modify(id, |v| {
-                        v.status.phase = Phase::Ready;
-                        v.status.backend_ref = Some(r.to_string());
-                        set_condition(&mut v.status.conditions, "Provisioned", true, "created", "");
-                        if matches!(v.spec.source, VolumeSource::Image(_)) {
-                            set_condition(
-                                &mut v.status.conditions,
-                                "ImageWritten",
-                                false,
-                                "pending",
-                                "image population happens at first attach",
-                            );
-                        }
-                        Ok(())
-                    })?)),
-                    Err(e) => Ok(Some(self.fail_volume(id, "create", e)?)),
-                }
-            }
+            Phase::Pending => self.provision_volume(id, &vol, &col).await,
             Phase::Updating => {
                 let backend = match self.volume_backend(&vol).await {
                     Ok(backend) => backend,
@@ -1099,10 +1102,101 @@ impl Client {
         }
     }
 
+    /// Create the blank volume, then copy an image into it while the phase
+    /// stays `Creating`. A failed copy removes the blank volume.
+    async fn provision_volume(
+        &self,
+        id: &Id,
+        vol: &Volume,
+        col: &Collection<Volume>,
+    ) -> ApiResult<Option<Volume>> {
+        let backend = match self.volume_backend(vol).await {
+            Ok(backend) => backend,
+            Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
+        };
+        let vol = col.modify(id, |v| {
+            v.status.phase = Phase::Creating;
+            Ok(())
+        })?;
+        let image_id = match &vol.spec.source {
+            VolumeSource::Image(image) => Some(image.clone()),
+            _ => None,
+        };
+        let staged = if let Some(image) = &image_id {
+            let mold = self.mold();
+            let checked = match crate::image::check_image(&mold, image, vol.spec.size_gib).await {
+                Ok(checked) => checked,
+                Err(e) => return Ok(Some(self.fail_volume(id, "image", e)?)),
+            };
+            match crate::image::stage_image(&mold, &checked.image, &self.spool_dir).await {
+                Ok(staged) => Some(staged),
+                Err(e) => return Ok(Some(self.fail_volume(id, "image", e)?)),
+            }
+        } else {
+            None
+        };
+        let created = match backend.create(&vol).await {
+            Ok(created) => created,
+            Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
+        };
+        let vol = col.modify(id, |v| {
+            v.status.backend_ref = Some(created.to_string());
+            Ok(())
+        })?;
+        if let (Some(image), Some(staged)) = (&image_id, staged.as_ref()) {
+            if let Err(e) = backend
+                .write_image(&vol, &staged.path, &staged.format)
+                .await
+            {
+                let e = Self::copy_failed(image, e);
+                let clear_ref = match backend.delete(&vol).await {
+                    Ok(()) => true,
+                    Err(del) => {
+                        tracing::warn!(
+                            volume = %id,
+                            error = %del,
+                            "removing a partial volume failed"
+                        );
+                        false
+                    }
+                };
+                return Ok(Some(self.mark_volume_failed(id, "image", e, clear_ref)?));
+            }
+        }
+        drop(staged);
+        Ok(Some(col.modify(id, |v| {
+            v.status.phase = Phase::Ready;
+            set_condition(&mut v.status.conditions, "Provisioned", true, "created", "");
+            if let Some(image) = &image_id {
+                set_condition(
+                    &mut v.status.conditions,
+                    "ImageWritten",
+                    true,
+                    "copied",
+                    image.to_string(),
+                );
+            }
+            Ok(())
+        })?))
+    }
+
     fn fail_volume(&self, id: &Id, op: &str, e: ApiError) -> ApiResult<Volume> {
+        self.mark_volume_failed(id, op, e, false)
+    }
+
+    fn mark_volume_failed(
+        &self,
+        id: &Id,
+        op: &str,
+        e: ApiError,
+        clear_ref: bool,
+    ) -> ApiResult<Volume> {
         tracing::warn!(volume = %id, op, error = %e, "volume reconcile failed");
         Ok(self.volumes().modify(id, |v| {
             v.status.phase = Phase::Error;
+            if clear_ref {
+                v.status.backend_ref = None;
+            }
             set_condition(
                 &mut v.status.conditions,
                 "Provisioned",
@@ -1112,6 +1206,11 @@ impl Client {
             );
             Ok(())
         })?)
+    }
+
+    fn copy_failed(image: &Id, mut err: ApiError) -> ApiError {
+        err.message = format!("copying image {image} failed: {}", err.message);
+        err
     }
 
     pub async fn reconcile_snapshot(&self, id: &Id) -> ApiResult<Option<Snapshot>> {

@@ -458,7 +458,7 @@ async fn presigned_get() {
 }
 
 #[tokio::test]
-async fn streaming_payload_not_implemented() {
+async fn streaming_ecdsa_still_not_implemented() {
     let w = world().await;
     let date = amz_now();
     let path = format!("/{}/chunked.txt", w.bucket);
@@ -472,9 +472,9 @@ async fn streaming_payload_not_implemented() {
         &w.secret,
         &w.region,
         &date,
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
         "silo.test",
-        &[],
+        &[("x-amz-decoded-content-length", "0")],
     )
     .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
@@ -786,5 +786,669 @@ async fn bearer_plus_presigned_conflict() {
     assert_eq!(
         extract_error_code(&String::from_utf8_lossy(&body)),
         "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rejected_on_non_put() {
+    let w = world().await;
+    let date = amz_now();
+    let path = format!("/{}/nope.txt", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &path,
+        "uploads",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "silo.test",
+        &[("x-amz-decoded-content-length", "0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn streaming_requires_decoded_length_in_signed_headers() {
+    let w = world().await;
+    let amz_date = amz_now();
+    let path = format!("/{}/unsigned-hdr.txt", w.bucket);
+    let host = "silo.test";
+    // Put decoded-content-length on the wire but omit it from SignedHeaders.
+    let headers = vec![
+        ("content-length".into(), "0".into()),
+        ("host".into(), host.into()),
+        (
+            "x-amz-content-sha256".into(),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+        ),
+        ("x-amz-date".into(), amz_date.clone()),
+    ];
+    let sig = sigv4::sign_request(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&path)
+                .header("host", host)
+                .header("content-length", "0")
+                .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-decoded-content-length", "0")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rejected_with_presigned_url() {
+    let w = world().await;
+    let amz_date = amz_now();
+    let path = format!("/{}/presign-stream.txt", w.bucket);
+    let host = "silo.test";
+    let q = sigv4::presign_query(
+        "PUT",
+        &path,
+        host,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+        3600,
+        "X-Amz-Content-Sha256=STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    );
+    // Also send decoded length header (unsigned) so classify would otherwise proceed.
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{path}?{q}"))
+                .header("host", host)
+                .header("x-amz-decoded-content-length", "0")
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rejected_on_delete() {
+    let w = world().await;
+    let date = amz_now();
+    let path = format!("/{}/del.txt", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "DELETE",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "silo.test",
+        &[("x-amz-decoded-content-length", "0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rejected_on_complete_multipart() {
+    let w = world().await;
+    let date = amz_now();
+    let path = format!("/{}/cmp.txt", w.bucket);
+    // CompleteMultipartUpload is POST ?uploadId=…
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &path,
+        "uploadId=fake-upload-id",
+        b"<CompleteMultipartUpload></CompleteMultipartUpload>",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "silo.test",
+        &[("x-amz-decoded-content-length", "0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+/// Sign only `signed_header_names` but send every header in `wire_headers`.
+#[allow(clippy::too_many_arguments)]
+async fn signed_call_partial(
+    app: &Router,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    access_key_id: &str,
+    secret: &[u8],
+    region: &str,
+    amz_date: &str,
+    payload_hash: &str,
+    host: &str,
+    wire_headers: &[(&str, &str)],
+    signed_header_names: &[&str],
+) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let mut sign_headers: Vec<(String, String)> = vec![
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), payload_hash.into()),
+        ("x-amz-date".into(), amz_date.into()),
+    ];
+    if method == "PUT" || method == "POST" {
+        sign_headers.push(("content-length".into(), body.len().to_string()));
+    }
+    for (k, v) in wire_headers {
+        if signed_header_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(k))
+        {
+            sign_headers.push(((*k).into(), (*v).into()));
+        }
+    }
+    sign_headers.sort_by(|a, b| a.0.cmp(&b.0));
+    // Deduplicate by keeping last of same key after sort — sign_request uses BTreeMap.
+    let signed_names: Vec<String> = {
+        let mut names: Vec<String> = sign_headers.iter().map(|(k, _)| k.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let sig = sigv4::sign_request(
+        method,
+        path,
+        query,
+        &sign_headers,
+        payload_hash,
+        access_key_id,
+        secret,
+        region,
+        amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{date_stamp}/{region}/s3/aws4_request, SignedHeaders={}, Signature={sig}",
+        signed_names.join(";")
+    );
+    let uri = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    let mut builder = Request::builder().method(method).uri(&uri);
+    builder = builder
+        .header("host", host)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("x-amz-date", amz_date);
+    if method == "PUT" || method == "POST" {
+        builder = builder.header("content-length", body.len().to_string());
+    }
+    for (k, v) in wire_headers {
+        builder = builder.header(*k, *v);
+    }
+    builder = builder.header(header::AUTHORIZATION, auth);
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_vec())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, bytes, headers)
+}
+
+async fn put_source_and_start_mpu(w: &World, src_key: &str, dst_key: &str, bytes: &[u8]) -> String {
+    let src_path = format!("/{}/{}", w.bucket, src_key);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        bytes,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(bytes),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/{}", w.bucket, dst_key);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &dst_path,
+        "uploads",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    String::from_utf8_lossy(&body)
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId")
+        .to_owned()
+}
+
+async fn list_parts_xml(w: &World, dst_key: &str, upload_id: &str) -> String {
+    let path = format!("/{}/{}", w.bucket, dst_key);
+    let q = format!("uploadId={upload_id}");
+    let (status, body, _) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        &q,
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+#[tokio::test]
+async fn copy_source_must_be_in_signed_headers() {
+    let w = world().await;
+    let src = b"copy-src-bytes!!";
+    let upload_id = put_source_and_start_mpu(&w, "src.bin", "dst.bin", src).await;
+    let path = format!("/{}/dst.bin", w.bucket);
+    let q = format!("partNumber=1&uploadId={upload_id}");
+    let copy_src = format!("/{}/src.bin", w.bucket);
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &path,
+        &q,
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[("x-amz-copy-source", &copy_src)],
+        &[], // omit copy-source from SignedHeaders
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let listed = list_parts_xml(&w, "dst.bin", &upload_id).await;
+    assert!(
+        !listed.contains("<Part>"),
+        "no part after unsigned copy-source: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn copy_source_range_must_be_in_signed_headers() {
+    let w = world().await;
+    let src = b"ABCDEFGH";
+    let upload_id = put_source_and_start_mpu(&w, "src-r.bin", "dst-r.bin", src).await;
+    let path = format!("/{}/dst-r.bin", w.bucket);
+    let q = format!("partNumber=1&uploadId={upload_id}");
+    let copy_src = format!("/{}/src-r.bin", w.bucket);
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &path,
+        &q,
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-copy-source-range", "bytes=0-3"),
+        ],
+        &["x-amz-copy-source"], // range present but unsigned
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let listed = list_parts_xml(&w, "dst-r.bin", &upload_id).await;
+    assert!(!listed.contains("<Part>"), "{listed}");
+}
+
+#[tokio::test]
+async fn copy_source_fully_signed_ok() {
+    let w = world().await;
+    let src = b"ABCDEFGH";
+    let upload_id = put_source_and_start_mpu(&w, "src-ok.bin", "dst-ok.bin", src).await;
+    let path = format!("/{}/dst-ok.bin", w.bucket);
+    let q = format!("partNumber=1&uploadId={upload_id}");
+    let copy_src = format!("/{}/src-ok.bin", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "PUT",
+        &path,
+        &q,
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-copy-source-range", "bytes=0-3"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("CopyPartResult"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let listed = list_parts_xml(&w, "dst-ok.bin", &upload_id).await;
+    assert!(listed.contains("<Part>"), "{listed}");
+}
+
+#[tokio::test]
+async fn copy_source_swapped_after_sign_rejected() {
+    let w = world().await;
+    let src_a = b"AAAAAAAA";
+    let src_b = b"BBBBBBBB";
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &format!("/{}/a.bin", w.bucket),
+        "",
+        src_a,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src_a),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &format!("/{}/b.bin", w.bucket),
+        "",
+        src_b,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src_b),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/swap.bin", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &dst_path,
+        "uploads",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = String::from_utf8_lossy(&body)
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .unwrap()
+        .to_owned();
+
+    let amz_date = amz_now();
+    let q = format!("partNumber=1&uploadId={upload_id}");
+    let copy_a = format!("/{}/a.bin", w.bucket);
+    let copy_b = format!("/{}/b.bin", w.bucket);
+    let host = "silo.test";
+    let payload_hash = EMPTY_PAYLOAD_SHA256;
+    // Sign for source A…
+    let headers = vec![
+        ("content-length".into(), "0".into()),
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), payload_hash.into()),
+        ("x-amz-copy-source".into(), copy_a.clone()),
+        ("x-amz-date".into(), amz_date.clone()),
+    ];
+    let sig = sigv4::sign_request(
+        "PUT",
+        &dst_path,
+        &q,
+        &headers,
+        payload_hash,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-copy-source;x-amz-date, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    // …but send source B with the captured signature.
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{dst_path}?{q}"))
+                .header("host", host)
+                .header("content-length", "0")
+                .header("x-amz-content-sha256", payload_hash)
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-copy-source", &copy_b)
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "SignatureDoesNotMatch"
+    );
+    let listed = list_parts_xml(&w, "swap.bin", &upload_id).await;
+    assert!(!listed.contains("<Part>"), "{listed}");
+}
+
+#[tokio::test]
+async fn copy_source_presigned_unsigned_header_access_denied() {
+    let w = world().await;
+    let src = b"presign-src";
+    let upload_id = put_source_and_start_mpu(&w, "psrc.bin", "pdst.bin", src).await;
+    let path = format!("/{}/pdst.bin", w.bucket);
+    let host = "silo.test";
+    let amz_date = amz_now();
+    // Presign with only host signed (legacy helper), then add unsigned copy-source.
+    let q = sigv4::presign_query(
+        "PUT",
+        &path,
+        host,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+        3600,
+        &format!("partNumber=1&uploadId={upload_id}"),
+    );
+    let copy_src = format!("/{}/psrc.bin", w.bucket);
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{path}?{q}"))
+                .header("host", host)
+                .header("content-length", "0")
+                .header("x-amz-copy-source", &copy_src)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+}
+
+#[tokio::test]
+async fn copy_source_presigned_fully_signed_ok() {
+    let w = world().await;
+    let src = b"presign-ok!";
+    let upload_id = put_source_and_start_mpu(&w, "psrc2.bin", "pdst2.bin", src).await;
+    let path = format!("/{}/pdst2.bin", w.bucket);
+    let host = "silo.test";
+    let amz_date = amz_now();
+    let copy_src = format!("/{}/psrc2.bin", w.bucket);
+    let q = sigv4::presign_query_with_headers(
+        "PUT",
+        &path,
+        host,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+        3600,
+        &format!("partNumber=1&uploadId={upload_id}"),
+        &[("x-amz-copy-source".into(), copy_src.clone())],
+    );
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{path}?{q}"))
+                .header("host", host)
+                .header("content-length", "0")
+                .header("x-amz-copy-source", &copy_src)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("CopyPartResult"),
+        "{}",
+        String::from_utf8_lossy(&body)
     );
 }

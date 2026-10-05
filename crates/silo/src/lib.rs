@@ -13,8 +13,12 @@
 //! Path-style S3 routes (`/{bucket}/{key}`, ListObjectsV2, multipart
 //! upload, ListMultipartUploads) share this module's HTTP router. Auth is
 //! gate bearer `Caller` or **AWS Signature Version 4** via keep access keys
-//! ([`sigv4`]): header auth and presigned GET/PUT. Not supported:
-//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked). Region comes from
+//! ([`sigv4`]): header auth, presigned GET/PUT, and aws-chunked streaming
+//! PutObject/UploadPart (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+//! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`). **UploadPartCopy**
+//! (`x-amz-copy-source` on `PUT …?partNumber=&uploadId=`) is supported;
+//! CopyObject is not implemented yet. Region comes from
 //! `[modules.silo] region` (default `pistack`).
 //!
 //! Multipart staging lives under `{data}/silo/{bucket}/.uploads/{uploadId}/`.
@@ -31,6 +35,8 @@
 //! * [`multipart`] — Create/Upload/Complete/Abort/List multipart helpers.
 //! * [`gc`] — the abandoned-upload sweep.
 //! * [`sigv4`] — AWS Signature Version 4 verification (in-process via keep).
+//! * [`copy`] — UploadPartCopy source/range/conditional helpers.
+//! * [`chunked`] — aws-chunked body decode (signed chunks and trailers).
 
 use async_trait::async_trait;
 use axum::Router;
@@ -38,7 +44,9 @@ use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::path::PathBuf;
 
+pub mod chunked;
 pub mod client;
+pub mod copy;
 pub mod gc;
 pub mod http;
 pub mod multipart;

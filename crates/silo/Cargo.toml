@@ -28,6 +28,10 @@ keep.workspace = true
 hmac.workspace = true
 percent-encoding.workspace = true
 subtle.workspace = true
+base64.workspace = true
+crc32fast.workspace = true
+crc32c.workspace = true
+sha1.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

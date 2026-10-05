@@ -8,15 +8,24 @@
 //!   `x-amz-content-sha256`)
 //! * Presigned URLs (query `X-Amz-*`) for any method, including GET/PUT
 //! * `UNSIGNED-PAYLOAD` and a declared hex SHA-256 payload hash
+//! * aws-chunked streaming bodies via [`crate::chunked`]:
+//!   `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+//!   `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, and
+//!   `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`
 //!
-//! Not supported: `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked) —
-//! those requests return `NotImplemented`.
+//! ECDSA / SigV4A streaming variants return `NotImplemented`.
+//!
+//! When `x-amz-copy-source` is present (UploadPartCopy today; CopyObject
+//! later), it and any present `x-amz-copy-source-*` condition/range headers
+//! must appear in SignedHeaders (header auth and presigned), matching the
+//! streaming `x-amz-decoded-content-length` rule — otherwise `AccessDenied`.
 //!
 //! On success the keep access-key's project-scoped [`Caller`] is attached
 //! to the request. Keep lookup failures and signature mismatches map to
 //! S3 XML error codes without distinguishing "why" beyond what S3 itself
 //! exposes (`InvalidAccessKeyId` vs `SignatureDoesNotMatch`).
 
+use crate::chunked::{StreamingAuth, StreamingKind, TrailerChecksum};
 use crate::multipart::{s3_code_of, s3_err};
 use axum::{
     extract::{OriginalUri, Request, State},
@@ -39,7 +48,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-pub const STREAMING_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+pub use crate::chunked::{STREAMING_PAYLOAD, STREAMING_SIGNED_TRAILER, STREAMING_UNSIGNED_TRAILER};
 /// Max clock skew accepted between `x-amz-date` / `X-Amz-Date` and server time.
 pub const MAX_SKEW_SECS: i64 = 15 * 60;
 /// Presigned URL maximum lifetime (7 days), matching S3.
@@ -100,6 +109,9 @@ pub async fn middleware(State(state): State<SigV4State>, mut req: Request, next:
             if let Some(sha) = auth.expected_payload_sha256 {
                 req.extensions_mut().insert(ExpectedPayloadSha256(sha));
             }
+            if let Some(streaming) = auth.streaming {
+                req.extensions_mut().insert(streaming);
+            }
             next.run(req).await
         }
         Err(err) => sigv4_error(err),
@@ -138,6 +150,7 @@ pub fn is_aws4_authorization(value: &str) -> bool {
 struct AuthOk {
     caller: Caller,
     expected_payload_sha256: Option<String>,
+    streaming: Option<StreamingAuth>,
 }
 
 /// `Ok(None)` = no SigV4 material (leave for bearer/`require_caller`).
@@ -147,16 +160,23 @@ fn authenticate(state: &SigV4State, req: &Request) -> ApiResult<Option<AuthOk>> 
         Some(p) => p,
     };
 
-    if parsed.payload_hash.eq_ignore_ascii_case(STREAMING_PAYLOAD)
-        || parsed
-            .payload_hash
-            .starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-    {
-        return Err(s3_err(
-            "NotImplemented",
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD (aws-chunked) is not supported",
-        ));
+    let streaming_kind = classify_streaming(&parsed.payload_hash, req.headers())?;
+    if let Some(ref kind) = streaming_kind {
+        if parsed.presigned {
+            return Err(s3_err(
+                "InvalidRequest",
+                "presigned URLs cannot use STREAMING-* payloads",
+            ));
+        }
+        if *req.method() != Method::PUT {
+            return Err(s3_err(
+                "InvalidRequest",
+                "STREAMING-* payload is only valid on PUT (PutObject/UploadPart)",
+            ));
+        }
+        check_streaming_signed_headers(&parsed, kind)?;
     }
+    check_copy_source_signed_headers(&parsed, req.headers())?;
 
     check_region(&parsed.region, &state.region)?;
     check_time_skew(parsed.amz_date, parsed.expires_secs)?;
@@ -207,10 +227,149 @@ fn authenticate(state: &SigV4State, req: &Request) -> ApiResult<Option<AuthOk>> 
         None
     };
 
+    let streaming = if let Some(kind) = streaming_kind {
+        let decoded = header_str(req.headers(), "x-amz-decoded-content-length")
+            .ok_or_else(|| {
+                s3_err(
+                    "InvalidRequest",
+                    "missing x-amz-decoded-content-length for aws-chunked upload",
+                )
+            })?
+            .parse::<u64>()
+            .map_err(|_| {
+                s3_err(
+                    "InvalidRequest",
+                    "x-amz-decoded-content-length must be a number",
+                )
+            })?;
+        let amz_date = parsed.amz_date.format("%Y%m%dT%H%M%S").to_string() + "Z";
+        let scope = format!("{}/{}/s3/aws4_request", parsed.date_stamp, parsed.region);
+        Some(StreamingAuth {
+            kind,
+            seed_signature: parsed.signature.clone(),
+            signing_key: signing_key.clone(),
+            amz_date,
+            scope,
+            decoded_content_length: decoded,
+        })
+    } else {
+        None
+    };
+
     Ok(Some(AuthOk {
         caller: credential.caller,
         expected_payload_sha256: expected_payload,
+        streaming,
     }))
+}
+
+fn classify_streaming(payload_hash: &str, headers: &HeaderMap) -> ApiResult<Option<StreamingKind>> {
+    let p = payload_hash.trim();
+    if p.eq_ignore_ascii_case(STREAMING_PAYLOAD) {
+        return Ok(Some(StreamingKind::Signed));
+    }
+    if p.eq_ignore_ascii_case(STREAMING_UNSIGNED_TRAILER) {
+        let checksum = trailer_from_headers(headers)?;
+        return Ok(Some(StreamingKind::UnsignedTrailer { checksum }));
+    }
+    if p.eq_ignore_ascii_case(STREAMING_SIGNED_TRAILER) {
+        let checksum = trailer_from_headers(headers)?;
+        return Ok(Some(StreamingKind::SignedTrailer { checksum }));
+    }
+    if p.to_ascii_uppercase().starts_with("STREAMING-AWS4-ECDSA")
+        || p.to_ascii_uppercase().contains("ECDSA-P256")
+    {
+        return Err(s3_err(
+            "NotImplemented",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-* is not supported",
+        ));
+    }
+    if p.to_ascii_uppercase().starts_with("STREAMING-") {
+        return Err(s3_err(
+            "NotImplemented",
+            format!("streaming payload mode '{p}' is not supported"),
+        ));
+    }
+    Ok(None)
+}
+
+fn check_streaming_signed_headers(parsed: &ParsedAuth, kind: &StreamingKind) -> ApiResult<()> {
+    let has = |name: &str| {
+        parsed
+            .signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    };
+    if !has("x-amz-decoded-content-length") {
+        return Err(s3_err(
+            "AccessDenied",
+            "x-amz-decoded-content-length must be in SignedHeaders for streaming uploads",
+        ));
+    }
+    match kind {
+        StreamingKind::UnsignedTrailer { .. } | StreamingKind::SignedTrailer { .. } => {
+            if !has("x-amz-trailer") {
+                return Err(s3_err(
+                    "AccessDenied",
+                    "x-amz-trailer must be in SignedHeaders for streaming trailer uploads",
+                ));
+            }
+        }
+        StreamingKind::Signed => {}
+    }
+    Ok(())
+}
+
+/// Headers that must be signed when present alongside `x-amz-copy-source`.
+/// Shared by UploadPartCopy and a future CopyObject.
+const COPY_SOURCE_DEPENDENT_HEADERS: &[&str] = &[
+    "x-amz-copy-source-range",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+];
+
+/// Require copy-source (and present dependents) in SignedHeaders so a
+/// captured signature cannot be replayed with a swapped source.
+fn check_copy_source_signed_headers(parsed: &ParsedAuth, headers: &HeaderMap) -> ApiResult<()> {
+    if header_str(headers, "x-amz-copy-source").is_none() {
+        return Ok(());
+    }
+    let has = |name: &str| {
+        parsed
+            .signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    };
+    if !has("x-amz-copy-source") {
+        return Err(s3_err(
+            "AccessDenied",
+            "x-amz-copy-source must be in SignedHeaders",
+        ));
+    }
+    for name in COPY_SOURCE_DEPENDENT_HEADERS {
+        if header_str(headers, name).is_some() && !has(name) {
+            return Err(s3_err(
+                "AccessDenied",
+                format!("{name} must be in SignedHeaders when present"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn trailer_from_headers(headers: &HeaderMap) -> ApiResult<TrailerChecksum> {
+    let raw = header_str(headers, "x-amz-trailer").ok_or_else(|| {
+        s3_err(
+            "InvalidRequest",
+            "missing x-amz-trailer for streaming trailer upload",
+        )
+    })?;
+    // Clients may send one name, or a comma-separated list; we accept the first
+    // checksum header name.
+    let first = raw.split(',').next().unwrap_or(raw).trim();
+    TrailerChecksum::parse(first)
 }
 
 #[derive(Debug)]
@@ -711,7 +870,10 @@ fn sigv4_error(err: ApiError) -> Response {
         "AuthorizationHeaderMalformed"
         | "InvalidRequest"
         | "InvalidArgument"
-        | "XAmzContentSHA256Mismatch" => StatusCode::BAD_REQUEST,
+        | "IncompleteBody"
+        | "BadDigest"
+        | "XAmzContentSHA256Mismatch"
+        | "XAmzContentChecksumMismatch" => StatusCode::BAD_REQUEST,
         "InvalidAccessKeyId"
         | "SignatureDoesNotMatch"
         | "AccessDenied"
@@ -848,6 +1010,87 @@ pub fn presign_query(
         region: region.to_owned(),
         amz_date: parse_amz_date(amz_date).expect("amz_date"),
         signed_headers: vec!["host".into()],
+        signature: String::new(),
+        payload_hash: UNSIGNED_PAYLOAD.to_owned(),
+        expires_secs: Some(expires),
+        presigned: true,
+    };
+    let sts = build_string_to_sign(&auth, &canonical);
+    let key = derive_signing_key(secret, &date_stamp, region, "s3");
+    let sig = hmac_sha256_hex(&key, sts.as_bytes());
+    format!("{canonical_qs}&X-Amz-Signature={sig}")
+}
+
+/// Like [`presign_query`], but signs additional request headers (lowercase
+/// names → values) and lists them in `X-Amz-SignedHeaders`. Used when a
+/// presigned PUT carries `x-amz-copy-source` (and dependents).
+#[allow(clippy::too_many_arguments)]
+pub fn presign_query_with_headers(
+    method: &str,
+    path: &str,
+    host: &str,
+    access_key_id: &str,
+    secret: &[u8],
+    region: &str,
+    amz_date: &str,
+    expires: i64,
+    extra_query: &str,
+    extra_headers: &[(String, String)],
+) -> String {
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let credential = format!("{access_key_id}/{date_stamp}/{region}/s3/aws4_request");
+    let mut header_map: BTreeMap<String, String> = BTreeMap::new();
+    header_map.insert("host".into(), collapse_ws(host));
+    for (k, v) in extra_headers {
+        header_map.insert(k.to_ascii_lowercase(), collapse_ws(v));
+    }
+    let signed: Vec<String> = header_map.keys().cloned().collect();
+    let signed_headers_param = signed.join(";");
+    let mut params: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+        ("X-Amz-Credential".into(), credential),
+        ("X-Amz-Date".into(), amz_date.to_owned()),
+        ("X-Amz-Expires".into(), expires.to_string()),
+        ("X-Amz-SignedHeaders".into(), signed_headers_param.clone()),
+    ];
+    for (k, v) in form_urlencoded_iter(extra_query) {
+        params.push((k, v));
+    }
+    params.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let canonical_qs = params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                utf8_percent_encode(k, QUERY_VALUE),
+                utf8_percent_encode(v, QUERY_VALUE)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut canonical = String::new();
+    canonical.push_str(method);
+    canonical.push('\n');
+    canonical.push_str(&canonical_uri(path));
+    canonical.push('\n');
+    canonical.push_str(&canonical_qs);
+    canonical.push('\n');
+    for name in &signed {
+        canonical.push_str(name);
+        canonical.push(':');
+        canonical.push_str(header_map.get(name).map(String::as_str).unwrap_or(""));
+        canonical.push('\n');
+    }
+    canonical.push('\n');
+    canonical.push_str(&signed_headers_param);
+    canonical.push('\n');
+    canonical.push_str(UNSIGNED_PAYLOAD);
+    let auth = ParsedAuth {
+        access_key_id: access_key_id.to_owned(),
+        date_stamp: date_stamp.clone(),
+        region: region.to_owned(),
+        amz_date: parse_amz_date(amz_date).expect("amz_date"),
+        signed_headers: signed,
         signature: String::new(),
         payload_hash: UNSIGNED_PAYLOAD.to_owned(),
         expires_secs: Some(expires),

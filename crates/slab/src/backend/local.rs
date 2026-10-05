@@ -5,6 +5,9 @@
 //! enough for a single host: `anvil` attaches the file directly.
 //!
 //! Layout: `<dir>/<vol-id>.raw`, `<dir>/snapshots/<snap-id>.raw`.
+//!
+//! An image is copied with `qemu-img convert -O raw -f <fmt> -n <src>
+//! <dir>/<vol-id>.raw`. `-n` keeps the sparse file at `size_gib`.
 
 use async_trait::async_trait;
 use pistack_types::error::ErrorCode;
@@ -60,6 +63,45 @@ impl LocalFileBackend {
         fs::create_dir_all(self.dir.join("snapshots"))
             .await
             .map_err(io_err)?;
+        Ok(())
+    }
+
+    /// `qemu-img convert -O raw -f <format> -n <src> <volume file>`.
+    fn image_convert_args(
+        &self,
+        vol: &Volume,
+        src: &std::path::Path,
+        format: &str,
+    ) -> ApiResult<Vec<String>> {
+        let dest = self.vol_ref_path(vol).to_string_lossy().into_owned();
+        Ok(super::qemu_img_convert_argv(format, src, &dest))
+    }
+
+    async fn prepare_raw_file(&self, vol: &Volume) -> ApiResult<()> {
+        self.ensure_dirs().await?;
+        let path = self.vol_ref_path(vol);
+        if fs::try_exists(&path).await.map_err(io_err)? {
+            return Ok(());
+        }
+        let file = fs::File::create(&path).await.map_err(io_err)?;
+        file.set_len(gib_to_bytes(vol.spec.size_gib))
+            .await
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    async fn ensure_size(&self, vol: &Volume) -> ApiResult<()> {
+        let path = self.vol_ref_path(vol);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(io_err)?;
+        let cur = file.metadata().await.map_err(io_err)?.len();
+        let want = gib_to_bytes(vol.spec.size_gib);
+        if cur < want {
+            file.set_len(want).await.map_err(io_err)?;
+        }
         Ok(())
     }
 
@@ -132,8 +174,9 @@ impl BlockBackend for LocalFileBackend {
         let size = gib_to_bytes(vol.spec.size_gib);
         match &vol.spec.source {
             VolumeSource::None | VolumeSource::Image(_) => {
-                // Image population is the reconciler's job (it streams from
-                // mold); the backend only provides the blank device.
+                // Blank file of the full size. Image bytes are written into
+                // it afterwards (`qemu-img convert -n`) so it is not shrunk
+                // to the image.
                 let f = fs::File::create(&path).await.map_err(io_err)?;
                 f.set_len(size).await.map_err(io_err)?;
             }
@@ -147,6 +190,18 @@ impl BlockBackend for LocalFileBackend {
             }
         }
         Ok(BackendRef::new(path.to_string_lossy().into_owned()))
+    }
+
+    async fn write_image(
+        &self,
+        vol: &Volume,
+        src: &std::path::Path,
+        format: &str,
+    ) -> ApiResult<()> {
+        self.prepare_raw_file(vol).await?;
+        let args = self.image_convert_args(vol, src, format)?;
+        super::run_qemu_img(src, &args).await?;
+        self.ensure_size(vol).await
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
@@ -289,4 +344,93 @@ fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{VolumeSpec, VolumeStatus};
+    use pistack_types::{kind, Meta};
+    use std::os::unix::fs::PermissionsExt;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn volume(size: u64) -> Volume {
+        Volume {
+            meta: Meta::new(kind::VOLUME, "data", None),
+            spec: VolumeSpec {
+                size_gib: size,
+                volume_type: "standard".into(),
+                source: VolumeSource::Image(pistack_types::Id::new(kind::IMAGE)),
+                bootable: false,
+                encrypted: false,
+            },
+            status: VolumeStatus::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_convert_command_targets_the_volume_file() {
+        let _qemu = super::super::QEMU_IMG_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("qemu-img");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\n\
+                 dest=\nfor a in \"$@\"; do dest=$a; done\nprintf 'x' > \"$dest\"\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(super::super::ENV_QEMU_IMG, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(super::super::ENV_QEMU_IMG);
+            }
+        }
+        let _reset = Reset;
+
+        let backend = LocalFileBackend::new(dir.path());
+        let vol = volume(1);
+        let src = dir.path().join("seed.qcow2");
+        std::fs::write(&src, b"seed").unwrap();
+        let dest = backend.volume_path(&vol);
+        let args = backend.image_convert_args(&vol, &src, "qcow2").unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "convert".to_owned(),
+                "-O".to_owned(),
+                "raw".to_owned(),
+                "-f".to_owned(),
+                "qcow2".to_owned(),
+                "-n".to_owned(),
+                src.display().to_string(),
+                dest.to_string_lossy().into_owned(),
+            ]
+        );
+
+        backend.write_image(&vol, &src, "qcow2").await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            logged,
+            args.iter().map(|a| format!("{a}\n")).collect::<String>()
+        );
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), GIB);
+
+        std::env::set_var(
+            super::super::ENV_QEMU_IMG,
+            dir.path().join("missing-qemu-img"),
+        );
+        let err = backend.write_image(&vol, &src, "qcow2").await.unwrap_err();
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
+    }
 }
