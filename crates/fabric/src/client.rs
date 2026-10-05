@@ -976,6 +976,30 @@ impl Client {
         self.associate_floating_ip(id, Some(port))
     }
 
+    /// The most specific subnet that `owner` may use and that contains
+    /// `addr`. Ties go to the lower id.
+    pub(crate) fn subnet_containing(
+        &self,
+        owner: &Meta,
+        addr: IpAddr,
+    ) -> ApiResult<Option<Subnet>> {
+        let mut subnets: Vec<Subnet> = self
+            .subnets()
+            .list(None)
+            .map_err(store_err)?
+            .into_iter()
+            .filter(|s| {
+                s.spec.cidr.contains(&addr) && check_same_project(owner, &s.meta, "subnet").is_ok()
+            })
+            .collect();
+        subnets.sort_by(|a, b| {
+            prefix_len(b.spec.cidr)
+                .cmp(&prefix_len(a.spec.cidr))
+                .then(a.meta.id.cmp(&b.meta.id))
+        });
+        Ok(subnets.into_iter().next())
+    }
+
     fn ensure_machine_port(
         &self,
         fip: &Meta,
@@ -1003,21 +1027,7 @@ impl Client {
             return Ok(existing.meta.id.clone());
         }
 
-        let mut subnets: Vec<Subnet> = self
-            .subnets()
-            .list(None)
-            .map_err(store_err)?
-            .into_iter()
-            .filter(|s| {
-                s.spec.cidr.contains(&addr) && check_same_project(fip, &s.meta, "subnet").is_ok()
-            })
-            .collect();
-        subnets.sort_by(|a, b| {
-            prefix_len(b.spec.cidr)
-                .cmp(&prefix_len(a.spec.cidr))
-                .then(a.meta.id.cmp(&b.meta.id))
-        });
-        let Some(sub) = subnets.into_iter().next() else {
+        let Some(sub) = self.subnet_containing(fip, addr)? else {
             return Err(ApiError::unprocessable(format!(
                 "no subnet contains {addr}"
             )));

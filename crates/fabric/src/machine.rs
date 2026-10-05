@@ -135,6 +135,17 @@ impl Client {
             {
                 continue;
             }
+            if !self.address_has_a_home(&machine.meta, addr, &ports) {
+                // Associate would fail with "no subnet contains" every pass,
+                // and a new floating IP would be created and rolled back each
+                // time. Wait until a subnet covers the address.
+                tracing::debug!(
+                    machine = %machine.meta.id,
+                    address = %addr,
+                    "fabric auto-fip: no subnet contains the guest address; skipped"
+                );
+                continue;
+            }
             if let Some(existing) = fips
                 .iter()
                 .find(|f| is_auto(f) && labeled_machine(f).as_ref() == Some(&machine.meta.id))
@@ -201,6 +212,26 @@ impl Client {
             }
         }
         self.reap_auto_floating_ips(&live)
+    }
+
+    /// True when associate can find or make a port for `addr`: a port in the
+    /// machine's project already holds it, or a subnet the machine may use
+    /// contains it. A store error counts as true so associate reports it.
+    fn address_has_a_home(
+        &self,
+        machine: &Meta,
+        addr: IpAddr,
+        ports: &[crate::types::Port],
+    ) -> bool {
+        if ports
+            .iter()
+            .any(|p| p.meta.project == machine.project && p.spec.fixed_ips.contains(&addr))
+        {
+            return true;
+        }
+        self.subnet_containing(machine, addr)
+            .map(|s| s.is_some())
+            .unwrap_or(true)
     }
 
     /// `fleet` if that external network exists, else the sole external
@@ -732,6 +763,29 @@ mod tests {
         client.sync_auto_floating_ips().unwrap();
         assert!(client.floating_ips().list(None).unwrap().is_empty());
         assert!(client.ports().list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_fip_skips_address_outside_every_subnet() {
+        let (store, client, project) = client();
+        let _fleet = external(&client, &project, "fleet", "10.66.66.80/28", "10.66.66.81");
+        guest(&client, &project);
+        let _machine = put_machine(&store, "lost", &project, vec!["10.89.0.180".into()]);
+        let mut events = store.events().subscribe();
+        for _ in 0..3 {
+            client.sync_auto_floating_ips().unwrap();
+            assert!(client.floating_ips().list(None).unwrap().is_empty());
+            assert!(client.ports().list(None).unwrap().is_empty());
+        }
+        // Not even a create-then-rollback: no floating IP was written at all.
+        while let Ok(ev) = events.try_recv() {
+            assert_ne!(ev.kind, kind::FLOATING_IP, "{ev:?}");
+        }
+        let found = put_machine(&store, "found", &project, vec!["10.88.0.60".into()]);
+        client.sync_auto_floating_ips().unwrap();
+        let fip = auto_for(&client, &found);
+        assert!(fip.spec.port.is_some());
+        assert_eq!(client.floating_ips().list(None).unwrap().len(), 1);
     }
 
     #[test]
