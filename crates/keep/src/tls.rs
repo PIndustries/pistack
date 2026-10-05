@@ -77,19 +77,26 @@ pub fn server_config(pki: &Pki) -> Result<ServerConfig> {
     Ok(cfg)
 }
 
-/// Gateway HTTPS for browsers and bearer tokens.
+/// Gateway HTTPS for browsers, bearer tokens, and agent mTLS.
 ///
-/// Unlike [`server_config`], this does not ask for a client certificate, so
-/// a browser does not open a certificate picker. ALPN is HTTP/1.1 only: the
-/// axum listener is built without the `http2` feature, and advertising `h2`
+/// Client certificates are requested and, when offered, must chain to
+/// `pki.ca_pem`. A client with no certificate is still admitted so the
+/// console and bearer-token callers keep working; `/rpc` enforces a peer
+/// certificate in application middleware. ALPN is HTTP/1.1 only: the axum
+/// listener is built without the `http2` feature, and advertising `h2`
 /// makes browsers speak a protocol the process cannot read.
 pub fn server_config_http(pki: &Pki) -> Result<ServerConfig> {
     let mut chain = certs_from_pem(&pki.cert_pem)?;
     chain.extend(certs_from_pem(&pki.ca_pem)?);
     let key = key_from_pem(&pki.key_pem)?;
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(roots_from_pem(&pki.ca_pem)?, provider())
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| KeepError::Tls(format!("client verifier: {e}")))?;
     let mut cfg = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
+        .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)?;
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(cfg)
@@ -110,6 +117,33 @@ pub fn client_config(ca_pem: &str, client: Option<&Pki>) -> Result<ClientConfig>
         None => builder.with_no_client_auth(),
     };
     Ok(cfg)
+}
+
+/// Peer identity recovered after a TLS handshake on the gateway listener.
+///
+/// `common_name` is set when the client presented a certificate that chained
+/// to the cloud CA. Plain HTTP and clients that offer no certificate leave it
+/// empty; `/rpc` treats a missing name as unauthenticated when strict.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerIdentity {
+    pub addr: Option<std::net::SocketAddr>,
+    pub common_name: Option<String>,
+}
+
+impl PeerIdentity {
+    pub fn from_tls(addr: std::net::SocketAddr, conn: &rustls::CommonState) -> Self {
+        Self {
+            addr: Some(addr),
+            common_name: peer_common_name(conn),
+        }
+    }
+
+    pub fn plain(addr: std::net::SocketAddr) -> Self {
+        Self {
+            addr: Some(addr),
+            common_name: None,
+        }
+    }
 }
 
 /// Common name of the peer's leaf certificate, if it presented one.
@@ -241,5 +275,82 @@ mod tests {
         let cns = srv.await.unwrap();
         assert_eq!(cns[0], None);
         assert_eq!(cns[1].as_deref(), Some("handshake-failed"));
+    }
+
+    #[tokio::test]
+    async fn http_listener_accepts_ca_client_and_rejects_foreign() {
+        let store = Store::in_memory().unwrap();
+        let key = RootKey::load_or_create(&store).unwrap();
+        let ca = Ca::load_or_init(&store, &key).unwrap();
+        let server = pki(&ca, "gateway", vec!["127.0.0.1".into()], CertUsage::Server);
+        let client = pki(&ca, "agent-http", vec![], CertUsage::Client);
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config_http(&server).unwrap()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut outcomes = Vec::new();
+            for _ in 0..3 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                match acceptor.accept(tcp).await {
+                    Ok(mut tls) => {
+                        outcomes.push(peer_common_name(tls.get_ref().1));
+                        tls.shutdown().await.ok();
+                    }
+                    Err(_) => outcomes.push(Some("handshake-failed".into())),
+                }
+            }
+            outcomes
+        });
+
+        // CA-signed client cert.
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&ca.bundle_pem(), Some(&client)).unwrap(),
+        ));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .unwrap();
+        tls.shutdown().await.ok();
+
+        // No client cert (browser / bearer style).
+        let connector =
+            TlsConnector::from(Arc::new(client_config(&ca.bundle_pem(), None).unwrap()));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .unwrap();
+        tls.shutdown().await.ok();
+
+        // Foreign CA client cert: the server must reject during handshake.
+        // The client may surface Ok or Err depending on when the alert arrives;
+        // the server-side accept outcome is the authority.
+        let other_store = Store::in_memory().unwrap();
+        let other_key = RootKey::load_or_create(&other_store).unwrap();
+        let other = Ca::load_or_init(&other_store, &other_key).unwrap();
+        let foreign = pki(&other, "spy", vec![], CertUsage::Client);
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&ca.bundle_pem(), Some(&foreign)).unwrap(),
+        ));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let foreign_client = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await;
+        if let Ok(mut tls) = foreign_client {
+            // Drive the connection so the server finishes rejecting.
+            let _ = tls.write_all(b"x").await;
+            tls.shutdown().await.ok();
+        }
+
+        let outcomes = srv.await.unwrap();
+        assert_eq!(outcomes[0].as_deref(), Some("agent-http"));
+        assert_eq!(outcomes[1], None);
+        assert_eq!(
+            outcomes[2].as_deref(),
+            Some("handshake-failed"),
+            "foreign client cert must not authenticate: {outcomes:?}"
+        );
     }
 }

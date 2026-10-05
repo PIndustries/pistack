@@ -25,7 +25,7 @@ Each phase ends at a gate an outside tool decides.
 - [x] `silo`, `shelf`, `gauge`, `blueprint` are store-backed HTTP APIs. silo writes object bytes under the data dir (32 MiB cap). gauge keeps an in-memory sample ring and Prometheus text. shelf shares stay Pending. blueprint apply accepts a document and does not create machines.
 - [x] A request with no Caller is unauthorized (`no credentials`) on fabric, beacon, relay, blueprint, gauge, slab, mold, silo, and shelf. `--dev` still injects an admin only at the gateway. `/`, `/healthz`, `POST /identity/tokens`, and `/rpc` do not require a token.
 - [x] Gateway TLS: `pistack server --tls-listen ADDR` (env `PISTACK_TLS_LISTEN`) serves the same app with rustls beside plain HTTP. Certs are `data_dir/tls/cert.pem`, `key.pem`, and `ca.pem`, reused when present and otherwise issued by keep. The address must be specific (not `0.0.0.0` or `::`). `--insecure-http` still only silences the plain-HTTP warning when TLS is not configured.
-- [ ] mTLS or a join token on `/rpc`. The network ACL is the lock.
+- [x] mTLS on `/rpc`: the TLS listener verifies client certificates against the cloud CA; verified peer identity reaches `/rpc`. Agents enroll with a spend-once join token (`POST /rpc/agents/enroll`) and present the issued certificate on hello/heartbeat/commands. Strict by default; set `PISTACK_RPC_INSECURE=1` only for local HTTP / tests. Optional `PISTACK_REQUIRE_JOIN=1` still authorizes `x-pistack-join` on every call.
 
 ## Phase 1 — Bootable cloud
 

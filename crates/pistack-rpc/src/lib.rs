@@ -7,7 +7,8 @@
 //! * [`queue`] – [`CommandQueue`], per-node FIFOs with pending/ack tracking
 //!   and timeouts; modules enqueue, the HTTP layer delivers.
 //! * [`server`] – [`router`], the axum routes agents call. [`router_with_store`]
-//!   is that router plus an optional join-token check.
+//!   applies join-token and client-certificate checks (strict mTLS by default;
+//!   set `PISTACK_RPC_INSECURE=1` for local HTTP).
 //! * [`client`] – [`AgentClient`], the agent side over reqwest.
 //! * [`events`] – [`EventBus`], a typed `broadcast<Event>` with filtered
 //!   subscriptions.
@@ -27,13 +28,15 @@ pub use client::AgentClient;
 pub use error::RpcError;
 pub use events::{EventBus, EventStream};
 pub use proto::{
-    AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, DiskTarget, Heartbeat,
-    HeartbeatAck, HelloAck, LogText, MachineKind, MachineRef, MachineReport, MachineRequest,
-    PortPlug, PowerState, ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach,
-    JOIN_HEADER,
+    AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, DiskTarget,
+    EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck, HelloAck, LogText, MachineKind,
+    MachineRef, MachineReport, MachineRequest, PortPlug, PowerState, ReportAck, RunningMachine,
+    VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
-pub use server::{router, router_with_store, REQUIRE_JOIN_ENV};
+pub use server::{
+    router, router_with_auth, router_with_store, RpcAuth, REQUIRE_JOIN_ENV, RPC_INSECURE_ENV,
+};
 
 #[cfg(test)]
 mod loopback {

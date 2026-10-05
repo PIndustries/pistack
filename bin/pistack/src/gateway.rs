@@ -65,10 +65,12 @@ pub fn build(
         app = app.nest(&format!("/{}", info.prefix), m.router(ctx.clone()));
     }
     // Agent transport (anvil <-> control plane). `pistack agent --join URL`
-    // talks to URL/rpc/agents/... The join check lives in the rpc router and
-    // stays off unless PISTACK_REQUIRE_JOIN=1, so an agent with no token keeps
-    // working. The token is `x-pistack-join`, not Authorization: a bearer that
-    // is not a gate token is rejected by `attach_caller` below.
+    // talks to URL/rpc/agents/... Strict by default: `/rpc` requires a
+    // cloud-CA client certificate (escape hatch `PISTACK_RPC_INSECURE=1`).
+    // Enroll spends `x-pistack-join` once for that certificate. Optional
+    // per-call join checks stay behind `PISTACK_REQUIRE_JOIN=1`. The token
+    // is not Authorization: a bearer that is not a gate token is rejected by
+    // `attach_caller` below.
     let store = (*ctx.store::<pistack_store::Store>()).clone();
     app = app.nest(
         "/rpc",
