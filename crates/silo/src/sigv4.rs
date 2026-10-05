@@ -15,9 +15,11 @@
 //!
 //! ECDSA / SigV4A streaming variants return `NotImplemented`.
 //!
-//! When `x-amz-copy-source` is present (UploadPartCopy / CopyObject), it and any present `x-amz-copy-source-*` condition/range headers
-//! must appear in SignedHeaders (header auth and presigned), matching the
-//! streaming `x-amz-decoded-content-length` rule — otherwise `AccessDenied`.
+//! When `x-amz-copy-source` is present (UploadPartCopy / CopyObject), it and
+//! any present `x-amz-copy-source-*` condition/range headers and
+//! `x-amz-metadata-directive` must appear in SignedHeaders (header auth and
+//! presigned), matching the streaming `x-amz-decoded-content-length` rule —
+//! otherwise `AccessDenied`.
 //!
 //! On success the keep access-key's project-scoped [`Caller`] is attached
 //! to the request. Keep lookup failures and signature mismatches map to
@@ -327,10 +329,12 @@ const COPY_SOURCE_DEPENDENT_HEADERS: &[&str] = &[
     "x-amz-copy-source-if-none-match",
     "x-amz-copy-source-if-modified-since",
     "x-amz-copy-source-if-unmodified-since",
+    "x-amz-metadata-directive",
 ];
 
-/// Require copy-source (and present dependents) in SignedHeaders so a
-/// captured signature cannot be replayed with a swapped source.
+/// Require copy-source (and present dependents, including
+/// `x-amz-metadata-directive`) in SignedHeaders so a captured signature
+/// cannot be replayed with a swapped source or directive.
 fn check_copy_source_signed_headers(parsed: &ParsedAuth, headers: &HeaderMap) -> ApiResult<()> {
     if header_str(headers, "x-amz-copy-source").is_none() {
         return Ok(());

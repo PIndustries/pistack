@@ -149,13 +149,14 @@ async fn put_object_inner(
     let copy_raw = header_str(&headers, "x-amz-copy-source");
     if let Some(copy_raw) = copy_raw {
         match (q.upload_id.as_deref(), q.part_number.as_deref()) {
-            (Some(_), Some(_)) => {
+            (Some(upload_id), Some(part_raw)) => {
                 return upload_part_copy_inner(
                     c,
                     &who,
                     bucket,
                     key,
-                    q,
+                    upload_id,
+                    part_raw,
                     &headers,
                     copy_raw,
                     streaming.is_some(),
@@ -378,19 +379,12 @@ async fn upload_part_copy_inner(
     who: &Caller,
     dest_bucket: crate::types::Bucket,
     key: String,
-    q: ObjectQuery,
+    upload_id: &str,
+    part_raw: &str,
     headers: &HeaderMap,
     copy_raw: &str,
     streaming: bool,
 ) -> ApiResult<Response> {
-    let upload_id = q
-        .upload_id
-        .as_deref()
-        .expect("UploadPartCopy requires uploadId");
-    let part_raw = q
-        .part_number
-        .as_deref()
-        .expect("UploadPartCopy requires partNumber");
     if streaming {
         return Err(multipart::s3_err(
             "InvalidRequest",
