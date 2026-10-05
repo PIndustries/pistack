@@ -439,14 +439,17 @@ const VIEWS = {
   stacks: {
     title: "Stacks",
     path: "/blueprint/stacks",
-    note: "Apply creates network, subnet, and machine rows from the document. Every other kind is skipped. The phase stays accepted.",
+    note: "Apply creates missing rows from the document, updates the rows an earlier apply of the stack created, and deletes managed rows the document no longer names. The phase is applying, then ready or failed. Roll back re-applies the previous revision.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
+      ["Revision", i => i.status && i.status.revision],
       ["Created", i => ((i.status && i.status.created) || []).join(", ")],
+      ["Updated", i => ((i.status && i.status.updated) || []).join(", ")],
       ["Message", i => i.status && i.status.message],
     ],
     apply: true,
+    rollback: true,
   },
   shares: {
     title: "Shares",
@@ -1311,7 +1314,7 @@ function createForm() {
     document.placeholder = "kind: network\nname: app\nspec: {}";
     form.append(el("strong", "New stack"));
     form.append(field("Name", name), field("Document", document));
-    form.append(el("p", "Apply creates network, subnet, and machine rows from this document. Every other kind is skipped.", "sub"));
+    form.append(el("p", "Apply creates network, subnet, machine, router, pod, listener, and DNS rows from this document. Every other kind is skipped.", "sub"));
     const go = el("button", "Create stack"); go.className = "primary"; go.type = "submit";
     form.append(go);
     onCreate(form, go, async () => {
@@ -1990,6 +1993,21 @@ async function render() {
             });
             if (td.childNodes.length) td.append(document.createTextNode(" "));
             td.append(apply);
+          }
+          const history = (item.status && item.status.history) || [];
+          if (view.rollback && history.length > 1) {
+            const back = el("button", "Roll back"); back.type = "button";
+            back.addEventListener("click", async () => {
+              if (!confirm("Roll " + item.name + " back to its previous revision?")) return;
+              setErr("");
+              back.disabled = true;
+              try {
+                await api("POST", view.path + "/" + item.id + "/rollback");
+                await render();
+              } catch (e) { setErr(e.message); }
+              back.disabled = false;
+            });
+            td.append(document.createTextNode(" "), back);
           }
           tr.append(td);
         }

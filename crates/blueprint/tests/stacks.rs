@@ -2,6 +2,7 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Create a stack from a JSON document, apply it, and reject an empty one.
+//! Update a stack's spec, apply the change, and roll it back.
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -35,7 +36,20 @@ async fn call(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    call_if_match(app, method, path, body, None).await
+}
+
+async fn call_if_match(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    if_match: Option<u64>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(path);
+    if let Some(rev) = if_match {
+        req = req.header(header::IF_MATCH, rev.to_string());
+    }
     let body = match body {
         Some(v) => {
             req = req.header(header::CONTENT_TYPE, "application/json");
@@ -91,7 +105,8 @@ async fn create_apply_and_reject_empty_document() {
     let (status, applied) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
     assert_eq!(status, StatusCode::OK, "{applied}");
     assert_eq!(applied["id"], id);
-    assert_eq!(applied["status"]["phase"], "accepted");
+    assert_eq!(applied["status"]["phase"], "ready");
+    assert_eq!(applied["status"]["revision"], 1);
     let created_ids = applied["status"]["created"].as_array().expect("created");
     assert_eq!(created_ids.len(), 1, "{applied}");
     let net_id = created_ids[0].as_str().unwrap();
@@ -104,7 +119,8 @@ async fn create_apply_and_reject_empty_document() {
         "{applied}"
     );
     assert_eq!(applied["spec"]["document"], document);
-    assert_eq!(applied["revision"], 2);
+    // One write marks the stack applying, one stores the result.
+    assert_eq!(applied["revision"], 3);
 
     let (status, rejected) = call(
         &app,
@@ -159,6 +175,8 @@ async fn kit_and_workflow_apply_over_http() {
 
     let (status, applied) = call(&app, "POST", &format!("/kits/{kit_id}/apply"), None).await;
     assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["status"]["phase"], "ready");
+    assert!(applied["status"].get("history").is_none(), "{applied}");
     assert_eq!(applied["status"]["created"].as_array().unwrap().len(), 1);
 
     let (status, again) = call(&app, "POST", &format!("/kits/{kit_id}/apply"), None).await;
@@ -232,6 +250,130 @@ async fn kit_and_workflow_apply_over_http() {
     assert_eq!(status, StatusCode::OK, "{stored}");
     assert_eq!(stored["status"]["phase"], "failed");
     assert_eq!(stored["status"]["applied"], json!(["first"]));
+}
+
+#[tokio::test]
+async fn update_apply_and_roll_back_over_http() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+    let v1 = "kind: network\nname: app\nspec: {}\n";
+    let v2 = "kind: network\nname: app\nspec:\n  mtu: 1400\n";
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({"name": "web", "spec": {"name": "web", "document": v1}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, none) = call(&app, "POST", &format!("/stacks/{id}/rollback"), None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{none}");
+
+    let (status, first) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["status"]["phase"], "ready");
+    let net_id = first["status"]["created"][0].as_str().unwrap().to_owned();
+    assert_eq!(first["status"]["managed"], json!([net_id]));
+    let rev = first["revision"].as_u64().unwrap();
+
+    // A stale If-Match is refused and changes nothing.
+    let (status, stale) = call_if_match(
+        &app,
+        "PUT",
+        &format!("/stacks/{id}"),
+        Some(json!({"spec": {"name": "web", "document": v2}})),
+        Some(rev - 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+
+    let (status, empty) = call(
+        &app,
+        "PUT",
+        &format!("/stacks/{id}"),
+        Some(json!({"spec": {"name": "web", "document": ""}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{empty}");
+
+    let (status, edited) = call_if_match(
+        &app,
+        "PUT",
+        &format!("/stacks/{id}"),
+        Some(json!({
+            "description": "bigger mtu",
+            "spec": {"name": "web", "document": v2}
+        })),
+        Some(rev),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(edited["spec"]["document"], v2);
+    assert_eq!(edited["description"], "bigger mtu");
+    assert_eq!(edited["status"]["revision"], 1, "PUT does not apply");
+
+    let (status, second) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["status"]["phase"], "ready");
+    assert_eq!(second["status"]["revision"], 2);
+    assert_eq!(second["status"]["updated"], json!([net_id]));
+    assert!(second["status"]["created"].as_array().unwrap().is_empty());
+    assert_eq!(second["status"]["history"].as_array().unwrap().len(), 2);
+
+    let (status, bad) = call(
+        &app,
+        "POST",
+        &format!("/stacks/{id}/rollback"),
+        Some(json!({"revision": 99})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+
+    let (status, back) = call(&app, "POST", &format!("/stacks/{id}/rollback"), None).await;
+    assert_eq!(status, StatusCode::OK, "{back}");
+    assert_eq!(back["spec"]["document"], v1);
+    assert_eq!(back["status"]["phase"], "ready");
+    assert_eq!(back["status"]["revision"], 3);
+    assert_eq!(back["status"]["updated"], json!([net_id]));
+    let history = back["status"]["history"].as_array().unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[2]["restored_from"], 1);
+    assert_eq!(history[2]["spec"]["document"], v1);
+
+    let (status, forward) = call(
+        &app,
+        "POST",
+        &format!("/stacks/{id}/rollback"),
+        Some(json!({"revision": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{forward}");
+    assert_eq!(forward["spec"]["document"], v2);
+    assert_eq!(forward["status"]["revision"], 4);
+    assert_eq!(forward["status"]["history"][3]["restored_from"], 2);
+
+    // A change apply cannot make leaves the stack failed with the reason.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        &format!("/stacks/{id}"),
+        Some(json!({"spec": {"name": "web", "document": "kind: network\nname: app\nspec:\n  kind: vlan\n"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, failed) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert!(status.is_client_error(), "{status} {failed}");
+    let (status, stored) = call(&app, "GET", &format!("/stacks/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored["status"]["phase"], "failed", "{stored}");
+    assert!(stored["status"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("apply failed:"));
+    assert_eq!(stored["status"]["revision"], 4);
 }
 
 fn admin_caller() -> Caller {

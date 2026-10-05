@@ -1558,6 +1558,7 @@ dependencies = [
  "chrono",
  "fabric",
  "forge",
+ "gauge",
  "http-body-util",
  "ipnet",
  "keep",

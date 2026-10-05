@@ -100,7 +100,7 @@ impl RelayL7Provider {
             }
             slot.bound.ip()
         };
-        let udp = crate::udp::UdpForward::bind(ip, targets).await?;
+        let udp = crate::udp::UdpForward::bind(SocketAddr::new(ip, 0), targets).await?;
         let bound = udp.bound().to_string();
         let mut slots = self.slots.lock();
         let slot = slots

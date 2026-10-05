@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Alarm resources and the in-memory sample point posted to gauge.
+//! Alarm resources and the sample point posted to gauge.
 
 use chrono::{DateTime, Utc};
 use pistack_types::{kind, Resource, Spec};
 use serde::{Deserialize, Serialize};
 
 /// Cap on the sample ring held by [`crate::Gauge`]. Oldest points are dropped.
+/// The ring is also snapshotted under `$PISTACK_DATA_DIR/gauge` when attached.
 pub const MAX_SAMPLES: usize = 10_000;
 
-/// One observation. Not a store resource; the ring lives on [`crate::Gauge`].
+/// One observation. Not a store resource; the ring lives on [`crate::SampleRing`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sample {
     pub metric: String,

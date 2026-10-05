@@ -3,13 +3,20 @@
 
 //! HTTP surface, mounted by the gateway at `/blueprint`.
 //!
-//! `GET|POST /stacks`, `GET|DELETE /stacks/{id}`, `POST /stacks/{id}/apply`,
-//! and the same routes for `/kits` and `/workflows`. Apply re-validates the
-//! stored document and creates network, subnet, machine, router, pod,
-//! listener, and record set rows from it. A kit is that same document. A
-//! workflow applies named stacks in order and stops on the first error.
-//! Unknown kinds are skipped. `status.phase` stays `accepted` on a stack
-//! or kit.
+//! `GET|POST /stacks`, `GET|PUT|DELETE /stacks/{id}`,
+//! `POST /stacks/{id}/apply`, `POST /stacks/{id}/rollback`, and `GET|POST`,
+//! `GET|DELETE /{id}`, `POST /{id}/apply` for `/kits` and `/workflows`.
+//!
+//! `PUT` stores a new spec (honouring `If-Match`); apply realizes it. Apply
+//! re-validates the stored document, creates missing network, subnet,
+//! machine, router, pod, listener, and record set rows, updates the rows
+//! an earlier apply of the same stack created, and deletes managed rows
+//! the document no longer names. `status.phase` is `applying` while it
+//! runs, then `ready` or `failed`. Each successful stack apply of a new
+//! spec is kept in `status.history`; rollback puts an earlier revision's
+//! spec back and applies it. A kit is that same document without history.
+//! A workflow applies named stacks in order and stops on the first error.
+//! Unknown kinds are skipped.
 //!
 //! The `Caller` comes from request extensions (set by the gateway). Without
 //! one, the request is rejected.
@@ -19,8 +26,9 @@ use crate::types::{
     Kit, KitSpec, Stack, StackSpec, Workflow, WorkflowSpec, KIT_KIND, WORKFLOW_KIND,
 };
 use axum::{
+    body::Bytes,
     extract::{Extension, Path, Query, Request, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -34,8 +42,12 @@ pub fn router(client: Client) -> axum::Router {
     axum::Router::new()
         .route("/", get(info))
         .route("/stacks", get(list_stacks).post(create_stack))
-        .route("/stacks/{id}", get(get_stack).delete(delete_stack))
+        .route(
+            "/stacks/{id}",
+            get(get_stack).put(update_stack).delete(delete_stack),
+        )
         .route("/stacks/{id}/apply", axum::routing::post(apply_stack))
+        .route("/stacks/{id}/rollback", axum::routing::post(rollback_stack))
         .route("/kits", get(list_kits).post(create_kit))
         .route("/kits/{id}", get(get_kit).delete(delete_kit))
         .route("/kits/{id}/apply", axum::routing::post(apply_kit))
@@ -66,6 +78,27 @@ pub struct CreateStack {
     #[serde(default)]
     pub project: Option<Id>,
     pub spec: StackSpec,
+}
+
+/// `PUT /stacks/{id}`. Omitted fields are left as they are.
+#[derive(Deserialize)]
+pub struct UpdateStack {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub annotations: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub spec: Option<StackSpec>,
+}
+
+/// `POST /stacks/{id}/rollback`. An empty body means the previous revision.
+#[derive(Deserialize, Default)]
+pub struct RollbackStack {
+    /// Revision from `status.history` to restore.
+    #[serde(default)]
+    pub revision: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -136,6 +169,22 @@ fn new_meta(
     meta.labels = labels;
     meta.annotations = annotations;
     Ok(meta)
+}
+
+fn if_match(headers: &HeaderMap) -> ApiResult<Option<u64>> {
+    match headers.get(header::IF_MATCH) {
+        None => Ok(None),
+        Some(v) => {
+            let s = v
+                .to_str()
+                .map_err(|_| ApiError::bad_request("If-Match is not ascii"))?;
+            s.trim()
+                .trim_matches('"')
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| ApiError::bad_request("If-Match must be a revision number"))
+        }
+    }
 }
 
 fn page<K: Kind>(mut items: Vec<K>, q: &ListQuery) -> Page<K> {
@@ -210,6 +259,33 @@ async fn delete_stack(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_stack(
+    State(client): State<Client>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateStack>,
+) -> ApiResult<Json<Stack>> {
+    let expected = if_match(&headers)?;
+    let project = list_project(&caller)?;
+    let cur = visible(&caller, client.resolve_stack(project.as_ref(), &id)?)?;
+    Ok(Json(client.update_stack(&cur.meta.id, expected, |s| {
+        if let Some(d) = &body.description {
+            s.meta.description = d.clone();
+        }
+        if let Some(l) = &body.labels {
+            s.meta.labels = l.clone();
+        }
+        if let Some(a) = &body.annotations {
+            s.meta.annotations = a.clone();
+        }
+        if let Some(spec) = &body.spec {
+            s.spec = spec.clone();
+        }
+        Ok(())
+    })?))
+}
+
 async fn apply_stack(
     State(client): State<Client>,
     Extension(caller): Extension<Caller>,
@@ -218,6 +294,23 @@ async fn apply_stack(
     let project = list_project(&caller)?;
     let cur = visible(&caller, client.resolve_stack(project.as_ref(), &id)?)?;
     Ok(Json(client.apply_stack(&cur.meta.id)?))
+}
+
+async fn rollback_stack(
+    State(client): State<Client>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Stack>> {
+    let body: RollbackStack = if body.iter().all(u8::is_ascii_whitespace) {
+        RollbackStack::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid rollback body: {e}")))?
+    };
+    let project = list_project(&caller)?;
+    let cur = visible(&caller, client.resolve_stack(project.as_ref(), &id)?)?;
+    Ok(Json(client.rollback_stack(&cur.meta.id, body.revision)?))
 }
 
 #[derive(Deserialize)]

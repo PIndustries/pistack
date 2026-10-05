@@ -127,16 +127,27 @@ impl RelayRealizer {
             .spec
             .ports
             .iter()
-            .any(|p| p.protocol != Protocol::Tcp || p.port == 0)
+            .any(|p| p.protocol == Protocol::Sctp || p.port == 0)
         {
             self.remove_service(service).await?;
-            return Err(ApiError::unavailable("service forward is tcp only"));
+            return Err(ApiError::unavailable("service forward is tcp and udp only"));
         }
         let client = self.client()?;
         let mut keep = Vec::new();
         let mut addrs = Vec::new();
         for port in &service.spec.ports {
-            let name = format!("svc-{}-{}", service.meta.id, port.port);
+            let udp = port.protocol == Protocol::Udp;
+            let (listener_protocol, pool_protocol) = if udp {
+                (ListenerProtocol::Udp, PoolProtocol::Udp)
+            } else {
+                (ListenerProtocol::Tcp, PoolProtocol::Tcp)
+            };
+            let base = if udp {
+                format!("svc-{}-{}-udp", service.meta.id, port.port)
+            } else {
+                format!("svc-{}-{}", service.meta.id, port.port)
+            };
+            let name = base.clone();
             keep.push(name.clone());
             let members = endpoint_addrs(endpoints, port)?;
             let bound = ensure_forward(
@@ -146,8 +157,8 @@ impl RelayRealizer {
                 SERVICE_LABEL,
                 &service.meta.id.to_string(),
                 Provider::Forward,
-                ListenerProtocol::Tcp,
-                PoolProtocol::Tcp,
+                listener_protocol.clone(),
+                pool_protocol,
                 port.port,
                 None,
                 &members,
@@ -163,7 +174,7 @@ impl RelayRealizer {
             let Some(&node_port) = service.status.node_ports.get(&port.port) else {
                 continue;
             };
-            let name = format!("svc-{}-{}-node-{node_port}", service.meta.id, port.port);
+            let name = format!("{base}-node-{node_port}");
             keep.push(name.clone());
             ensure_forward(
                 &client,
@@ -172,8 +183,8 @@ impl RelayRealizer {
                 SERVICE_LABEL,
                 &service.meta.id.to_string(),
                 Provider::Forward,
-                ListenerProtocol::Tcp,
-                PoolProtocol::Tcp,
+                listener_protocol,
+                pool_protocol,
                 node_port,
                 Some(SocketAddr::new(self.node_address, node_port)),
                 &members,
@@ -273,7 +284,7 @@ impl ServiceRealizer for RelayRealizer {
 fn endpoint_addrs(endpoints: &[Endpoint], port: &ServicePort) -> ApiResult<Vec<SocketAddr>> {
     let dest = port.target_port.unwrap_or(port.port);
     if dest == 0 {
-        return Err(ApiError::unavailable("service forward is tcp only"));
+        return Err(ApiError::unavailable("service target port must not be 0"));
     }
     let mut out = Vec::new();
     for ep in endpoints {
@@ -588,7 +599,8 @@ async fn ensure_forward(
         .clone()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiError::unavailable("listener is not available"))?;
-    if !listener_answers(&addr).await {
+    // A udp socket cannot be probed with a connect; its bind is the proof.
+    if listener.spec.protocol != ListenerProtocol::Udp && !listener_answers(&addr).await {
         return Err(ApiError::unavailable("listener is not available"));
     }
     Ok(addr)

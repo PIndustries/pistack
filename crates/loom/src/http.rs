@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
     let r = crud::<JobSpec>(r);
     let r = crud::<CronJobSpec>(r);
     let r = crud::<IngressSpec>(r);
+    let r = crud::<AutoscalerSpec>(r);
     r.with_state(state)
 }
 
@@ -296,7 +297,7 @@ impl Api for ServiceSpec {
             return Err(ApiError::bad_request("spec.ports must not be empty"));
         }
         let mut seen = BTreeSet::new();
-        let mut node_ports = BTreeSet::new();
+        let mut node_ports = BTreeMap::new();
         for p in &self.ports {
             if p.port == 0 {
                 return Err(ApiError::bad_request("port must be 1-65535"));
@@ -320,7 +321,11 @@ impl Api for ServiceSpec {
                         NODE_PORT_RANGE.end()
                     )));
                 }
-                if !node_ports.insert(node_port) {
+                // The tcp and udp sides of one port may share a node port.
+                if node_ports
+                    .insert(node_port, p.port)
+                    .is_some_and(|had| had != p.port)
+                {
                     return Err(ApiError::bad_request(format!(
                         "node_port {node_port} is listed twice"
                     )));
@@ -390,6 +395,42 @@ impl Api for CronJobSpec {
     fn validate(&mut self, _current: Option<&CronJob>) -> ApiResult<()> {
         Schedule::parse(&self.schedule).map_err(|e| ApiError::bad_request(e.to_string()))?;
         self.job_template.validate(None)
+    }
+}
+
+impl Api for AutoscalerSpec {
+    type Status = AutoscalerStatus;
+    const NOUN: &'static str = "autoscalers";
+    const DELETE: DeleteMode = DeleteMode::Direct;
+    fn validate(&mut self, _current: Option<&Autoscaler>) -> ApiResult<()> {
+        self.target_name = self.target_name.trim().to_owned();
+        self.metric = self.metric.trim().to_owned();
+        if self.target_name.is_empty() || self.target_name.len() > 128 {
+            return Err(ApiError::bad_request(
+                "spec.target_name must be 1-128 characters",
+            ));
+        }
+        if self.metric.is_empty() || self.metric.len() > 256 {
+            return Err(ApiError::bad_request(
+                "spec.metric must be 1-256 characters",
+            ));
+        }
+        if !self.target_value.is_finite() || self.target_value <= 0.0 {
+            return Err(ApiError::bad_request(
+                "spec.target_value must be a finite number greater than zero",
+            ));
+        }
+        if self.max_replicas < self.min_replicas {
+            return Err(ApiError::bad_request(
+                "spec.max_replicas must be >= spec.min_replicas",
+            ));
+        }
+        if self.max_replicas == 0 {
+            return Err(ApiError::bad_request(
+                "spec.max_replicas must be at least 1",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -637,7 +678,7 @@ async fn index() -> Json<serde_json::Value> {
         "resources": [
             PodSpec::NOUN, ReplicaSetSpec::NOUN, DeploymentSpec::NOUN, StatefulSetSpec::NOUN,
             DaemonSetSpec::NOUN, ServiceSpec::NOUN, ConfigMapSpec::NOUN, JobSpec::NOUN,
-            CronJobSpec::NOUN, IngressSpec::NOUN,
+            CronJobSpec::NOUN, IngressSpec::NOUN, AutoscalerSpec::NOUN,
         ],
     }))
 }
@@ -986,6 +1027,12 @@ mod tests {
         assert!(spec(ServiceKind::NodePort, &[(80, Some(8080))])
             .validate(None)
             .is_err());
+        let mut shared = spec(
+            ServiceKind::NodePort,
+            &[(53, Some(30053)), (53, Some(30053))],
+        );
+        shared.ports[1].protocol = Protocol::Udp;
+        assert!(shared.validate(None).is_ok());
         assert!(spec(
             ServiceKind::NodePort,
             &[(80, Some(30080)), (81, Some(30080))]

@@ -25,9 +25,11 @@ pub struct UdpForward {
 }
 
 impl UdpForward {
-    /// Bind `ip` on an ephemeral port and copy datagrams to `members`.
-    /// `members` must be non-empty. `ip` must be loopback or private.
-    pub async fn bind(ip: IpAddr, members: Vec<SocketAddr>) -> ApiResult<Self> {
+    /// Bind `addr` (port 0 for an ephemeral port) and copy datagrams to
+    /// `members`. `members` must be non-empty. The address must be loopback
+    /// or private.
+    pub async fn bind(addr: SocketAddr, members: Vec<SocketAddr>) -> ApiResult<Self> {
+        let ip = addr.ip();
         if members.is_empty() {
             return Err(ApiError::unavailable("udp pool has no up member"));
         }
@@ -36,9 +38,9 @@ impl UdpForward {
                 "udp refuses {ip}; only a loopback or private address can be bound"
             )));
         }
-        let socket = UdpSocket::bind(SocketAddr::new(ip, 0))
+        let socket = UdpSocket::bind(addr)
             .await
-            .map_err(|e| ApiError::unavailable(format!("udp bind {ip}: {e}")))?;
+            .map_err(|e| ApiError::unavailable(format!("udp bind {addr}: {e}")))?;
         let bound = socket
             .local_addr()
             .map_err(|e| ApiError::unavailable(format!("udp local address: {e}")))?;
