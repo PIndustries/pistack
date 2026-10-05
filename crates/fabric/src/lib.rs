@@ -28,7 +28,7 @@ mod reconcile;
 pub mod types;
 mod usage;
 
-pub use backend::{HostNat, MockBackend, NetBackend, OvnBackend, OverlayBackend};
+pub use backend::{HostNat, MockBackend, NetBackend, OverlayBackend, OvnBackend};
 pub use client::{Client, DEFAULT_SG};
 pub use overlay::{
     device_hex, plan, OverlayPlan, PlanError, PlanHost, PlanNetwork, PlanPort, PlanRouter,

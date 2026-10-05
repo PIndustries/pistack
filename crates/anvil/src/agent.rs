@@ -897,7 +897,9 @@ still here
         let tail = tail_log_bytes("abcdefghijklmnop".as_bytes(), 4);
         assert_eq!(tail, "mnop");
         let split = tail_log_bytes(&[b'a', 0xc3, 0xa9, b'b'], 2);
-        assert!(!split.contains('\u{fffd}') || split.ends_with('b') || split == "éb" || split == "b");
+        assert!(
+            !split.contains('\u{fffd}') || split.ends_with('b') || split == "éb" || split == "b"
+        );
         assert!(split.ends_with('b'));
     }
 
@@ -940,7 +942,9 @@ still here
         std::fs::write(&outside, "ssh-ed25519 AAAALEAK demo\n").unwrap();
         std::os::unix::fs::symlink(&outside, bundle.join("log")).unwrap();
         std::fs::remove_file(vm.join("console.log")).unwrap();
-        let err = read_machine_logs_in(&id, &youki, &images).await.unwrap_err();
+        let err = read_machine_logs_in(&id, &youki, &images)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, pistack_types::error::ErrorCode::NotFound);
         assert!(!err.message.contains("AAAALEAK"));
         assert!(!err.message.contains("ssh-ed25519"));
@@ -1006,7 +1010,11 @@ still here
                 assert!(!e.message.contains("ssh-"));
             }
             Ok(v) => {
-                let n = v.get("text").and_then(|t| t.as_str()).map(|s| s.len()).unwrap_or(0);
+                let n = v
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
                 panic!("expected no log for a fresh id, got {n} bytes");
             }
         }

@@ -99,7 +99,7 @@ pub fn all_plans(store: &Store) -> ApiResult<Vec<(String, Value)>> {
         }
         let on_net: Vec<&Guest> = guests
             .iter()
-            .filter(|g| &g.port.spec.network == &net.meta.id)
+            .filter(|g| g.port.spec.network == net.meta.id)
             .collect();
         let designated = on_net.iter().map(|g| g.underlay).min();
         let plan_ports = on_net
@@ -314,7 +314,7 @@ fn shared_nat_network(net: &Network, subnets: &[Subnet]) -> bool {
     matches!(net.spec.kind, NetworkKind::Overlay)
         && subnets
             .iter()
-            .any(|s| &s.spec.network == &net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24")
+            .any(|s| s.spec.network == net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24")
 }
 
 fn refused_physnet(name: &str) -> bool {
@@ -405,14 +405,11 @@ fn segment_hosts(
     subnets: &[Subnet],
 ) -> Vec<SeenHost> {
     let mut nodes: BTreeMap<String, Ipv4Addr> = BTreeMap::new();
-    for guest in guests
-        .iter()
-        .filter(|g| &g.port.spec.network == &net.meta.id)
-    {
+    for guest in guests.iter().filter(|g| g.port.spec.network == net.meta.id) {
         nodes.insert(guest.node.clone(), guest.underlay);
     }
     if matches!(kind, Realised::Provider(_) | Realised::External(_)) {
-        for fip in fips.iter().filter(|f| &f.spec.network == &net.meta.id) {
+        for fip in fips.iter().filter(|f| f.spec.network == net.meta.id) {
             let Some((underlay, node, _)) = float_binding(fip, guests, routers, subnets) else {
                 continue;
             };
@@ -447,7 +444,7 @@ fn router_hosts(
             };
             let here: Vec<&Guest> = guests
                 .iter()
-                .filter(|g| &g.port.spec.network == &sub.spec.network)
+                .filter(|g| g.port.spec.network == sub.spec.network)
                 .collect();
             let Some(underlay) = here.iter().map(|g| g.underlay).min() else {
                 continue;

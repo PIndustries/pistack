@@ -446,7 +446,11 @@ async fn reconciler_loop_drives_volume_to_ready() {
     task.await.expect("reconciler exits");
 }
 
-fn type_create(name: &str, backend: &str, params: serde_json::Value) -> Create<slab::VolumeTypeSpec> {
+fn type_create(
+    name: &str,
+    backend: &str,
+    params: serde_json::Value,
+) -> Create<slab::VolumeTypeSpec> {
     let mut map = std::collections::BTreeMap::new();
     if let Some(obj) = params.as_object() {
         for (k, v) in obj {
@@ -590,10 +594,7 @@ async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
     assert_ne!(rbd.status.phase, Phase::Ready);
     assert!(rbd.status.backend_ref.is_none());
     let logged = std::fs::read_to_string(&rbd_log).unwrap_or_default();
-    assert!(
-        !logged.lines().any(|line| line == "create"),
-        "{logged}"
-    );
+    assert!(!logged.lines().any(|line| line == "create"), "{logged}");
 
     c.create_volume_type(type_create("nomon", "rbd", json!({"pool": "volumes"})))
         .expect("rbd type without monitors");
@@ -623,10 +624,7 @@ async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
         .expect("reconcile")
         .expect("exists");
     assert_ne!(bare.status.phase, Phase::Ready);
-    assert!(
-        !quiet.exists(),
-        "missing monitors must not run rbd"
-    );
+    assert!(!quiet.exists(), "missing monitors must not run rbd");
 }
 
 #[tokio::test]
@@ -685,8 +683,7 @@ async fn backup_round_trip_and_oversize_refusal() {
     assert_ne!(restored.meta.id, vol.meta.id);
     let restored_path = LocalFileBackend::new(dir.path()).volume_path(&restored);
     let mut got = vec![0u8; payload.len()];
-    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got)
-        .unwrap();
+    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got).unwrap();
     assert_eq!(got, payload);
 
     let huge = silo::MAX_OBJECT_BYTES as u64 + 1;
@@ -714,7 +711,11 @@ async fn backup_round_trip_and_oversize_refusal() {
         .reconcile_backup(&big.meta.id)
         .await
         .expect_err("oversize");
-    assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+    assert_eq!(
+        err.code,
+        pistack_types::error::ErrorCode::Unavailable,
+        "{err}"
+    );
     assert!(err.message.contains(&huge.to_string()), "{err}");
     let big = c.backups().get(&big.meta.id).expect("big");
     assert_ne!(big.status.phase, Phase::Ready);

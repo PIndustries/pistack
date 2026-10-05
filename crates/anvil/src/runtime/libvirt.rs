@@ -619,9 +619,9 @@ async fn classify_path(path: &str) -> ApiResult<HostDisk> {
     };
     // Follow a symlink only after the requested path is known. A symlink
     // outside /dev must not become a block attach of some other device.
-    let followed = tokio::fs::metadata(&requested).await.map_err(|e| {
-        ApiError::unavailable(format!("volume path {}: {e}", requested.display()))
-    })?;
+    let followed = tokio::fs::metadata(&requested)
+        .await
+        .map_err(|e| ApiError::unavailable(format!("volume path {}: {e}", requested.display())))?;
     let canon = if meta.file_type().is_symlink() {
         tokio::fs::canonicalize(&requested).await.map_err(|e| {
             ApiError::unavailable(format!("volume path {}: {e}", requested.display()))
@@ -656,7 +656,9 @@ fn rbd_names(pool: &str, image: &str) -> ApiResult<String> {
 
 fn parse_monitor(raw: &str) -> ApiResult<(String, u16)> {
     let raw = raw.trim();
-    if raw.is_empty() || raw.len() > 128 || raw.chars().any(|c| c.is_control() || c == '\'' || c == '"')
+    if raw.is_empty()
+        || raw.len() > 128
+        || raw.chars().any(|c| c.is_control() || c == '\'' || c == '"')
     {
         return Err(ApiError::bad_request(
             "rbd monitor must be a host or host:port",
@@ -668,9 +670,9 @@ fn parse_monitor(raw: &str) -> ApiResult<(String, u16)> {
                 "rbd monitor must be a host or host:port",
             ));
         }
-        let port: u16 = port.parse().map_err(|_| {
-            ApiError::bad_request("rbd monitor must be a host or host:port")
-        })?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| ApiError::bad_request("rbd monitor must be a host or host:port"))?;
         if port == 0 {
             return Err(ApiError::bad_request(
                 "rbd monitor must be a host or host:port",
@@ -869,7 +871,10 @@ async fn attach_host_disk(
         Some(dev) => dev.to_owned(),
         None => next_device(&listing)?,
     };
-    virsh(attach_disk_args(domain, source, &device, block, read_only, live)).await?;
+    virsh(attach_disk_args(
+        domain, source, &device, block, read_only, live,
+    ))
+    .await?;
     Ok(device)
 }
 
@@ -940,7 +945,12 @@ async fn detach_by_source(domain: &str, needle: &str, device: Option<&str>) -> A
     };
     check_device(&dev)?;
     let state = dom_state(domain).await?;
-    let mut args = vec!["detach-disk".to_owned(), domain.to_owned(), dev, "--config".into()];
+    let mut args = vec![
+        "detach-disk".to_owned(),
+        domain.to_owned(),
+        dev,
+        "--config".into(),
+    ];
     if state == "running" || state == "paused" {
         args.push("--live".into());
     }
@@ -2208,7 +2218,9 @@ exit 0
         let _guard = ClearEnv("PISTACK_VIRSH");
 
         std::fs::write(root.join("missing"), b"1").unwrap();
-        let missing = plug_port(&port_req("10.90.0.10", Some(4))).await.unwrap_err();
+        let missing = plug_port(&port_req("10.90.0.10", Some(4)))
+            .await
+            .unwrap_err();
         assert_eq!(missing.code, pistack_types::error::ErrorCode::Unavailable);
         let calls = std::fs::read_to_string(root.join("calls")).unwrap();
         assert!(calls.contains("domstate"));
@@ -2217,8 +2229,8 @@ exit 0
         let _ = std::fs::remove_file(root.join("missing"));
         let _ = std::fs::remove_file(root.join("calls"));
 
-        let plugged = plug_port(&port_req("10.88.0.10", Some(4))).await.unwrap();
-        let _ = plugged;
+        plug_port(&port_req("10.88.0.10", Some(4))).await.unwrap();
+        ();
         let xml = std::fs::read_to_string(root.join("device.xml")).unwrap();
         assert!(xml.contains("<source bridge='po01a102de3f33'/>"));
         assert!(!xml.contains("pistack0"));

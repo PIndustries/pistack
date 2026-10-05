@@ -40,9 +40,7 @@ pub async fn apply(share: &mut Share) -> ApiResult<()> {
             realize_ceph(share, &id).await
         }
         PROTOCOL_NFS => realize_nfs(share, &id).await,
-        other => Err(ApiError::bad_request(format!(
-            "unknown protocol '{other}'"
-        ))),
+        other => Err(ApiError::bad_request(format!("unknown protocol '{other}'"))),
     }
 }
 
@@ -72,11 +70,7 @@ async fn realize_nfs(share: &mut Share, id: &str) -> ApiResult<()> {
         .spec
         .access
         .iter()
-        .filter_map(|rule| {
-            rule.cidr
-                .as_ref()
-                .map(|cidr| (cidr.clone(), rule.mode))
-        })
+        .filter_map(|rule| rule.cidr.as_ref().map(|cidr| (cidr.clone(), rule.mode)))
         .collect();
     if rules.is_empty() {
         remove_exports(id).await?;
@@ -273,10 +267,7 @@ async fn run_tool(bin: &Path, args: &[&str]) -> Result<(), String> {
     let err = String::from_utf8_lossy(&output.stderr);
     let out = String::from_utf8_lossy(&output.stdout);
     let detail = clip(&format!("{err} {out}"));
-    let name = bin
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tool");
+    let name = bin.file_name().and_then(|s| s.to_str()).unwrap_or("tool");
     if detail.is_empty() {
         Err(format!("{name} failed"))
     } else {
@@ -556,7 +547,11 @@ mod tests {
         let mut failed = sample(PROTOCOL_NFS, Some("10.0.0.0/24"));
         apply(&mut failed).await.unwrap();
         assert_eq!(failed.status.phase, Phase::Pending);
-        assert!(failed.status.message.contains("boom"), "{}", failed.status.message);
+        assert!(
+            failed.status.message.contains("boom"),
+            "{}",
+            failed.status.message
+        );
 
         std::env::set_var("PISTACK_EXPORTFS", &ok);
         let mut ready = sample(PROTOCOL_NFS, Some("10.4.0.0/24"));
@@ -619,10 +614,7 @@ mod tests {
         ready.spec.size_gib = 2;
         apply(&mut ready).await.unwrap();
         assert_eq!(ready.status.phase, Phase::Ready);
-        assert_eq!(
-            ready.status.message,
-            format!("pistack/{}", ready.meta.id)
-        );
+        assert_eq!(ready.status.message, format!("pistack/{}", ready.meta.id));
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("subvolume"), "{text}");
         assert!(text.contains("create"), "{text}");

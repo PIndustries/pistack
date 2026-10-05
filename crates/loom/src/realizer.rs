@@ -73,9 +73,10 @@ impl RelayRealizer {
     }
 
     fn client(&self) -> ApiResult<Client> {
-        let store = self.store.get().cloned().ok_or_else(|| {
-            ApiError::unavailable("relay realizer is not attached to the store")
-        })?;
+        let store =
+            self.store.get().cloned().ok_or_else(|| {
+                ApiError::unavailable("relay realizer is not attached to the store")
+            })?;
         Ok(Client::new(store, self.providers.clone()))
     }
 
@@ -267,9 +268,9 @@ fn one_backend(
 ) -> ApiResult<Vec<SocketAddr>> {
     let services = client.store().collection::<Service>();
     let svc = if let Some(id) = Id::parse(kinds::SERVICE, &backend.service) {
-        services.get(&id).map_err(|_| {
-            ApiError::unavailable("ingress backend is not available")
-        })?
+        services
+            .get(&id)
+            .map_err(|_| ApiError::unavailable("ingress backend is not available"))?
     } else {
         services
             .get_by_name(ingress.meta.project.as_ref(), &backend.service)
@@ -278,7 +279,12 @@ fn one_backend(
     if !projects_match(&ingress.meta.project, &svc.meta.project) {
         return Err(ApiError::unavailable("ingress backend is not available"));
     }
-    let Some(port) = svc.spec.ports.iter().find(|p| port_matches(p, &backend.port)) else {
+    let Some(port) = svc
+        .spec
+        .ports
+        .iter()
+        .find(|p| port_matches(p, &backend.port))
+    else {
         return Err(ApiError::unavailable("ingress backend is not available"));
     };
     if port.protocol != Protocol::Tcp {
@@ -320,9 +326,7 @@ async fn ensure_forward(
     let lb = match client.balancers().get_by_name(project.as_ref(), name) {
         Ok(lb) => {
             if lb.spec.vip_network != VIP_NETWORK || lb.spec.provider != provider {
-                return Err(ApiError::unavailable(
-                    "listener is not available",
-                ));
+                return Err(ApiError::unavailable("listener is not available"));
             }
             lb
         }
@@ -346,7 +350,11 @@ async fn ensure_forward(
     let pool = match client.pools_of(&lb.meta.id)?.into_iter().next() {
         Some(pool) => pool,
         None => client.create_pool(
-            Meta::new(relay::types::kinds::POOL, format!("{name}-pool"), project.clone()),
+            Meta::new(
+                relay::types::kinds::POOL,
+                format!("{name}-pool"),
+                project.clone(),
+            ),
             PoolSpec {
                 balancer: lb.meta.id.clone(),
                 protocol: pool_protocol,
@@ -421,7 +429,10 @@ async fn ensure_forward(
 
     let provider_handle = client.provider_for(&lb)?;
     let live = provider_handle.ensure_balancer(&lb).await?;
-    let lb = client.balancers().get(&lb.meta.id).map_err(ApiError::from)?;
+    let lb = client
+        .balancers()
+        .get(&lb.meta.id)
+        .map_err(ApiError::from)?;
     let listener = client
         .listeners()
         .get(&listener.meta.id)
@@ -439,7 +450,10 @@ async fn ensure_forward(
         client.reconcile_pool(&pool.meta.id).await;
     }
 
-    let lb = client.balancers().get(&lb.meta.id).map_err(ApiError::from)?;
+    let lb = client
+        .balancers()
+        .get(&lb.meta.id)
+        .map_err(ApiError::from)?;
     let listener = client
         .listeners()
         .get(&listener.meta.id)
@@ -496,7 +510,8 @@ async fn delete_labeled(client: &Client, label: &str, id: &str) -> ApiResult<()>
 async fn delete_unnamed(client: &Client, label: &str, id: &str, keep: &[String]) -> ApiResult<()> {
     let lbs = client.balancers().list(None).map_err(ApiError::from)?;
     for lb in lbs {
-        if lb.meta.labels.get(label) == Some(&id.to_owned()) && !keep.iter().any(|n| n == &lb.meta.name)
+        if lb.meta.labels.get(label) == Some(&id.to_owned())
+            && !keep.iter().any(|n| n == &lb.meta.name)
         {
             client.delete_balancer(&lb.meta.id).await?;
         }

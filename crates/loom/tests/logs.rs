@@ -87,7 +87,13 @@ async fn get_logs(app: &Router, id: &Id) -> (StatusCode, Option<String>, Vec<u8>
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, content_type, bytes)
 }
 
@@ -95,7 +101,10 @@ async fn get_logs(app: &Router, id: &Id) -> (StatusCode, Option<String>, Vec<u8>
 async fn pod_logs_return_the_command_text() {
     let store = Store::in_memory().unwrap();
     let node = host("host-a", "node-a");
-    store.collection::<forge::Host>().create(node.clone()).unwrap();
+    store
+        .collection::<forge::Host>()
+        .create(node.clone())
+        .unwrap();
     let machine = Id::new(pistack_types::kind::MACHINE);
     let row = pod("web", Some(machine.clone()), Some(node.meta.id.clone()));
     store.collection::<Pod>().create(row.clone()).unwrap();
@@ -181,7 +190,10 @@ async fn pod_logs_return_the_command_text() {
     assert!(String::from_utf8_lossy(&body).contains("pod logs are not configured"));
 
     let no_machine = pod("no-machine", None, Some(node.meta.id.clone()));
-    store.collection::<Pod>().create(no_machine.clone()).unwrap();
+    store
+        .collection::<Pod>()
+        .create(no_machine.clone())
+        .unwrap();
     let (status, _, _) = get_logs(&app, &no_machine.meta.id).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -195,12 +207,18 @@ async fn pod_logs_return_the_command_text() {
         Some(Id::new(pistack_types::kind::MACHINE)),
         Some(Id::new(pistack_types::kind::HOST)),
     );
-    store.collection::<Pod>().create(missing_host.clone()).unwrap();
+    store
+        .collection::<Pod>()
+        .create(missing_host.clone())
+        .unwrap();
     let (status, _, _) = get_logs(&app, &missing_host.meta.id).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
     let blank = host("host-blank", "");
-    store.collection::<forge::Host>().create(blank.clone()).unwrap();
+    store
+        .collection::<forge::Host>()
+        .create(blank.clone())
+        .unwrap();
     let blank_pod = pod(
         "blank",
         Some(Id::new(pistack_types::kind::MACHINE)),

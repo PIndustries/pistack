@@ -1001,7 +1001,9 @@ mod tests {
                 value: Some(serde_json::to_vec("abc").unwrap()),
             }],
         };
-        let err = store.apply_entries(std::slice::from_ref(&entry)).unwrap_err();
+        let err = store
+            .apply_entries(std::slice::from_ref(&entry))
+            .unwrap_err();
         assert!(err.to_string().contains("gap"), "{err}");
         assert!(store.get_meta::<String>("cluster_id").unwrap().is_none());
     }

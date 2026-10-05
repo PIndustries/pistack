@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::backend::{AttachInfo, AttachTarget, BlockBackend, LocalFileBackend, LvmBackend, RbdBackend};
+use crate::backend::{
+    AttachInfo, AttachTarget, BlockBackend, LocalFileBackend, LvmBackend, RbdBackend,
+};
 use crate::place;
 use crate::quota::{AllowAll, QuotaCheck, QuotaRequest};
 use crate::types::*;
@@ -438,7 +440,11 @@ impl Client {
         })?;
         let vol = self.ready_volume(id).await?;
         let node = place::node_for_machine(&self.store, machine)?;
-        let info = self.volume_backend(&vol).await?.attach_info(&vol, &node).await?;
+        let info = self
+            .volume_backend(&vol)
+            .await?
+            .attach_info(&vol, &node)
+            .await?;
         let path = local_path(&info)?;
         let req = VolumeAttach {
             machine: machine.clone(),
@@ -469,7 +475,11 @@ impl Client {
         })?;
         let vol = self.volumes().get(id)?;
         let node = place::node_for_machine(&self.store, machine)?;
-        let info = self.volume_backend(&vol).await?.attach_info(&vol, &node).await?;
+        let info = self
+            .volume_backend(&vol)
+            .await?
+            .attach_info(&vol, &node)
+            .await?;
         let path = local_path(&info)?;
         let req = VolumeDetach {
             machine: machine.clone(),
@@ -545,7 +555,10 @@ impl Client {
                 vol.status.phase
             )));
         }
-        self.volume_backend(&vol).await?.attach_info(&vol, host).await
+        self.volume_backend(&vol)
+            .await?
+            .attach_info(&vol, host)
+            .await
     }
 
     // ---- snapshots --------------------------------------------------------
@@ -650,9 +663,11 @@ impl Client {
                 backup.status.phase
             )));
         }
-        let key = backup.status.object_ref.as_deref().ok_or_else(|| {
-            ApiError::conflict(format!("backup {id} has no stored object"))
-        })?;
+        let key = backup
+            .status
+            .object_ref
+            .as_deref()
+            .ok_or_else(|| ApiError::conflict(format!("backup {id} has no stored object")))?;
         let bucket = self.backup_bucket(&backup)?;
         let (obj, bytes) = self.silo().get_object(&bucket.meta.id, key).await?;
         if bytes.len() as u64 != obj.status.size_bytes || obj.status.sha256.is_empty() {
@@ -1037,7 +1052,9 @@ impl Client {
         bytes: &[u8],
     ) -> ApiResult<()> {
         let (obj, got) = self.silo().get_object(&bucket.meta.id, key).await?;
-        if got != bytes || obj.status.size_bytes != bytes.len() as u64 || obj.status.sha256.is_empty()
+        if got != bytes
+            || obj.status.size_bytes != bytes.len() as u64
+            || obj.status.sha256.is_empty()
         {
             return Err(ApiError::internal("backup bytes were not stored"));
         }
@@ -1082,9 +1099,11 @@ impl Client {
                 return Ok(bucket);
             }
         }
-        if let Some(bucket) = silo.list_buckets(None)?.into_iter().find(|bucket| {
-            bucket.meta.name == target || bucket.meta.id.to_string() == target
-        }) {
+        if let Some(bucket) = silo
+            .list_buckets(None)?
+            .into_iter()
+            .find(|bucket| bucket.meta.name == target || bucket.meta.id.to_string() == target)
+        {
             return Ok(bucket);
         }
         Err(ApiError::not_found(format!(
@@ -1158,10 +1177,8 @@ fn bytes_to_gib(bytes: u64) -> u64 {
 }
 
 fn oversize(len: u64) -> ApiError {
-    ApiError::unavailable(format!("backup is {len} bytes, larger than 1 GiB")).with_detail(
-        "size_bytes",
-        serde_json::Value::from(len),
-    )
+    ApiError::unavailable(format!("backup is {len} bytes, larger than 1 GiB"))
+        .with_detail("size_bytes", serde_json::Value::from(len))
 }
 
 fn io_err(err: std::io::Error) -> ApiError {
@@ -1205,7 +1222,9 @@ async fn write_prefix(path: &Path, bytes: &[u8]) -> ApiResult<()> {
         .open(path)
         .await
         .map_err(io_err)?;
-    file.seek(std::io::SeekFrom::Start(0)).await.map_err(io_err)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(io_err)?;
     file.write_all(bytes).await.map_err(io_err)?;
     let len = file.metadata().await.map_err(io_err)?.len();
     if (bytes.len() as u64) > len {

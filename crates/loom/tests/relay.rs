@@ -138,7 +138,14 @@ async fn closed(addr: &str) {
 #[tokio::test]
 async fn unbound_realizer_is_unavailable() {
     let relay = RelayRealizer::new();
-    let svc = service("web", ServiceKind::ClusterIp, 80, 8080, Protocol::Tcp, vec![]);
+    let svc = service(
+        "web",
+        ServiceKind::ClusterIp,
+        80,
+        8080,
+        Protocol::Tcp,
+        vec![],
+    );
     let err = relay.realize(&svc, &[]).await.unwrap_err();
     assert!(
         err.message.contains("relay realizer is not attached"),
@@ -164,26 +171,17 @@ async fn cluster_ip_and_load_balancer_forward_and_remove_is_idempotent() {
         Protocol::Tcp,
         vec![endpoint(one_addr)],
     );
-    let addrs = relay
-        .realize(&svc, &[endpoint(one_addr)])
-        .await
-        .unwrap();
+    let addrs = relay.realize(&svc, &[endpoint(one_addr)]).await.unwrap();
     assert_eq!(addrs.len(), 1);
     assert!(addrs[0].starts_with("127.0.0.1:"), "{}", addrs[0]);
     assert_eq!(ping(&addrs[0]).await, b"one!");
 
-    let again = relay
-        .realize(&svc, &[endpoint(one_addr)])
-        .await
-        .unwrap();
+    let again = relay.realize(&svc, &[endpoint(one_addr)]).await.unwrap();
     assert_eq!(again, addrs);
     assert_eq!(ping(&again[0]).await, b"one!");
 
     svc.spec.ports[0].target_port = Some(two_addr.port());
-    let moved = relay
-        .realize(&svc, &[endpoint(two_addr)])
-        .await
-        .unwrap();
+    let moved = relay.realize(&svc, &[endpoint(two_addr)]).await.unwrap();
     assert_eq!(moved, addrs);
     assert_eq!(ping(&moved[0]).await, b"two!");
 
@@ -213,7 +211,10 @@ async fn cluster_ip_and_load_balancer_forward_and_remove_is_idempotent() {
     assert!(bound.starts_with("127.0.0.1:"), "{bound}");
     assert_eq!(ping(&bound).await, b"one!");
     cluster.spec.ports[0].protocol = Protocol::Udp;
-    let err = relay.realize(&cluster, &[endpoint(one_addr)]).await.unwrap_err();
+    let err = relay
+        .realize(&cluster, &[endpoint(one_addr)])
+        .await
+        .unwrap_err();
     assert!(err.message.contains("service forward is tcp only"), "{err}");
     closed(&bound).await;
     assert!(store
@@ -221,7 +222,8 @@ async fn cluster_ip_and_load_balancer_forward_and_remove_is_idempotent() {
         .list(None)
         .unwrap()
         .iter()
-        .all(|lb| lb.meta.labels.get("loom.pistack.io/service") != Some(&cluster.meta.id.to_string())));
+        .all(|lb| lb.meta.labels.get("loom.pistack.io/service")
+            != Some(&cluster.meta.id.to_string())));
 }
 
 #[tokio::test]
@@ -238,9 +240,15 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
         },
         status: loom::IngressStatus::default(),
     };
-    store.collection::<Ingress>().create(missing.clone()).unwrap();
+    store
+        .collection::<Ingress>()
+        .create(missing.clone())
+        .unwrap();
     let err = relay.ensure_ingress(&missing).await.unwrap_err();
-    assert!(err.message.contains("ingress backend is not available"), "{err}");
+    assert!(
+        err.message.contains("ingress backend is not available"),
+        "{err}"
+    );
     assert!(!err.message.contains("Ready"));
     let ctl = IngressController::new(store.clone(), Some(relay.clone()));
     ctl.reconcile_once().await.unwrap();
@@ -308,12 +316,17 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
     assert!(ready.status);
     assert_eq!(ready.reason, "Programmed");
     let body = http_get(&addr).await;
-    assert!(body.windows(b"hello-edge".len()).any(|w| w == b"hello-edge"), "{body:?}");
+    assert!(
+        body.windows(b"hello-edge".len())
+            .any(|w| w == b"hello-edge"),
+        "{body:?}"
+    );
 
     let mut orphan_meta = Meta::new(kind::BALANCER, "orphan-edge", None);
-    orphan_meta
-        .labels
-        .insert("loom.pistack.io/ingress".into(), Id::new(loom::kinds::INGRESS).to_string());
+    orphan_meta.labels.insert(
+        "loom.pistack.io/ingress".into(),
+        Id::new(loom::kinds::INGRESS).to_string(),
+    );
     let orphan = relay::Balancer {
         meta: orphan_meta,
         spec: relay::BalancerSpec {
@@ -324,7 +337,10 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
         },
         status: relay::BalancerStatus::default(),
     };
-    store.collection::<relay::Balancer>().create(orphan.clone()).unwrap();
+    store
+        .collection::<relay::Balancer>()
+        .create(orphan.clone())
+        .unwrap();
     relay.gc_ingresses().await.unwrap();
     assert!(store
         .collection::<relay::Balancer>()
