@@ -22,6 +22,11 @@ use crate::proto::{
 /// the full wait is not cut off by the client.
 const POLL_GRACE: Duration = Duration::from_secs(10);
 
+/// How long to wait for a server to accept a connection. Short, so a
+/// powered-off server (whose packets vanish rather than being refused) is
+/// skipped quickly in favour of the next known one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Where the agent routes are mounted under a server's API address.
 pub const RPC_PATH: &str = "/rpc";
 
@@ -80,7 +85,7 @@ impl AgentClient {
         node_name: impl Into<String>,
     ) -> Result<Self, RpcError> {
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Self::with_http(http, base_url, node_name)
@@ -215,8 +220,11 @@ impl AgentClient {
     }
 
     /// Send one call, following "not the leader" answers to the leader.
-    /// A connection failure moves the client to the next known server and
-    /// returns the error, so the caller's retry lands somewhere new.
+    /// A refused or timed-out connection, a timed-out call, or a "no leader
+    /// yet" answer moves the client to the next known server and returns
+    /// the error, so the caller's retry lands somewhere new. A follower cut
+    /// off from the majority keeps saying "no leader yet"; another server
+    /// may already know the winner.
     async fn send<T: DeserializeOwned>(
         &self,
         build: impl Fn(&str) -> RequestBuilder,
@@ -227,12 +235,18 @@ impl AgentClient {
             let result = match self.prepare(build(&base)).send().await {
                 Ok(resp) => decode(resp).await,
                 Err(e) => {
-                    if e.is_connect() {
+                    if e.is_connect() || e.is_timeout() {
                         self.rotate(&base);
                     }
                     return Err(RpcError::Http(e));
                 }
             };
+            if let Err(RpcError::Api { status: 503, error }) = &result {
+                if leader_hint(error).is_none() {
+                    self.rotate(&base);
+                    return result;
+                }
+            }
             if hops < MAX_LEADER_HOPS {
                 if let Err(RpcError::Api { error, .. }) = &result {
                     if let Some(next) = leader_hint(error) {
@@ -327,7 +341,7 @@ fn mtls_http_client(ca_pem: &str, client: &keep::Pki) -> Result<reqwest::Client,
     identity.push_str(&client.key_pem);
     let identity = reqwest::Identity::from_pem(identity.as_bytes()).map_err(RpcError::Http)?;
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
         .identity(identity);
     for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).map_err(RpcError::Http)? {
@@ -502,6 +516,49 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_leader_yet_moves_the_client_to_the_next_known_server() {
+        let lead = leader(vec![]).await;
+        let app = axum::Router::new().fallback(|| async {
+            ApiError::unavailable("no leader yet, retry soon").into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cut_off = format!("http://{addr}");
+        let c = AgentClient::new(rpc_base(&cut_off), "n1").unwrap();
+        c.learn_servers([lead.as_str()]);
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Api { status: 503, .. }), "{err}");
+        assert_eq!(c.base_url(), rpc_base(&lead));
+        assert!(c
+            .next_commands(Duration::from_secs(0))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_moves_the_client_on() {
+        let lead = leader(vec![]).await;
+        // Accepts connections but never replies, like a wedged host.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let silent = format!("http://{addr}");
+        let c = AgentClient::new(rpc_base(&silent), "n1").unwrap();
+        c.learn_servers([lead.as_str()]);
+        // A zero-second poll times out after the grace period.
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(&err, RpcError::Http(e) if e.is_timeout()), "{err}");
+        assert_eq!(c.base_url(), rpc_base(&lead));
     }
 
     #[test]
