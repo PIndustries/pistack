@@ -36,7 +36,7 @@ struct Slot {
     udp: Option<crate::udp::UdpForward>,
 }
 
-/// Local TCP forwarder. Serves [`Provider::Ovn`] (L4). HTTP stays on
+/// Local TCP forwarder. Serves [`Provider::Forward`] (L4). HTTP stays on
 /// [`super::RelayL7Provider`].
 pub struct ForwardProvider {
     slots: parking_lot::Mutex<HashMap<Id, Slot>>,
@@ -163,7 +163,7 @@ impl LbProvider for ForwardProvider {
     }
 
     fn serves(&self, provider: Provider) -> bool {
-        provider == Provider::Ovn
+        provider == Provider::Forward
     }
 
     async fn ensure_balancer(&self, lb: &Balancer) -> ApiResult<Realized> {
@@ -288,7 +288,7 @@ mod tests {
                 vip_network: "net".into(),
                 vip_address: vip,
                 floating_ip: None,
-                provider: Provider::Ovn,
+                provider: Provider::Forward,
                 admin_up: true,
             },
             status: BalancerStatus::default(),
@@ -379,7 +379,7 @@ mod tests {
     fn serves_l4_not_pingora() {
         let p = ForwardProvider::new();
         assert_eq!(p.name(), "forward");
-        assert!(p.serves(Provider::Ovn));
+        assert!(p.serves(Provider::Forward));
         assert!(!p.serves(Provider::Relay));
     }
 

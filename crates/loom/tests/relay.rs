@@ -331,7 +331,7 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
         meta: orphan_meta,
         spec: relay::BalancerSpec {
             vip_network: "cluster".into(),
-            provider: relay::Provider::Ovn,
+            provider: relay::Provider::Forward,
             admin_up: true,
             ..relay::BalancerSpec::default()
         },

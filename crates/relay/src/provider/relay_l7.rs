@@ -639,7 +639,7 @@ mod tests {
         let p = RelayL7Provider::new();
         assert_eq!(p.name(), "http");
         assert!(p.serves(Provider::Relay));
-        assert!(!p.serves(Provider::Ovn));
+        assert!(!p.serves(Provider::Forward));
     }
 
     #[tokio::test]

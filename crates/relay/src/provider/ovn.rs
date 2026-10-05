@@ -51,8 +51,9 @@
 //! `Load_Balancer._uuid` of the TCP row (or the UDP row if there is no TCP
 //! listener).
 //!
-//! HTTP listeners are refused here (`serves(Provider::Ovn)` only); they go
-//! to [`super::RelayL7Provider`].
+//! Parked: this stub serves no provider value, so a balancer can never be
+//! routed here. L4 balancers go to [`super::ForwardProvider`] and HTTP
+//! listeners to [`super::RelayL7Provider`].
 
 use super::{LbProvider, ListenerView, Realized};
 use crate::types::{Balancer, Provider};
@@ -87,8 +88,8 @@ impl LbProvider for OvnProvider {
         "ovn"
     }
 
-    fn serves(&self, provider: Provider) -> bool {
-        provider == Provider::Ovn
+    fn serves(&self, _provider: Provider) -> bool {
+        false
     }
 
     async fn ensure_balancer(&self, _lb: &Balancer) -> ApiResult<Realized> {
