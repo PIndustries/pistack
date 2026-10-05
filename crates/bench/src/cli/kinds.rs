@@ -503,6 +503,87 @@ pub static KINDS: &[KindDef] = &[
             col!("LABELS", labels),
         ],
     },
+    KindDef {
+        noun: "statefulset",
+        aliases: &["statefulsets", "sts"],
+        path: "/loom/statefulsets",
+        id_prefix: "sts",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("REPLICAS", "/spec/replicas"),
+            col!("READY", "/status/ready"),
+            col!("CURRENT", "/status/current"),
+            col!("UPDATED", "/status/updated"),
+            col!("SERVICE", "/spec/service_name"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
+        noun: "daemonset",
+        aliases: &["daemonsets", "ds"],
+        path: "/loom/daemonsets",
+        id_prefix: "ds",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("DESIRED", "/status/desired"),
+            col!("CURRENT", "/status/current"),
+            col!("READY", "/status/ready"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
+        noun: "autoscaler",
+        aliases: &["autoscalers", "scaler", "hpa"],
+        path: "/loom/autoscalers",
+        id_prefix: "scaler",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("TARGET-KIND", "/spec/target_kind"),
+            col!("TARGET", "/spec/target_name"),
+            col!("METRIC", "/spec/metric"),
+            col!("MIN", "/spec/min_replicas"),
+            col!("MAX", "/spec/max_replicas"),
+            col!("DESIRED", "/status/desired_replicas"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("TARGET-VALUE", "/spec/target_value"),
+            col!("CURRENT", "/status/current_replicas"),
+            col!("LAST-METRIC", "/status/last_metric"),
+            col!("MESSAGE", "/status/message"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "stack",
+        aliases: &["stacks"],
+        path: "/blueprint/stacks",
+        id_prefix: "stack",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("PHASE", phase),
+            col!("REVISION", "/status/revision"),
+            col!("MESSAGE", "/status/message"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
 ];
 
 pub fn by_noun(noun: &str) -> Option<&'static KindDef> {
@@ -529,6 +610,10 @@ mod tests {
         assert_eq!(by_noun("floating_ip").unwrap().noun, "fip");
         assert_eq!(by_noun("VolumeType").unwrap().noun, "voltype");
         assert_eq!(by_noun("principal").unwrap().noun, "user");
+        assert_eq!(by_noun("sts").unwrap().path, "/loom/statefulsets");
+        assert_eq!(by_noun("DaemonSet").unwrap().noun, "daemonset");
+        assert_eq!(by_noun("hpa").unwrap().noun, "autoscaler");
+        assert_eq!(by_noun("stack").unwrap().path, "/blueprint/stacks");
         assert!(by_noun("bogus").is_none());
     }
 

@@ -101,6 +101,9 @@ mod tests {
         assert!(!text.contains("innerHTML"));
         assert!(text.contains("data-view=\"pods\""));
         assert!(text.contains("data-view=\"deployments\""));
+        assert!(text.contains("data-view=\"statefulsets\""));
+        assert!(text.contains("data-view=\"daemonsets\""));
+        assert!(text.contains("data-view=\"autoscalers\""));
         assert!(text.contains("data-view=\"services\""));
         assert!(text.contains("data-view=\"jobs\""));
         assert!(text.contains("data-view=\"ingresses\""));
@@ -109,6 +112,9 @@ mod tests {
         assert!(text.contains("data-view=\"alarms\""));
         assert!(text.contains("/loom/pods"));
         assert!(text.contains("/loom/deployments"));
+        assert!(text.contains("/loom/statefulsets"));
+        assert!(text.contains("/loom/daemonsets"));
+        assert!(text.contains("/loom/autoscalers"));
         assert!(text.contains("/loom/services"));
         assert!(text.contains("/loom/jobs"));
         assert!(text.contains("/loom/ingresses"));
@@ -118,6 +124,9 @@ mod tests {
         assert!(text.contains("/gauge/alarms"));
         assert!(text.contains("Create pod"));
         assert!(text.contains("Create deployment"));
+        assert!(text.contains("Create StatefulSet"));
+        assert!(text.contains("Create DaemonSet"));
+        assert!(text.contains("Create autoscaler"));
         assert!(text.contains("Create service"));
         assert!(text.contains("Create job"));
         assert!(text.contains("Create ingress"));
