@@ -239,6 +239,26 @@ pub fn validate_key(key: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// Reject characters that make ListObjectsV2 (and similar) XML ill-formed
+/// even with `encoding-type=url`. Applied only on S3 key-creating paths
+/// (PutObject, CreateMultipartUpload, CopyObject destination); GET/HEAD/
+/// DELETE and listing still accept existing objects whose keys contain them.
+///
+/// Rejected: U+0001..=U+001F (all C0, including tab/LF/CR), U+007F, U+FFFE,
+/// U+FFFF. NUL is already rejected by [`validate_key`].
+pub fn reject_xml_unsafe_key(key: &str) -> ApiResult<()> {
+    for c in key.chars() {
+        let u = c as u32;
+        if (0x01..=0x1f).contains(&u) || u == 0x7f || u == 0xfffe || u == 0xffff {
+            // Fixed message — never echo the key (may contain control bytes).
+            return Err(ApiError::bad_request(
+                "Object key contains XML-unsafe characters",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn content_type_or_default(value: Option<String>) -> String {
     match value {
         Some(v) if !v.trim().is_empty() => v,
@@ -264,6 +284,25 @@ mod tests {
         assert!(validate_key(".uploads/x").is_err());
         assert!(validate_key(r"foo\bar").is_err());
         assert!(validate_key("a/").is_err());
+        // validate_key still allows control chars (legacy objects readable).
+        assert!(validate_key("a\u{1}b").is_ok());
+        assert!(validate_key("a\tb").is_ok());
+    }
+
+    #[test]
+    fn xml_unsafe_key_chars() {
+        assert!(reject_xml_unsafe_key("hello").is_ok());
+        assert!(reject_xml_unsafe_key("a b").is_ok());
+        assert!(reject_xml_unsafe_key("a+b").is_ok());
+        assert!(reject_xml_unsafe_key("café").is_ok());
+        assert!(reject_xml_unsafe_key("a\u{1}b").is_err());
+        assert!(reject_xml_unsafe_key("a\tb").is_err());
+        assert!(reject_xml_unsafe_key("a\nb").is_err());
+        assert!(reject_xml_unsafe_key("a\u{7f}b").is_err());
+        assert!(reject_xml_unsafe_key("a\u{fffe}").is_err());
+        assert!(reject_xml_unsafe_key("a\u{ffff}").is_err());
+        let msg = reject_xml_unsafe_key("a\u{1}b").unwrap_err().to_string();
+        assert!(!msg.contains('\u{1}'), "{msg}");
     }
 
     #[test]
