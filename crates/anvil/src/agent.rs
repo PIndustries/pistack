@@ -20,9 +20,9 @@ use std::time::Duration;
 use chrono::Utc;
 use keep::Pki;
 use pistack_rpc::proto::{
-    AgentHello, Command, CommandKind, CommandResult, Heartbeat, LogText, MachineRef, MachineReport,
-    MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached, VolumeDetach,
-    MAX_LONG_POLL_SECS,
+    AgentHello, Command, CommandKind, CommandResult, Heartbeat, LogText, MachineKind, MachineRef,
+    MachineReport, MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached,
+    VolumeDetach, MAX_LONG_POLL_SECS,
 };
 use pistack_rpc::{AgentClient, RpcError, RPC_INSECURE_ENV};
 use pistack_types::{ApiError, Phase, Resources};
@@ -425,13 +425,13 @@ impl Agent {
             CommandKind::PlugPort => {
                 let req: PortPlug = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, "anvil: plug port");
-                crate::runtime::libvirt::plug_port(&req).await?;
+                attach_port(&self.runtimes, &req).await?;
                 Ok(serde_json::Value::Null)
             }
             CommandKind::UnplugPort => {
                 let req: PortPlug = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, "anvil: unplug port");
-                crate::runtime::libvirt::unplug_port(&req).await?;
+                detach_port(&self.runtimes, &req).await?;
                 Ok(serde_json::Value::Null)
             }
             CommandKind::SyncOverlay => {
@@ -457,6 +457,30 @@ impl Agent {
                 "publish is handled by the edge host, not this agent",
             )),
         }
+    }
+}
+
+/// Cloud Hypervisor is the VM runtime only when this host selected it.
+/// libvirt keeps port plug on every other host, including the mock.
+fn cloud_vm(runtimes: &Runtimes) -> bool {
+    runtimes
+        .get(MachineKind::Vm)
+        .is_some_and(|rt| rt.name() == "cloud-hypervisor")
+}
+
+async fn attach_port(runtimes: &Runtimes, req: &PortPlug) -> Result<(), ApiError> {
+    if cloud_vm(runtimes) {
+        crate::runtime::cloud::plug_port(req).await
+    } else {
+        crate::runtime::libvirt::plug_port(req).await
+    }
+}
+
+async fn detach_port(runtimes: &Runtimes, req: &PortPlug) -> Result<(), ApiError> {
+    if cloud_vm(runtimes) {
+        crate::runtime::cloud::unplug_port(req).await
+    } else {
+        crate::runtime::libvirt::unplug_port(req).await
     }
 }
 
@@ -817,6 +841,22 @@ pub fn report(m: RunningMachine) -> MachineReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plug_uses_cloud_only_when_that_runtime_owns_vms() {
+        let cloud: crate::runtime::SharedRuntime = Arc::new(crate::runtime::CloudRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Vm, cloud);
+        assert!(cloud_vm(&rts));
+
+        let lib: crate::runtime::SharedRuntime = Arc::new(crate::runtime::LibvirtRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Vm, lib);
+        assert!(!cloud_vm(&rts));
+
+        let mock: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::default());
+        assert!(!cloud_vm(&Runtimes::all(mock)));
+    }
 
     #[test]
     fn join_url_adds_rpc_prefix_once() {
