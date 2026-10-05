@@ -3,13 +3,19 @@
 
 //! Multipart upload staging under `{root}/{bucket}/.uploads/{uploadId}/`.
 //!
-//! Stale uploads are **not** garbage-collected yet: abort and complete remove
-//! their staging dirs, but crashed clients leave orphans until an operator
-//! deletes `.uploads` by hand.
+//! Each staging dir holds `meta.json` (bucket, key, content type, initiation
+//! time) plus `part-N` / `part-N.md5`. Abort and complete remove the dir;
+//! uploads a client never finishes are removed by [`crate::gc`] once they
+//! are older than `[modules.silo] multipart_ttl_secs`.
+//!
+//! Staging is plain files on disk, never store records, so an unfinished
+//! upload is not an object: it does not show up in object listings or
+//! object sizes.
 
 use crate::client::Client;
 use crate::types::*;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::Stream;
 use md5::Md5;
 use pistack_types::{ApiError, ApiResult, Id};
@@ -29,6 +35,29 @@ pub struct UploadMeta {
     pub bucket: String,
     pub key: String,
     pub content_type: String,
+    /// When CreateMultipartUpload ran. Absent on uploads staged before this
+    /// field existed; readers fall back to the `meta.json` mtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiated: Option<DateTime<Utc>>,
+}
+
+/// One in-progress upload, as returned by ListMultipartUploads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadSummary {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: DateTime<Utc>,
+}
+
+/// A staging directory found on disk. `meta` is `None` when `meta.json` is
+/// missing or unreadable (for example a create that crashed half way).
+#[derive(Clone, Debug)]
+pub(crate) struct StagedUpload {
+    pub upload_id: String,
+    pub dir: PathBuf,
+    pub meta: Option<UploadMeta>,
+    /// `meta.initiated`, else the `meta.json` mtime, else the dir mtime.
+    pub initiated: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +99,7 @@ impl Client {
             bucket: bucket_id.to_string(),
             key: key.to_owned(),
             content_type: content_type_or_default(content_type),
+            initiated: Some(Utc::now()),
         };
         let meta_path = dir.join("meta.json");
         let bytes = serde_json::to_vec_pretty(&meta)
@@ -318,6 +348,57 @@ impl Client {
         self.remove_upload_dir(bucket_id, upload_id).await
     }
 
+    /// ListMultipartUploads: in-progress uploads in the bucket, ordered by
+    /// key then upload id (upload ids are time-ordered, so this is
+    /// initiation order within a key).
+    ///
+    /// `key_marker` skips keys up to and including it; with
+    /// `upload_id_marker` as well, uploads for `key_marker` itself with a
+    /// larger upload id are kept. `upload_id_marker` without `key_marker`
+    /// is ignored, as in S3. Returns `(page, truncated)`.
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket_id: &Id,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: usize,
+    ) -> ApiResult<(Vec<UploadSummary>, bool)> {
+        let _bucket = self.store().collection::<Bucket>().get(bucket_id)?;
+        let bucket = bucket_id.to_string();
+        let prefix = prefix.filter(|p| !p.is_empty());
+        let key_marker = key_marker.filter(|m| !m.is_empty());
+        let upload_id_marker = upload_id_marker.filter(|m| !m.is_empty());
+
+        let mut uploads: Vec<UploadSummary> = scan_staged(&self.uploads_root(bucket_id))
+            .await?
+            .into_iter()
+            .filter_map(|st| {
+                let meta = st.meta?;
+                if meta.bucket != bucket {
+                    return None;
+                }
+                Some(UploadSummary {
+                    key: meta.key,
+                    upload_id: st.upload_id,
+                    initiated: st.initiated?,
+                })
+            })
+            .filter(|u| prefix.is_none_or(|p| u.key.starts_with(p)))
+            .filter(|u| match (key_marker, upload_id_marker) {
+                (None, _) => true,
+                (Some(km), None) => u.key.as_str() > km,
+                (Some(km), Some(um)) => {
+                    u.key.as_str() > km || (u.key == km && u.upload_id.as_str() > um)
+                }
+            })
+            .collect();
+        uploads.sort_by(|a, b| a.key.cmp(&b.key).then(a.upload_id.cmp(&b.upload_id)));
+        let truncated = uploads.len() > max_uploads;
+        uploads.truncate(max_uploads);
+        Ok((uploads, truncated))
+    }
+
     async fn load_upload_meta(&self, bucket_id: &Id, upload_id: &str) -> ApiResult<UploadMeta> {
         let dir = self.upload_dir(bucket_id, upload_id)?;
         let meta_path = dir.join("meta.json");
@@ -350,6 +431,66 @@ impl Client {
             Err(e) => Err(io_err(e)),
         }
     }
+}
+
+/// Every staging dir directly under `uploads_root`. A missing root is an
+/// empty list; entries that are not directories or have an invalid upload
+/// id are skipped.
+pub(crate) async fn scan_staged(uploads_root: &Path) -> ApiResult<Vec<StagedUpload>> {
+    let mut entries = match tokio::fs::read_dir(uploads_root).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut out = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(io_err)? {
+        let Ok(upload_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if validate_upload_id(&upload_id).is_err() {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        out.push(read_staged(entry.path(), upload_id).await);
+    }
+    Ok(out)
+}
+
+async fn read_staged(dir: PathBuf, upload_id: String) -> StagedUpload {
+    let meta_path = dir.join("meta.json");
+    let meta = match tokio::fs::read(&meta_path).await {
+        Ok(bytes) => match serde_json::from_slice::<UploadMeta>(&bytes) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::debug!(path = %meta_path.display(), error = %e, "silo: unreadable upload meta");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let initiated = match meta.as_ref().and_then(|m| m.initiated) {
+        Some(t) => Some(t),
+        None => match mtime(&meta_path).await {
+            Some(t) => Some(t),
+            None => mtime(&dir).await,
+        },
+    };
+    StagedUpload {
+        upload_id,
+        dir,
+        meta,
+        initiated,
+    }
+}
+
+async fn mtime(path: &Path) -> Option<DateTime<Utc>> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    meta.modified().ok().map(DateTime::<Utc>::from)
 }
 
 /// Parse CompleteMultipartUpload XML into ordered parts.
@@ -427,7 +568,7 @@ pub fn s3_code_of(err: &ApiError) -> Option<&str> {
     err.details.get("s3_code").and_then(|v| v.as_str())
 }
 
-fn io_err(e: std::io::Error) -> ApiError {
+pub(crate) fn io_err(e: std::io::Error) -> ApiError {
     ApiError::internal(format!("silo: {e}"))
 }
 

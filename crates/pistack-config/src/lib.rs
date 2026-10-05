@@ -94,6 +94,8 @@ format = "text"
 # [modules.silo]
 # # Largest single PUT in bytes (default 5 GiB).
 # max_object_bytes = 5368709120
+# # Seconds before an unfinished multipart upload is swept (default 7 days).
+# multipart_ttl_secs = 604800
 # [modules.keep]
 # # Defaults for projects whose gate quotas do not name `secrets`,
 # # `certificates` or `access_keys`; a project quota always wins.

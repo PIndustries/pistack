@@ -11,19 +11,24 @@
 //! `[modules.silo] max_object_bytes`.
 //!
 //! Path-style S3 routes (`/{bucket}/{key}`, ListObjectsV2, multipart
-//! upload) share this module's HTTP router and the same bearer/`Caller`
-//! auth. **AWS Signature Version 4 is not verified**; clients must present
-//! a gate token (or run under the gateway's `--dev` admin injection).
+//! upload, ListMultipartUploads) share this module's HTTP router and the
+//! same bearer/`Caller` auth. **AWS Signature Version 4 is not verified**;
+//! clients must present a gate token (or run under the gateway's `--dev`
+//! admin injection).
 //!
 //! Multipart staging lives under `{data}/silo/{bucket}/.uploads/{uploadId}/`.
-//! Abort and complete delete that directory; **stale uploads are not GC'd**
-//! yet if a client disappears mid-upload.
+//! Abort and complete delete that directory. Uploads a client never
+//! finishes are swept once they are older than `[modules.silo]
+//! multipart_ttl_secs` (default 7 days, see [`gc`]); the sweep runs at
+//! startup and then periodically while this node is the cluster leader.
+//! Staging is never a store record, so unfinished uploads are not objects.
 //!
 //! * [`types`] — `Bucket`, `Object`, [`SiloConfig`].
 //! * [`Client`] — the library API.
 //! * [`http`] — native routes mounted at `/silo`.
 //! * [`s3`] — path-style S3-compatible handlers on the same router.
-//! * [`multipart`] — Create/Upload/Complete/Abort multipart helpers.
+//! * [`multipart`] — Create/Upload/Complete/Abort/List multipart helpers.
+//! * [`gc`] — the abandoned-upload sweep.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -32,6 +37,7 @@ use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::path::PathBuf;
 
 pub mod client;
+pub mod gc;
 pub mod http;
 pub mod multipart;
 pub mod s3;
@@ -90,6 +96,22 @@ impl Module for Silo {
         let store = ctx.store::<Store>();
         http::router(self.client((*store).clone()))
     }
+
+    /// Abandoned multipart uploads are swept while this node is leader:
+    /// once on promotion (startup on a sole server) and then periodically.
+    async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
+        let store = ctx.store::<Store>();
+        let client = self.client((*store).clone());
+        let ttl = self.config.multipart_ttl();
+        let leadership = ctx.leadership.clone();
+        let shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move {
+            leadership
+                .run_while_leader(shutdown, move |active| gc::run(client.clone(), ttl, active))
+                .await;
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +129,7 @@ mod tests {
         let max = 64 * 1024;
         let silo = Silo::configured(SiloConfig {
             max_object_bytes: max,
+            ..SiloConfig::default()
         });
         assert_eq!(silo.client(store).max_object_bytes(), max);
     }
