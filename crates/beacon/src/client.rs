@@ -12,6 +12,10 @@ use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Id, Meta, Phase};
 use std::collections::BTreeMap;
 
+/// Status message for secondary zones until AXFR pull lands.
+pub const SECONDARY_PENDING_MSG: &str =
+    "secondary zone transfer (AXFR) is not implemented; zone is not served";
+
 #[derive(Clone)]
 pub struct Client {
     store: Store,
@@ -136,6 +140,7 @@ impl Client {
         meta.id = Id::new(kind::RECORD);
         let zone = self.zones().get(&spec.zone).map_err(store_err)?;
         check_same_project(&meta, &zone.meta, "zone")?;
+        require_primary(&zone)?;
         validate_recordset(&zone, &mut spec)?;
         self.check_exclusive(&zone, &spec, None)?;
         self.recordsets()
@@ -163,6 +168,7 @@ impl Client {
             return Err(ApiError::bad_request("record set zone is immutable"));
         }
         let zone = self.zones().get(&cur.spec.zone).map_err(store_err)?;
+        require_primary(&zone)?;
         validate_recordset(&zone, &mut next.spec)?;
         self.check_exclusive(&zone, &next.spec, Some(id))?;
         self.recordsets().update(next, expected).map_err(store_err)
@@ -211,6 +217,7 @@ impl Client {
         owner: &str,
     ) -> ApiResult<RecordSet> {
         let z = self.zones().get(zone).map_err(store_err)?;
+        require_primary(&z)?;
         let mut spec = RecordSetSpec {
             zone: zone.clone(),
             name: name.to_owned(),
@@ -272,6 +279,29 @@ impl Client {
             Some(z) => z,
             None => return Ok(None),
         };
+        // Secondaries are accepted on the wire model but not transferred yet.
+        // Keep them Pending with an honest message; never Ready, never served.
+        if matches!(zone.spec.kind, ZoneKind::Secondary { .. }) {
+            if zone.status.phase == Phase::Pending
+                && zone.status.message == SECONDARY_PENDING_MSG
+                && zone.status.serial == 0
+                && zone.status.records == 0
+            {
+                return Ok(Some(zone));
+            }
+            let updated = self
+                .zones()
+                .modify(id, |z| {
+                    z.status.phase = Phase::Pending;
+                    z.status.serial = 0;
+                    z.status.records = 0;
+                    z.status.digest.clear();
+                    z.status.message = SECONDARY_PENDING_MSG.into();
+                    Ok(())
+                })
+                .map_err(store_err)?;
+            return Ok(Some(updated));
+        }
         let sets = self.recordsets_in_zone(id)?;
         let digest = content_digest(&zone, &sets);
         if zone.status.digest == digest && zone.status.phase == Phase::Ready {
@@ -344,6 +374,16 @@ fn content_digest(zone: &Zone, sets: &[RecordSet]) -> String {
     zone.nameservers().hash(&mut h);
     ordered.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+fn require_primary(zone: &Zone) -> ApiResult<()> {
+    if matches!(zone.spec.kind, ZoneKind::Primary) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "record sets belong on primary zones; secondaries are transfer-only",
+        ))
+    }
 }
 
 /// A project resource may only reference resources in its own project or
@@ -491,6 +531,43 @@ mod tests {
             c.reconcile_zone(&z.meta.id).unwrap().unwrap().status.serial,
             3
         );
+    }
+
+    #[test]
+    fn secondary_stays_pending_and_rejects_records() {
+        let c = client();
+        let z = c
+            .create_zone(
+                Meta::new(kind::ZONE, "sec", None),
+                ZoneSpec {
+                    name: "sec.cloud.".into(),
+                    kind: ZoneKind::Secondary {
+                        primaries: vec!["10.0.0.1:53".into()],
+                    },
+                    ..ZoneSpec::default()
+                },
+            )
+            .unwrap();
+        let out = c.reconcile_zone(&z.meta.id).unwrap().unwrap();
+        assert_eq!(out.status.phase, Phase::Pending);
+        assert_eq!(out.status.message, SECONDARY_PENDING_MSG);
+        assert_eq!(out.status.serial, 0);
+        assert!(c
+            .create_recordset(
+                Meta::new(kind::RECORD, "a", None),
+                RecordSetSpec {
+                    zone: z.meta.id.clone(),
+                    name: "web".into(),
+                    kind: RecordType::A,
+                    ttl: None,
+                    records: vec!["10.0.0.4".into()],
+                },
+            )
+            .is_err());
+        // Idempotent reconcile.
+        let again = c.reconcile_zone(&z.meta.id).unwrap().unwrap();
+        assert_eq!(again.status.phase, Phase::Pending);
+        assert_eq!(again.meta.revision, out.meta.revision);
     }
 
     #[test]

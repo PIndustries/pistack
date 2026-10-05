@@ -12,7 +12,8 @@
 //! not expose DNS on every interface; set `0.0.0.0:53` in production, where
 //! the binary needs `CAP_NET_BIND_SERVICE`).
 //!
-//! Only queries are served: updates, notifies and zone transfers get NOTIMP.
+//! Queries and primary-zone AXFR (TCP only) are served. Updates, notifies and
+//! IXFR get NOTIMP. Secondary zones are never compiled into the catalog.
 
 use crate::client::Client;
 use crate::types::{in_zone, RecordType as Rt, Zone, KINDS};
@@ -21,6 +22,7 @@ use hickory_proto::op::{Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{NS, SOA};
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_server::net::runtime::Time;
+use hickory_server::net::xfer::Protocol;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
@@ -79,6 +81,11 @@ impl Catalog {
             .iter()
             .filter(|z| in_zone(&z.apex.to_ascii(), &n))
             .max_by_key(|z| z.apex.num_labels())
+    }
+
+    /// Exact apex match, for AXFR (the query name must be the zone name).
+    fn find_apex(&self, name: &Name) -> Option<&ZoneData> {
+        self.zones.iter().find(|z| &z.apex == name)
     }
 }
 
@@ -152,6 +159,23 @@ pub struct Answer {
 }
 
 impl ZoneData {
+    /// Full zone contents for AXFR: SOA, every non-SOA record, SOA again.
+    fn axfr(&self) -> Vec<Record> {
+        let mut out = vec![self.soa.clone()];
+        let mut names: Vec<&Name> = self.records.keys().collect();
+        names.sort();
+        for name in names {
+            for r in &self.records[name] {
+                if r.record_type() == RecordType::SOA {
+                    continue;
+                }
+                out.push(r.clone());
+            }
+        }
+        out.push(self.soa.clone());
+        out
+    }
+
     fn lookup(&self, name: &Name, qtype: RecordType) -> Answer {
         let mut answers = Vec::new();
         let mut current = name.clone();
@@ -304,6 +328,16 @@ impl Handler {
         let catalog = self.catalog()?;
         Ok(catalog.find(name).map(|z| z.lookup(name, qtype)))
     }
+
+    /// AXFR answer for an exact zone apex, or `None` when we do not own it.
+    pub fn resolve_axfr(&self, apex: &Name) -> anyhow::Result<Option<Answer>> {
+        let catalog = self.catalog()?;
+        Ok(catalog.find_apex(apex).map(|z| Answer {
+            code: ResponseCode::NoError,
+            answers: z.axfr(),
+            authorities: Vec::new(),
+        }))
+    }
 }
 
 #[async_trait]
@@ -359,12 +393,28 @@ impl Handler {
         }
         let info = request.request_info().map_err(|_| ResponseCode::FormErr)?;
         let qtype = info.query.query_type();
-        if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
-            return Err(ResponseCode::NotImp);
-        }
         let lower: &LowerName = info.query.name();
         let mut name = Name::from(lower);
         name.set_fqdn(true);
+
+        if qtype == RecordType::IXFR {
+            return Err(ResponseCode::NotImp);
+        }
+        if qtype == RecordType::AXFR {
+            // AXFR is TCP-only (RFC 5936). Refuse UDP so clients fall back.
+            if request.protocol() != Protocol::Tcp {
+                return Err(ResponseCode::Refused);
+            }
+            return match self.resolve_axfr(&name) {
+                Ok(Some(a)) => Ok(a),
+                Ok(None) => Err(ResponseCode::Refused),
+                Err(e) => {
+                    tracing::error!(error = %e, "beacon: axfr failed");
+                    Err(ResponseCode::ServFail)
+                }
+            };
+        }
+
         match self.resolve(&name, qtype) {
             Ok(Some(a)) => Ok(a),
             Ok(None) => Err(ResponseCode::Refused),
@@ -531,5 +581,13 @@ mod tests {
                 .len(),
             1
         );
+
+        // AXFR: SOA … records … SOA, exact apex only.
+        let xfr = h.resolve_axfr(&n("example.cloud.")).unwrap().unwrap();
+        assert_eq!(xfr.code, ResponseCode::NoError);
+        assert_eq!(xfr.answers.first().unwrap().record_type(), RecordType::SOA);
+        assert_eq!(xfr.answers.last().unwrap().record_type(), RecordType::SOA);
+        assert!(xfr.answers.len() >= 4); // SOA + NS + A(s) + SOA
+        assert!(h.resolve_axfr(&n("other.tld.")).unwrap().is_none());
     }
 }
