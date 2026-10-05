@@ -15,9 +15,13 @@
 //!
 //! ECDSA / SigV4A streaming variants return `NotImplemented`.
 //!
-//! When `x-amz-copy-source` is present (UploadPartCopy / CopyObject), it and any present `x-amz-copy-source-*` condition/range headers
-//! must appear in SignedHeaders (header auth and presigned), matching the
-//! streaming `x-amz-decoded-content-length` rule — otherwise `AccessDenied`.
+//! When `x-amz-copy-source` is present (UploadPartCopy / CopyObject), it and
+//! any present `x-amz-copy-source-*` condition/range headers and
+//! `x-amz-metadata-directive` must appear in SignedHeaders (header auth and
+//! presigned). When the directive is `REPLACE`, a present `Content-Type`
+//! must be signed too (the only REPLACE-applied header silo stores).
+//! Matching the streaming `x-amz-decoded-content-length` rule — otherwise
+//! `AccessDenied`.
 //!
 //! On success the keep access-key's project-scoped [`Caller`] is attached
 //! to the request. Keep lookup failures and signature mismatches map to
@@ -327,10 +331,16 @@ const COPY_SOURCE_DEPENDENT_HEADERS: &[&str] = &[
     "x-amz-copy-source-if-none-match",
     "x-amz-copy-source-if-modified-since",
     "x-amz-copy-source-if-unmodified-since",
+    "x-amz-metadata-directive",
 ];
 
-/// Require copy-source (and present dependents) in SignedHeaders so a
-/// captured signature cannot be replayed with a swapped source.
+/// Require copy-source (and present dependents, including
+/// `x-amz-metadata-directive`) in SignedHeaders so a captured signature
+/// cannot be replayed with a swapped source or directive.
+///
+/// When the directive is `REPLACE`, any present `Content-Type` must also be
+/// signed — that is the only request header silo applies on REPLACE today
+/// (no `x-amz-meta-*` / Content-Disposition / Encoding / Cache-Control).
 fn check_copy_source_signed_headers(parsed: &ParsedAuth, headers: &HeaderMap) -> ApiResult<()> {
     if header_str(headers, "x-amz-copy-source").is_none() {
         return Ok(());
@@ -354,6 +364,16 @@ fn check_copy_source_signed_headers(parsed: &ParsedAuth, headers: &HeaderMap) ->
                 format!("{name} must be in SignedHeaders when present"),
             ));
         }
+    }
+    let directive = header_str(headers, "x-amz-metadata-directive").map(|v| v.to_ascii_uppercase());
+    if directive.as_deref() == Some("REPLACE")
+        && header_str(headers, "content-type").is_some()
+        && !has("content-type")
+    {
+        return Err(s3_err(
+            "AccessDenied",
+            "content-type must be in SignedHeaders when x-amz-metadata-directive is REPLACE",
+        ));
     }
     Ok(())
 }

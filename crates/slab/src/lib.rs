@@ -7,8 +7,8 @@
 //! * [`backend`] — the `BlockBackend` seam and the `local`, `lvm`, `rbd`
 //!   reference backends.
 //! * [`Client`] — the module core; the only writer of `status`. `forge`
-//!   uses [`Client::attach_info`], [`Client::mark_attached`] and
-//!   [`Client::mark_detached`].
+//!   uses [`Client::attach_info`], [`Client::begin_attach`],
+//!   [`Client::confirm_attach`] and [`Client::mark_detached`].
 //! * [`quota`] — optional extra `QuotaCheck`. Project `volumes` quotas are
 //!   enforced in [`Client`] through `gate`.
 //! * HTTP under `/volume`: `/volumes`, `/snapshots`, `/backups`,

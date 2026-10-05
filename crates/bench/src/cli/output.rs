@@ -377,4 +377,59 @@ mod tests {
         );
         assert_eq!(age("garbage", now), "");
     }
+
+    #[test]
+    fn volume_list_shows_attaching_and_the_host_path() {
+        let created = Utc::now().to_rfc3339();
+        let item = json!({
+            "name": "data",
+            "id": "vol-0199a5e0-1111-7000-8000-000000000001",
+            "created_at": created,
+            "spec": {"size_gib": 1, "volume_type": "standard", "bootable": false},
+            "status": {
+                "phase": "ready",
+                "attached_to": "mach-0199a5e0-2222-7000-8000-000000000002",
+                "device": "vdb",
+                "host_path": "/var/lib/pistack/volumes/data",
+                "conditions": [{
+                    "type": "Attached",
+                    "status": false,
+                    "reason": "Attaching",
+                    "message": "waiting",
+                    "last_transition": created
+                }]
+            }
+        });
+        let mut buf = Vec::new();
+        print_list(
+            &mut buf,
+            Format {
+                output: Output::Table,
+                no_headers: false,
+            },
+            kinds::by_noun("volume").unwrap(),
+            std::slice::from_ref(&item),
+        )
+        .unwrap();
+        let listed = String::from_utf8(buf).unwrap();
+        assert!(listed.contains("ATTACH"), "{listed}");
+        assert!(listed.contains("HOST-PATH"), "{listed}");
+        assert!(listed.contains("Attaching"), "{listed}");
+        assert!(listed.contains("/var/lib/pistack/volumes/data"), "{listed}");
+
+        let mut buf = Vec::new();
+        print_one(
+            &mut buf,
+            Format {
+                output: Output::Table,
+                no_headers: false,
+            },
+            &item,
+        )
+        .unwrap();
+        let shown = String::from_utf8(buf).unwrap();
+        assert!(shown.contains("status.host_path"), "{shown}");
+        assert!(shown.contains("/var/lib/pistack/volumes/data"), "{shown}");
+        assert!(shown.contains("Attaching"), "{shown}");
+    }
 }

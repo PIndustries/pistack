@@ -12,7 +12,7 @@ pub mod cloud;
 pub mod libvirt;
 mod metal;
 pub mod mock;
-mod rbdmap;
+pub(crate) mod rbdmap;
 pub mod youki;
 
 use async_trait::async_trait;

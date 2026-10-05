@@ -387,10 +387,17 @@ pub struct VolumeAttach {
     pub target: Option<DiskTarget>,
 }
 
-/// What the guest disk was named, so `slab` can record `status.device`.
+/// What the guest disk was named, and the host path the agent checked.
+///
+/// `host_path` is set when a local file, an LVM device node, or an RBD
+/// mapped device (`/dev/rbdN` or the recorded path) exists. A VM network
+/// disk has no host map, so `host_path` is absent.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeAttached {
     pub device: String,
+    /// Host file or device node the agent verified. Absent for a VM network disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
 }
 
 /// Payload of [`CommandKind::DetachVolume`].
@@ -729,6 +736,24 @@ mod tests {
         assert!(shown.contains("<redacted>"));
         let back = serde_json::to_value(&parsed).unwrap();
         assert_eq!(back["target"]["pool"], "volumes");
+    }
+
+    #[test]
+    fn volume_attached_host_path_is_optional() {
+        let old: VolumeAttached = serde_json::from_str(r#"{"device":"vdb"}"#).unwrap();
+        assert_eq!(old.device, "vdb");
+        assert!(old.host_path.is_none());
+        let wire = serde_json::to_value(&old).unwrap();
+        assert!(wire.get("host_path").is_none());
+
+        let with = VolumeAttached {
+            device: "vdc".into(),
+            host_path: Some("/dev/rbd0".into()),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["host_path"], "/dev/rbd0");
+        let back: VolumeAttached = serde_json::from_value(value).unwrap();
+        assert_eq!(back, with);
     }
 
     #[test]

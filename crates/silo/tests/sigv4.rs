@@ -1474,3 +1474,491 @@ async fn copy_object_unsigned_copy_source_access_denied() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn metadata_directive_must_be_in_signed_headers() {
+    let w = world().await;
+    let src = b"directive-src";
+    let src_path = format!("/{}/dir-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/dir-dst.bin", w.bucket);
+    let copy_src = format!("/{}/dir-src.bin", w.bucket);
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-type", "application/json"),
+        ],
+        &["x-amz-copy-source"], // directive present but unsigned
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn metadata_directive_fully_signed_ok() {
+    let w = world().await;
+    let src = b"directive-ok";
+    let src_path = format!("/{}/dir-ok-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/dir-ok-dst.bin", w.bucket);
+    let copy_src = format!("/{}/dir-ok-src.bin", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-type", "application/json"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("CopyObjectResult"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn metadata_directive_flipped_after_sign_rejected() {
+    let w = world().await;
+    let src = b"flip-src!!";
+    let src_path = format!("/{}/flip-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/flip-dst.bin", w.bucket);
+    let copy_src = format!("/{}/flip-src.bin", w.bucket);
+    let amz_date = amz_now();
+    let host = "silo.test";
+    let payload_hash = EMPTY_PAYLOAD_SHA256;
+    // Sign with COPY…
+    let headers = vec![
+        ("content-length".into(), "0".into()),
+        ("content-type".into(), "application/json".into()),
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), payload_hash.into()),
+        ("x-amz-copy-source".into(), copy_src.clone()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-metadata-directive".into(), "COPY".into()),
+    ];
+    let sig = sigv4::sign_request(
+        "PUT",
+        &dst_path,
+        "",
+        &headers,
+        payload_hash,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-copy-source;x-amz-date;x-amz-metadata-directive, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    // …but send REPLACE + new content-type with the captured signature.
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&dst_path)
+                .header("host", host)
+                .header("content-length", "0")
+                .header("content-type", "application/json")
+                .header("x-amz-content-sha256", payload_hash)
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-copy-source", &copy_src)
+                .header("x-amz-metadata-directive", "REPLACE")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let code = extract_error_code(&String::from_utf8_lossy(&body));
+    assert_eq!(
+        code,
+        "SignatureDoesNotMatch",
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn replace_unsigned_content_type_access_denied() {
+    let w = world().await;
+    let src = b"replace-ct-src";
+    let src_path = format!("/{}/rct-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/rct-dst.bin", w.bucket);
+    let copy_src = format!("/{}/rct-src.bin", w.bucket);
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-type", "application/json"),
+        ],
+        &["x-amz-copy-source", "x-amz-metadata-directive"], // Content-Type unsigned
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn replace_signed_content_type_ok() {
+    let w = world().await;
+    let src = b"replace-ct-ok";
+    let src_path = format!("/{}/rct-ok-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/rct-ok-dst.bin", w.bucket);
+    let copy_src = format!("/{}/rct-ok-src.bin", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-type", "application/json"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("CopyObjectResult"));
+}
+
+#[tokio::test]
+async fn copy_directive_unsigned_content_type_unaffected() {
+    let w = world().await;
+    let src = b"copy-ct-unaffected";
+    let src_path = format!("/{}/cct-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/cct-dst.bin", w.bucket);
+    let copy_src = format!("/{}/cct-src.bin", w.bucket);
+    // COPY directive: Content-Type on the wire is ignored for metadata, so
+    // leaving it unsigned must not AccessDenied.
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[
+            ("x-amz-copy-source", &copy_src),
+            ("x-amz-metadata-directive", "COPY"),
+            ("content-type", "application/json"),
+        ],
+        &["x-amz-copy-source", "x-amz-metadata-directive"],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
+#[tokio::test]
+async fn replace_content_type_flipped_after_sign_rejected() {
+    let w = world().await;
+    let src = b"flip-ct-src";
+    let src_path = format!("/{}/flip-ct-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/flip-ct-dst.bin", w.bucket);
+    let copy_src = format!("/{}/flip-ct-src.bin", w.bucket);
+    let amz_date = amz_now();
+    let host = "silo.test";
+    let payload_hash = EMPTY_PAYLOAD_SHA256;
+    let headers = vec![
+        ("content-length".into(), "0".into()),
+        ("content-type".into(), "application/json".into()),
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), payload_hash.into()),
+        ("x-amz-copy-source".into(), copy_src.clone()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-metadata-directive".into(), "REPLACE".into()),
+    ];
+    let sig = sigv4::sign_request(
+        "PUT",
+        &dst_path,
+        "",
+        &headers,
+        payload_hash,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_date,
+    );
+    let date_stamp: String = amz_date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-copy-source;x-amz-date;x-amz-metadata-directive, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&dst_path)
+                .header("host", host)
+                .header("content-length", "0")
+                .header("content-type", "image/png") // flipped after sign
+                .header("x-amz-content-sha256", payload_hash)
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-copy-source", &copy_src)
+                .header("x-amz-metadata-directive", "REPLACE")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "SignatureDoesNotMatch"
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

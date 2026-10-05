@@ -7,6 +7,7 @@ use chrono::Utc;
 use pistack_types::{kind, Condition, Id, Kind, Meta, Phase, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Kind prefixes. `vol` and `snap` are cross-module and come from
 /// `pistack_types::kind`; the others are slab-private.
@@ -119,12 +120,26 @@ fn default_volume_type() -> String {
 pub struct VolumeStatus {
     #[serde(default)]
     pub phase: Phase,
-    /// Machine the volume is attached to, if any.
+    /// Machine the volume is attaching to or attached to, if any.
+    ///
+    /// Set for the whole attach, including `Attaching`, so a second attach
+    /// is rejected before the host path exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to: Option<Id>,
     /// Guest device name requested at attach, e.g. `vdb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// Host file or device node from a confirmed attach.
+    ///
+    /// A local file, an LVM device node, or an RBD mapped device
+    /// (`/dev/rbdN` or the path the agent recorded). Absent for a VM
+    /// network disk, which has no host map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
+    /// Agent node that accepted the attach. Used to unmap an RBD device
+    /// after the machine record is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_node: Option<String>,
     /// Opaque backend handle: a file path, an LV path, an RBD image name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_ref: Option<String>,
@@ -133,6 +148,26 @@ pub struct VolumeStatus {
 }
 
 resource_kind!(Volume, VolumeSpec, VolumeStatus, KIND_VOLUME);
+
+impl Volume {
+    /// Host path when the attach is confirmed and a path was recorded.
+    ///
+    /// `None` while the reason is `Attaching` or `AttachFailed`, after
+    /// detach, and for a VM network disk that is attached with no host path.
+    /// Callers that mount the volume on a pod wait until this is `Some`.
+    pub fn is_attached_ready(&self) -> Option<&Path> {
+        let attached = self
+            .status
+            .conditions
+            .iter()
+            .any(|c| c.kind == "Attached" && c.status);
+        if !attached {
+            return None;
+        }
+        let path = self.status.host_path.as_deref().filter(|p| !p.is_empty())?;
+        Some(Path::new(path))
+    }
+}
 
 // ---- Snapshot -------------------------------------------------------------
 

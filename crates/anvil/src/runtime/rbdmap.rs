@@ -52,6 +52,30 @@ impl Mapped {
     }
 }
 
+/// Device path for a mapped head image.
+///
+/// `Ok(None)` when the image is not mapped, or when `rbd` is not installed.
+/// A VM network disk has no host map, so a missing tool is not an attach error.
+pub(crate) async fn mapped_device(pool: &str, image: &str) -> ApiResult<Option<String>> {
+    if pool.is_empty() || image.is_empty() {
+        return Ok(None);
+    }
+    let bin = rbd_program();
+    let mapped = match list_mapped(&bin).await {
+        Ok(mapped) => mapped,
+        Err(err) if err.message.contains("not installed") => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(found) = find_head(&mapped, pool, image) else {
+        return Ok(None);
+    };
+    match published_device(pool, image, Some(&found.device)) {
+        Ok(path) => Ok(Some(path)),
+        Err(_) if device_arg_ok(&found.device) => Ok(Some(found.device.clone())),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Map `pool`/`image` if it is not already mapped. Returns `/dev/rbd/<pool>/<image>`
 /// when that link exists, otherwise the device `rbd` reported (`/dev/rbdN`).
 pub(crate) async fn map_image(
