@@ -5,20 +5,24 @@
 //!
 //! Pods are named `<sts>-<ordinal>` and owned through `OWNER_LABEL`. Scale
 //! up creates the next ordinal; scale down deletes the highest first.
-//! `OrderedReady` waits for a pod to be Running before touching the next
-//! ordinal; `Parallel` does every ordinal in one pass. A template change
-//! under `RollingUpdate` replaces mismatched pods highest-first (same
-//! delete/recreate path Deployment uses for `Recreate`).
+//! `OrderedReady` waits for a pod to be Running and Ready
+//! ([`super::pod_ready`], i.e. `PodStatus::is_ready`) before creating the
+//! next ordinal; `Parallel` does every ordinal in one pass. A template
+//! change under `RollingUpdate` replaces mismatched pods highest-first
+//! (same delete/recreate path Deployment uses for `Recreate`); under
+//! `OrderedReady` the next pod is replaced only once the one before it is
+//! back and Ready. A pod with no readiness probe is ready once its
+//! containers run.
 //!
 //! `volume_claim_templates` create one `slab` volume per ordinal
 //! (`<sts>-<claim>-<ordinal>`) and attach it as `VolumeSource::Volume`.
 
-use super::{delete_quietly, owned_by, patch_status, request_delete, Controller};
+use super::{delete_quietly, owned_by, patch_status, pod_ready, request_delete, Controller};
 use crate::selector::template_hash;
 use crate::types::{
-    delete_requested, set_condition, Pod, PodManagementPolicy, PodPhase, PodStatus, PodTemplate,
-    PodVolume, StatefulSet, StatefulSetUpdateStrategy, VolumeClaimTemplate, VolumeSource,
-    OWNER_LABEL, POD_NAME_LABEL, POD_ORDINAL_LABEL, POD_TEMPLATE_HASH,
+    delete_requested, set_condition, Pod, PodManagementPolicy, PodStatus, PodTemplate, PodVolume,
+    StatefulSet, StatefulSetUpdateStrategy, VolumeClaimTemplate, VolumeSource, OWNER_LABEL,
+    POD_NAME_LABEL, POD_ORDINAL_LABEL, POD_TEMPLATE_HASH,
 };
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{kind, Id, Phase, Resource, Spec};
@@ -151,15 +155,32 @@ impl StatefulSetController {
 
         // Rolling update: replace mismatched pods, highest first.
         if sts.spec.update_strategy == StatefulSetUpdateStrategy::RollingUpdate {
-            let mismatched: Vec<u32> = by_ordinal
-                .iter()
-                .filter(|(_, p)| p.meta.labels.get(POD_TEMPLATE_HASH) != Some(&hash))
-                .map(|(o, _)| *o)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            for o in mismatched {
+            let stale = |o: &u32| {
+                by_ordinal
+                    .get(o)
+                    .is_some_and(|p| p.meta.labels.get(POD_TEMPLATE_HASH) != Some(&hash))
+            };
+            let replace: Vec<u32> = if ordered {
+                // One pod down at a time: wait at the first ordinal that is
+                // missing or not Ready (the scale-up below creates it or
+                // waits for it), unless it is an old pod, which serves
+                // nothing and is replaced first so a broken template can be
+                // rolled forward.
+                match (0..want).find(|o| by_ordinal.get(o).is_none_or(|p| !pod_ready(p))) {
+                    None => by_ordinal
+                        .keys()
+                        .rev()
+                        .copied()
+                        .find(stale)
+                        .into_iter()
+                        .collect(),
+                    Some(o) if stale(&o) => vec![o],
+                    Some(_) => Vec::new(),
+                }
+            } else {
+                by_ordinal.keys().rev().copied().filter(stale).collect()
+            };
+            for o in replace {
                 if let Some(p) = by_ordinal.get(&o) {
                     request_delete(&self.pods(), &p.meta.id)?;
                     tracing::info!(sts = %sts.meta.id, pod = %p.meta.id, ordinal = o, "loom: statefulset rolling update");
@@ -174,7 +195,7 @@ impl StatefulSetController {
         for o in 0..want {
             match by_ordinal.get(&o) {
                 Some(p) => {
-                    if ordered && p.status.phase != PodPhase::Running {
+                    if ordered && !pod_ready(p) {
                         break;
                     }
                 }
@@ -210,10 +231,7 @@ impl StatefulSetController {
         hash: &str,
     ) -> anyhow::Result<()> {
         let replicas = by_ordinal.len() as u32;
-        let ready = by_ordinal
-            .values()
-            .filter(|p| p.status.phase == PodPhase::Running)
-            .count() as u32;
+        let ready = by_ordinal.values().filter(|p| pod_ready(p)).count() as u32;
         let current = by_ordinal
             .values()
             .filter(|p| p.meta.labels.get(POD_TEMPLATE_HASH).map(|v| v.as_str()) == Some(hash))

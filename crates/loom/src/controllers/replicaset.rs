@@ -5,13 +5,14 @@
 //!
 //! Pods are owned through `OWNER_LABEL`. Orphan pods that match the
 //! selector are adopted; surplus pods are deleted oldest first; missing ones
-//! are created from the template as `<rs>-<5 random>`.
+//! are created from the template as `<rs>-<5 random>`. `status.ready`
+//! counts pods that are Running and Ready ([`super::pod_ready`]).
 
 use super::{
-    delete_quietly, live_pods, owned_by, patch_status, pod_from_template, request_delete,
-    Controller,
+    delete_quietly, live_pods, owned_by, patch_status, pod_from_template, pod_ready,
+    request_delete, Controller,
 };
-use crate::types::{delete_requested, set_condition, Pod, PodPhase, ReplicaSet, OWNER_LABEL};
+use crate::types::{delete_requested, set_condition, Pod, ReplicaSet, OWNER_LABEL};
 use pistack_store::{Collection, Store};
 
 pub struct ReplicaSetController {
@@ -79,11 +80,11 @@ impl ReplicaSetController {
                 tracing::info!(rs = %rs.meta.id, pod = %pod.meta.id, name = %pod.meta.name, "loom: pod created");
             }
         } else if have > want {
-            // Oldest first; among equals prefer not-yet-running pods.
+            // Unready pods first (they serve nothing), then oldest first.
             let mut victims = live.clone();
             victims.sort_by(|a, b| {
-                let ra = a.status.phase == PodPhase::Running;
-                let rb = b.status.phase == PodPhase::Running;
+                let ra = pod_ready(a);
+                let rb = pod_ready(b);
                 ra.cmp(&rb).then(a.meta.created_at.cmp(&b.meta.created_at))
             });
             for p in victims.iter().take(have - want) {
@@ -93,10 +94,8 @@ impl ReplicaSetController {
         }
 
         let replicas = have as u32;
-        let ready = live
-            .iter()
-            .filter(|p| p.status.phase == PodPhase::Running)
-            .count() as u32;
+        // Ready, not merely Running: the Deployment rolls on these counts.
+        let ready = live.iter().filter(|p| pod_ready(p)).count() as u32;
         let target = rs.spec.replicas;
         patch_status(&self.sets(), &rs.meta.id, |s| {
             s.replicas = replicas;

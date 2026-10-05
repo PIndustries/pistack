@@ -14,7 +14,7 @@ use axum::{
 use http_body_util::BodyExt;
 use loom::{
     ConfigMap, CronJob, Deployment, Ingress, Job, Loom, Pod, PodPhase, ReplicaSet, Service,
-    MACHINE_POD_LABEL, POD_TEMPLATE_HASH,
+    StatefulSet, MACHINE_POD_LABEL, POD_TEMPLATE_HASH,
 };
 use pistack_store::Store;
 use pistack_types::{kind, Caller, Id, Meta, Module, ModuleContext, Page, Phase};
@@ -435,6 +435,8 @@ async fn rolling_update_and_rollback() {
     .await;
     assert_eq!(st, StatusCode::OK);
 
+    // No readiness probe: each new pod turns Ready once it runs, so the
+    // roll goes all the way through.
     let mut max_seen = 0usize;
     wait_until("v2 rolled out", || {
         let ps: Vec<Pod> = pods
@@ -447,7 +449,9 @@ async fn rolling_update_and_rollback() {
         let v2 = ps
             .iter()
             .filter(|p| {
-                p.spec.containers[0].image == "nginx:1.28" && p.status.phase == PodPhase::Running
+                p.spec.containers[0].image == "nginx:1.28"
+                    && p.status.phase == PodPhase::Running
+                    && p.status.is_ready()
             })
             .count();
         let v1 = ps
@@ -499,6 +503,152 @@ async fn rolling_update_and_rollback() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn rolling_update_holds_while_the_new_pod_is_not_ready() {
+    let h = harness().await;
+    let app = &h.app;
+    let pods = h.store.collection::<Pod>();
+    let sets = h.store.collection::<ReplicaSet>();
+
+    let (st, d) = call::<Deployment>(
+        app,
+        "POST",
+        "/deployments",
+        Some(serde_json::json!({
+            "name": "api",
+            "spec": {
+                "replicas": 2,
+                "template": web_template(),
+                "strategy": {"type": "RollingUpdate", "max_surge": 1, "max_unavailable": 0}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{d:?}");
+    wait_until("v1 available", || {
+        let d = h.store.collection::<Deployment>().get(&d.meta.id).unwrap();
+        (d.status.available != 2).then(|| format!("{:?}", d.status))
+    })
+    .await;
+
+    // v2 has a readiness probe no host agent ever reports on here, so its
+    // pod runs but never turns Ready.
+    let mut t2 = web_template();
+    t2["spec"]["containers"][0]["image"] = serde_json::json!("nginx:1.28");
+    t2["spec"]["containers"][0]["readiness_probe"] =
+        serde_json::json!({"tcp_socket": {"port": 80}, "period_seconds": 1});
+    let mut spec = serde_json::to_value(&d.spec).unwrap();
+    spec["template"] = t2;
+    let (st, _) = raw(
+        app,
+        "PUT",
+        &format!("/deployments/{}", d.meta.id),
+        Some(serde_json::json!({"spec": spec})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let live = || -> Vec<Pod> {
+        pods.list(None)
+            .unwrap()
+            .into_iter()
+            .filter(|p| !loom::delete_requested(p))
+            .collect()
+    };
+    wait_until("v2 pod running", || {
+        let n = live()
+            .iter()
+            .filter(|p| {
+                p.spec.containers[0].image == "nginx:1.28" && p.status.phase == PodPhase::Running
+            })
+            .count();
+        (n != 1).then(|| format!("{n} v2 running"))
+    })
+    .await;
+    // Give the controllers several passes; the roll must not move.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let ps = live();
+    let v2: Vec<&Pod> = ps
+        .iter()
+        .filter(|p| p.spec.containers[0].image == "nginx:1.28")
+        .collect();
+    let v1 = ps
+        .iter()
+        .filter(|p| p.spec.containers[0].image == "nginx:1.27")
+        .count();
+    assert_eq!(v2.len(), 1, "one surge pod only");
+    assert!(!v2[0].status.is_ready(), "{:?}", v2[0].status);
+    assert_eq!(v1, 2, "old pods kept while the new one is not ready");
+    let old = sets
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .find(|rs| rs.spec.template.spec.containers[0].image == "nginx:1.27")
+        .unwrap();
+    assert_eq!(old.spec.replicas, 2);
+    let d = h.store.collection::<Deployment>().get(&d.meta.id).unwrap();
+    assert_eq!(d.status.available, 2);
+    assert_eq!(d.status.updated, 1);
+}
+
+#[tokio::test]
+async fn statefulset_without_probes_rolls_in_order() {
+    let h = harness().await;
+    let app = &h.app;
+    let pods = h.store.collection::<Pod>();
+
+    let (st, sts) = call::<StatefulSet>(
+        app,
+        "POST",
+        "/statefulsets",
+        Some(serde_json::json!({
+            "name": "db",
+            "spec": {"replicas": 2, "template": web_template()}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{sts:?}");
+    let ready_on = |image: &str| -> usize {
+        pods.list(None)
+            .unwrap()
+            .iter()
+            .filter(|p| {
+                !loom::delete_requested(p)
+                    && p.spec.containers[0].image == image
+                    && p.status.phase == PodPhase::Running
+                    && p.status.is_ready()
+            })
+            .count()
+    };
+    wait_until("db-0 and db-1 ready", || {
+        let n = ready_on("nginx:1.27");
+        (n != 2).then(|| format!("{n}/2 ready"))
+    })
+    .await;
+
+    let mut spec = serde_json::to_value(&sts.spec).unwrap();
+    spec["template"]["spec"]["containers"][0]["image"] = serde_json::json!("nginx:1.28");
+    let (st, _) = raw(
+        app,
+        "PUT",
+        &format!("/statefulsets/{}", sts.meta.id),
+        Some(serde_json::json!({"spec": spec})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    wait_until("db rolled to v2", || {
+        let n = ready_on("nginx:1.28");
+        let s = h
+            .store
+            .collection::<StatefulSet>()
+            .get(&sts.meta.id)
+            .unwrap();
+        (n != 2 || s.status.ready != 2 || s.status.updated != 2)
+            .then(|| format!("{n}/2 v2 ready, status {:?}", s.status))
+    })
+    .await;
 }
 
 #[tokio::test]
