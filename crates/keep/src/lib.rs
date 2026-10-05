@@ -18,11 +18,13 @@
 //! under one root key ([`crypto::RootKey`]). A [`backend::KeyBackend`],
 //! chosen with `PISTACK_KEEP_BACKEND`, keeps that key between restarts:
 //! * `software` (default): base64 in store meta `keep/root_key`.
-//! * `vault`: **partial**. Wrapped by a Vault Transit key over HTTP; only
-//!   the ciphertext is stored (`keep/root_key_wrapped`). Round-trips for
-//!   real and is tested against a mock Transit server; migrating an existing
-//!   software key, re-wrapping after Transit key rotation and a lab run
-//!   against real Vault are not done.
+//! * `vault`: wrapped by a Vault Transit key over HTTP; only the ciphertext
+//!   is stored (`keep/root_key_wrapped`). `pistack keep migrate-to-vault`
+//!   moves an existing software key in (one store transaction, verified
+//!   round-trip first), `pistack keep rewrap` follows a Transit key
+//!   rotation, and `pistack keep migrate-to-software` goes back. Tested
+//!   against a mock Transit server and, locally, a `vault server -dev`; not
+//!   yet run in the lab against a production Vault.
 //! * `pkcs11`: **parked**. Refused with an error; nothing pretends to work.
 //!
 //! Every path that needs the key, including [`read_payload`], goes through

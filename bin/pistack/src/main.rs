@@ -11,10 +11,17 @@
 //! pistack agent  --join URL      a host (anvil)
 //! pistack store dump             inspect state
 //! pistack store backup --to FILE copy the store and open the copy
+//! pistack keep status            where the root key is kept; can the configured backend open it
+//! pistack keep migrate-to-vault  move the software root key into Vault Transit
+//! pistack keep migrate-to-software --allow-plaintext-key   the reverse
+//! pistack keep rewrap            re-encrypt the root key under the latest Transit key version
 //! ```
+//!
+//! The `keep` commands run on a stopped node's store; see `keepcmd.rs`.
 
 mod cluster;
 mod gateway;
+mod keepcmd;
 mod listen;
 mod server;
 
@@ -74,6 +81,31 @@ enum Cmd {
         #[command(subcommand)]
         cmd: StoreCmd,
     },
+    /// Root-key operations on the local store. Stop the server first.
+    Keep {
+        #[command(subcommand)]
+        cmd: KeepCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeepCmd {
+    /// Show where the root key is kept and whether the configured backend opens it.
+    Status,
+    /// Wrap the software root key with Vault Transit, verify, then drop the
+    /// plaintext copy in the same transaction. Needs PISTACK_KEEP_BACKEND=vault
+    /// and the PISTACK_KEEP_VAULT_* settings.
+    MigrateToVault,
+    /// Unwrap the root key from Vault and store it in the clear, dropping the
+    /// wrapped copy in the same transaction.
+    MigrateToSoftware {
+        /// Confirm that the key will be readable by anyone with the store file.
+        #[arg(long)]
+        allow_plaintext_key: bool,
+    },
+    /// After rotating the Transit key, re-encrypt the stored root key under
+    /// its latest version. Do this before raising min_decryption_version.
+    Rewrap,
 }
 
 #[derive(Subcommand)]
@@ -129,6 +161,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Store { cmd } => match cmd {
             StoreCmd::Dump => server::dump(cli.data_dir),
             StoreCmd::Backup { to } => server::backup(cli.data_dir, to),
+        },
+        Cmd::Keep { cmd } => match cmd {
+            KeepCmd::Status => keepcmd::status(&cli.data_dir),
+            KeepCmd::MigrateToVault => keepcmd::migrate_to_vault(&cli.data_dir),
+            KeepCmd::MigrateToSoftware {
+                allow_plaintext_key,
+            } => keepcmd::migrate_to_software(&cli.data_dir, allow_plaintext_key),
+            KeepCmd::Rewrap => keepcmd::rewrap(&cli.data_dir),
         },
     }
 }
