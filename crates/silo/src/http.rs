@@ -19,7 +19,8 @@
 //! `{id}` is a bucket id or name. Object puts stream the body to disk and
 //! refuse anything larger than the client's configured max (default 5 GiB).
 //! `{*key}` is the object key and may contain `/`; `..`, empty, and absolute
-//! keys are rejected.
+//! keys are rejected. Native PUT also rejects XML-unsafe key characters
+//! (same rule as S3 PutObject) after bucket visibility.
 //!
 //! The `Caller` comes from request extensions (gate bearer token) or from
 //! AWS SigV4 verification ([`crate::sigv4`]) on S3 routes. Without one, the
@@ -326,6 +327,8 @@ async fn put_object(
     req: Request,
 ) -> ApiResult<(StatusCode, Json<Object>)> {
     let bucket = load_bucket(&c, &caller(ext)?, &id)?;
+    // After visibility; before any write / temp file.
+    reject_xml_unsafe_key(&key)?;
     let len = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())

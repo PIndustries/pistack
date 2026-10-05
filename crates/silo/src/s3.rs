@@ -41,7 +41,11 @@
 //! [`crate::delimiter`]) and `encoding-type=url` (percent-encode key-name
 //! fields; echo `<EncodingType>url</EncodingType>`). Other non-empty
 //! encoding-type values are `InvalidArgument`. `fetch-owner` is ignored.
-//! Initiator/Owner are not reported.
+//! Initiator/Owner are not reported. ListObjectsV2 continuation tokens are
+//! opaque URL-safe base64. PutObject, CreateMultipartUpload, and CopyObject
+//! destination keys reject XML-unsafe characters (C0 controls, U+007F,
+//! U+FFFE, U+FFFF) after bucket visibility; GET/HEAD/DELETE leave existing
+//! keys readable.
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
@@ -172,6 +176,8 @@ async fn put_object_inner(
                 .await;
             }
             (None, None) => {
+                // CopyObject destination key (after load_bucket above).
+                reject_xml_unsafe_key(&key)?;
                 return copy_object_inner(
                     c,
                     &who,
@@ -216,6 +222,8 @@ async fn put_object_inner(
             .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
         return Ok(resp);
     }
+    // PutObject (incl. aws-chunked streaming); after load_bucket, before write.
+    reject_xml_unsafe_key(&key)?;
     let ctype = content_type_header(&headers);
     let stream = maybe_decode_chunked(req.into_body().into_data_stream(), streaming)?;
     let obj = c
@@ -622,6 +630,8 @@ async fn post_object_inner(
     let bucket = load_bucket(&c, &who, &bucket)?;
     let expected = req.extensions().get::<ExpectedPayloadSha256>().cloned();
     if q.uploads.is_some() && q.upload_id.is_none() {
+        // CreateMultipartUpload: after load_bucket, before staging write.
+        reject_xml_unsafe_key(&key)?;
         let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
             .await
             .map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
@@ -753,7 +763,7 @@ async fn list_or_bucket_inner(
     }
     let who = caller(ext)?;
     // Auth / visibility first so a garbage token on a foreign bucket is still
-    // AccessDenied, not InvalidArgument.
+    // NoSuchBucket, not InvalidArgument.
     let bucket = load_bucket(&c, &who, &bucket_name)?;
     let encode_url = parse_encoding_type(q.encoding_type.as_deref())?;
     let max_keys = parse_max_keys(q.max_keys.as_deref())?;

@@ -3054,3 +3054,294 @@ async fn opaque_continuation_token_control_char_and_errors() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
     assert_eq!(extract_error_code(&err), "NoSuchBucket");
 }
+
+// ---- XML-unsafe key chars on create paths --------------------------------------
+
+fn assert_xml_unsafe_rejected(status: StatusCode, body: &[u8]) {
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(body)
+    );
+    let err = String::from_utf8_lossy(body);
+    assert_eq!(extract_error_code(&err), "InvalidArgument", "{err}");
+    assert!(
+        err.contains("XML-unsafe"),
+        "expected fixed XML-unsafe message: {err}"
+    );
+    // Fixed message must not echo the key / control bytes.
+    assert!(!err.contains('\u{1}'), "{err}");
+    assert!(!err.contains('\t') || !err.contains("a\tb"), "{err}");
+}
+
+#[tokio::test]
+async fn xml_unsafe_key_rejected_on_put_create_multipart_copy() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "xml-unsafe").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    let bad_keys: &[(&str, &str)] = &[
+        ("a%01b", "a\u{1}b"),
+        ("a%09b", "a\tb"),
+        ("a%7Fb", "a\u{7f}b"),
+        ("a%EF%BF%BF", "a\u{ffff}"),
+    ];
+
+    for (uri_key, _) in bad_keys {
+        let (status, body, _) = call(
+            &app,
+            "PUT",
+            &format!("/{bucket}/{uri_key}"),
+            Some(b"x".to_vec()),
+            "application/octet-stream",
+            Some(&who),
+        )
+        .await;
+        assert_xml_unsafe_rejected(status, &body);
+
+        let (status, body, _) = call(
+            &app,
+            "POST",
+            &format!("/{bucket}/{uri_key}?uploads"),
+            Some(Vec::new()),
+            "application/octet-stream",
+            Some(&who),
+        )
+        .await;
+        assert_xml_unsafe_rejected(status, &body);
+    }
+
+    // CopyObject destination key rejected.
+    client
+        .put_object(&bucket_id, "src-ok.txt", b"src", None)
+        .await
+        .expect("seed src");
+    for (uri_key, _) in bad_keys {
+        let (status, body, _) = call_with_headers(
+            &app,
+            "PUT",
+            &format!("/{bucket}/{uri_key}"),
+            None,
+            "application/octet-stream",
+            Some(&who),
+            &[("x-amz-copy-source", &format!("/{bucket}/src-ok.txt"))],
+        )
+        .await;
+        assert_xml_unsafe_rejected(status, &body);
+    }
+
+    // Normal unicode / space / '+' still accepted on PutObject.
+    for (uri_key, want_key) in [
+        ("caf%C3%A9.txt", "café.txt"),
+        ("a%20b.txt", "a b.txt"),
+        ("a%2Bb.txt", "a+b.txt"),
+    ] {
+        let (status, _, _) = call(
+            &app,
+            "PUT",
+            &format!("/{bucket}/{uri_key}"),
+            Some(b"ok".to_vec()),
+            "application/octet-stream",
+            Some(&who),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uri_key}");
+        let head = client.head_object(&bucket_id, want_key).expect("head");
+        assert_eq!(head.spec.key, want_key);
+    }
+
+    // No temp leftovers after rejections.
+    let bucket_dir = client.root().join(bucket_id.to_string());
+    let tmps = walkdir_tmp(&bucket_dir);
+    assert!(tmps.is_empty(), "leftover temps: {tmps:?}");
+}
+
+#[tokio::test]
+async fn xml_unsafe_legacy_object_still_readable_and_foreign_bucket() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "xml-legacy").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+
+    // Pre-seed via Client (bypasses S3 create-path rejection): write under
+    // the bucket dir with a control-char key so GET/HEAD/DELETE/list still work.
+    let ctrl = "legacy\u{1}key";
+    client
+        .put_object(&bucket_id, ctrl, b"legacy-bytes", None)
+        .await
+        .expect("seed via Client");
+    // Confirm bytes landed under the bucket dir.
+    let on_disk = client.key_path(&bucket_id, ctrl).expect("key_path");
+    assert!(on_disk.is_file(), "{on_disk:?}");
+    assert_eq!(std::fs::read(&on_disk).unwrap(), b"legacy-bytes");
+
+    let uri_key = "legacy%01key";
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{bucket}/{uri_key}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body, b"legacy-bytes");
+
+    let (status, _, headers) = call(
+        &app,
+        "HEAD",
+        &format!("/{bucket}/{uri_key}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.contains_key(header::CONTENT_LENGTH));
+
+    let xml = list_objects_v2(
+        &app,
+        &who,
+        &format!("/{bucket}?list-type=2&encoding-type=url"),
+    )
+    .await;
+    assert!(xml.contains("<ListBucketResult"), "{xml}");
+    let keys = listed_contents_keys(&xml);
+    assert!(
+        keys.iter()
+            .any(|k| k.contains("%01") || s3_unquote(k) == ctrl),
+        "{keys:?}"
+    );
+
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &format!("/{bucket}/{uri_key}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!on_disk.exists());
+
+    // Foreign/invisible bucket + bad key → visibility error first.
+    let stranger = project_caller(&Id::new(kind::PROJECT));
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/{bucket}/a%01b"),
+        Some(b"x".to_vec()),
+        "application/octet-stream",
+        Some(&stranger),
+    )
+    .await;
+    let err = String::from_utf8_lossy(&body);
+    assert_ne!(
+        extract_error_code(&err),
+        "InvalidArgument",
+        "must not reject key before visibility: {err}"
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+    assert_eq!(extract_error_code(&err), "NoSuchBucket");
+}
+
+#[tokio::test]
+async fn native_put_rejects_xml_unsafe_key() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "native-xml").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+    let bucket_dir = client.root().join(bucket_id.to_string());
+
+    // Native PUT with control-char key → 400, nothing written, no temps.
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/a%01b"),
+        Some(b"nope".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: Value = serde_json::from_slice(&body).expect("json error");
+    let msg = err["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("XML-unsafe"), "{err}");
+    assert!(!msg.contains('\u{1}'), "{msg}");
+    assert!(!bucket_dir.join("a\u{1}b").exists());
+    assert!(
+        walkdir_tmp(&bucket_dir).is_empty(),
+        "leftover temps: {:?}",
+        walkdir_tmp(&bucket_dir)
+    );
+
+    // Normal key still works.
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/ok.txt"),
+        Some(b"yes".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(std::fs::read(bucket_dir.join("ok.txt")).unwrap(), b"yes");
+
+    // Foreign/invisible bucket + bad key → visibility first (not InvalidArgument /
+    // XML-unsafe).
+    let stranger = project_caller(&Id::new(kind::PROJECT));
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/a%01b"),
+        Some(b"x".to_vec()),
+        "application/octet-stream",
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: Value = serde_json::from_slice(&body).expect("json");
+    let msg = err["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.contains("XML-unsafe"),
+        "must not reject key before visibility: {err}"
+    );
+}
