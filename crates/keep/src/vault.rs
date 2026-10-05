@@ -9,7 +9,10 @@
 //! returned `vault:v…` ciphertext in store meta
 //! [`META_ROOT_KEY_WRAPPED`](crate::backend::META_ROOT_KEY_WRAPPED). On
 //! start it asks Vault to decrypt that ciphertext (`POST
-//! /v1/<mount>/decrypt/<key>`) and keeps the data key in memory. Payload
+//! /v1/<mount>/decrypt/<key>`) and keeps the data key in memory. After a
+//! Transit key rotation, `POST /v1/<mount>/rewrap/<key>` re-encrypts the
+//! stored ciphertext under the latest key version without the plaintext
+//! leaving Vault (see `pistack keep rewrap`). Payload
 //! sealing stays local AES-256-GCM ([`RootKey`](crate::RootKey)); Vault
 //! sees one key-sized request per process, not every secret.
 //!
@@ -82,6 +85,20 @@ impl VaultTransit {
             .map_err(|_| self.err("decrypt", "response plaintext is not base64"))
     }
 
+    /// Re-encrypt `ciphertext` under the latest version of the Transit key.
+    /// Vault decrypts and encrypts internally; the plaintext is not returned.
+    pub fn rewrap(&self, ciphertext: &str) -> Result<String> {
+        let v = self.call("rewrap", json!({ "ciphertext": ciphertext }))?;
+        let ct = v
+            .pointer("/data/ciphertext")
+            .and_then(Value::as_str)
+            .ok_or_else(|| self.err("rewrap", "response has no data.ciphertext"))?;
+        if !ct.starts_with("vault:") {
+            return Err(self.err("rewrap", "response ciphertext is not a vault: blob"));
+        }
+        Ok(ct.to_owned())
+    }
+
     fn err(&self, op: &str, msg: impl std::fmt::Display) -> KeepError {
         KeepError::Backend(format!(
             "vault transit {op} with key '{}' at {}: {msg}",
@@ -152,8 +169,20 @@ impl VaultTransit {
     }
 }
 
-/// A Transit look-alike for tests: one named key, token check, real AES-GCM
-/// underneath so ciphertext really depends on the server's key.
+/// Transit key version `n` of a `vault:v<n>:...` ciphertext.
+pub fn ciphertext_version(ciphertext: &str) -> Option<u32> {
+    ciphertext
+        .strip_prefix("vault:v")?
+        .split_once(':')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// A Transit look-alike for tests: one named key with versions, token
+/// check, real AES-GCM underneath so ciphertext really depends on the
+/// server's key. Supports encrypt, decrypt and rewrap, key rotation and
+/// `min_decryption_version`, like Transit.
 #[cfg(test)]
 pub(crate) mod mock {
     use super::*;
@@ -164,7 +193,8 @@ pub(crate) mod mock {
         routing::post,
         Json, Router,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     pub const TOKEN: &str = "s.test-token";
@@ -174,7 +204,16 @@ pub(crate) mod mock {
         pub addr: String,
         pub encrypts: AtomicUsize,
         pub decrypts: AtomicUsize,
-        key: RootKey,
+        pub rewraps: AtomicUsize,
+        /// Key versions; version `n` is `keys[n - 1]`.
+        keys: Mutex<Vec<RootKey>>,
+        min_decryption_version: AtomicUsize,
+        /// Decrypt returns the wrong bytes (a broken or hostile Vault).
+        pub tamper: AtomicBool,
+        /// Rewrap re-encrypts different bytes than it decrypted.
+        pub tamper_rewrap: AtomicBool,
+        /// Every call fails with 503 (Vault sealed or down).
+        pub down: AtomicBool,
     }
 
     impl MockVault {
@@ -188,7 +227,12 @@ pub(crate) mod mock {
                 addr,
                 encrypts: AtomicUsize::new(0),
                 decrypts: AtomicUsize::new(0),
-                key: RootKey::generate(),
+                rewraps: AtomicUsize::new(0),
+                keys: Mutex::new(vec![RootKey::generate()]),
+                min_decryption_version: AtomicUsize::new(1),
+                tamper: AtomicBool::new(false),
+                tamper_rewrap: AtomicBool::new(false),
+                down: AtomicBool::new(false),
             });
             let st = state.clone();
             std::thread::spawn(move || {
@@ -219,6 +263,40 @@ pub(crate) mod mock {
                 timeout: Duration::from_secs(5),
             }
         }
+
+        /// `vault write -f transit/keys/<key>/rotate`: returns the new version.
+        pub fn rotate(&self) -> usize {
+            let mut k = self.keys.lock();
+            k.push(RootKey::generate());
+            k.len()
+        }
+
+        /// `vault write transit/keys/<key>/config min_decryption_version=n`.
+        pub fn set_min_decryption_version(&self, n: usize) {
+            self.min_decryption_version.store(n, Ordering::SeqCst);
+        }
+
+        fn seal(&self, pt: &[u8]) -> String {
+            let keys = self.keys.lock();
+            let sealed = keys.last().unwrap().seal(pt, b"mock-transit").unwrap();
+            let blob = B64.encode(serde_json::to_vec(&sealed).unwrap());
+            format!("vault:v{}:{blob}", keys.len())
+        }
+
+        fn open(&self, ct: &str) -> std::result::Result<Vec<u8>, &'static str> {
+            let n = ciphertext_version(ct).ok_or("invalid ciphertext")? as usize;
+            if n < self.min_decryption_version.load(Ordering::SeqCst) {
+                return Err("ciphertext or signature version is disallowed by policy (too old)");
+            }
+            let keys = self.keys.lock();
+            let key = keys.get(n.wrapping_sub(1)).ok_or("invalid key version")?;
+            let blob = ct.splitn(3, ':').nth(2).ok_or("invalid ciphertext")?;
+            B64.decode(blob)
+                .ok()
+                .and_then(|j| serde_json::from_slice::<Sealed>(&j).ok())
+                .and_then(|s| key.open(&s, b"mock-transit").ok())
+                .ok_or("invalid ciphertext")
+        }
     }
 
     fn fail(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
@@ -231,39 +309,55 @@ pub(crate) mod mock {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
+        if st.down.load(Ordering::SeqCst) {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed");
+        }
         if headers.get("x-vault-token").and_then(|v| v.to_str().ok()) != Some(TOKEN) {
             return fail(StatusCode::FORBIDDEN, "permission denied");
         }
         if name != KEY {
             return fail(StatusCode::BAD_REQUEST, "encryption key not found");
         }
+        let ct = || body["ciphertext"].as_str().unwrap_or_default().to_owned();
         match op.as_str() {
             "encrypt" => {
                 st.encrypts.fetch_add(1, Ordering::SeqCst);
                 let Some(pt) = body["plaintext"].as_str().and_then(|s| B64.decode(s).ok()) else {
                     return fail(StatusCode::BAD_REQUEST, "bad plaintext");
                 };
-                let sealed = st.key.seal(&pt, b"mock-transit").unwrap();
-                let blob = B64.encode(serde_json::to_vec(&sealed).unwrap());
-                (
-                    StatusCode::OK,
-                    Json(json!({ "data": { "ciphertext": format!("vault:v1:{blob}") } })),
-                )
+                let c = st.seal(&pt);
+                (StatusCode::OK, Json(json!({ "data": { "ciphertext": c } })))
             }
             "decrypt" => {
                 st.decrypts.fetch_add(1, Ordering::SeqCst);
-                let opened = body["ciphertext"]
-                    .as_str()
-                    .and_then(|c| c.strip_prefix("vault:v1:"))
-                    .and_then(|b| B64.decode(b).ok())
-                    .and_then(|j| serde_json::from_slice::<Sealed>(&j).ok())
-                    .and_then(|s| st.key.open(&s, b"mock-transit").ok());
-                match opened {
-                    Some(pt) => (
-                        StatusCode::OK,
-                        Json(json!({ "data": { "plaintext": B64.encode(pt) } })),
-                    ),
-                    None => fail(StatusCode::BAD_REQUEST, "invalid ciphertext"),
+                match st.open(&ct()) {
+                    Ok(mut pt) => {
+                        if st.tamper.load(Ordering::SeqCst) {
+                            pt[0] ^= 0xff;
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({ "data": { "plaintext": B64.encode(pt) } })),
+                        )
+                    }
+                    Err(m) => fail(StatusCode::BAD_REQUEST, m),
+                }
+            }
+            "rewrap" => {
+                st.rewraps.fetch_add(1, Ordering::SeqCst);
+                match st.open(&ct()) {
+                    Ok(mut pt) => {
+                        if st.tamper_rewrap.load(Ordering::SeqCst) {
+                            pt[0] ^= 0xff;
+                        }
+                        let c = st.seal(&pt);
+                        let v = ciphertext_version(&c);
+                        (
+                            StatusCode::OK,
+                            Json(json!({ "data": { "ciphertext": c, "key_version": v } })),
+                        )
+                    }
+                    Err(m) => fail(StatusCode::BAD_REQUEST, m),
                 }
             }
             _ => fail(StatusCode::NOT_FOUND, "unsupported path"),
@@ -329,6 +423,28 @@ mod tests {
         };
         let msg = cfg.encrypt(b"k").unwrap_err().to_string();
         assert!(msg.contains("request failed"), "{msg}");
+    }
+
+    #[test]
+    fn rewrap_moves_ciphertext_to_the_latest_key_version() {
+        let vault = MockVault::start();
+        let cfg = vault.config(TOKEN, KEY);
+        let ct = cfg.encrypt(b"root").unwrap();
+        assert_eq!(ciphertext_version(&ct), Some(1));
+        assert_eq!(vault.rotate(), 2);
+        let re = cfg.rewrap(&ct).unwrap();
+        assert_eq!(ciphertext_version(&re), Some(2));
+        assert_eq!(cfg.decrypt(&re).unwrap(), b"root");
+        // Raising min_decryption_version locks out the old ciphertext, for
+        // decrypt and rewrap alike.
+        vault.set_min_decryption_version(2);
+        let e = cfg.decrypt(&ct).unwrap_err().to_string();
+        assert!(e.contains("too old"), "{e}");
+        assert!(cfg.rewrap(&ct).unwrap_err().to_string().contains("too old"));
+        assert_eq!(cfg.decrypt(&re).unwrap(), b"root");
+        assert_eq!(ciphertext_version("vault:v12:abc"), Some(12));
+        assert_eq!(ciphertext_version("vault:x:abc"), None);
+        assert_eq!(ciphertext_version("plain"), None);
     }
 
     #[tokio::test]

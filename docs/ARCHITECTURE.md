@@ -53,7 +53,7 @@ pub trait Module {
 | shelf | Share, ShareAccess | CephFS / NFS |
 | beacon | Zone, RecordSet | its own authoritative server (hickory) |
 | relay | Balancer, Listener, Pool, Member, HealthMonitor | OVN LB (L4), Pingora (L7) |
-| keep | Secret, Certificate, CertificateAuthority | root key: software store (default), Vault Transit (partial), PKCS#11 (parked) |
+| keep | Secret, Certificate, CertificateAuthority | root key: software store (default), Vault Transit, PKCS#11 (parked) |
 | blueprint | Stack, Workflow, Kit | every other module |
 | gauge | Metric (Prometheus), Alarm, UsageRecord | anvil reports, events |
 | bench | none | all APIs (CLI + console) |
@@ -73,6 +73,8 @@ One scheduler in `forge` places every workload. It reads `Host` inventory report
 ## Security
 
 `keep` is the cloud CA. Every server and agent gets a certificate at join; every API call is mTLS or bearer-token over TLS. `gate` issues signed tokens (verifiable without a store lookup) and evaluates one policy document for the whole cloud.
+
+Secret payloads and CA keys are sealed with AES-256-GCM under one root key. `PISTACK_KEEP_BACKEND` picks where that key lives between restarts: in the store (`software`, the default) or wrapped by a Vault Transit key (`vault`), in which case only Vault's ciphertext is stored and the server asks Vault to unwrap it once at startup. There is no fallback between backends: a store keyed by one backend refuses to start under the other. Moving between them, and following a Transit key rotation, are offline operator commands on a stopped node (`pistack keep migrate-to-vault`, `migrate-to-software`, `rewrap`, `status`). Each migration verifies the round trip with Vault first, then swaps the keys in one store transaction, so a crash leaves either the old key or the new one, never neither. The commands change one node's store, so they run on every control-plane node.
 
 ## One system
 
