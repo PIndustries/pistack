@@ -157,7 +157,8 @@ async fn create_share(
     share.meta.description = req.description;
     share.meta.labels = req.labels;
     share.meta.annotations = req.annotations;
-    realize::apply(&mut share).await?;
+    realize::prepare(&store, &mut share).await?;
+    share.status.observed_revision = 1;
     let share = shares(&store).create(share)?;
     Ok((StatusCode::CREATED, Json(share)))
 }
@@ -183,9 +184,11 @@ async fn update_share(
     let mut spec = req.spec;
     assign_name(&mut spec, req.name.as_deref(), Some(&share.meta.name))?;
     spec.validate()?;
+    let rev = share.meta.revision;
     share.meta.name = spec.name.clone();
     share.spec = spec;
-    realize::apply(&mut share).await?;
+    realize::prepare(&store, &mut share).await?;
+    share.status.observed_revision = rev + 1;
     Ok(Json(shares(&store).update(share, expected)?))
 }
 
@@ -195,7 +198,7 @@ async fn delete_share(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let share = load(&store, &caller(ext)?, &id)?;
-    realize::remove(&share).await?;
+    realize::unpublish(&store, &share).await?;
     shares(&store).delete(&share.meta.id)?;
     Ok(StatusCode::NO_CONTENT)
 }

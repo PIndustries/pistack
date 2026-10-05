@@ -15,6 +15,32 @@
 //! that cannot be unpacked, or an empty rootfs is unavailable and is not
 //! recorded as running. `exec` runs `youki exec` in one container of a pod
 //! sandbox and returns that command's exit code, stdout, and stderr.
+//!
+//! Privilege. A root agent keeps this root OCI config and runs `youki`
+//! directly. `PISTACK_YOUKI_SUDO` does not change that.
+//!
+//! When the agent is not root and `PISTACK_YOUKI_SUDO` is `1`, `true`, or
+//! `yes`, every youki invocation (`create`, `start`, `kill`, `delete`,
+//! `state`, `exec`) is `sudo -n <youki> ...` and the OCI config stays the root
+//! config. Allow only that binary. `sudo -n` fails closed without the rule:
+//!
+//! ```text
+//! # /etc/sudoers.d/pistack-youki
+//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki
+//! ```
+//!
+//! Replace `ubuntu` and `/usr/bin/youki` with the agent user and the youki
+//! path on the host.
+//!
+//! When the agent is not root and sudo mode is off, the sandbox creates a
+//! user namespace and maps container uid 0 and gid 0 onto the agent's uid and
+//! gid with size 1. That map does not need `newuidmap`. Each pod container
+//! joins the sandbox user namespace by path first, then the shared pid,
+//! network, ipc and uts namespaces. Cgroup memory and cpu limits are written
+//! only when that controller is delegated and the cgroup directory is
+//! writable. `PISTACK_YOUKI_NETNS`, when it is an absolute path, is joined as
+//! the network namespace; a rootless agent skips that path when it is owned
+//! by another uid and keeps the sandbox's own network namespace.
 
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
@@ -52,6 +78,9 @@ struct Saved {
     /// Container names in the same order as `containers`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     container_names: Vec<String>,
+    /// Probe definitions only. The sandbox document itself is not stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    probes: Vec<crate::probe::ContainerProbes>,
 }
 
 #[async_trait]
@@ -66,10 +95,17 @@ impl MachineRuntime for YoukiRuntime {
         let id = req.id.clone();
         let bundle = bundle_dir(&id)?;
         let prior = read_state(&bundle).await?;
+        let probes = crate::probe::probes_in_user_data(req.user_data.as_deref());
         if let Some(saved) = prior.as_ref() {
             if saved.power == PowerState::On && parse_id(&saved.id)? == id {
                 // Already running: do not exec youki again. Addresses come
-                // from this request, not from whatever was stored.
+                // from this request, not from whatever was stored. Refresh
+                // the probe list so a restarted agent can keep checking.
+                if saved.probes != probes {
+                    let mut updated = saved.clone();
+                    updated.probes = probes;
+                    write_state(&bundle, &updated).await?;
+                }
                 return Ok(RunningMachine {
                     id,
                     addresses: nic_addresses(req),
@@ -77,11 +113,12 @@ impl MachineRuntime for YoukiRuntime {
                 });
             }
         }
+        let mode = resolve_run_mode()?;
         // user_data and ssh_keys are not written, logged, or passed to youki.
         if let Some(plan) = sandbox_plan(req)? {
-            return start_pod(&bin, &bundle, req, &plan, prior.is_some()).await;
+            return start_pod(&bin, &mode, &bundle, req, &plan, prior.is_some()).await;
         }
-        if let Err(e) = write_bundle(&bundle, req).await {
+        if let Err(e) = write_bundle(&bundle, req, &mode).await {
             if prior.is_none() {
                 let _ = remove_bundle(&bundle).await;
             }
@@ -90,15 +127,21 @@ impl MachineRuntime for YoukiRuntime {
         let id_str = id.to_string();
         let bundle_str = path_arg(&bundle);
         if prior.is_none() {
-            exec_youki(&bin, &["create", "--bundle", &bundle_str, &id_str]).await?;
-            if let Err(e) = exec_youki(&bin, &["start", &id_str]).await {
+            exec_youki(
+                &bin,
+                &mode,
+                &["create", "--bundle", &bundle_str, &id_str],
+                None,
+            )
+            .await?;
+            if let Err(e) = exec_youki(&bin, &mode, &["start", &id_str], None).await {
                 // Create succeeded and start did not. Drop the container so a
                 // retry can create it again, and do not record it as running.
-                let _ = exec_youki(&bin, &["delete", &id_str]).await;
+                let _ = exec_youki(&bin, &mode, &["delete", &id_str], None).await;
                 return Err(e);
             }
         } else {
-            exec_youki(&bin, &["start", &id_str]).await?;
+            exec_youki(&bin, &mode, &["start", &id_str], None).await?;
         }
         let addresses = nic_addresses(req);
         write_state(
@@ -109,6 +152,7 @@ impl MachineRuntime for YoukiRuntime {
                 power: PowerState::On,
                 containers: Vec::new(),
                 container_names: Vec::new(),
+                probes: Vec::new(),
             },
         )
         .await?;
@@ -131,11 +175,12 @@ impl MachineRuntime for YoukiRuntime {
         if saved.power == PowerState::Off {
             return Ok(());
         }
+        let mode = resolve_run_mode()?;
         // Containers first, then the sandbox that owns their namespaces.
         let mut order: Vec<String> = saved.containers.iter().rev().cloned().collect();
         order.push(id.to_string());
         for cid in &order {
-            exec_youki(&bin, &["kill", cid, "SIGTERM"]).await?;
+            exec_youki(&bin, &mode, &["kill", cid, "SIGTERM"], None).await?;
         }
         saved.power = PowerState::Off;
         write_state(&bundle, &saved).await
@@ -148,6 +193,7 @@ impl MachineRuntime for YoukiRuntime {
         if !bundle.exists() {
             return Ok(());
         }
+        let mode = resolve_run_mode()?;
         let saved = read_state(&bundle).await?;
         let had_state = saved.is_some();
         let mut order: Vec<String> = saved
@@ -158,7 +204,7 @@ impl MachineRuntime for YoukiRuntime {
             .collect();
         order.push(id.to_string());
         for cid in &order {
-            if let Err(e) = exec_youki(&bin, &["delete", cid]).await {
+            if let Err(e) = exec_youki(&bin, &mode, &["delete", cid], None).await {
                 // A bundle with no state was never created in youki. A container
                 // youki has already forgotten is gone too. Anything else stays on
                 // disk so a later delete can retry.
@@ -260,6 +306,17 @@ impl MachineRuntime for YoukiRuntime {
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
     }
+
+    async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
+        let Ok(bundle) = bundle_dir(id) else {
+            return Vec::new();
+        };
+        let _guard = lock().lock().await;
+        match read_state(&bundle).await {
+            Ok(Some(saved)) => saved.probes,
+            _ => Vec::new(),
+        }
+    }
 }
 
 fn lock() -> &'static tokio::sync::Mutex<()> {
@@ -279,9 +336,12 @@ impl YoukiRuntime {
     #[allow(clippy::too_many_arguments)]
     /// Run `argv` with `youki exec` inside `container` of the pod sandbox `id`.
     ///
-    /// `env` and `cwd` are optional: an empty slice and `None` leave the
-    /// container's own environment and working directory. `timeout` bounds
-    /// the wait. `output_cap` is the most bytes kept of stdout and of stderr,
+    /// The invocation follows the same privilege path as `create` and `start`:
+    /// `sudo -n <youki> exec ...` when sudo mode is on, and `youki` directly
+    /// when the agent is root or in the rootless fallback. `env` and `cwd`
+    /// are optional: an empty slice and `None` leave the container's own
+    /// environment and working directory. `timeout` bounds the wait.
+    /// `output_cap` is the most bytes kept of stdout and of stderr,
     /// separately. The returned exit code is the command's, including
     /// non-zero. A missing youki binary is unavailable. A container this
     /// sandbox does not have, or a machine that is not on this host, is not
@@ -318,7 +378,18 @@ impl YoukiRuntime {
             }
             resolve_container(&saved, container)?.to_owned()
         };
-        run_exec(&bin, &container_id, argv, env, cwd, timeout, output_cap).await
+        let mode = resolve_run_mode()?;
+        run_exec(
+            &bin,
+            &mode.privilege,
+            &container_id,
+            argv,
+            env,
+            cwd,
+            timeout,
+            output_cap,
+        )
+        .await
     }
 }
 
@@ -370,6 +441,259 @@ fn is_executable(p: &Path) -> bool {
     {
         p.is_file()
     }
+}
+
+/// How this agent is allowed to run youki.
+#[derive(Clone, Debug)]
+enum Privilege {
+    /// Agent euid is 0. youki is executed directly with the root OCI config.
+    Root,
+    /// Agent is not root and `PISTACK_YOUKI_SUDO` is set. youki is
+    /// `sudo -n <youki>` and the OCI config stays the root config.
+    Sudo { sudo: PathBuf },
+    /// Agent is not root and sudo mode is off. The OCI config creates a
+    /// user namespace with a single-id map. No `newuidmap` binary is required.
+    Rootless { uid: u32, gid: u32 },
+}
+
+/// Cgroup controllers this process may write. Root and sudo always report
+/// both, because youki itself runs as root. Rootless reports a controller
+/// only when the current cgroup directory is writable and lists it.
+#[derive(Clone, Copy, Debug)]
+struct CgroupCaps {
+    memory: bool,
+    cpu: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RunMode {
+    privilege: Privilege,
+    cgroup: CgroupCaps,
+}
+
+impl RunMode {
+    #[cfg(test)]
+    fn privileged() -> Self {
+        Self {
+            privilege: Privilege::Root,
+            cgroup: CgroupCaps {
+                memory: true,
+                cpu: true,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn rootless(uid: u32, gid: u32) -> Self {
+        Self {
+            privilege: Privilege::Rootless { uid, gid },
+            cgroup: CgroupCaps {
+                memory: false,
+                cpu: false,
+            },
+        }
+    }
+}
+
+const SUDO_ENV: &str = "PISTACK_YOUKI_SUDO";
+const SUDO_BIN_ENV: &str = "PISTACK_YOUKI_SUDO_BIN";
+const NETNS_ENV: &str = "PISTACK_YOUKI_NETNS";
+
+/// Sample sudoers rule. Operators replace the user and the youki path.
+const SUDOERS_SAMPLE: &str = "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki";
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn resolve_run_mode() -> ApiResult<RunMode> {
+    let privilege = resolve_privilege()?;
+    let cgroup = match privilege {
+        Privilege::Rootless { .. } => probe_cgroup_caps(),
+        Privilege::Root | Privilege::Sudo { .. } => CgroupCaps {
+            memory: true,
+            cpu: true,
+        },
+    };
+    Ok(RunMode { privilege, cgroup })
+}
+
+fn resolve_privilege() -> ApiResult<Privilege> {
+    let (uid, gid) = agent_ids();
+    if uid == 0 {
+        return Ok(Privilege::Root);
+    }
+    if env_flag(SUDO_ENV) {
+        return match sudo_bin() {
+            Some(sudo) => Ok(Privilege::Sudo { sudo }),
+            None if unprivileged_userns_available() => Err(ApiError::unavailable(format!(
+                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
+            ))),
+            None => Err(privilege_unavailable()),
+        };
+    }
+    if unprivileged_userns_available() {
+        return Ok(Privilege::Rootless { uid, gid });
+    }
+    Err(privilege_unavailable())
+}
+
+fn privilege_unavailable() -> ApiError {
+    ApiError::unavailable(format!(
+        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
+    ))
+}
+
+fn agent_ids() -> (u32, u32) {
+    #[cfg(test)]
+    if let Some(ids) = test_agent_ids() {
+        return ids;
+    }
+    #[cfg(unix)]
+    {
+        // geteuid and getegid do not fail.
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        (uid, gid)
+    }
+    #[cfg(not(unix))]
+    (0, 0)
+}
+
+#[cfg(test)]
+fn test_agent_ids() -> Option<(u32, u32)> {
+    let uid = std::env::var("PISTACK_YOUKI_TEST_EUID")
+        .ok()
+        .and_then(|v| v.parse().ok())?;
+    let gid = std::env::var("PISTACK_YOUKI_TEST_EGID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(uid);
+    Some((uid, gid))
+}
+
+/// `PISTACK_YOUKI_SUDO_BIN` replaces `sudo` for tests. An empty value is ignored.
+fn sudo_bin() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os(SUDO_BIN_ENV) {
+        if !v.is_empty() {
+            let path = PathBuf::from(v);
+            return is_executable(&path).then_some(path);
+        }
+    }
+    crate::facts::which("sudo")
+}
+
+fn unprivileged_userns_available() -> bool {
+    #[cfg(test)]
+    if let Ok(value) = std::env::var("PISTACK_YOUKI_TEST_USERNS") {
+        return matches!(value.as_str(), "1" | "true" | "yes");
+    }
+    !sysctl_is_zero("/proc/sys/kernel/unprivileged_userns_clone")
+        && !sysctl_is_zero("/proc/sys/user/max_user_namespaces")
+}
+
+fn sysctl_is_zero(path: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| text.trim() == "0")
+        .unwrap_or(false)
+}
+
+fn probe_cgroup_caps() -> CgroupCaps {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(dir) = cgroup_v2_dir() else {
+            return CgroupCaps {
+                memory: false,
+                cpu: false,
+            };
+        };
+        if !dir.is_dir() || !dir_writable(&dir) {
+            return CgroupCaps {
+                memory: false,
+                cpu: false,
+            };
+        }
+        let Ok(text) = std::fs::read_to_string(dir.join("cgroup.controllers")) else {
+            return CgroupCaps {
+                memory: false,
+                cpu: false,
+            };
+        };
+        let has = |name: &str| text.split_whitespace().any(|c| c == name);
+        CgroupCaps {
+            memory: has("memory"),
+            cpu: has("cpu"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        CgroupCaps {
+            memory: false,
+            cpu: false,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_dir() -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        // cgroup v2 is hierarchy 0 with an empty controller field.
+        if hierarchy == "0" && controllers.is_empty() {
+            return Some(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn dir_writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // access follows the caller's credentials. W_OK is the write bit.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+fn file_uid(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).ok().map(|meta| meta.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Absolute `PISTACK_YOUKI_NETNS`, or nothing. Relative paths and `..` are ignored.
+fn requested_host_netns() -> Option<PathBuf> {
+    host_netns_from(std::env::var_os(NETNS_ENV).as_deref())
+}
+
+fn host_netns_from(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let raw = raw?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() || has_parent_dir(&path) {
+        tracing::warn!(
+            path = %path.display(),
+            "youki runtime: ignoring {NETNS_ENV}; it must be an absolute path"
+        );
+        return None;
+    }
+    Some(path)
 }
 
 fn nic_addresses(req: &MachineRequest) -> Vec<String> {
@@ -659,76 +983,147 @@ fn has_parent_dir(path: &Path) -> bool {
         || path.to_string_lossy().split('/').any(|p| p == "..")
 }
 
-fn sandbox_namespaces() -> Vec<serde_json::Value> {
-    ["pid", "network", "ipc", "uts", "mount"]
-        .into_iter()
-        .map(|kind| serde_json::json!({ "type": kind }))
-        .collect()
+fn sandbox_namespaces(mode: &RunMode, host_netns: Option<&Path>) -> Vec<serde_json::Value> {
+    let mut namespaces = Vec::new();
+    if matches!(&mode.privilege, Privilege::Rootless { .. }) {
+        // Created here, not joined. Mappings belong on this spec only.
+        namespaces.push(serde_json::json!({ "type": "user" }));
+    }
+    namespaces.push(serde_json::json!({ "type": "pid" }));
+    namespaces.push(network_namespace(mode, host_netns));
+    for kind in ["ipc", "uts", "mount"] {
+        namespaces.push(serde_json::json!({ "type": kind }));
+    }
+    namespaces
 }
 
-fn container_namespaces(pid: u32) -> Vec<serde_json::Value> {
+fn network_namespace(mode: &RunMode, host_netns: Option<&Path>) -> serde_json::Value {
+    let Some(path) = host_netns else {
+        return serde_json::json!({ "type": "network" });
+    };
+    let path_str = path.to_string_lossy().into_owned();
+    match &mode.privilege {
+        Privilege::Rootless { uid, .. } => match file_uid(path) {
+            Some(owner) if owner == *uid => {
+                serde_json::json!({ "type": "network", "path": path_str })
+            }
+            Some(owner) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    owner,
+                    agent = uid,
+                    "youki runtime: skipping network namespace owned by another uid; using the sandbox network namespace"
+                );
+                serde_json::json!({ "type": "network" })
+            }
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "youki runtime: skipping network namespace that cannot be inspected; using the sandbox network namespace"
+                );
+                serde_json::json!({ "type": "network" })
+            }
+        },
+        Privilege::Root | Privilege::Sudo { .. } => {
+            serde_json::json!({ "type": "network", "path": path_str })
+        }
+    }
+}
+
+fn container_namespaces(pid: u32, rootless: bool) -> Vec<serde_json::Value> {
     let join = |kind: &str, name: &str| {
         serde_json::json!({
             "type": kind,
             "path": format!("/proc/{pid}/ns/{name}"),
         })
     };
-    vec![
-        join("pid", "pid"),
-        join("network", "net"),
-        join("ipc", "ipc"),
-        join("uts", "uts"),
-        serde_json::json!({ "type": "mount" }),
-    ]
+    let mut namespaces = Vec::new();
+    // The user namespace is joined before the other shared namespaces.
+    if rootless {
+        namespaces.push(join("user", "user"));
+    }
+    namespaces.push(join("pid", "pid"));
+    namespaces.push(join("network", "net"));
+    namespaces.push(join("ipc", "ipc"));
+    namespaces.push(join("uts", "uts"));
+    namespaces.push(serde_json::json!({ "type": "mount" }));
+    namespaces
 }
 
-fn oci_config(
-    hostname: Option<&str>,
-    limits: &Limits,
-    args: &[String],
-    env: &[String],
-    cwd: &str,
-    namespaces: &[serde_json::Value],
-    binds: &[OciBind],
-) -> serde_json::Value {
-    let mut linux = serde_json::json!({ "namespaces": namespaces });
-    let mut resources = serde_json::Map::new();
-    if limits.memory_mib > 0 {
-        let bytes = limits.memory_mib.saturating_mul(1024 * 1024);
-        resources.insert("memory".into(), serde_json::json!({ "limit": bytes }));
+impl RunMode {
+    fn oci_config(
+        &self,
+        hostname: Option<&str>,
+        limits: &Limits,
+        process: (&[String], &[String], &str),
+        namespaces: &[serde_json::Value],
+        binds: &[OciBind],
+    ) -> serde_json::Value {
+        let (args, env, cwd) = process;
+        let mut linux = serde_json::json!({ "namespaces": namespaces });
+        if let Privilege::Rootless { uid, gid } = &self.privilege {
+            if creates_user_namespace(namespaces) {
+                linux["uidMappings"] = id_map(*uid);
+                linux["gidMappings"] = id_map(*gid);
+            }
+        }
+        let mut resources = serde_json::Map::new();
+        if self.cgroup.memory && limits.memory_mib > 0 {
+            let bytes = limits.memory_mib.saturating_mul(1024 * 1024);
+            resources.insert("memory".into(), serde_json::json!({ "limit": bytes }));
+        }
+        if self.cgroup.cpu && limits.vcpus > 0 {
+            let period: u64 = 100_000;
+            let quota = period.saturating_mul(u64::from(limits.vcpus));
+            resources.insert(
+                "cpu".into(),
+                serde_json::json!({ "period": period, "quota": quota }),
+            );
+        }
+        if !resources.is_empty() {
+            linux["resources"] = serde_json::Value::Object(resources);
+        }
+        let mut mounts = default_mounts();
+        for bind in binds {
+            mounts.push(bind_mount(bind));
+        }
+        let mut spec = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": {"uid": 0, "gid": 0},
+                "args": args,
+                "env": env,
+                "cwd": cwd
+            },
+            "root": {"path": "rootfs", "readonly": false},
+            "mounts": mounts,
+            "linux": linux
+        });
+        if let Some(host) = hostname {
+            spec["hostname"] = serde_json::Value::String(host.to_owned());
+        }
+        spec
     }
-    if limits.vcpus > 0 {
-        let period: u64 = 100_000;
-        let quota = period.saturating_mul(u64::from(limits.vcpus));
-        resources.insert(
-            "cpu".into(),
-            serde_json::json!({ "period": period, "quota": quota }),
-        );
-    }
-    if !resources.is_empty() {
-        linux["resources"] = serde_json::Value::Object(resources);
-    }
-    let mut mounts = default_mounts();
-    for bind in binds {
-        mounts.push(bind_mount(bind));
-    }
-    let mut spec = serde_json::json!({
-        "ociVersion": "1.0.2",
-        "process": {
-            "terminal": false,
-            "user": {"uid": 0, "gid": 0},
-            "args": args,
-            "env": env,
-            "cwd": cwd
-        },
-        "root": {"path": "rootfs", "readonly": false},
-        "mounts": mounts,
-        "linux": linux
-    });
-    if let Some(host) = hostname {
-        spec["hostname"] = serde_json::Value::String(host.to_owned());
-    }
-    spec
+}
+
+fn creates_user_namespace(namespaces: &[serde_json::Value]) -> bool {
+    namespaces.iter().any(|ns| {
+        ns.get("type").and_then(|kind| kind.as_str()) == Some("user")
+            && namespace_path(ns).is_none()
+    })
+}
+
+fn namespace_path(ns: &serde_json::Value) -> Option<&str> {
+    ns.get("path")
+        .and_then(|path| path.as_str())
+        .filter(|path| !path.is_empty())
+}
+
+/// One map entry: container id 0 is the agent's id, size 1. youki writes that
+/// directly and does not look up `newuidmap`.
+fn id_map(host_id: u32) -> serde_json::Value {
+    serde_json::json!([{ "containerID": 0, "hostID": host_id, "size": 1 }])
 }
 
 fn default_mounts() -> Vec<serde_json::Value> {
@@ -806,7 +1201,7 @@ fn process_spec(launch: Option<&Launch>, cfg: &ImageConfig) -> (Vec<String>, Vec
     (proc, env, cwd)
 }
 
-async fn write_bundle(bundle: &Path, req: &MachineRequest) -> ApiResult<()> {
+async fn write_bundle(bundle: &Path, req: &MachineRequest, mode: &RunMode) -> ApiResult<()> {
     let launch = launch_from(req);
     let image = choose_image(req, launch.as_ref())?;
     let limits = Limits {
@@ -819,8 +1214,9 @@ async fn write_bundle(bundle: &Path, req: &MachineRequest) -> ApiResult<()> {
         req.name.clone()
     };
     let bundle = bundle.to_path_buf();
+    let mode = mode.clone();
     tokio::task::spawn_blocking(move || {
-        install_bundle(&bundle, &image, &hostname, &limits, launch.as_ref())
+        install_bundle(&bundle, &image, &hostname, &limits, launch.as_ref(), &mode)
     })
     .await
     .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
@@ -832,6 +1228,7 @@ fn install_bundle(
     hostname: &str,
     limits: &Limits,
     launch: Option<&Launch>,
+    mode: &RunMode,
 ) -> ApiResult<()> {
     std::fs::create_dir_all(bundle).map_err(|e| {
         ApiError::unavailable(format!("youki runtime: creating {}: {e}", bundle.display()))
@@ -849,13 +1246,12 @@ fn install_bundle(
         let _ = std::fs::remove_file(&image_note);
     }
     let (args, env, cwd) = process_spec(launch, &cfg);
-    let text = serde_json::to_vec_pretty(&oci_config(
+    let netns = requested_host_netns();
+    let text = serde_json::to_vec_pretty(&mode.oci_config(
         Some(hostname),
         limits,
-        &args,
-        &env,
-        &cwd,
-        &sandbox_namespaces(),
+        (&args, &env, &cwd),
+        &sandbox_namespaces(mode, netns.as_deref()),
         &[],
     ))
     .map_err(|e| ApiError::internal(format!("youki runtime: encoding config: {e}")))?;
@@ -1830,17 +2226,19 @@ fn cannot_unpack_container(container: &SandboxContainer, index: usize) -> ApiErr
 /// Sandbox bundle plus one bundle per container. Does not call youki.
 /// Container configs join `pid`'s namespaces; the sandbox config does not.
 #[cfg(test)]
-fn stage_pod_bundles(
-    bundle: &Path,
-    hostname: &str,
-    limits: &Limits,
-    plan: &PodPlan,
-    disks: &[AttachedDisk],
-    fallback_image: &str,
-    pid: u32,
-) -> ApiResult<()> {
-    let processes = prepare_pod(bundle, hostname, limits, plan, fallback_image)?;
-    write_container_configs(bundle, plan, &processes, disks, limits, pid)
+impl RunMode {
+    fn stage_pod_bundles(
+        &self,
+        bundle: &Path,
+        hostname: &str,
+        limits: &Limits,
+        plan: &PodPlan,
+        fallback_image: &str,
+        pid: u32,
+    ) -> ApiResult<()> {
+        let processes = prepare_pod(bundle, hostname, limits, plan, fallback_image, self)?;
+        write_container_configs(bundle, plan, &processes, &[], limits, pid, self)
+    }
 }
 
 fn prepare_pod(
@@ -1849,11 +2247,12 @@ fn prepare_pod(
     limits: &Limits,
     plan: &PodPlan,
     fallback_image: &str,
+    mode: &RunMode,
 ) -> ApiResult<Vec<PreparedProcess>> {
     std::fs::create_dir_all(bundle).map_err(|e| volume_io(bundle, e))?;
     materialize_volumes(bundle, plan)?;
     write_mount_plan(bundle, plan)?;
-    write_pause_rootfs(bundle, hostname, limits)?;
+    write_pause_rootfs(bundle, hostname, limits, mode)?;
     let mut processes = Vec::new();
     for (index, container) in plan.containers.iter().enumerate() {
         let image = choose_container_image(index, &container.image, fallback_image)
@@ -1881,19 +2280,23 @@ fn prepare_pod(
     Ok(processes)
 }
 
-fn write_pause_rootfs(bundle: &Path, hostname: &str, limits: &Limits) -> ApiResult<()> {
+fn write_pause_rootfs(
+    bundle: &Path,
+    hostname: &str,
+    limits: &Limits,
+    mode: &RunMode,
+) -> ApiResult<()> {
     let rootfs = bundle.join("rootfs");
     reset_dir(&rootfs)?;
     write_mode(&rootfs.join("pause"), PAUSE_ELF, 0o755)?;
     let args = vec!["/pause".to_string()];
     let env = vec![format!("PATH={DEFAULT_PATH}")];
-    let spec = oci_config(
+    let netns = requested_host_netns();
+    let spec = mode.oci_config(
         Some(hostname),
         limits,
-        &args,
-        &env,
-        "/",
-        &sandbox_namespaces(),
+        (&args, &env, "/"),
+        &sandbox_namespaces(mode, netns.as_deref()),
         &[],
     );
     write_json(&bundle.join("config.json"), &spec, 0o644)
@@ -1906,10 +2309,12 @@ fn write_container_configs(
     disks: &[AttachedDisk],
     limits: &Limits,
     pid: u32,
+    mode: &RunMode,
 ) -> ApiResult<()> {
     // Projected dirs are rewritten; EmptyDir and container rootfs are not.
     materialize_volumes(bundle, plan)?;
-    let namespaces = container_namespaces(pid);
+    let rootless = matches!(&mode.privilege, Privilege::Rootless { .. });
+    let namespaces = container_namespaces(pid, rootless);
     for (index, process) in processes.iter().enumerate() {
         let mounts = plan
             .containers
@@ -1917,12 +2322,10 @@ fn write_container_configs(
             .map(|container| container.volume_mounts.as_slice())
             .unwrap_or(&[]);
         let binds = oci_binds(bundle, &plan.volumes, mounts, disks);
-        let spec = oci_config(
+        let spec = mode.oci_config(
             None,
             limits,
-            &process.args,
-            &process.env,
-            &process.cwd,
+            (&process.args, &process.env, &process.cwd),
             &namespaces,
             &binds,
         );
@@ -2248,6 +2651,7 @@ fn parse_state_pid(stdout: &[u8]) -> Option<u32> {
 /// ipc and uts namespaces. `state.json` is written only after they are running.
 async fn start_pod(
     bin: &Path,
+    mode: &RunMode,
     bundle: &Path,
     req: &MachineRequest,
     plan: &PodPlan,
@@ -2256,7 +2660,7 @@ async fn start_pod(
     if prior {
         if let Some(saved) = read_state(bundle).await? {
             for cid in saved.containers.iter().rev() {
-                if let Err(e) = exec_youki(bin, &["delete", cid]).await {
+                if let Err(e) = exec_youki(bin, mode, &["delete", cid], None).await {
                     if !container_missing(&e) {
                         return Err(e);
                     }
@@ -2279,8 +2683,16 @@ async fn start_pod(
     let plan_prep = plan.clone();
     let host_prep = hostname;
     let image = req.image.clone();
+    let mode_prep = mode.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare_pod(&bundle_prep, &host_prep, &limits, &plan_prep, &image)
+        prepare_pod(
+            &bundle_prep,
+            &host_prep,
+            &limits,
+            &plan_prep,
+            &image,
+            &mode_prep,
+        )
     })
     .await
     .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?;
@@ -2296,30 +2708,37 @@ async fn start_pod(
     let id_str = id.to_string();
     let bundle_str = path_arg(bundle);
     if !prior {
-        if let Err(e) = exec_youki(bin, &["create", "--bundle", &bundle_str, &id_str]).await {
+        if let Err(e) = exec_youki(
+            bin,
+            mode,
+            &["create", "--bundle", &bundle_str, &id_str],
+            None,
+        )
+        .await
+        {
             let _ = remove_bundle(bundle).await;
             return Err(e);
         }
-        if let Err(e) = exec_youki(bin, &["start", &id_str]).await {
-            let _ = exec_youki(bin, &["delete", &id_str]).await;
+        if let Err(e) = exec_youki(bin, mode, &["start", &id_str], None).await {
+            let _ = exec_youki(bin, mode, &["delete", &id_str], None).await;
             let _ = remove_bundle(bundle).await;
             return Err(e);
         }
     } else {
-        exec_youki(bin, &["start", &id_str]).await?;
+        exec_youki(bin, mode, &["start", &id_str], None).await?;
     }
-    let state = match run_youki(bin, &["state", &id_str]).await {
+    let state = match run_youki(bin, mode, &["state", &id_str], None).await {
         Ok(output) => output,
         Err(e) => {
             if !prior {
-                abort_new_pod(bin, bundle, &id_str, &[]).await;
+                abort_new_pod(bin, mode, bundle, &id_str, &[]).await;
             }
             return Err(e);
         }
     };
     let Some(pid) = parse_state_pid(&state.stdout) else {
         if !prior {
-            abort_new_pod(bin, bundle, &id_str, &[]).await;
+            abort_new_pod(bin, mode, bundle, &id_str, &[]).await;
         }
         return Err(ApiError::unavailable(
             "youki runtime: sandbox state has no pid",
@@ -2328,32 +2747,49 @@ async fn start_pod(
     let bundle_cfg = bundle.to_path_buf();
     let plan_cfg = plan.clone();
     let limits_cfg = limits;
+    let mode_cfg = mode.clone();
     if let Err(e) = tokio::task::spawn_blocking(move || {
         let disks = read_disks(&bundle_cfg)?;
-        write_container_configs(&bundle_cfg, &plan_cfg, &processes, &disks, &limits_cfg, pid)
+        write_container_configs(
+            &bundle_cfg,
+            &plan_cfg,
+            &processes,
+            &disks,
+            &limits_cfg,
+            pid,
+            &mode_cfg,
+        )
     })
     .await
     .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
     {
         if !prior {
-            abort_new_pod(bin, bundle, &id_str, &[]).await;
+            abort_new_pod(bin, mode, bundle, &id_str, &[]).await;
         }
         return Err(e);
     }
+    let user_ns = user_ns_join(mode, pid);
     let mut started = Vec::new();
     for index in 0..plan.containers.len() {
         let cid = container_youki_id(&id, index);
         let cdir = path_arg(&container_dir(bundle, index));
-        if let Err(e) = exec_youki(bin, &["create", "--bundle", &cdir, &cid]).await {
+        if let Err(e) = exec_youki(
+            bin,
+            mode,
+            &["create", "--bundle", &cdir, &cid],
+            user_ns.as_deref(),
+        )
+        .await
+        {
             if !prior {
-                abort_new_pod(bin, bundle, &id_str, &started).await;
+                abort_new_pod(bin, mode, bundle, &id_str, &started).await;
             }
             return Err(e);
         }
-        if let Err(e) = exec_youki(bin, &["start", &cid]).await {
+        if let Err(e) = exec_youki(bin, mode, &["start", &cid], user_ns.as_deref()).await {
             if !prior {
-                let _ = exec_youki(bin, &["delete", &cid]).await;
-                abort_new_pod(bin, bundle, &id_str, &started).await;
+                let _ = exec_youki(bin, mode, &["delete", &cid], None).await;
+                abort_new_pod(bin, mode, bundle, &id_str, &started).await;
             }
             return Err(e);
         }
@@ -2367,6 +2803,7 @@ async fn start_pod(
             power: PowerState::On,
             containers: started,
             container_names: plan.containers.iter().map(|c| c.name.clone()).collect(),
+            probes: crate::probe::probes_in_user_data(req.user_data.as_deref()),
         },
     )
     .await?;
@@ -2377,11 +2814,17 @@ async fn start_pod(
     })
 }
 
-async fn abort_new_pod(bin: &Path, bundle: &Path, sandbox_id: &str, created: &[String]) {
+async fn abort_new_pod(
+    bin: &Path,
+    mode: &RunMode,
+    bundle: &Path,
+    sandbox_id: &str,
+    created: &[String],
+) {
     for cid in created.iter().rev() {
-        let _ = exec_youki(bin, &["delete", cid]).await;
+        let _ = exec_youki(bin, mode, &["delete", cid], None).await;
     }
-    let _ = exec_youki(bin, &["delete", sandbox_id]).await;
+    let _ = exec_youki(bin, mode, &["delete", sandbox_id], None).await;
     let _ = remove_bundle(bundle).await;
 }
 
@@ -2521,8 +2964,10 @@ fn timeout_label(timeout: Duration) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exec(
     bin: &Path,
+    privilege: &Privilege,
     container_id: &str,
     argv: &[String],
     env: &[(String, String)],
@@ -2531,7 +2976,7 @@ async fn run_exec(
     output_cap: usize,
 ) -> ApiResult<ExecOutput> {
     let args = exec_argv(container_id, argv, env, cwd);
-    let mut cmd = Command::new(bin);
+    let mut cmd = youki_command(bin, privilege);
     cmd.args(&args)
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -2539,9 +2984,13 @@ async fn run_exec(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(|e| {
-        ApiError::unavailable(format!("youki runtime: cannot run {}: {e}", bin.display()))
-    })?;
+    let program = match privilege {
+        Privilege::Sudo { sudo } => sudo.display().to_string(),
+        Privilege::Root | Privilege::Rootless { .. } => bin.display().to_string(),
+    };
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
     let mut group = GroupKill::arm(child.id());
     let stdout = spawn_reader(child.stdout.take(), output_cap);
     let stderr = spawn_reader(child.stderr.take(), output_cap);
@@ -2654,20 +3103,45 @@ fn utf8_prefix_end(buf: &[u8]) -> usize {
     end
 }
 
-async fn exec_youki(bin: &Path, args: &[&str]) -> ApiResult<()> {
-    run_youki(bin, args).await.map(|_| ())
+/// Rootless container create/start must already be inside the sandbox user
+/// namespace. youki 0.7 treats a joined user namespace (a path, no new map)
+/// as "no user namespace" when the calling process is outside one.
+fn user_ns_join(mode: &RunMode, pid: u32) -> Option<PathBuf> {
+    match &mode.privilege {
+        Privilege::Rootless { .. } => Some(PathBuf::from(format!("/proc/{pid}/ns/user"))),
+        Privilege::Root | Privilege::Sudo { .. } => None,
+    }
 }
 
-async fn run_youki(bin: &Path, args: &[&str]) -> ApiResult<std::process::Output> {
-    let mut cmd = Command::new(bin);
+async fn exec_youki(
+    bin: &Path,
+    mode: &RunMode,
+    args: &[&str],
+    join_user_ns: Option<&Path>,
+) -> ApiResult<()> {
+    run_youki(bin, mode, args, join_user_ns).await.map(|_| ())
+}
+
+async fn run_youki(
+    bin: &Path,
+    mode: &RunMode,
+    args: &[&str],
+    join_user_ns: Option<&Path>,
+) -> ApiResult<std::process::Output> {
+    let mut cmd = youki_command(bin, &mode.privilege);
     cmd.args(args)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = cmd.spawn().map_err(|e| {
-        ApiError::unavailable(format!("youki runtime: cannot run {}: {e}", bin.display()))
-    })?;
+    arm_user_ns_join(&mut cmd, join_user_ns);
+    let program = match &mode.privilege {
+        Privilege::Sudo { sudo } => sudo.display().to_string(),
+        Privilege::Root | Privilege::Rootless { .. } => bin.display().to_string(),
+    };
+    let child = cmd
+        .spawn()
+        .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
     let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
@@ -2691,6 +3165,66 @@ async fn run_youki(bin: &Path, args: &[&str]) -> ApiResult<std::process::Output>
         "youki runtime: {op} failed: {}",
         stderr_tail(&output.stderr, output.status)
     )))
+}
+
+fn youki_command(bin: &Path, privilege: &Privilege) -> Command {
+    match privilege {
+        Privilege::Sudo { sudo } => {
+            let mut cmd = Command::new(sudo);
+            cmd.arg("-n").arg(bin);
+            cmd
+        }
+        Privilege::Root | Privilege::Rootless { .. } => Command::new(bin),
+    }
+}
+
+fn arm_user_ns_join(cmd: &mut Command, path: Option<&Path>) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(path) = path else {
+            return;
+        };
+        // A missing path is the test double (the sandbox pid is not real).
+        // A path that exists and cannot be joined fails the command.
+        if !path.exists() {
+            return;
+        }
+        let path = path.to_path_buf();
+        // SAFETY: the closure runs in the forked child before exec. That child
+        // is single-threaded, so setns(CLONE_NEWUSER) is valid there.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(cmd.as_std_mut(), move || {
+                enter_user_ns(&path)
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cmd, path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enter_user_ns(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "youki runtime: user namespace path",
+        )
+    })?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::setns(fd, libc::CLONE_NEWUSER) };
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 fn stderr_tail(stderr: &[u8], status: std::process::ExitStatus) -> String {
@@ -2731,26 +3265,49 @@ mod tests {
     }
 
     struct EnvGuard {
-        bin: Option<std::ffi::OsString>,
-        state: Option<std::ffi::OsString>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
     impl EnvGuard {
+        /// Points youki at the test binary and forces the root OCI config.
+        /// Sudo, netns, and user-namespace overrides from the developer
+        /// environment are cleared for the duration of the test.
         fn set(bin: &Path, state: &Path) -> Self {
-            let prev = Self {
-                bin: std::env::var_os("PISTACK_YOUKI_BIN"),
-                state: std::env::var_os("PISTACK_YOUKI_STATE"),
-            };
+            let keys = [
+                "PISTACK_YOUKI_BIN",
+                "PISTACK_YOUKI_STATE",
+                SUDO_ENV,
+                SUDO_BIN_ENV,
+                NETNS_ENV,
+                "PISTACK_YOUKI_TEST_EUID",
+                "PISTACK_YOUKI_TEST_EGID",
+                "PISTACK_YOUKI_TEST_USERNS",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
             std::env::set_var("PISTACK_YOUKI_BIN", bin);
             std::env::set_var("PISTACK_YOUKI_STATE", state);
-            prev
+            std::env::set_var("PISTACK_YOUKI_TEST_EUID", "0");
+            for key in [
+                SUDO_ENV,
+                SUDO_BIN_ENV,
+                NETNS_ENV,
+                "PISTACK_YOUKI_TEST_EGID",
+                "PISTACK_YOUKI_TEST_USERNS",
+            ] {
+                std::env::remove_var(key);
+            }
+            Self { saved }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            restore("PISTACK_YOUKI_BIN", self.bin.take());
-            restore("PISTACK_YOUKI_STATE", self.state.take());
+            for (key, prev) in self.saved.drain(..) {
+                restore(key, prev);
+            }
         }
     }
 
@@ -2758,6 +3315,25 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
+        }
+    }
+
+    struct EnvSlot {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvSlot {
+        fn clear(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvSlot {
+        fn drop(&mut self) {
+            restore(self.key, self.prev.take());
         }
     }
 
@@ -3454,6 +4030,7 @@ mod tests {
                 memory_mib: 1,
             },
             None,
+            &RunMode::privileged(),
         )
         .unwrap_err();
         assert!(err.message.contains("image rootfs is empty"), "{err}");
@@ -3546,8 +4123,10 @@ mod tests {
         assert_eq!(&PAUSE_ELF[24..32], &0x400078u64.to_le_bytes());
     }
 
-    #[test]
-    fn pod_bundles_mount_every_container() {
+    #[tokio::test]
+    async fn pod_bundles_mount_every_container() {
+        let _guard = env_lock().lock().await;
+        let _netns = EnvSlot::clear(NETNS_ENV);
         let tmp = std::env::temp_dir().join(format!(
             "pistack-youki-pod-{}-{}",
             std::process::id(),
@@ -3624,10 +4203,15 @@ mod tests {
             vcpus: 1,
             memory_mib: 64,
         };
-        stage_pod_bundles(&bundle, "web", &limits, &plan, &[], "not-a-path", 4242).unwrap();
+        let privileged = RunMode::privileged();
+        privileged
+            .stage_pod_bundles(&bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
         let scratch = bundle.join("volumes").join("0-scratch");
         std::fs::write(scratch.join("keep-me"), "yes").unwrap();
-        stage_pod_bundles(&bundle, "web", &limits, &plan, &[], "not-a-path", 4242).unwrap();
+        privileged
+            .stage_pod_bundles(&bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(scratch.join("keep-me")).unwrap(),
             "yes"
@@ -3655,7 +4239,9 @@ mod tests {
         assert_eq!(mode_of(&sec_dir.join("password")), 0o400);
         assert_eq!(mode_of(&sec_dir), 0o700);
         std::fs::write(cfg_dir.join("extra"), "gone").unwrap();
-        stage_pod_bundles(&bundle, "web", &limits, &plan, &[], "not-a-path", 4242).unwrap();
+        privileged
+            .stage_pod_bundles(&bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
         assert!(!cfg_dir.join("extra").exists());
         assert_eq!(
             std::fs::read_to_string(scratch.join("keep-me")).unwrap(),
@@ -4159,6 +4745,402 @@ mod tests {
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.contains("do-not-log-user-data"), "{logged}");
         assert!(!logged.contains("do-not-log-ssh-key"), "{logged}");
+    }
+
+    fn ns_kinds(cfg: &serde_json::Value) -> Vec<&str> {
+        cfg["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ns| ns["type"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn root_and_sudo_configs_stay_privileged() {
+        let limits = Limits {
+            vcpus: 2,
+            memory_mib: 64,
+        };
+        let args = vec!["/bin/app".to_string()];
+        let env = vec!["PATH=/bin".to_string()];
+        for mode in [
+            RunMode::privileged(),
+            RunMode {
+                privilege: Privilege::Sudo {
+                    sudo: PathBuf::from("/bin/sudo"),
+                },
+                cgroup: CgroupCaps {
+                    memory: true,
+                    cpu: true,
+                },
+            },
+        ] {
+            let spec = mode.oci_config(
+                Some("host"),
+                &limits,
+                (&args, &env, "/"),
+                &sandbox_namespaces(&mode, None),
+                &[],
+            );
+            assert_eq!(spec["process"]["user"]["uid"], 0);
+            assert_eq!(spec["process"]["user"]["gid"], 0);
+            assert!(spec["linux"].get("uidMappings").is_none());
+            assert!(spec["linux"].get("gidMappings").is_none());
+            assert_eq!(
+                ns_kinds(&spec),
+                vec!["pid", "network", "ipc", "uts", "mount"]
+            );
+            assert!(spec["linux"]["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|ns| ns.get("path").is_none()));
+            assert_eq!(
+                spec["linux"]["resources"]["memory"]["limit"],
+                64 * 1024 * 1024
+            );
+            assert_eq!(spec["linux"]["resources"]["cpu"]["period"], 100_000);
+            assert_eq!(spec["linux"]["resources"]["cpu"]["quota"], 200_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn rootless_pod_maps_one_id_and_joins_the_sandbox_user_namespace() {
+        let _guard = env_lock().lock().await;
+        let _netns = EnvSlot::clear(NETNS_ENV);
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-rootless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let image = tmp.join("image");
+        std::fs::create_dir_all(image.join("bin")).unwrap();
+        std::fs::write(image.join("marker"), "a").unwrap();
+        let mut request = req("web", "not-a-path", "10.9.0.2");
+        request.user_data = Some(sandbox_doc(image.to_str().unwrap()));
+        let plan = sandbox_plan(&request).unwrap().unwrap();
+        let bundle = tmp.join("pod");
+        let limits = Limits {
+            vcpus: 2,
+            memory_mib: 64,
+        };
+        let mode = RunMode::rootless(1000, 1000);
+        mode.stage_pod_bundles(&bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
+
+        let sandbox: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            ns_kinds(&sandbox),
+            vec!["user", "pid", "network", "ipc", "uts", "mount"]
+        );
+        assert!(sandbox["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|ns| ns.get("path").is_none()));
+        assert_eq!(
+            sandbox["linux"]["uidMappings"],
+            serde_json::json!([{ "containerID": 0, "hostID": 1000, "size": 1 }])
+        );
+        assert_eq!(
+            sandbox["linux"]["gidMappings"],
+            serde_json::json!([{ "containerID": 0, "hostID": 1000, "size": 1 }])
+        );
+        assert_eq!(sandbox["process"]["user"]["uid"], 0);
+        assert_eq!(sandbox["process"]["user"]["gid"], 0);
+        assert!(sandbox["linux"].get("resources").is_none());
+
+        for index in ["0", "1"] {
+            let cfg: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(bundle.join("containers").join(index).join("config.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                ns_kinds(&cfg),
+                vec!["user", "pid", "network", "ipc", "uts", "mount"]
+            );
+            assert_eq!(ns_path(&cfg, "user").as_deref(), Some("/proc/4242/ns/user"));
+            assert_eq!(ns_path(&cfg, "pid").as_deref(), Some("/proc/4242/ns/pid"));
+            assert_eq!(
+                ns_path(&cfg, "network").as_deref(),
+                Some("/proc/4242/ns/net")
+            );
+            assert_eq!(ns_path(&cfg, "ipc").as_deref(), Some("/proc/4242/ns/ipc"));
+            assert_eq!(ns_path(&cfg, "uts").as_deref(), Some("/proc/4242/ns/uts"));
+            assert_eq!(ns_path(&cfg, "mount"), None);
+            assert!(cfg["linux"].get("uidMappings").is_none());
+            assert!(cfg["linux"].get("gidMappings").is_none());
+            assert_eq!(cfg["process"]["user"]["uid"], 0);
+            assert!(cfg["linux"].get("resources").is_none());
+        }
+
+        let mut delegated = mode.clone();
+        delegated.cgroup = CgroupCaps {
+            memory: true,
+            cpu: false,
+        };
+        delegated
+            .stage_pod_bundles(&bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
+        let sandbox: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            sandbox["linux"]["resources"]["memory"]["limit"],
+            64 * 1024 * 1024
+        );
+        assert!(sandbox["linux"]["resources"].get("cpu").is_none());
+
+        let netns = tmp.join("netns");
+        std::fs::write(&netns, b"ns").unwrap();
+        let owner = file_uid(&netns).unwrap();
+        let owned = RunMode::rootless(owner, owner);
+        let joined = sandbox_namespaces(&owned, Some(&netns));
+        assert_eq!(
+            joined
+                .iter()
+                .find(|ns| ns["type"] == "network")
+                .and_then(|ns| ns["path"].as_str()),
+            Some(netns.to_str().unwrap())
+        );
+        let foreign = RunMode::rootless(owner.wrapping_add(1), owner);
+        let skipped = sandbox_namespaces(&foreign, Some(&netns));
+        assert!(skipped
+            .iter()
+            .find(|ns| ns["type"] == "network")
+            .unwrap()
+            .get("path")
+            .is_none());
+        assert_eq!(
+            skipped.first().and_then(|ns| ns["type"].as_str()),
+            Some("user")
+        );
+        let root = sandbox_namespaces(&RunMode::privileged(), Some(&netns));
+        assert_eq!(
+            root.iter()
+                .find(|ns| ns["type"] == "network")
+                .and_then(|ns| ns["path"].as_str()),
+            Some(netns.to_str().unwrap())
+        );
+        assert!(root.iter().all(|ns| ns["type"] != "user"));
+        assert!(host_netns_from(Some(std::ffi::OsStr::new("rel/ns"))).is_none());
+        assert!(host_netns_from(Some(std::ffi::OsStr::new("/tmp/../etc"))).is_none());
+        assert_eq!(
+            host_netns_from(Some(std::ffi::OsStr::new("/var/run/netns/pod"))),
+            Some(PathBuf::from("/var/run/netns/pod"))
+        );
+    }
+
+    fn write_sudo(path: &Path, log: &Path) {
+        let quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {quoted}\nprintf '\\n' >> {quoted}\nif [ \"$1\" = -n ]; then shift; fi\nexec \"$@\"\n"
+        );
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn assert_sudo_op(lines: &[String], youki: &str, op: &str) {
+        assert!(
+            lines
+                .windows(3)
+                .any(|w| w[0] == "-n" && w[1] == youki && w[2] == op),
+            "missing sudo {op}: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_wraps_every_youki_command_and_root_ignores_it() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-sudo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let youki_log = tmp.join("youki.log");
+        let sudo_log = tmp.join("sudo.log");
+        let youki = tmp.join("youki");
+        let sudo = tmp.join("sudo");
+        write_script(&youki, &youki_log, 0);
+        write_sudo(&sudo, &sudo_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "1000");
+        std::env::set_var("PISTACK_YOUKI_TEST_EGID", "1000");
+        std::env::set_var(SUDO_ENV, "1");
+        std::env::set_var(SUDO_BIN_ENV, &sudo);
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+
+        let image = tmp.join("image");
+        std::fs::create_dir_all(image.join("bin")).unwrap();
+        std::fs::write(image.join("marker"), "keep").unwrap();
+        let mut request = req("web", "not-a-path", "10.8.0.1");
+        request.user_data = Some(sandbox_doc(image.to_str().unwrap()));
+        let rt = YoukiRuntime;
+        rt.start(&request).await.unwrap();
+        let bundle = state.join(request.id.to_string());
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap()).unwrap();
+        assert!(cfg["linux"].get("uidMappings").is_none());
+        assert_eq!(
+            ns_kinds(&cfg),
+            vec!["pid", "network", "ipc", "uts", "mount"]
+        );
+        assert_eq!(cfg["process"]["user"]["uid"], 0);
+        assert!(cfg["linux"]["resources"].get("memory").is_some());
+
+        let youki_arg = youki.to_string_lossy().into_owned();
+        let exec_out = rt
+            .exec(
+                &request.id,
+                "web",
+                &["/bin/echo".into(), "hello".into()],
+                &[("MODE".into(), "prod".into())],
+                Some("/work"),
+                Duration::from_secs(5),
+                EXEC_OUTPUT_CAP,
+            )
+            .await
+            .unwrap();
+        assert_eq!(exec_out.exit_code, 0);
+        let sudo_lines = arg_lines(&std::fs::read_to_string(&sudo_log).unwrap());
+        for op in ["create", "start", "state", "exec"] {
+            assert_sudo_op(&sudo_lines, &youki_arg, op);
+        }
+        let youki_lines = arg_lines(&std::fs::read_to_string(&youki_log).unwrap());
+        let web_id = format!("{}-0", request.id);
+        assert!(
+            has_seq(
+                &youki_lines,
+                &[
+                    "exec".into(),
+                    "--cwd".into(),
+                    "/work".into(),
+                    "--env".into(),
+                    "MODE=prod".into(),
+                    web_id,
+                    "--".into(),
+                    "/bin/echo".into(),
+                    "hello".into(),
+                ],
+            ),
+            "{youki_lines:?}"
+        );
+
+        // Rootless fallback runs youki directly, the same way as create and start.
+        std::env::remove_var(SUDO_ENV);
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "1");
+        let sudo_before = std::fs::read_to_string(&sudo_log).unwrap();
+        let youki_before = std::fs::read_to_string(&youki_log).unwrap().len();
+        let rootless = rt
+            .exec(
+                &request.id,
+                "side",
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(5),
+                64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rootless.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), sudo_before);
+        let youki_now = std::fs::read_to_string(&youki_log).unwrap();
+        let added = arg_lines(&youki_now[youki_before..]);
+        let side_id = format!("{}-1", request.id);
+        assert!(
+            has_seq(
+                &added,
+                &["exec".into(), side_id, "--".into(), "/bin/true".into(),],
+            ),
+            "{added:?}"
+        );
+        assert!(added.iter().all(|line| line != "-n"));
+        std::env::set_var(SUDO_ENV, "1");
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+        let youki_text = std::fs::read_to_string(&youki_log).unwrap();
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+        assert!(!youki_text.contains("do-not-log-user-data"));
+        assert!(!youki_text.contains("do-not-log-ssh-key"));
+        assert!(!sudo_text.contains("do-not-log-user-data"));
+        assert!(!sudo_text.contains("do-not-log-ssh-key"));
+        assert!(!youki_text.contains("-n"));
+
+        rt.stop(&request.id).await.unwrap();
+        rt.delete(&request.id).await.unwrap();
+        let after = arg_lines(&std::fs::read_to_string(&sudo_log).unwrap());
+        assert_sudo_op(&after, &youki_arg, "kill");
+        assert_sudo_op(&after, &youki_arg, "delete");
+
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "0");
+        let _ = std::fs::write(&sudo_log, b"");
+        let _ = std::fs::write(&youki_log, b"");
+        let plain = req("plain", image.to_str().unwrap(), "10.8.0.2");
+        rt.start(&plain).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+        let direct = arg_lines(&std::fs::read_to_string(&youki_log).unwrap());
+        assert!(direct.iter().any(|line| line == "create"));
+        assert!(direct.iter().all(|line| line != "-n"));
+        rt.delete(&plain.id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn privilege_errors_name_sudo_and_the_user_namespace() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-priv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        write_script(&youki, &tmp.join("youki.log"), 0);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "1000");
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+        let rt = YoukiRuntime;
+        let request = req("web", "not-a-path", "10.8.0.3");
+        let err = rt.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains(SUDO_ENV), "{err}");
+        assert!(err.message.contains("NOPASSWD"), "{err}");
+        assert!(err.message.contains("newuidmap"), "{err}");
+        assert!(!state.join(request.id.to_string()).exists());
+
+        std::env::set_var(SUDO_ENV, "yes");
+        std::env::set_var(SUDO_BIN_ENV, tmp.join("missing-sudo"));
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "1");
+        let err = rt.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("sudo is not available"), "{err}");
+        assert!(err.message.contains(&format!("unset {SUDO_ENV}")), "{err}");
+        assert!(!state.join(request.id.to_string()).exists());
+
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+        let err = rt.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("NOPASSWD"), "{err}");
+        assert!(!err.message.contains("unset"), "{err}");
     }
 
     struct DirGuard(PathBuf);

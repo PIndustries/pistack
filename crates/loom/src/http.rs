@@ -111,6 +111,12 @@ fn validate_pod_spec(spec: &PodSpec) -> ApiResult<()> {
                 c.name
             )));
         }
+        if let Some(probe) = &c.liveness_probe {
+            validate_probe(&c.name, "liveness_probe", probe)?;
+        }
+        if let Some(probe) = &c.readiness_probe {
+            validate_probe(&c.name, "readiness_probe", probe)?;
+        }
         for vm in &c.volume_mounts {
             if !spec.volumes.iter().any(|v| v.name == vm.name) {
                 return Err(ApiError::bad_request(format!(
@@ -126,6 +132,56 @@ fn validate_pod_spec(spec: &PodSpec) -> ApiResult<()> {
             return Err(ApiError::bad_request(format!(
                 "volume name '{}' is used twice",
                 v.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_probe(container: &str, which: &str, probe: &Probe) -> ApiResult<()> {
+    let handlers = [
+        probe.http_get.is_some(),
+        probe.tcp_socket.is_some(),
+        probe.exec.is_some(),
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if handlers == 0 {
+        return Err(ApiError::bad_request(format!(
+            "container '{container}' {which} needs http_get, tcp_socket, or exec"
+        )));
+    }
+    if handlers > 1 {
+        return Err(ApiError::bad_request(format!(
+            "container '{container}' {which} has more than one handler"
+        )));
+    }
+    if let Some(http) = &probe.http_get {
+        if http.port == 0 {
+            return Err(ApiError::bad_request(format!(
+                "container '{container}' {which} http_get port must be set"
+            )));
+        }
+        if let Some(host) = &http.host {
+            if host.trim().is_empty() || host.contains([' ', '/']) {
+                return Err(ApiError::bad_request(format!(
+                    "container '{container}' {which} http_get host is invalid"
+                )));
+            }
+        }
+    }
+    if let Some(tcp) = &probe.tcp_socket {
+        if tcp.port == 0 {
+            return Err(ApiError::bad_request(format!(
+                "container '{container}' {which} tcp_socket port must be set"
+            )));
+        }
+    }
+    if let Some(exec) = &probe.exec {
+        if exec.command.is_empty() || exec.command.iter().any(|c| c.is_empty()) {
+            return Err(ApiError::bad_request(format!(
+                "container '{container}' {which} exec command is empty"
             )));
         }
     }
@@ -1083,6 +1139,72 @@ mod tests {
         spec.volumes.push(PodVolume {
             name: "data".into(),
             source: VolumeSource::EmptyDir,
+        });
+        assert!(validate_pod_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn probe_validation_rejects_a_bad_handler() {
+        let mut spec = PodSpec {
+            containers: vec![Container {
+                name: "web".into(),
+                image: "nginx".into(),
+                liveness_probe: Some(Probe {
+                    http_get: Some(HttpGetProbe {
+                        path: "/".into(),
+                        port: 0,
+                        host: None,
+                        scheme: None,
+                    }),
+                    ..Probe::default()
+                }),
+                ..Container::default()
+            }],
+            ..PodSpec::default()
+        };
+        assert!(validate_pod_spec(&spec).is_err());
+
+        spec.containers[0].liveness_probe = Some(Probe {
+            http_get: Some(HttpGetProbe {
+                path: "/".into(),
+                port: 8080,
+                host: None,
+                scheme: None,
+            }),
+            tcp_socket: Some(TcpSocketProbe { port: 8080 }),
+            ..Probe::default()
+        });
+        assert!(validate_pod_spec(&spec).is_err());
+
+        spec.containers[0].liveness_probe = Some(Probe {
+            exec: Some(ExecProbe { command: vec![] }),
+            ..Probe::default()
+        });
+        assert!(validate_pod_spec(&spec).is_err());
+
+        spec.containers[0].liveness_probe = Some(Probe {
+            exec: Some(ExecProbe {
+                command: vec!["".into()],
+            }),
+            ..Probe::default()
+        });
+        assert!(validate_pod_spec(&spec).is_err());
+
+        spec.containers[0].readiness_probe = Some(Probe {
+            http_get: Some(HttpGetProbe {
+                path: "/ready".into(),
+                port: 8080,
+                host: Some("bad host".into()),
+                scheme: None,
+            }),
+            ..Probe::default()
+        });
+        spec.containers[0].liveness_probe = None;
+        assert!(validate_pod_spec(&spec).is_err());
+
+        spec.containers[0].readiness_probe = Some(Probe {
+            tcp_socket: Some(TcpSocketProbe { port: 80 }),
+            ..Probe::default()
         });
         assert!(validate_pod_spec(&spec).is_ok());
     }

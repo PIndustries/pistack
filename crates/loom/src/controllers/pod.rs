@@ -24,20 +24,29 @@
 //! * when a container's main process exits, `power = Off` plus a condition
 //!   `ContainerExited{status: true, reason: "<exit code>", message: "<name>"}`
 //!   (`reason` is the decimal exit code of the first container to exit);
-//! * `phase = Error` when the sandbox or a container cannot be started.
+//! * `phase = Error` when the sandbox or a container cannot be started;
+//! * `status.probes` carries the host agent's liveness and readiness
+//!   streaks for each container.
 //!
 //! The controller maps that to the pod: `Running`, `Succeeded` (exit 0),
 //! `Failed`, and restarts per `restart_policy` by bumping the machine's
 //! `spec.restarts` (the same knob `POST /machines/{id}/reboot` uses) with an
-//! exponential backoff capped at five minutes.
+//! exponential backoff capped at five minutes. A container with no
+//! readiness probe is ready once it is running. A readiness probe holds
+//! the pod's Ready condition false until its success streak reaches
+//! `success_threshold`. A liveness streak that reaches `failure_threshold`
+//! restarts that container the same way, without the exit backoff, and
+//! bumps only that container's restart count. An exec probe is reported
+//! unsupported and does not restart the container.
 
 use super::{delete_quietly, patch_status, request_delete, Controller};
 use crate::types::{
     set_condition, ContainerState, ContainerStatus, EnvVarSource, Pod, PodPhase, PodStatus,
-    RestartPolicy, VolumeSource, MACHINE_POD_LABEL,
+    ProbeHandlerKind, RestartPolicy, VolumeSource, MACHINE_POD_LABEL, POD_READY,
 };
 use chrono::{Duration, Utc};
 use forge::{Machine, MachineKind, MachineSpec, PowerState, Size};
+use pistack_rpc::proto::{ProbeReport, PROBE_LIVENESS, PROBE_READINESS};
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{Id, Phase, Resources};
 use serde::{Deserialize, Serialize};
@@ -93,6 +102,8 @@ pub const SANDBOX_KIND: &str = "PodSandbox";
 /// Machine condition anvil sets when a container exits; `reason` is the
 /// decimal exit code.
 pub const EXITED_CONDITION: &str = "ContainerExited";
+/// Pod condition set from liveness probes. Absent when the pod has none.
+const LIVENESS_CONDITION: &str = "Liveness";
 /// Network attached when the pod names none and the project has a network
 /// by this name. Otherwise the project's only non-external network is used
 /// (see [`pick_networks`]).
@@ -478,6 +489,11 @@ impl PodController {
             .iter()
             .map(|c| (c.name.clone(), c.image.clone()))
             .collect();
+        let reports = m.status.probes.clone();
+        // Same branch as the running arm below: power is on (or not yet
+        // known) and a restart we asked for has not landed.
+        let check_liveness =
+            matches!(mphase, Phase::Ready) && !restart_in_flight && mpower != PowerState::Off;
 
         let updated = patch_status(&self.pods(), &pod.meta.id, |s| {
             s.machine = Some(mid.clone());
@@ -516,12 +532,12 @@ impl PodController {
                                 finished_at: Utc::now(),
                             };
                         }
-                        set_condition(&mut s.conditions, "Ready", false, "Terminated", "");
+                        set_condition(&mut s.conditions, POD_READY, false, "Terminated", "");
                     }
                     (PowerState::Off, None) => {
                         s.phase = PodPhase::Unknown;
                         s.message = "machine is powered off".into();
-                        set_condition(&mut s.conditions, "Ready", false, "PoweredOff", "");
+                        set_condition(&mut s.conditions, POD_READY, false, "PoweredOff", "");
                     }
                     _ => {
                         s.phase = PodPhase::Running;
@@ -529,15 +545,7 @@ impl PodController {
                         s.message.clear();
                         let started = s.start_time.unwrap_or_else(Utc::now);
                         s.start_time = Some(started);
-                        for c in &mut s.container_statuses {
-                            c.ready = true;
-                            if !matches!(c.state, ContainerState::Running { .. }) {
-                                c.state = ContainerState::Running {
-                                    started_at: Utc::now(),
-                                };
-                            }
-                        }
-                        set_condition(&mut s.conditions, "Ready", true, "Running", "");
+                        apply_readiness(pod, &reports, s);
                     }
                 },
                 Phase::Error => {
@@ -549,7 +557,7 @@ impl PodController {
                             reason: "StartFailed".into(),
                         };
                     }
-                    set_condition(&mut s.conditions, "Ready", false, "MachineError", &mmsg);
+                    set_condition(&mut s.conditions, POD_READY, false, "MachineError", &mmsg);
                 }
                 Phase::Pending | Phase::Creating | Phase::Updating => {
                     if !s.phase.is_terminal() || mphase != Phase::Updating {
@@ -562,13 +570,17 @@ impl PodController {
                             reason: "ContainerCreating".into(),
                         };
                     }
-                    set_condition(&mut s.conditions, "Ready", false, "Starting", "");
+                    set_condition(&mut s.conditions, POD_READY, false, "Starting", "");
                 }
                 Phase::Deleting => {
                     s.message = "machine is being deleted".into();
                 }
             }
         })?;
+
+        if check_liveness {
+            self.apply_liveness(&updated, &mid, &reports).await?;
+        }
 
         // Restart policy: on a terminal pod whose machine still exists, ask
         // forge for a reboot once the backoff has elapsed.
@@ -598,7 +610,7 @@ impl PodController {
             .status
             .conditions
             .iter()
-            .find(|c| c.kind == "Ready")
+            .find(|c| c.kind == POD_READY)
             .map(|c| c.last_transition)
             .unwrap_or_else(Utc::now);
         if Utc::now() - since < backoff {
@@ -631,7 +643,7 @@ impl PodController {
                     reason: "Restarting".into(),
                 };
             }
-            set_condition(&mut s.conditions, "Ready", false, "Restarting", "");
+            set_condition(&mut s.conditions, POD_READY, false, "Restarting", "");
             set_condition(&mut s.conditions, "BackOff", false, "Restarted", "");
         })?;
         tracing::info!(pod = %pod.meta.id, restarts = restarts + 1, "loom: restarting pod");
@@ -656,7 +668,7 @@ impl PodController {
                 for c in &mut s.container_statuses {
                     c.ready = false;
                 }
-                set_condition(&mut s.conditions, "Ready", false, "MachineGone", "");
+                set_condition(&mut s.conditions, POD_READY, false, "MachineGone", "");
             })?;
             return Ok(());
         }
@@ -708,10 +720,195 @@ impl PodController {
                 };
             }
             set_condition(&mut s.conditions, "PodScheduled", false, "Pending", "");
-            set_condition(&mut s.conditions, "Ready", false, "Starting", "");
+            set_condition(&mut s.conditions, POD_READY, false, "Starting", "");
         })?;
         tracing::info!(pod = %pod.meta.id, machine = %mid, "loom: machine created for pod");
         Ok(())
+    }
+
+    /// Restart containers whose liveness streak has reached the threshold.
+    ///
+    /// The whole sandbox restarts, because that is the machine restart
+    /// knob, and only the containers that failed have their restart count
+    /// bumped. `Never` records the failure and leaves the pod running.
+    /// Exec probes are unsupported and do not count as failures.
+    async fn apply_liveness(
+        &self,
+        pod: &Pod,
+        machine: &Id,
+        reports: &[ProbeReport],
+    ) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        let mut saw_check = false;
+        let mut exec_unsupported = false;
+        let mut missing = false;
+        for container in &pod.spec.containers {
+            let Some(probe) = &container.liveness_probe else {
+                continue;
+            };
+            match probe.handler() {
+                ProbeHandlerKind::Http | ProbeHandlerKind::Tcp => {
+                    saw_check = true;
+                    let failures = probe_report(reports, &container.name, PROBE_LIVENESS)
+                        .map(|r| r.failures)
+                        .unwrap_or(0);
+                    if failures >= probe.failures_required() {
+                        failed.push(container.name.clone());
+                    }
+                }
+                ProbeHandlerKind::Exec => exec_unsupported = true,
+                ProbeHandlerKind::Missing => missing = true,
+            }
+        }
+        if failed.is_empty() && !saw_check && !exec_unsupported && !missing {
+            return Ok(());
+        }
+        if !failed.is_empty() {
+            let names = failed.join(", ");
+            match pod.spec.restart_policy {
+                RestartPolicy::Always | RestartPolicy::OnFailure => {
+                    match self.machines().modify(machine, |m| {
+                        m.spec.restarts += 1;
+                        m.spec.power = forge::DesiredPower::On;
+                        Ok(())
+                    }) {
+                        Ok(_) | Err(StoreError::NotFound(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    patch_status(&self.pods(), &pod.meta.id, |s| {
+                        s.phase = PodPhase::Pending;
+                        s.message = format!("restarting {names}");
+                        for c in &mut s.container_statuses {
+                            if failed.contains(&c.name) {
+                                c.restart_count += 1;
+                            }
+                            c.ready = false;
+                            c.state = ContainerState::Waiting {
+                                reason: "Restarting".into(),
+                            };
+                        }
+                        set_condition(&mut s.conditions, POD_READY, false, "Restarting", "");
+                        set_condition(
+                            &mut s.conditions,
+                            LIVENESS_CONDITION,
+                            false,
+                            "ProbeFailed",
+                            &names,
+                        );
+                    })?;
+                    tracing::info!(pod = %pod.meta.id, containers = %names, "loom: liveness restart");
+                }
+                RestartPolicy::Never => {
+                    patch_status(&self.pods(), &pod.meta.id, |s| {
+                        set_condition(
+                            &mut s.conditions,
+                            LIVENESS_CONDITION,
+                            false,
+                            "ProbeFailed",
+                            &names,
+                        );
+                    })?;
+                }
+            }
+            return Ok(());
+        }
+        if saw_check {
+            patch_status(&self.pods(), &pod.meta.id, |s| {
+                set_condition(&mut s.conditions, LIVENESS_CONDITION, true, "Ok", "");
+            })?;
+            return Ok(());
+        }
+        let message = if exec_unsupported {
+            "exec probes are not supported"
+        } else {
+            "probe has no handler"
+        };
+        patch_status(&self.pods(), &pod.meta.id, |s| {
+            set_condition(
+                &mut s.conditions,
+                LIVENESS_CONDITION,
+                false,
+                "Unsupported",
+                message,
+            );
+        })?;
+        Ok(())
+    }
+}
+
+fn probe_report<'a>(
+    reports: &'a [ProbeReport],
+    container: &str,
+    kind: &str,
+) -> Option<&'a ProbeReport> {
+    reports
+        .iter()
+        .find(|r| r.container == container && r.kind == kind)
+}
+
+fn mark_running(state: &mut ContainerState) {
+    if !matches!(state, ContainerState::Running { .. }) {
+        *state = ContainerState::Running {
+            started_at: Utc::now(),
+        };
+    }
+}
+
+fn hold_not_ready(cs: &mut ContainerStatus, message: &str, waiting: &mut Vec<String>) {
+    cs.ready = false;
+    cs.state = ContainerState::Waiting {
+        reason: message.to_owned(),
+    };
+    waiting.push(format!("{}: {message}", cs.name));
+}
+
+/// Set each container's ready flag and the pod Ready condition from the
+/// readiness streaks on the machine. A container with no readiness probe
+/// is ready. Phase is left to the caller.
+fn apply_readiness(pod: &Pod, reports: &[ProbeReport], status: &mut PodStatus) {
+    let mut waiting = Vec::new();
+    for cs in &mut status.container_statuses {
+        let Some(spec) = pod.spec.containers.iter().find(|c| c.name == cs.name) else {
+            continue;
+        };
+        let Some(probe) = spec.readiness_probe.as_ref() else {
+            cs.ready = true;
+            mark_running(&mut cs.state);
+            continue;
+        };
+        match probe.handler() {
+            ProbeHandlerKind::Http | ProbeHandlerKind::Tcp => {
+                let report = probe_report(reports, &cs.name, PROBE_READINESS);
+                let successes = report.map(|r| r.successes).unwrap_or(0);
+                if successes >= probe.successes_required() {
+                    cs.ready = true;
+                    mark_running(&mut cs.state);
+                } else {
+                    let message = report
+                        .map(|r| r.message.as_str())
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or("readiness probe has not passed");
+                    hold_not_ready(cs, message, &mut waiting);
+                }
+            }
+            ProbeHandlerKind::Exec => {
+                hold_not_ready(cs, "exec probes are not supported", &mut waiting);
+            }
+            ProbeHandlerKind::Missing => {
+                hold_not_ready(cs, "probe has no handler", &mut waiting);
+            }
+        }
+    }
+    if status.container_statuses.iter().all(|c| c.ready) {
+        set_condition(&mut status.conditions, POD_READY, true, "Running", "");
+    } else {
+        set_condition(
+            &mut status.conditions,
+            POD_READY,
+            false,
+            "ContainersNotReady",
+            &waiting.join("; "),
+        );
     }
 }
 
@@ -760,14 +957,18 @@ impl Controller for PodController {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill_projections, project_secret, PodSandbox};
+    use super::{fill_projections, project_secret, PodController, PodSandbox, LIVENESS_CONDITION};
+    use crate::controllers::Controller;
     use crate::types::{
-        ConfigMap, ConfigMapSpec, Container, EnvVar, EnvVarSource, Pod, PodSpec, PodVolume,
-        VolumeSource,
+        ConfigMap, ConfigMapSpec, Container, EnvVar, EnvVarSource, ExecProbe, HttpGetProbe, Pod,
+        PodPhase, PodSpec, PodVolume, Probe, RestartPolicy, TcpSocketProbe, VolumeSource,
+        MACHINE_POD_LABEL, POD_READY,
     };
     use base64::{engine::general_purpose::STANDARD, Engine};
+    use forge::{new_machine, Machine, MachineKind, MachineSpec, PowerState};
+    use pistack_rpc::proto::{ProbeReport, PROBE_LIVENESS, PROBE_READINESS};
     use pistack_store::Store;
-    use pistack_types::{kind, Id};
+    use pistack_types::{kind, Id, Phase};
     use std::collections::BTreeMap;
 
     #[test]
@@ -927,6 +1128,406 @@ mod tests {
         let machine = serde_json::to_string(&sandbox).unwrap();
         assert!(machine.contains("s3cret-value"));
         assert!(machine.contains("plain-token"));
+    }
+
+    fn http_probe(port: u16, success: u32, failure: u32) -> Probe {
+        Probe {
+            http_get: Some(HttpGetProbe {
+                path: "/health".into(),
+                port,
+                host: None,
+                scheme: None,
+            }),
+            success_threshold: success,
+            failure_threshold: failure,
+            ..Probe::default()
+        }
+    }
+
+    fn tcp_probe(port: u16, success: u32) -> Probe {
+        Probe {
+            tcp_socket: Some(TcpSocketProbe { port }),
+            success_threshold: success,
+            ..Probe::default()
+        }
+    }
+
+    fn exec_probe() -> Probe {
+        Probe {
+            exec: Some(ExecProbe {
+                command: vec!["/bin/true".into()],
+            }),
+            ..Probe::default()
+        }
+    }
+
+    fn ctr(name: &str, liveness: Option<Probe>, readiness: Option<Probe>) -> Container {
+        Container {
+            name: name.into(),
+            image: "img".into(),
+            liveness_probe: liveness,
+            readiness_probe: readiness,
+            ..Container::default()
+        }
+    }
+
+    fn streak(
+        container: &str,
+        kind: &str,
+        successes: u32,
+        failures: u32,
+        message: &str,
+    ) -> ProbeReport {
+        ProbeReport {
+            container: container.into(),
+            kind: kind.into(),
+            success: failures == 0 && successes > 0,
+            successes,
+            failures,
+            message: message.into(),
+        }
+    }
+
+    struct Fixture {
+        store: Store,
+        pod: Id,
+        machine: Id,
+    }
+
+    fn running_pod(
+        policy: RestartPolicy,
+        containers: Vec<Container>,
+        probes: Vec<ProbeReport>,
+        spec_restarts: u64,
+        status_restarts: u64,
+        counts: &[(&str, u32)],
+    ) -> Fixture {
+        let store = Store::in_memory().unwrap();
+        let mut pod = Pod::new(
+            "web",
+            None,
+            PodSpec {
+                containers,
+                restart_policy: policy,
+                ..PodSpec::default()
+            },
+        );
+        if !counts.is_empty() {
+            pod.status.container_statuses = pod
+                .spec
+                .containers
+                .iter()
+                .map(|c| crate::types::ContainerStatus {
+                    name: c.name.clone(),
+                    image: c.image.clone(),
+                    restart_count: counts
+                        .iter()
+                        .find(|(n, _)| *n == c.name)
+                        .map(|(_, count)| *count)
+                        .unwrap_or(0),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        let pod = store.collection::<Pod>().create(pod).unwrap();
+        let mut machine = new_machine(
+            "pod-web",
+            None,
+            MachineSpec {
+                kind: MachineKind::Container,
+                size: "small".into(),
+                image: "img".into(),
+                restarts: spec_restarts,
+                ..MachineSpec::default()
+            },
+        );
+        machine
+            .meta
+            .labels
+            .insert(MACHINE_POD_LABEL.into(), pod.meta.id.to_string());
+        machine.status.phase = Phase::Ready;
+        machine.status.power = PowerState::On;
+        machine.status.restarts = status_restarts;
+        machine.status.host = Some(Id::new(kind::HOST));
+        machine.status.addresses = vec!["10.1.0.8".into()];
+        machine.status.probes = probes;
+        let machine = store.collection::<Machine>().create(machine).unwrap();
+        Fixture {
+            store,
+            pod: pod.meta.id,
+            machine: machine.meta.id.clone(),
+        }
+    }
+
+    async fn pass(store: &Store) {
+        PodController::new(store.clone())
+            .reconcile_once()
+            .await
+            .unwrap();
+    }
+
+    fn load(store: &Store, id: &Id) -> Pod {
+        store.collection::<Pod>().get(id).unwrap()
+    }
+
+    fn reason<'a>(pod: &'a Pod, kind: &str) -> &'a str {
+        pod.status
+            .conditions
+            .iter()
+            .find(|c| c.kind == kind)
+            .map(|c| c.reason.as_str())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pod_without_probes_is_ready_once_running() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", None, None)],
+            vec![],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert_eq!(pod.status.pod_ip.as_deref(), Some("10.1.0.8"));
+        assert!(pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "Running");
+        assert!(pod.status.container_statuses[0].ready);
+        assert!(pod
+            .status
+            .conditions
+            .iter()
+            .all(|c| c.kind != LIVENESS_CONDITION));
+    }
+
+    #[tokio::test]
+    async fn readiness_holds_ready_until_the_success_streak() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", None, Some(http_probe(8080, 2, 3)))],
+            vec![streak("web", PROBE_READINESS, 1, 0, "")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(!pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "ContainersNotReady");
+        assert!(!pod.status.container_statuses[0].ready);
+        let message = pod
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == POD_READY)
+            .unwrap()
+            .message
+            .clone();
+        assert!(message.contains("readiness probe has not passed"));
+
+        fx.store
+            .collection::<Machine>()
+            .modify(&fx.machine, |m| {
+                m.status.probes = vec![streak("web", PROBE_READINESS, 2, 0, "")];
+                Ok(())
+            })
+            .unwrap();
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "Running");
+        assert!(pod.status.container_statuses[0].ready);
+    }
+
+    #[tokio::test]
+    async fn tcp_readiness_passes_once_the_streak_is_met() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", None, Some(tcp_probe(80, 1)))],
+            vec![streak("web", PROBE_READINESS, 1, 0, "")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(pod.status.is_ready());
+        assert!(pod.status.container_statuses[0].ready);
+    }
+
+    #[tokio::test]
+    async fn exec_readiness_stays_not_ready() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", None, Some(exec_probe()))],
+            vec![],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(!pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "ContainersNotReady");
+        let message = &pod
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == POD_READY)
+            .unwrap()
+            .message;
+        assert!(message.contains("not supported"));
+        assert!(!pod.status.container_statuses[0].ready);
+    }
+
+    #[tokio::test]
+    async fn liveness_failure_restarts_only_that_container() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![
+                ctr("web", Some(http_probe(8080, 1, 3)), None),
+                ctr("sidecar", None, None),
+            ],
+            vec![streak("web", PROBE_LIVENESS, 0, 3, "http status 500")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Pending);
+        assert!(!pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "Restarting");
+        assert_eq!(reason(&pod, LIVENESS_CONDITION), "ProbeFailed");
+        assert!(pod.status.message.contains("web"));
+        let web = pod
+            .status
+            .container_statuses
+            .iter()
+            .find(|c| c.name == "web")
+            .unwrap();
+        let side = pod
+            .status
+            .container_statuses
+            .iter()
+            .find(|c| c.name == "sidecar")
+            .unwrap();
+        assert_eq!(web.restart_count, 1);
+        assert_eq!(side.restart_count, 0);
+        assert!(!web.ready);
+        assert!(!side.ready);
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn liveness_below_threshold_does_not_restart() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", Some(http_probe(8080, 1, 3)), None)],
+            vec![streak("web", PROBE_LIVENESS, 0, 2, "connect: refused")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(pod.status.is_ready());
+        assert_eq!(pod.status.container_statuses[0].restart_count, 0);
+        assert_eq!(reason(&pod, LIVENESS_CONDITION), "Ok");
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn liveness_failure_restarts_on_failure_policy() {
+        let fx = running_pod(
+            RestartPolicy::OnFailure,
+            vec![ctr("web", Some(http_probe(8080, 1, 1)), None)],
+            vec![streak("web", PROBE_LIVENESS, 0, 1, "timed out")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Pending);
+        assert_eq!(pod.status.container_statuses[0].restart_count, 1);
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn liveness_failure_does_not_restart_when_policy_is_never() {
+        let fx = running_pod(
+            RestartPolicy::Never,
+            vec![ctr("web", Some(http_probe(8080, 1, 3)), None)],
+            vec![streak("web", PROBE_LIVENESS, 0, 3, "http status 500")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert_eq!(pod.status.container_statuses[0].restart_count, 0);
+        assert!(pod.status.container_statuses[0].ready);
+        assert_eq!(reason(&pod, LIVENESS_CONDITION), "ProbeFailed");
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn exec_liveness_is_unsupported_and_does_not_restart() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", Some(exec_probe()), None)],
+            vec![],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert_eq!(pod.status.container_statuses[0].restart_count, 0);
+        assert_eq!(reason(&pod, LIVENESS_CONDITION), "Unsupported");
+        let message = pod
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == LIVENESS_CONDITION)
+            .unwrap();
+        assert!(message.message.contains("not supported"));
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn liveness_restart_in_flight_is_not_counted_twice() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", Some(http_probe(8080, 1, 3)), None)],
+            vec![streak("web", PROBE_LIVENESS, 0, 9, "http status 500")],
+            1,
+            0,
+            &[("web", 1)],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Pending);
+        assert_eq!(pod.status.container_statuses[0].restart_count, 1);
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 1);
+        assert_eq!(machine.status.restarts, 0);
     }
 }
 

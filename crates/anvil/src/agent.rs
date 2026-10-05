@@ -11,11 +11,13 @@
 //!
 //! The command poll and the heartbeat run as separate tasks on purpose: a
 //! `select!` that dropped an in-flight poll to send a heartbeat would lose
-//! any command the server had just marked delivered.
+//! any command the server had just marked delivered. Liveness and readiness
+//! probes run on their own tick and ride back on the heartbeat.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use keep::Pki;
@@ -25,10 +27,11 @@ use pistack_rpc::proto::{
     VolumeAttached, VolumeDetach, MAX_LONG_POLL_SECS,
 };
 use pistack_rpc::{AgentClient, RpcError, RPC_INSECURE_ENV};
-use pistack_types::{ApiError, Phase, Resources};
+use pistack_types::{ApiError, Id, Phase, Resources};
 use tokio_util::sync::CancellationToken;
 
 use crate::facts::{self, HostFacts};
+use crate::probe::{self, ProbeBook, ProbeTarget};
 use crate::runtime::{select_runtimes, RunningMachine, Runtimes};
 
 /// Environment variable that lets the mock runtime stand in for kinds with
@@ -261,6 +264,7 @@ pub async fn run_agent_with_facts(
         client,
         runtimes,
         facts,
+        probes: Arc::new(ProbeBook::new()),
     };
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -295,6 +299,7 @@ struct Agent {
     client: AgentClient,
     runtimes: Runtimes,
     facts: HostFacts,
+    probes: Arc<ProbeBook>,
 }
 
 impl Agent {
@@ -335,6 +340,7 @@ impl Agent {
             session.clone(),
             forgotten.clone(),
         ));
+        let probes = tokio::spawn(self.clone_for_probes().run(session.clone()));
 
         let wait =
             Duration::from_secs(MAX_LONG_POLL_SECS).min(interval.max(Duration::from_secs(1)));
@@ -354,6 +360,7 @@ impl Agent {
         };
         session.cancel();
         let _ = hb.await;
+        let _ = probes.await;
         end
     }
 
@@ -362,6 +369,15 @@ impl Agent {
             client: self.client.clone(),
             runtimes: self.runtimes.clone(),
             resources: self.facts.resources,
+            probes: self.probes.clone(),
+        }
+    }
+
+    fn clone_for_probes(&self) -> ProbeLoop {
+        ProbeLoop {
+            runtimes: self.runtimes.clone(),
+            probes: self.probes.clone(),
+            last_adopt: Mutex::new(None),
         }
     }
 
@@ -395,6 +411,11 @@ impl Agent {
                 let req: MachineRequest = payload(c.payload)?;
                 tracing::info!(machine = %req.id, name = %req.name, kind = ?req.kind, "anvil: start");
                 let rt = self.runtimes.start(&req).await?;
+                self.probes.install(
+                    &req.id,
+                    probe::probes_in_user_data(req.user_data.as_deref()),
+                    Utc::now(),
+                );
                 serde_json::to_value(rt).map_err(|e| ApiError::internal(e.to_string()))
             }
             CommandKind::StopMachine => {
@@ -407,6 +428,7 @@ impl Agent {
                 let r: MachineRef = payload(c.payload)?;
                 tracing::info!(machine = %r.id, "anvil: delete");
                 self.runtimes.delete(&r.id).await?;
+                self.probes.forget(&r.id);
                 Ok(serde_json::Value::Null)
             }
             CommandKind::AttachVolume => {
@@ -723,6 +745,94 @@ struct HeartbeatTask {
     client: AgentClient,
     runtimes: Runtimes,
     resources: Resources,
+    probes: Arc<ProbeBook>,
+}
+
+/// Runs due probes about once a second. Adoption from the runtime (so a
+/// restarted agent keeps checking) is slower, and only while nothing is
+/// tracked yet, so a host with no probes does not list machines every tick.
+struct ProbeLoop {
+    runtimes: Runtimes,
+    probes: Arc<ProbeBook>,
+    last_adopt: Mutex<Option<Instant>>,
+}
+
+const ADOPT_EVERY: Duration = Duration::from_secs(15);
+
+impl ProbeLoop {
+    async fn run(self, stop: CancellationToken) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            self.pass().await;
+        }
+    }
+
+    fn adopt_due(&self) -> bool {
+        let guard = self.last_adopt.lock().unwrap_or_else(|e| e.into_inner());
+        match *guard {
+            None => true,
+            Some(at) => at.elapsed() >= ADOPT_EVERY,
+        }
+    }
+
+    fn mark_adopted(&self) {
+        *self.last_adopt.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    async fn pass(&self) {
+        let adopt = !self.probes.has_tracks() && self.adopt_due();
+        if !self.probes.has_tracks() && !adopt {
+            return;
+        }
+        let machines = self.runtimes.list().await;
+        let now = Utc::now();
+        if adopt {
+            for machine in &machines {
+                if machine.power != pistack_rpc::proto::PowerState::On
+                    || self.probes.contains(&machine.id)
+                {
+                    continue;
+                }
+                let specs = self.runtimes.container_probes(&machine.id).await;
+                if !specs.is_empty() {
+                    self.probes.install(&machine.id, specs, now);
+                }
+            }
+            self.mark_adopted();
+        }
+        if machines.is_empty() || !self.probes.has_tracks() {
+            return;
+        }
+        let live: BTreeSet<Id> = machines.iter().map(|m| m.id.clone()).collect();
+        self.probes.retain(&live);
+        let targets: Vec<ProbeTarget> = machines
+            .iter()
+            .map(|m| ProbeTarget {
+                id: m.id.clone(),
+                power_on: m.power == pistack_rpc::proto::PowerState::On,
+                address: m.addresses.iter().find(|a| !a.is_empty()).cloned(),
+            })
+            .collect();
+        let due = self.probes.due(&targets, now);
+        for check in due {
+            let outcome = probe::execute(&check).await;
+            if !outcome.success {
+                tracing::debug!(
+                    machine = %check.machine,
+                    container = %check.container,
+                    kind = %check.kind,
+                    message = %outcome.message,
+                    "anvil: probe failed"
+                );
+            }
+            self.probes.record(&check, &outcome);
+        }
+    }
 }
 
 impl HeartbeatTask {
@@ -742,10 +852,17 @@ impl HeartbeatTask {
                 _ = tick.tick() => {}
             }
             let machines = self.runtimes.list().await;
+            let mut rows = Vec::with_capacity(machines.len());
+            for machine in machines {
+                let id = machine.id.clone();
+                let mut row = report(machine);
+                row.probes = self.probes.reports(&id);
+                rows.push(row);
+            }
             let hb = Heartbeat {
                 node_name: self.client.node_name().to_owned(),
                 resources_free: self.resources,
-                machines: machines.into_iter().map(report).collect(),
+                machines: rows,
                 at: Utc::now(),
             };
             match self.client.heartbeat(&hb).await {
@@ -854,6 +971,7 @@ pub fn report(m: RunningMachine) -> MachineReport {
         resources: None,
         addresses: m.addresses,
         power: Some(m.power),
+        probes: Vec::new(),
     }
 }
 
@@ -1116,6 +1234,7 @@ still here
             client,
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
+            probes: Arc::new(ProbeBook::new()),
         };
         let bad = agent
             .execute(Command {
@@ -1279,6 +1398,7 @@ still here
             client,
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
+            probes: Arc::new(ProbeBook::new()),
         };
         let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
             command_timeout: Duration::from_secs(5),

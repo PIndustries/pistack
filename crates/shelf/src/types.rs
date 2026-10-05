@@ -2,9 +2,11 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Share resources. `spec` is the request. NFS is [`Phase::Ready`] only
-//! after `exportfs` accepts the client CIDR. CephFS is [`Phase::Ready`]
-//! only after `ceph` creates the subvolume.
+//! after the managed exports file is loaded with `exportfs -ra`. CephFS is
+//! [`Phase::Ready`] only after `ceph` creates the subvolume. An NFS export
+//! that fails is [`Phase::Error`]; the reconcile loop retries it.
 
+use chrono::{DateTime, Utc};
 use pistack_types::{kind, ApiError, ApiResult, Phase, Resource, Spec};
 use serde::{Deserialize, Serialize};
 
@@ -88,12 +90,28 @@ fn nonempty(s: Option<&str>) -> Option<String> {
 }
 
 /// Observed state. `Ready` means the share is exported or the subvolume exists.
+/// `Error` keeps the last NFS failure in [`Self::message`] until a later pass
+/// succeeds.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShareStatus {
     #[serde(default)]
     pub phase: Phase,
     #[serde(default)]
     pub message: String,
+    /// Failures since the last `Ready`. Drives retry backoff.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub failures: u32,
+    /// Earliest time a failed NFS share may be retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
+    /// Revision this status describes. A pass that finds this equal to
+    /// `meta.revision` does not run again until [`Self::retry_at`].
+    #[serde(default)]
+    pub observed_revision: u64,
+}
+
+fn u32_is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Default for ShareStatus {
@@ -101,6 +119,9 @@ impl Default for ShareStatus {
         Self {
             phase: Phase::Pending,
             message: PENDING_MESSAGE.to_owned(),
+            failures: 0,
+            retry_at: None,
+            observed_revision: 0,
         }
     }
 }

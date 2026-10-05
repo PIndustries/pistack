@@ -31,7 +31,8 @@ pub use proto::{
     AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, DiskTarget,
     EnrollRequest, EnrollResponse, ExecEnv, ExecOutput, ExecRequest, Heartbeat, HeartbeatAck,
     HelloAck, LogText, MachineKind, MachineRef, MachineReport, MachineRequest, PortPlug,
-    PowerState, ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER,
+    PowerState, ProbeReport, ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach,
+    JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
 pub use server::{
@@ -136,6 +137,7 @@ mod loopback {
                     resources: None,
                     addresses: vec!["10.0.0.5".into()],
                     power: None,
+                    probes: Vec::new(),
                 }],
                 at: Utc::now(),
             })
