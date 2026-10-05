@@ -330,9 +330,9 @@ mod tests {
     use super::*;
     use crate::types::{VolumeSpec, VolumeStatus};
     use pistack_types::{kind, Meta};
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
-    static LOCK: Mutex<()> = Mutex::new(());
+    static LOCK: Mutex<()> = Mutex::const_new(());
 
     fn volume(size: u64) -> Volume {
         Volume {
@@ -350,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_argv_contains_id_and_size() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv.log");
         let script = dir.path().join("rbd");
@@ -395,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_monitors_or_pool_does_not_create() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LOCK.lock().await;
         let vol = volume(4);
         let err = RbdBackend::new("volumes", "pistack", Vec::new())
             .create(&vol)
