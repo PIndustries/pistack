@@ -673,7 +673,8 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
         let url = format!("{}/cluster/vote", peer.api.trim_end_matches('/'));
         let request = request.clone();
         votes.spawn(async move {
-            let result = rpc_post_json(&url, &request).await;
+            let result: anyhow::Result<pistack_cluster::VoteResponse> =
+                rpc_post_json(&url, &request).await;
             (url, result)
         });
     }
