@@ -506,3 +506,285 @@ async fn unsigned_payload_put_ok() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn upload_part_correct_hash_ok_wrong_hash_rejected() {
+    let w = world().await;
+    let key_path = format!("/{}/mp.txt", w.bucket);
+    // CreateMultipartUpload with empty payload hash.
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &key_path,
+        "uploads",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let xml = String::from_utf8_lossy(&body);
+    let upload_id = xml
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId")
+        .to_owned();
+
+    let part = b"part-bytes-here";
+    let good = sha256_hex(part);
+    let q = format!("partNumber=1&uploadId={upload_id}");
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &key_path,
+        &q,
+        part,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &good,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "good part hash");
+
+    // Wrong declared hash: reject and leave no staged part for part 2.
+    let part2 = b"other-part-bytes";
+    let lie = sha256_hex(b"not-the-part");
+    let q2 = format!("partNumber=2&uploadId={upload_id}");
+    let (status, body, _) = signed_call(
+        &w.app,
+        "PUT",
+        &key_path,
+        &q2,
+        part2,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &lie,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "XAmzContentSHA256Mismatch"
+    );
+
+    // ListParts should show only part 1.
+    let (status, body, _) = signed_call(
+        &w.app,
+        "GET",
+        &key_path,
+        &format!("uploadId={upload_id}"),
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let list = String::from_utf8_lossy(&body);
+    assert!(list.contains("<PartNumber>1</PartNumber>"), "{list}");
+    assert!(!list.contains("<PartNumber>2</PartNumber>"), "{list}");
+}
+
+#[tokio::test]
+async fn garbage_aws4_scheme_suffix_not_sigv4() {
+    let w = world().await;
+    let path = format!("/{}/x.txt", w.bucket);
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&path)
+        .header("host", "silo.test")
+        .header(
+            header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256garbage Credential=x, Signature=y",
+        )
+        .header("x-amz-date", amz_now())
+        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
+        .header(header::CONTENT_LENGTH, "1")
+        .body(Body::from("x"))
+        .unwrap();
+    let resp = w.app.clone().oneshot(req).await.unwrap();
+    // Not recognized as SigV4 and no bearer Caller → unauthorized.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn duplicate_authorization_rejected() {
+    let w = world().await;
+    let path = format!("/{}/x.txt", w.bucket);
+    let date = amz_now();
+    let hash = sha256_hex(b"x");
+    let headers = vec![
+        ("host".into(), "silo.test".into()),
+        ("x-amz-content-sha256".into(), hash.clone()),
+        ("x-amz-date".into(), date.clone()),
+        ("content-length".into(), "1".into()),
+    ];
+    let sig = sigv4::sign_request(
+        "PUT",
+        &path,
+        "",
+        &headers,
+        &hash,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+    );
+    let date_stamp: String = date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&path)
+        .header("host", "silo.test")
+        .header("x-amz-content-sha256", &hash)
+        .header("x-amz-date", &date)
+        .header(header::CONTENT_LENGTH, "1")
+        .header(header::AUTHORIZATION, &auth)
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::from("x"))
+        .unwrap();
+    let resp = w.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidArgument"
+    );
+}
+
+#[tokio::test]
+async fn bearer_plus_sigv4_header_conflict() {
+    let w = world().await;
+    let path = format!("/{}/conflict.txt", w.bucket);
+    let who = Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "bearer".into(),
+        project: Some(Id::new(kind::PROJECT)),
+        roles: vec!["member".into()],
+        system: false,
+    };
+    let (status, body, _) = {
+        let date = amz_now();
+        let hash = sha256_hex(b"x");
+        let headers = vec![
+            ("host".into(), "silo.test".into()),
+            ("x-amz-content-sha256".into(), hash.clone()),
+            ("x-amz-date".into(), date.clone()),
+            ("content-length".into(), "1".into()),
+        ];
+        let sig = sigv4::sign_request(
+            "PUT",
+            &path,
+            "",
+            &headers,
+            &hash,
+            &w.access_key_id,
+            &w.secret,
+            &w.region,
+            &date,
+        );
+        let date_stamp: String = date.chars().take(8).collect();
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date, Signature={sig}",
+            w.access_key_id, w.region
+        );
+        let req = Request::builder()
+            .method("PUT")
+            .uri(&path)
+            .header("host", "silo.test")
+            .header("x-amz-content-sha256", &hash)
+            .header("x-amz-date", &date)
+            .header(header::CONTENT_LENGTH, "1")
+            .header(header::AUTHORIZATION, auth)
+            .extension(who.clone())
+            .body(Body::from("x"))
+            .unwrap();
+        let resp = w.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap().to_vec();
+        (status, body, ())
+    };
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn bearer_plus_presigned_conflict() {
+    let w = world().await;
+    let path = format!("/{}/pre-conflict.txt", w.bucket);
+    // Seed with signed PUT first (no bearer).
+    let payload = b"seed";
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &path,
+        "",
+        payload,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(payload),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let qs = sigv4::presign_query(
+        "GET",
+        &path,
+        "silo.test",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        3600,
+        "",
+    );
+    let who = Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "bearer".into(),
+        project: Some(Id::new(kind::PROJECT)),
+        roles: vec!["member".into()],
+        system: false,
+    };
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("{path}?{qs}"))
+        .header("host", "silo.test")
+        .extension(who)
+        .body(Body::empty())
+        .unwrap();
+    let resp = w.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}

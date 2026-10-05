@@ -74,9 +74,23 @@ pub struct SigV4State {
 
 /// Axum middleware: if no [`Caller`] is present yet and the request carries
 /// SigV4 (header or query), verify it via keep and insert `credential.caller`.
-/// Bearer-authenticated requests (Caller already set) pass through untouched.
+///
+/// A request that already has a bearer [`Caller`] **and** SigV4 material
+/// (AWS4 `Authorization` or presigned `X-Amz-*` query) is rejected — the
+/// two schemes must not be combined. Bearer-only requests pass through.
 pub async fn middleware(State(state): State<SigV4State>, mut req: Request, next: Next) -> Response {
-    if req.extensions().get::<Caller>().is_some() {
+    let has_caller = req.extensions().get::<Caller>().is_some();
+    let sigv4 = match detect_sigv4_material(&req) {
+        Ok(v) => v,
+        Err(err) => return sigv4_error(err),
+    };
+    if has_caller && sigv4 {
+        return sigv4_error(s3_err(
+            "InvalidRequest",
+            "cannot combine bearer credentials with SigV4",
+        ));
+    }
+    if has_caller {
         return next.run(req).await;
     }
     match authenticate(&state, &req) {
@@ -90,6 +104,35 @@ pub async fn middleware(State(state): State<SigV4State>, mut req: Request, next:
         }
         Err(err) => sigv4_error(err),
     }
+}
+
+/// `true` when the request carries SigV4 header or presigned query auth.
+/// Errors on multiple `Authorization` headers.
+fn detect_sigv4_material(req: &Request) -> ApiResult<bool> {
+    let auths: Vec<_> = req
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .collect();
+    if auths.len() > 1 {
+        return Err(s3_err("InvalidArgument", "multiple Authorization headers"));
+    }
+    if let Some(raw) = auths.first().and_then(|v| v.to_str().ok()) {
+        if is_aws4_authorization(raw) {
+            return Ok(true);
+        }
+    }
+    let q = req.uri().query().unwrap_or("");
+    Ok(query_has(q, "X-Amz-Algorithm")
+        || query_has(q, "X-Amz-Credential")
+        || query_has(q, "X-Amz-Signature"))
+}
+
+/// Scheme token is exactly `AWS4-HMAC-SHA256` followed by a space.
+pub fn is_aws4_authorization(value: &str) -> bool {
+    const PREFIX: &[u8] = b"AWS4-HMAC-SHA256 ";
+    let v = value.as_bytes();
+    v.len() >= PREFIX.len() && v[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
 }
 
 struct AuthOk {
@@ -188,13 +231,15 @@ struct ParsedAuth {
 
 fn parse_auth(req: &Request) -> ApiResult<Option<ParsedAuth>> {
     let headers = req.headers();
-    if let Some(auth) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if auth.len() >= 16 && auth.as_bytes()[..16].eq_ignore_ascii_case(b"AWS4-HMAC-SHA256") {
+    let auths: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
+    if auths.len() > 1 {
+        return Err(s3_err("InvalidArgument", "multiple Authorization headers"));
+    }
+    if let Some(auth) = auths.first().and_then(|v| v.to_str().ok()) {
+        if is_aws4_authorization(auth) {
             return Ok(Some(parse_authorization_header(auth, headers)?));
         }
+        // `AWS4-HMAC-SHA256garbage` is not SigV4; leave for other auth.
     }
     let q = req.uri().query().unwrap_or("");
     if query_has(q, "X-Amz-Algorithm") {
@@ -654,6 +699,11 @@ pub fn check_payload_sha256(
     Ok(())
 }
 
+/// Hash `body` and compare to a declared SigV4 payload hash (no-op if none).
+pub fn verify_body_sha256(expected: Option<&ExpectedPayloadSha256>, body: &[u8]) -> ApiResult<()> {
+    check_payload_sha256(expected, &hex_sha256(body))
+}
+
 fn sigv4_error(err: ApiError) -> Response {
     let code = s3_code_of(&err).unwrap_or("AccessDenied");
     let status = match code {
@@ -887,6 +937,16 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert!(got.ends_with(
             "X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
         ));
+    }
+
+    #[test]
+    fn aws4_scheme_requires_trailing_space() {
+        assert!(is_aws4_authorization(
+            "AWS4-HMAC-SHA256 Credential=x/20200101/pistack/s3/aws4_request, Signature=ab"
+        ));
+        assert!(!is_aws4_authorization("AWS4-HMAC-SHA256garbage"));
+        assert!(!is_aws4_authorization("AWS4-HMAC-SHA256"));
+        assert!(!is_aws4_authorization("Bearer x"));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use pistack_types::{ApiError, ApiResult, Id, Meta, Phase, Spec};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
@@ -581,7 +582,7 @@ where
         let sha256 = hex_encode(sha.finalize().as_slice());
         if let Some(want) = expected_sha256 {
             let want = want.to_ascii_lowercase();
-            if sha256 != want {
+            if !bool::from(sha256.as_bytes().ct_eq(want.as_bytes())) {
                 return Err(crate::multipart::s3_err(
                     "XAmzContentSHA256Mismatch",
                     "The provided 'x-amz-content-sha256' header does not match what was computed.",
