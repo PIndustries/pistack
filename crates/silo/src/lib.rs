@@ -34,11 +34,15 @@ pub mod types;
 pub use client::Client;
 pub use types::*;
 
-/// Object storage module. `silo::Silo` is a unit value so the gateway can
-/// keep constructing it that way. The data directory is read when the
-/// router is built; size limits come from [`SiloConfig::load`].
-#[derive(Default)]
-pub struct Silo;
+/// Object storage module.
+///
+/// The binary builds this with [`Silo::configured`] after loading
+/// [`SiloConfig`] at assemble time. [`Default`] keeps the 5 GiB cap for
+/// tests and ad-hoc mounts.
+#[derive(Clone, Default)]
+pub struct Silo {
+    config: SiloConfig,
+}
 
 impl Silo {
     /// `$PISTACK_DATA_DIR/silo`, or `./data/silo` when the variable is unset.
@@ -49,9 +53,19 @@ impl Silo {
             .join("silo")
     }
 
+    /// Module with an explicit size limit (and any future silo settings).
+    pub fn configured(config: SiloConfig) -> Self {
+        Self { config }
+    }
+
+    /// Settings the module was built with.
+    pub fn config(&self) -> &SiloConfig {
+        &self.config
+    }
+
+    /// Client using this module's config and [`Self::data_root`].
     pub fn client(&self, store: Store) -> Client {
-        let cfg = SiloConfig::load();
-        Client::new(store, Self::data_root()).with_max_object_bytes(cfg.max_object_bytes)
+        Client::new(store, Self::data_root()).with_max_object_bytes(self.config.max_object_bytes)
     }
 }
 
@@ -68,10 +82,26 @@ impl Module for Silo {
 
     fn router(&self, ctx: ModuleContext) -> Router {
         let store = ctx.store::<Store>();
-        let cfg = SiloConfig::load();
-        http::router(
-            Client::new((*store).clone(), Self::data_root())
-                .with_max_object_bytes(cfg.max_object_bytes),
-        )
+        http::router(self.client((*store).clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pistack_store::Store;
+    use tempfile::tempdir;
+    use tokio::sync::broadcast;
+
+    #[test]
+    fn configured_max_reaches_client() {
+        let dir = tempdir().unwrap();
+        let (events, _) = broadcast::channel(16);
+        let store = Store::open(dir.path().join("state.redb"), events).unwrap();
+        let max = 64 * 1024;
+        let silo = Silo::configured(SiloConfig {
+            max_object_bytes: max,
+        });
+        assert_eq!(silo.client(store).max_object_bytes(), max);
     }
 }

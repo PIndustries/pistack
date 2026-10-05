@@ -38,20 +38,32 @@ impl Default for SiloConfig {
 }
 
 impl SiloConfig {
+    /// Reject `max_object_bytes = 0` (unset uses [`MAX_OBJECT_BYTES`]).
+    pub fn validate(&self) -> Result<(), pistack_config::ConfigError> {
+        if self.max_object_bytes == 0 {
+            return Err(pistack_config::ConfigError::Module {
+                module: "silo".into(),
+                message: "max_object_bytes must be greater than 0".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Read `[modules.silo]` from a loaded config. Missing section → defaults.
+    /// A present section with `max_object_bytes = 0` is rejected.
     pub fn from_config(cfg: &pistack_config::Config) -> Result<Self, pistack_config::ConfigError> {
-        cfg.module("silo")
+        let silo: Self = cfg.module("silo")?;
+        silo.validate()?;
+        Ok(silo)
     }
 
     /// Load process config (file + `PISTACK__*`) and take `[modules.silo]`.
     ///
-    /// On config load failure, returns defaults so the module still starts;
-    /// the error is logged by the caller when wired that way.
-    pub fn load() -> Self {
-        match pistack_config::Config::load(None) {
-            Ok(cfg) => Self::from_config(&cfg).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+    /// No config file → defaults (5 GiB). Invalid silo settings (including
+    /// `max_object_bytes = 0`) return an error so assemble can refuse to start.
+    pub fn load() -> Result<Self, pistack_config::ConfigError> {
+        let cfg = pistack_config::Config::load(None)?;
+        Self::from_config(&cfg)
     }
 }
 
@@ -231,5 +243,13 @@ mod tests {
             .unwrap();
         let silo = SiloConfig::from_config(&cfg).unwrap();
         assert_eq!(silo.max_object_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn silo_config_rejects_zero() {
+        let cfg =
+            pistack_config::Config::from_toml("[modules.silo]\nmax_object_bytes = 0\n").unwrap();
+        let err = SiloConfig::from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("max_object_bytes"), "{err}");
     }
 }

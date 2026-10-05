@@ -37,7 +37,7 @@ pub struct Assembly {
 }
 
 /// Every module in the binary, in mount order. Adding a module = one line.
-pub fn assemble(dev: bool) -> Assembly {
+pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig) -> Assembly {
     let gate_m = Arc::new(gate::Gate::default());
     let registry = Arc::new(forge::DriverRegistry::new());
     let queue = CommandQueue::new(QueueConfig::default());
@@ -59,7 +59,7 @@ pub fn assemble(dev: bool) -> Assembly {
         Arc::new(fabric_module()),
         Arc::new(slab::Slab::default().with_queue(queue.clone())),
         Arc::new(mold::Mold::default()),
-        Arc::new(silo::Silo),
+        Arc::new(silo::Silo::configured(silo_cfg)),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),
         Arc::new(relay_module().with_queue(queue.clone())),
@@ -219,7 +219,12 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     // any module opens keep.
     let key_backend = keep::backend::configured().context("keep root-key backend")?;
     tracing::info!(backend = key_backend.name(), "keep: root-key backend");
-    let asm = assemble(opts.dev);
+    let silo_cfg = silo::SiloConfig::load().context("silo config")?;
+    tracing::info!(
+        max_object_bytes = silo_cfg.max_object_bytes,
+        "silo: max object size"
+    );
+    let asm = assemble(opts.dev, silo_cfg);
 
     // Start modules first so gate has generated its signing key before the
     // gateway asks for the verifier.
