@@ -87,8 +87,10 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
 
 /// `PISTACK_FABRIC_BACKEND=hostnat` is the single-host NAT datapath.
 /// `PISTACK_FABRIC_BACKEND=overlay` is the VXLAN segment datapath. The agent
-/// applies that plan. Anything else, including an unset variable, keeps the
-/// mock backend so tests and a laptop server never touch interfaces.
+/// applies that plan. Anything else keeps the mock backend so tests and a
+/// laptop server never touch interfaces. A server started without the
+/// variable uses the cluster's saved choice (see `fabricchoice`), which
+/// `run` puts back into the variable before modules are assembled.
 /// `PISTACK_RELAY_BACKEND=forward` mounts the in-process forwarder and HTTP
 /// proxy, and `mock` keeps the mock. Unset follows the fabric: `hostnat` or
 /// `overlay` gets the forwarder, anything else the mock. `run` refuses any
@@ -212,6 +214,9 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         members = established.members.len(),
         "control plane membership"
     );
+    // Before any module reads the fabric setting, and before the follow
+    // loop starts replicating: a leader's save reaches every server.
+    crate::fabricchoice::settle(&store).context("fabric backend")?;
     leadership.set(established.leader);
     let cluster = std::sync::Arc::new(crate::cluster::handle_from(
         node_id,
