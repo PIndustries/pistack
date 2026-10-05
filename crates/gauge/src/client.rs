@@ -4,9 +4,7 @@
 //! Writes samples and alarms. The only place alarm `status` is updated.
 
 use crate::store::SampleRing;
-use crate::types::{
-    phase_for, sanitize_metric, Alarm, AlarmSpec, AlarmStatus, Sample,
-};
+use crate::types::{phase_for, sanitize_metric, Alarm, AlarmSpec, AlarmStatus, Sample};
 use chrono::{DateTime, Utc};
 use pistack_store::{Collection, Store};
 use pistack_types::{ApiError, ApiResult, Id, Meta};

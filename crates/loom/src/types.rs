@@ -165,6 +165,148 @@ pub struct Container {
     pub volume_mounts: Vec<VolumeMount>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub working_dir: String,
+    /// Checked on the host that runs the pod. Failure past
+    /// `failure_threshold` restarts the container when the restart policy
+    /// allows it. An `exec` handler is stored and reported unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness_probe: Option<Probe>,
+    /// While this probe has not passed, the container is not ready and the
+    /// pod's Ready condition stays false. Absent means the container is
+    /// ready once it is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<Probe>,
+}
+
+/// One check against a container. Exactly one of `http_get`, `tcp_socket`,
+/// or `exec` is set. Zero `period_seconds`, `timeout_seconds`,
+/// `success_threshold`, or `failure_threshold` means the default.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Probe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_get: Option<HttpGetProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_socket: Option<TcpSocketProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<ExecProbe>,
+    #[serde(default)]
+    pub initial_delay_seconds: u32,
+    #[serde(default = "default_period")]
+    pub period_seconds: u32,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u32,
+    #[serde(default = "default_success")]
+    pub success_threshold: u32,
+    #[serde(default = "default_failure")]
+    pub failure_threshold: u32,
+}
+
+fn default_period() -> u32 {
+    10
+}
+fn default_timeout() -> u32 {
+    1
+}
+fn default_success() -> u32 {
+    1
+}
+fn default_failure() -> u32 {
+    3
+}
+
+fn nonzero(value: u32, default: u32) -> u32 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self {
+            http_get: None,
+            tcp_socket: None,
+            exec: None,
+            initial_delay_seconds: 0,
+            period_seconds: default_period(),
+            timeout_seconds: default_timeout(),
+            success_threshold: default_success(),
+            failure_threshold: default_failure(),
+        }
+    }
+}
+
+impl Probe {
+    pub fn period(&self) -> u32 {
+        nonzero(self.period_seconds, default_period())
+    }
+    pub fn timeout(&self) -> u32 {
+        nonzero(self.timeout_seconds, default_timeout())
+    }
+    pub fn successes_required(&self) -> u32 {
+        nonzero(self.success_threshold, default_success())
+    }
+    pub fn failures_required(&self) -> u32 {
+        nonzero(self.failure_threshold, default_failure())
+    }
+    pub fn handler(&self) -> ProbeHandlerKind {
+        if self.http_get.is_some() {
+            ProbeHandlerKind::Http
+        } else if self.tcp_socket.is_some() {
+            ProbeHandlerKind::Tcp
+        } else if self.exec.is_some() {
+            ProbeHandlerKind::Exec
+        } else {
+            ProbeHandlerKind::Missing
+        }
+    }
+}
+
+/// Which action a [`Probe`] will run. `Exec` is accepted on the spec and
+/// reported unsupported until a later change can run a command in the
+/// container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeHandlerKind {
+    Http,
+    Tcp,
+    Exec,
+    Missing,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpGetProbe {
+    #[serde(default = "default_probe_path")]
+    pub path: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<ProbeScheme>,
+}
+
+fn default_probe_path() -> String {
+    "/".into()
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ProbeScheme {
+    #[default]
+    #[serde(alias = "http")]
+    Http,
+    #[serde(alias = "https")]
+    Https,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpSocketProbe {
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExecProbe {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +444,23 @@ pub struct PodStatus {
 }
 
 pub type Pod = Resource<PodSpec, PodStatus>;
+
+/// Condition kind [`PodStatus::is_ready`] reads.
+pub const POD_READY: &str = "Ready";
+
+impl PodStatus {
+    /// Whether controllers should treat this pod as ready to serve.
+    ///
+    /// True when the [`POD_READY`] condition is present and true. A pod
+    /// with no readiness probe reaches that once every container is
+    /// running. A readiness probe holds the condition false until the
+    /// probe has passed.
+    pub fn is_ready(&self) -> bool {
+        self.conditions
+            .iter()
+            .any(|c| c.kind == POD_READY && c.status)
+    }
+}
 
 /// A pod template: the metadata a controller stamps on each pod plus its spec.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -946,4 +1105,74 @@ pub fn set_condition(
 /// Whether a delete has been requested (see `DELETE_ANNOTATION`).
 pub fn delete_requested<S, T>(r: &Resource<S, T>) -> bool {
     r.meta.annotations.contains_key(DELETE_ANNOTATION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_without_probes_still_decodes() {
+        let container: Container = serde_json::from_str(r#"{"name":"web","image":"img"}"#).unwrap();
+        assert!(container.liveness_probe.is_none());
+        assert!(container.readiness_probe.is_none());
+        let encoded = serde_json::to_value(&container).unwrap();
+        assert!(encoded.get("liveness_probe").is_none());
+        assert!(encoded.get("readiness_probe").is_none());
+    }
+
+    #[test]
+    fn probe_defaults_fill_omitted_fields_and_zero_means_default() {
+        let probe: Probe =
+            serde_json::from_str(r#"{"http_get":{"path":"/health","port":8080}}"#).unwrap();
+        assert_eq!(probe.initial_delay_seconds, 0);
+        assert_eq!(probe.period_seconds, 10);
+        assert_eq!(probe.timeout_seconds, 1);
+        assert_eq!(probe.success_threshold, 1);
+        assert_eq!(probe.failure_threshold, 3);
+        assert_eq!(probe.http_get.as_ref().unwrap().path, "/health");
+        assert_eq!(probe.handler(), ProbeHandlerKind::Http);
+
+        let tcp: Probe = serde_json::from_str(r#"{"tcp_socket":{"port":80}}"#).unwrap();
+        assert_eq!(tcp.handler(), ProbeHandlerKind::Tcp);
+        assert_eq!(tcp.period(), 10);
+
+        let zero = Probe {
+            period_seconds: 0,
+            timeout_seconds: 0,
+            success_threshold: 0,
+            failure_threshold: 0,
+            ..Probe::default()
+        };
+        assert_eq!(zero.period(), 10);
+        assert_eq!(zero.timeout(), 1);
+        assert_eq!(zero.successes_required(), 1);
+        assert_eq!(zero.failures_required(), 3);
+
+        let exec: Probe = serde_json::from_str(r#"{"exec":{"command":["/bin/true"]}}"#).unwrap();
+        assert_eq!(exec.handler(), ProbeHandlerKind::Exec);
+        assert_eq!(exec.exec.unwrap().command, vec!["/bin/true".to_string()]);
+
+        let scheme: HttpGetProbe =
+            serde_json::from_str(r#"{"path":"/","port":443,"scheme":"https"}"#).unwrap();
+        assert_eq!(scheme.scheme, Some(ProbeScheme::Https));
+    }
+
+    #[test]
+    fn is_ready_reads_the_ready_condition() {
+        let mut status = PodStatus::default();
+        assert!(!status.is_ready());
+        set_condition(&mut status.conditions, POD_READY, false, "Starting", "");
+        assert!(!status.is_ready());
+        set_condition(&mut status.conditions, POD_READY, true, "Running", "");
+        assert!(status.is_ready());
+        set_condition(
+            &mut status.conditions,
+            "PodScheduled",
+            true,
+            "Scheduled",
+            "",
+        );
+        assert!(status.is_ready());
+    }
 }

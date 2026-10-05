@@ -106,6 +106,36 @@ pub struct MachineReport {
     /// Observed power state, when the runtime knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power: Option<PowerState>,
+    /// Latest liveness and readiness streaks for a pod sandbox. Empty for
+    /// a machine that has no probes. The control plane copies this onto
+    /// the machine status; it is not a separate call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<ProbeReport>,
+}
+
+/// `kind` on a [`ProbeReport`] for a liveness probe.
+pub const PROBE_LIVENESS: &str = "liveness";
+/// `kind` on a [`ProbeReport`] for a readiness probe.
+pub const PROBE_READINESS: &str = "readiness";
+
+/// One container probe as the host last observed it.
+///
+/// `successes` and `failures` are the current consecutive streaks. A
+/// success clears `failures` and the other way around. The pod controller
+/// compares the streaks with the probe thresholds on the pod spec.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProbeReport {
+    pub container: String,
+    /// [`PROBE_LIVENESS`] or [`PROBE_READINESS`].
+    pub kind: String,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub successes: u32,
+    #[serde(default)]
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 // ---- machine command payloads ---------------------------------------------
