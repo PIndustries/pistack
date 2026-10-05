@@ -3,24 +3,25 @@
 
 //! Writes samples and alarms. The only place alarm `status` is updated.
 
+use crate::store::SampleRing;
 use crate::types::{
-    phase_for, sanitize_metric, Alarm, AlarmSpec, AlarmStatus, Sample, MAX_SAMPLES,
+    phase_for, sanitize_metric, Alarm, AlarmSpec, AlarmStatus, Sample,
 };
 use chrono::{DateTime, Utc};
 use pistack_store::{Collection, Store};
 use pistack_types::{ApiError, ApiResult, Id, Meta};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Client {
     store: Store,
-    samples: Arc<Mutex<Vec<Sample>>>,
+    samples: Arc<SampleRing>,
 }
 
 impl Client {
-    pub fn new(store: Store, samples: Arc<Mutex<Vec<Sample>>>) -> Self {
+    pub fn new(store: Store, samples: Arc<SampleRing>) -> Self {
         Self { store, samples }
     }
 
@@ -28,12 +29,12 @@ impl Client {
         &self.store
     }
 
-    fn alarms(&self) -> Collection<Alarm> {
-        self.store.collection()
+    pub fn ring(&self) -> &SampleRing {
+        &self.samples
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<Sample>> {
-        self.samples.lock().unwrap_or_else(|p| p.into_inner())
+    fn alarms(&self) -> Collection<Alarm> {
+        self.store.collection()
     }
 
     /// Append a sample and re-evaluate every alarm watching `metric`.
@@ -50,35 +51,24 @@ impl Client {
             value,
             timestamp: Utc::now(),
         };
-        {
-            let mut buf = self.lock();
-            push_sample(&mut buf, sample.clone());
-        }
+        self.samples.push(sample.clone());
         self.evaluate(&metric)?;
         Ok(sample)
     }
 
     /// Samples in arrival order. `metric` filters when set.
     pub fn list_samples(&self, metric: Option<&str>) -> Vec<Sample> {
-        let buf = self.lock();
-        buf.iter()
-            .filter(|s| metric.is_none_or(|m| s.metric == m))
-            .cloned()
-            .collect()
+        self.samples.list(metric)
     }
 
     fn latest(&self, metric: &str) -> Option<Sample> {
-        self.lock()
-            .iter()
-            .rev()
-            .find(|s| s.metric == metric)
-            .cloned()
+        self.samples.latest(metric)
     }
 
     /// Prometheus text exposition: one gauge per metric, the latest sample.
     /// Names are sanitised to `[a-zA-Z_:][a-zA-Z0-9_:]*`.
     pub fn metrics_text(&self) -> String {
-        let buf = self.lock();
+        let buf = self.samples.lock();
         let mut latest: BTreeMap<String, (DateTime<Utc>, f64)> = BTreeMap::new();
         for sample in buf.iter() {
             let series = prom_series(&sample.metric);
@@ -171,26 +161,19 @@ impl Client {
 
 /// Host capacity: `pistack_host_memory_mib` and `pistack_host_vcpus`,
 /// labeled by `node`. Does not re-evaluate alarms.
-pub fn record_host(samples: &Mutex<Vec<Sample>>, node: &str, memory_mib: u64, vcpus: u32) {
+pub fn record_host(samples: &SampleRing, node: &str, memory_mib: u64, vcpus: u32) {
     let node = node_label(node);
     let now = Utc::now();
-    let mut buf = samples.lock().unwrap_or_else(|p| p.into_inner());
-    push_sample(
-        &mut buf,
-        Sample {
-            metric: format!("pistack_host_memory_mib{{node=\"{node}\"}}"),
-            value: memory_mib as f64,
-            timestamp: now,
-        },
-    );
-    push_sample(
-        &mut buf,
-        Sample {
-            metric: format!("pistack_host_vcpus{{node=\"{node}\"}}"),
-            value: vcpus as f64,
-            timestamp: now,
-        },
-    );
+    samples.push(Sample {
+        metric: format!("pistack_host_memory_mib{{node=\"{node}\"}}"),
+        value: memory_mib as f64,
+        timestamp: now,
+    });
+    samples.push(Sample {
+        metric: format!("pistack_host_vcpus{{node=\"{node}\"}}"),
+        value: vcpus as f64,
+        timestamp: now,
+    });
 }
 
 fn node_label(node: &str) -> String {
@@ -226,14 +209,6 @@ fn prom_series(metric: &str) -> String {
         }
         None => sanitize_metric(metric),
     }
-}
-
-fn push_sample(buf: &mut Vec<Sample>, sample: Sample) {
-    if buf.len() >= MAX_SAMPLES {
-        let drop_n = buf.len() + 1 - MAX_SAMPLES;
-        buf.drain(..drop_n);
-    }
-    buf.push(sample);
 }
 
 fn format_value(value: f64) -> String {
@@ -273,12 +248,13 @@ fn validate_alarm(spec: &AlarmSpec) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MAX_SAMPLES;
     use pistack_store::Store;
     use std::sync::Arc;
 
     #[test]
     fn record_host_is_in_prometheus_text() {
-        let samples = Arc::new(Mutex::new(Vec::new()));
+        let samples = Arc::new(SampleRing::memory());
         record_host(&samples, "node-a", 2048, 4);
         let client = Client::new(Store::in_memory().unwrap(), samples);
         let text = client.metrics_text();
@@ -295,5 +271,18 @@ mod tests {
                 && (l.ends_with(" 4") || l.ends_with(" 4.0"))),
             "{text}"
         );
+    }
+
+    #[test]
+    fn max_samples_is_enforced() {
+        let ring = SampleRing::memory();
+        for i in 0..(MAX_SAMPLES + 5) {
+            ring.push(Sample {
+                metric: "m".into(),
+                value: i as f64,
+                timestamp: Utc::now(),
+            });
+        }
+        assert_eq!(ring.list(None).len(), MAX_SAMPLES);
     }
 }

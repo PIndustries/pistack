@@ -4,7 +4,7 @@
 //! Container orchestration: pods, deployments, services, controllers.
 //!
 //! * [`types`] — `Pod`, `ReplicaSet`, `Deployment`, `StatefulSet`,
-//!   `DaemonSet`, `Service`, `ConfigMap`, `Job`, `CronJob`, `Ingress`;
+//!   `DaemonSet`, `Service`, `ConfigMap`, `Job`, `CronJob`, `Ingress`, `Autoscaler`;
 //!   all `Resource<Spec, Status>` (metadata + spec + status, labels,
 //!   selectors).
 //! * [`controllers`] — one reconcile loop per kind. Pods become forge
@@ -15,7 +15,7 @@
 //! * [`realizer`] — `ServiceRealizer`, the seam to fabric/relay.
 //! * [`http`] — the `loom` API: `/pods`, `/replicasets`, `/deployments`,
 //!   `/statefulsets`, `/daemonsets`, `/services`, `/configmaps`, `/jobs`,
-//!   `/cronjobs`, `/ingresses`.
+//!   `/cronjobs`, `/ingresses`, `/autoscalers`.
 //!
 //! `Loom` is dev mode: unauthenticated requests are admin, services are
 //! realised by [`NoopRealizer`], cluster IPs come from `10.96.0.0/12`.
@@ -38,6 +38,7 @@ pub use types::*;
 use async_trait::async_trait;
 use axum::Router;
 use controllers::{
+    autoscaler::AutoscalerController,
     cronjob::CronJobController,
     daemonset::DaemonSetController,
     deployment::DeploymentController,
@@ -190,6 +191,10 @@ async fn start(config: &LoomConfig, ctx: ModuleContext) -> anyhow::Result<()> {
     ));
     tokio::spawn(controllers::run(
         JobController::new(store.clone()),
+        ctx.clone(),
+    ));
+    tokio::spawn(controllers::run(
+        AutoscalerController::new(store.clone()),
         ctx.clone(),
     ));
     tokio::spawn(controllers::run(CronJobController::new(store), ctx));

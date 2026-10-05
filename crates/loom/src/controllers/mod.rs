@@ -16,6 +16,7 @@
 //!   and carried out by the owning controller once children are gone.
 //! * Ownership is a label (`OWNER_LABEL` = owner id), never a scan by name.
 
+pub mod autoscaler;
 pub mod cronjob;
 pub mod daemonset;
 pub mod deployment;

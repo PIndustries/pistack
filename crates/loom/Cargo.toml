@@ -13,6 +13,7 @@ forge.workspace = true
 keep.workspace = true
 base64.workspace = true
 relay.workspace = true
+gauge.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
