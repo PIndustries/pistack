@@ -33,15 +33,15 @@
 
 use super::{delete_quietly, patch_status, request_delete, Controller};
 use crate::types::{
-    set_condition, ContainerState, ContainerStatus, Pod, PodPhase, PodStatus, RestartPolicy,
-    MACHINE_POD_LABEL,
+    set_condition, ContainerState, ContainerStatus, EnvVarSource, Pod, PodPhase, PodStatus,
+    RestartPolicy, VolumeSource, MACHINE_POD_LABEL,
 };
 use chrono::{Duration, Utc};
 use forge::{Machine, MachineKind, MachineSpec, PowerState, Size};
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{Id, Phase, Resources};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The document a pod's machine carries in `spec.user_data`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +57,23 @@ pub struct PodSandbox {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service_account: String,
     pub networks: Vec<String>,
+    /// ConfigMap file bodies keyed by name and by id. Empty from
+    /// [`PodSandbox::from_pod`]; filled when the machine is created.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_maps: BTreeMap<String, ProjectedFiles>,
+    /// Secret file bodies keyed by name and by id. Same lifetime as
+    /// [`Self::config_maps`]. Payloads are not part of the pod spec.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, ProjectedFiles>,
+}
+
+/// File bodies for one ConfigMap or Secret. `binary_data` values are base64.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProjectedFiles {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub data: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub binary_data: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,7 +113,153 @@ impl PodSandbox {
             volumes: pod.spec.volumes.clone(),
             service_account: pod.spec.service_account.clone(),
             networks: networks_of(pod),
+            config_maps: BTreeMap::new(),
+            secrets: BTreeMap::new(),
         }
+    }
+}
+
+/// Copy ConfigMap and Secret bodies the pod references into the sandbox
+/// document the agent receives. A missing object is left out; the runtime
+/// then starts without that value.
+fn fill_projections(store: &Store, sandbox: &mut PodSandbox) {
+    let project = sandbox.pod.project.clone();
+    let (config_maps, secrets) = referenced_objects(sandbox);
+    for name in config_maps {
+        let Some(cm) = find_config_map(store, project.as_ref(), &name) else {
+            tracing::warn!(config_map = %name, "loom: config map is not available for the sandbox");
+            continue;
+        };
+        remember(
+            &mut sandbox.config_maps,
+            &cm.meta.name,
+            &cm.meta.id.to_string(),
+            ProjectedFiles {
+                data: cm.spec.data.clone(),
+                binary_data: cm.spec.binary_data.clone(),
+            },
+        );
+    }
+    for name in secrets {
+        let Some(id) = find_secret_id(store, project.as_ref(), &name) else {
+            tracing::warn!(secret = %name, "loom: secret is not available for the sandbox");
+            continue;
+        };
+        let bytes = match keep::read_payload(store, &id) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(secret = %name, error = %e, "loom: secret payload is not available for the sandbox");
+                continue;
+            }
+        };
+        let label = store
+            .collection::<keep::Secret>()
+            .get(&id)
+            .map(|s| s.meta.name)
+            .unwrap_or_default();
+        remember(
+            &mut sandbox.secrets,
+            &label,
+            &id.to_string(),
+            project_secret(&bytes),
+        );
+    }
+}
+
+fn referenced_objects(sandbox: &PodSandbox) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut config_maps = BTreeSet::new();
+    let mut secrets = BTreeSet::new();
+    for container in &sandbox.containers {
+        for env in &container.env {
+            match &env.value_from {
+                Some(EnvVarSource::ConfigMap { name, .. }) => {
+                    config_maps.insert(name.clone());
+                }
+                Some(EnvVarSource::Secret { name, .. }) => {
+                    secrets.insert(name.clone());
+                }
+                None => {}
+            }
+        }
+    }
+    for volume in &sandbox.volumes {
+        match &volume.source {
+            VolumeSource::ConfigMap(name) => {
+                config_maps.insert(name.clone());
+            }
+            VolumeSource::Secret(name) => {
+                secrets.insert(name.clone());
+            }
+            VolumeSource::EmptyDir | VolumeSource::Volume(_) => {}
+        }
+    }
+    (config_maps, secrets)
+}
+
+fn remember(
+    map: &mut BTreeMap<String, ProjectedFiles>,
+    name: &str,
+    id: &str,
+    files: ProjectedFiles,
+) {
+    if !name.is_empty() {
+        map.insert(name.to_owned(), files.clone());
+    }
+    if !id.is_empty() && id != name {
+        map.insert(id.to_owned(), files);
+    }
+}
+
+fn find_config_map(
+    store: &Store,
+    project: Option<&Id>,
+    name_or_id: &str,
+) -> Option<crate::types::ConfigMap> {
+    let col = store.collection::<crate::types::ConfigMap>();
+    if let Some(id) = Id::parse(crate::types::kinds::CONFIG_MAP, name_or_id) {
+        if let Ok(cm) = col.get(&id) {
+            return Some(cm);
+        }
+    }
+    col.get_by_name(project, name_or_id).ok()
+}
+
+fn find_secret_id(store: &Store, project: Option<&Id>, name_or_id: &str) -> Option<Id> {
+    if let Some(id) = Id::parse(pistack_types::kind::SECRET, name_or_id) {
+        return Some(id);
+    }
+    store
+        .collection::<keep::Secret>()
+        .get_by_name(project, name_or_id)
+        .ok()
+        .map(|s| s.meta.id)
+}
+
+/// A JSON object of strings becomes one key per field. Any other payload is
+/// a single `data` entry (text, or base64 when the bytes are not text).
+fn project_secret(bytes: &[u8]) -> ProjectedFiles {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if let Ok(map) = serde_json::from_str::<BTreeMap<String, String>>(text) {
+            if !map.is_empty() {
+                return ProjectedFiles {
+                    data: map,
+                    binary_data: BTreeMap::new(),
+                };
+            }
+        }
+        let mut data = BTreeMap::new();
+        data.insert("data".into(), text.to_owned());
+        return ProjectedFiles {
+            data,
+            binary_data: BTreeMap::new(),
+        };
+    }
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut binary_data = BTreeMap::new();
+    binary_data.insert("data".into(), STANDARD.encode(bytes));
+    ProjectedFiles {
+        data: BTreeMap::new(),
+        binary_data,
     }
 }
 
@@ -176,7 +339,8 @@ impl PodController {
             .first()
             .map(|c| c.image.clone())
             .unwrap_or_default();
-        let sandbox = PodSandbox::from_pod(pod);
+        let mut sandbox = PodSandbox::from_pod(pod);
+        fill_projections(&self.store, &mut sandbox);
         let user_data = serde_json::to_string(&sandbox)?;
         let volumes = pod
             .spec
@@ -528,5 +692,177 @@ impl Controller for PodController {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fill_projections, project_secret, PodSandbox};
+    use crate::types::{
+        ConfigMap, ConfigMapSpec, Container, EnvVar, EnvVarSource, Pod, PodSpec, PodVolume,
+        VolumeSource,
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use pistack_store::Store;
+    use pistack_types::{kind, Id};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn project_secret_splits_a_json_object_and_keeps_other_payloads() {
+        let json = project_secret(br#"{"password":"s3cret-value"}"#);
+        assert_eq!(
+            json.data.get("password").map(String::as_str),
+            Some("s3cret-value")
+        );
+        assert!(json.binary_data.is_empty());
+
+        let text = project_secret(b"plain-token");
+        assert_eq!(
+            text.data.get("data").map(String::as_str),
+            Some("plain-token")
+        );
+
+        let empty = project_secret(b"{}");
+        assert_eq!(empty.data.get("data").map(String::as_str), Some("{}"));
+
+        let odd = project_secret(br#"{"n":1}"#);
+        assert_eq!(odd.data.get("data").map(String::as_str), Some(r#"{"n":1}"#));
+
+        let raw = [0xff, 0xfe];
+        let binary = project_secret(&raw);
+        assert!(binary.data.is_empty());
+        assert_eq!(
+            binary.binary_data.get("data").map(String::as_str),
+            Some(STANDARD.encode(raw).as_str())
+        );
+    }
+
+    #[test]
+    fn sandbox_carries_projected_files_the_debug_view_omits() {
+        let store = Store::in_memory().unwrap();
+        let project = Id::new(kind::PROJECT);
+        let keep = keep::Client::open(&store).unwrap();
+        let secret = keep
+            .create_secret(
+                keep::Secret::new("db", Some(project.clone()), keep::SecretSpec::default()),
+                br#"{"password":"s3cret-value"}"#,
+            )
+            .unwrap();
+        let plain = keep
+            .create_secret(
+                keep::Secret::new("token", Some(project.clone()), keep::SecretSpec::default()),
+                b"plain-token",
+            )
+            .unwrap();
+        let mut data = BTreeMap::new();
+        data.insert("MODE".into(), "prod".into());
+        let cm = store
+            .collection::<ConfigMap>()
+            .create(ConfigMap::new(
+                "app",
+                Some(project.clone()),
+                ConfigMapSpec {
+                    data,
+                    ..ConfigMapSpec::default()
+                },
+            ))
+            .unwrap();
+        let pod = Pod::new(
+            "web",
+            Some(project),
+            PodSpec {
+                containers: vec![Container {
+                    name: "web".into(),
+                    image: "img".into(),
+                    env: vec![
+                        EnvVar {
+                            name: "MODE".into(),
+                            value_from: Some(EnvVarSource::ConfigMap {
+                                name: "app".into(),
+                                key: "MODE".into(),
+                            }),
+                            ..EnvVar::default()
+                        },
+                        EnvVar {
+                            name: "PASSWORD".into(),
+                            value_from: Some(EnvVarSource::Secret {
+                                name: secret.meta.id.to_string(),
+                                key: "password".into(),
+                            }),
+                            ..EnvVar::default()
+                        },
+                    ],
+                    ..Container::default()
+                }],
+                volumes: vec![
+                    PodVolume {
+                        name: "cfg".into(),
+                        source: VolumeSource::ConfigMap(cm.meta.id.to_string()),
+                    },
+                    PodVolume {
+                        name: "sec".into(),
+                        source: VolumeSource::Secret(secret.meta.name.clone()),
+                    },
+                    PodVolume {
+                        name: "tok".into(),
+                        source: VolumeSource::Secret(plain.meta.id.to_string()),
+                    },
+                ],
+                ..PodSpec::default()
+            },
+        );
+        let mut sandbox = PodSandbox::from_pod(&pod);
+        let debug = serde_json::to_value(&sandbox).unwrap();
+        assert!(debug.get("config_maps").is_none());
+        assert!(debug.get("secrets").is_none());
+        assert!(!debug.to_string().contains("s3cret-value"));
+        fill_projections(&store, &mut sandbox);
+        let by_name = sandbox.config_maps.get("app").unwrap();
+        let by_id = sandbox.config_maps.get(&cm.meta.id.to_string()).unwrap();
+        assert_eq!(by_name.data.get("MODE").map(String::as_str), Some("prod"));
+        assert_eq!(by_id.data.get("MODE").map(String::as_str), Some("prod"));
+        assert_eq!(
+            sandbox
+                .secrets
+                .get("db")
+                .unwrap()
+                .data
+                .get("password")
+                .map(String::as_str),
+            Some("s3cret-value")
+        );
+        assert_eq!(
+            sandbox
+                .secrets
+                .get(&secret.meta.id.to_string())
+                .unwrap()
+                .data
+                .get("password")
+                .map(String::as_str),
+            Some("s3cret-value")
+        );
+        assert_eq!(
+            sandbox
+                .secrets
+                .get("token")
+                .unwrap()
+                .data
+                .get("data")
+                .map(String::as_str),
+            Some("plain-token")
+        );
+        assert_eq!(
+            sandbox
+                .secrets
+                .get(&plain.meta.id.to_string())
+                .unwrap()
+                .data
+                .get("data")
+                .map(String::as_str),
+            Some("plain-token")
+        );
+        let machine = serde_json::to_string(&sandbox).unwrap();
+        assert!(machine.contains("s3cret-value"));
+        assert!(machine.contains("plain-token"));
     }
 }

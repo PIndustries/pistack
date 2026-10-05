@@ -65,17 +65,25 @@ impl RootKey {
         Self::from_bytes(b)
     }
 
+    /// Read the root key when one is already stored. Does not create a key.
+    pub fn load_existing(store: &Store) -> Result<Option<Self>> {
+        let Some(b64) = store.get_meta::<String>(META_ROOT_KEY)? else {
+            return Ok(None);
+        };
+        let raw = B64
+            .decode(b64.trim())
+            .map_err(|e| KeepError::Crypto(format!("root key is not base64: {e}")))?;
+        let bytes: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| KeepError::Crypto("root key must be 32 bytes".into()))?;
+        Ok(Some(Self::from_bytes(bytes)))
+    }
+
     /// Read the root key from the store, generating and persisting one on
     /// first start.
     pub fn load_or_create(store: &Store) -> Result<Self> {
-        if let Some(b64) = store.get_meta::<String>(META_ROOT_KEY)? {
-            let raw = B64
-                .decode(b64.trim())
-                .map_err(|e| KeepError::Crypto(format!("root key is not base64: {e}")))?;
-            let bytes: [u8; 32] = raw
-                .try_into()
-                .map_err(|_| KeepError::Crypto("root key must be 32 bytes".into()))?;
-            return Ok(Self::from_bytes(bytes));
+        if let Some(key) = Self::load_existing(store)? {
+            return Ok(key);
         }
         let key = Self::generate();
         store.put_meta(META_ROOT_KEY, &B64.encode(*key.bytes))?;
