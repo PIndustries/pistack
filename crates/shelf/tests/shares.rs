@@ -28,15 +28,32 @@ fn install_share_tools(dir: &std::path::Path) {
         std::fs::set_permissions(&script, perms).unwrap();
     }
     std::env::set_var("PISTACK_EXPORTFS", &script);
+    std::env::set_var("PISTACK_EXPORTS_FILE", dir.join("pistack.exports"));
+    std::env::set_var("PISTACK_SHELF_EUID", "0");
+    std::env::remove_var("PISTACK_SHELF_HELPER");
     std::env::set_var("PISTACK_CEPH_BIN", dir.join("no-ceph"));
     std::env::remove_var("PISTACK_CEPH_FS");
 }
 
 fn clear_share_tools() {
-    std::env::remove_var("PISTACK_EXPORTFS");
-    std::env::remove_var("PISTACK_CEPH_BIN");
-    std::env::remove_var("PISTACK_CEPH_FS");
-    std::env::remove_var("PISTACK_SHELF_DIR");
+    for key in [
+        "PISTACK_EXPORTFS",
+        "PISTACK_CEPH_BIN",
+        "PISTACK_CEPH_FS",
+        "PISTACK_SHELF_DIR",
+        "PISTACK_EXPORTS_FILE",
+        "PISTACK_SHELF_EUID",
+        "PISTACK_SHELF_HELPER",
+        "PISTACK_DATA_DIR",
+        "PISTACK_SHELF_BACKOFF_MS",
+        "PISTACK_SHELF_RETRY_MS",
+        "PISTACK_EXPORTFS_LOG",
+        "PISTACK_EXPORT_FAIL",
+        "PISTACK_SUDO_LOG",
+        "PISTACK_HELPER_LOG",
+    ] {
+        std::env::remove_var(key);
+    }
 }
 
 fn open_store(dir: &std::path::Path) -> Store {
@@ -208,20 +225,23 @@ async fn create_list_and_reject_bad_protocol() {
         home_dir.file_name().and_then(|s| s.to_str()),
         Some(id.as_str())
     );
-    let exports = std::fs::read_to_string(
-        home_dir
-            .parent()
-            .unwrap()
-            .join("exports.d")
-            .join(format!("{id}.exports")),
-    )
-    .unwrap();
+    let exports = std::fs::read_to_string(dir.path().join("pistack.exports")).unwrap();
+    let line = format!(
+        "{} 10.0.0.0/24(ro,sync,no_subtree_check)",
+        home_dir.display()
+    );
+    assert!(
+        exports.starts_with("# Managed by pistack shelf"),
+        "{exports}"
+    );
+    assert!(exports.contains(&line), "{exports}");
     assert_eq!(
-        exports,
-        format!(
-            "{} 10.0.0.0/24(ro,sync,no_subtree_check)\n",
-            home_dir.display()
-        )
+        exports
+            .lines()
+            .filter(|l| l.contains("(ro,") || l.contains("(rw,"))
+            .count(),
+        1,
+        "{exports}"
     );
     assert_eq!(share["revision"], 1);
     assert!(share.get("project").is_none());
@@ -411,18 +431,20 @@ async fn nfs_share_writes_exports_and_delete_removes_them() {
     let share_dir = std::path::PathBuf::from(share["status"]["message"].as_str().unwrap());
     assert!(share_dir.is_dir(), "{}", share_dir.display());
     assert_eq!(share_dir.file_name().and_then(|s| s.to_str()), Some(id));
-    let exports_path = share_dir
-        .parent()
-        .unwrap()
-        .join("exports.d")
-        .join(format!("{id}.exports"));
+    let exports_path = dir.path().join("pistack.exports");
     let exports = std::fs::read_to_string(&exports_path).unwrap();
     let shown = share_dir.display().to_string();
-    assert_eq!(
-        exports,
-        format!(
-            "{shown} 10.0.0.0/24(ro,sync,no_subtree_check)\n{shown} 10.1.0.0/24(rw,sync,no_subtree_check)\n"
-        )
+    assert!(
+        exports.starts_with("# Managed by pistack shelf"),
+        "{exports}"
+    );
+    assert!(
+        exports.contains(&format!("{shown} 10.0.0.0/24(ro,sync,no_subtree_check)")),
+        "{exports}"
+    );
+    assert!(
+        exports.contains(&format!("{shown} 10.1.0.0/24(rw,sync,no_subtree_check)")),
+        "{exports}"
     );
 
     let (st, _) = call(
@@ -436,6 +458,475 @@ async fn nfs_share_writes_exports_and_delete_removes_them() {
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
     assert!(!share_dir.exists());
-    assert!(!exports_path.exists());
+    let exports = std::fs::read_to_string(&exports_path).unwrap();
+    assert!(!exports.contains(&shown), "{exports}");
+    assert!(!exports.contains(id), "{exports}");
+    clear_share_tools();
+}
+
+fn executable(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+fn export_lines(path: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+struct RestoreEnv {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl RestoreEnv {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+
+impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+async fn stop_loop(shutdown: pistack_types::module::CancellationToken) {
+    shutdown.cancel();
+    tokio::task::yield_now().await;
+    shelf::quiesce().await;
+    tokio::task::yield_now().await;
+    shelf::quiesce().await;
+}
+
+#[tokio::test]
+async fn server_creates_share_root_and_share_directory() {
+    let _guard = shelf_lock().lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bad = dir.path().join("not-a-directory");
+    std::fs::write(&bad, "x").unwrap();
+    let bad_root = bad.join("shares");
+    std::env::set_var("PISTACK_SHELF_DIR", &bad_root);
+    std::env::remove_var("PISTACK_DATA_DIR");
+    std::env::set_var("PISTACK_EXPORTS_FILE", dir.path().join("pistack.exports"));
+    std::env::set_var("PISTACK_SHELF_EUID", "0");
+    std::env::remove_var("PISTACK_SHELF_HELPER");
+    executable(dir.path(), "exportfs", "#!/bin/sh\nexit 0\n");
+    std::env::set_var("PISTACK_EXPORTFS", dir.path().join("exportfs"));
+    std::env::set_var("PISTACK_CEPH_BIN", dir.path().join("no-ceph"));
+    let app = router(open_store(dir.path()));
+
+    let (st, blocked) = call(
+        &app,
+        "POST",
+        "/shares",
+        Some(json!({
+            "name": "blocked",
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 1,
+                "access": [{ "cidr": "10.0.0.0/24", "mode": "read" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{blocked}");
+    assert_eq!(blocked["status"]["phase"], "error");
+    let message = blocked["status"]["message"].as_str().unwrap();
+    assert!(message.contains("cannot create share root"), "{message}");
+    assert!(
+        message.contains(&bad_root.display().to_string()),
+        "{message}"
+    );
+
+    std::env::remove_var("PISTACK_SHELF_DIR");
+    let data = dir.path().join("data");
+    std::env::set_var("PISTACK_DATA_DIR", &data);
+    let root = data.join("shares");
+    assert!(!root.exists(), "share root is created by the server");
+
+    let (st, share) = call(
+        &app,
+        "POST",
+        "/shares",
+        Some(json!({
+            "name": "home",
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 1,
+                "access": [{ "cidr": "10.8.0.0/24", "mode": "write" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{share}");
+    assert_eq!(share["status"]["phase"], "ready", "{share}");
+    assert!(root.is_dir(), "{}", root.display());
+    let share_dir = std::path::PathBuf::from(share["status"]["message"].as_str().unwrap());
+    assert!(share_dir.is_dir(), "{}", share_dir.display());
+    assert_eq!(
+        share_dir.parent().and_then(|p| p.canonicalize().ok()),
+        root.canonicalize().ok()
+    );
+    let id = share["id"].as_str().unwrap();
+    assert_eq!(share_dir.file_name().and_then(|s| s.to_str()), Some(id));
+    clear_share_tools();
+}
+
+#[tokio::test]
+async fn managed_exports_file_adds_updates_and_deletes() {
+    let _guard = shelf_lock().lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shelf = dir.path().join("shares");
+    std::env::set_var("PISTACK_SHELF_DIR", &shelf);
+    let exports_path = dir.path().join("pistack.exports");
+    let log = dir.path().join("exportfs.log");
+    install_share_tools(dir.path());
+    executable(
+        dir.path(),
+        "exportfs",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_EXPORTFS_LOG\"\nexit 0\n",
+    );
+    std::env::set_var("PISTACK_EXPORTFS_LOG", &log);
+    let app = router(open_store(dir.path()));
+
+    let (st, first) = call(
+        &app,
+        "POST",
+        "/shares",
+        Some(json!({
+            "name": "alpha",
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 1,
+                "access": [{ "cidr": "10.0.0.0/24", "mode": "read" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{first}");
+    assert_eq!(first["status"]["phase"], "ready");
+    let first_id = first["id"].as_str().unwrap();
+    let first_dir = first["status"]["message"].as_str().unwrap();
+    let first_line = format!("{first_dir} 10.0.0.0/24(ro,sync,no_subtree_check)");
+
+    let (st, second) = call(
+        &app,
+        "POST",
+        "/shares",
+        Some(json!({
+            "name": "beta",
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 2,
+                "access": [{ "cidr": "10.1.0.0/24", "mode": "write" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{second}");
+    let second_id = second["id"].as_str().unwrap();
+    let second_dir = second["status"]["message"].as_str().unwrap();
+    let second_line = format!("{second_dir} 10.1.0.0/24(rw,sync,no_subtree_check)");
+    let body = std::fs::read_to_string(&exports_path).unwrap();
+    assert!(body.starts_with("# Managed by pistack shelf"), "{body}");
+    let lines = export_lines(&exports_path);
+    assert!(lines.contains(&first_line), "{lines:?}");
+    assert!(lines.contains(&second_line), "{lines:?}");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(!shelf.join("exports.d").exists());
+
+    let (st, updated) = call(
+        &app,
+        "PUT",
+        &format!("/shares/{first_id}"),
+        Some(json!({
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 3,
+                "access": [{ "cidr": "10.2.0.0/24", "mode": "write" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{updated}");
+    assert_eq!(updated["status"]["phase"], "ready");
+    let updated_dir = updated["status"]["message"].as_str().unwrap();
+    let updated_line = format!("{updated_dir} 10.2.0.0/24(rw,sync,no_subtree_check)");
+    let lines = export_lines(&exports_path);
+    assert!(lines.contains(&updated_line), "{lines:?}");
+    assert!(lines.contains(&second_line), "{lines:?}");
+    assert!(
+        !lines.iter().any(|l| l.contains("10.0.0.0/24")),
+        "{lines:?}"
+    );
+
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/shares/{first_id}"),
+        None,
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(!std::path::Path::new(first_dir).exists());
+    let lines = export_lines(&exports_path);
+    assert_eq!(lines, vec![second_line.clone()], "{lines:?}");
+
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/shares/{second_id}"),
+        None,
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(export_lines(&exports_path).is_empty());
+    let log_text = std::fs::read_to_string(&log).unwrap();
+    assert!(log_text.lines().any(|line| line == "-ra"), "{log_text}");
+    clear_share_tools();
+}
+
+#[tokio::test]
+async fn failed_export_is_retried_after_backoff() {
+    let _guard = shelf_lock().lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shelf = dir.path().join("shares");
+    let log = dir.path().join("exportfs.log");
+    let fail = dir.path().join("fail");
+    std::fs::write(&fail, "1").unwrap();
+    std::env::set_var("PISTACK_SHELF_DIR", &shelf);
+    std::env::set_var("PISTACK_EXPORTS_FILE", dir.path().join("pistack.exports"));
+    std::env::set_var("PISTACK_SHELF_EUID", "0");
+    std::env::remove_var("PISTACK_SHELF_HELPER");
+    std::env::set_var("PISTACK_EXPORTFS_LOG", &log);
+    std::env::set_var("PISTACK_EXPORT_FAIL", &fail);
+    std::env::set_var("PISTACK_SHELF_BACKOFF_MS", "800");
+    std::env::set_var("PISTACK_SHELF_RETRY_MS", "100");
+    std::env::set_var("PISTACK_CEPH_BIN", dir.path().join("no-ceph"));
+    executable(
+        dir.path(),
+        "exportfs",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_EXPORTFS_LOG\"\n\
+         if [ -f \"$PISTACK_EXPORT_FAIL\" ]; then echo boom >&2; exit 1; fi\nexit 0\n",
+    );
+    std::env::set_var("PISTACK_EXPORTFS", dir.path().join("exportfs"));
+
+    let store = open_store(dir.path());
+    let shutdown = pistack_types::module::CancellationToken::new();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: shutdown.clone(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    Shelf.start(ctx).await.expect("start shelf");
+    let app = router(store);
+
+    let (st, share) = call(
+        &app,
+        "POST",
+        "/shares",
+        Some(json!({
+            "name": "retry",
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 1,
+                "access": [{ "cidr": "10.3.0.0/24", "mode": "read" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{share}");
+    assert_eq!(share["status"]["phase"], "error");
+    assert_ne!(share["status"]["phase"], "pending");
+    let message = share["status"]["message"].as_str().unwrap();
+    assert!(message.contains("boom"), "{message}");
+    assert!(share["status"]["retry_at"].is_string(), "{share}");
+    let id = share["id"].as_str().unwrap().to_owned();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let calls = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls, 1, "backoff holds the retry");
+
+    std::fs::remove_file(&fail).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    let mut ready = None;
+    while tokio::time::Instant::now() < deadline {
+        let (st, body) = call(
+            &app,
+            "GET",
+            &format!("/shares/{id}"),
+            None,
+            Some(admin()),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        if body["status"]["phase"] == "ready" {
+            ready = Some(body);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let ready = ready.expect("reconcile loop retries the failed share");
+    assert!(
+        ready["status"]["message"].as_str().unwrap().contains(&id),
+        "{ready}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert!(
+        calls >= 2,
+        "exportfs ran again after backoff, log lines {calls}"
+    );
+    stop_loop(shutdown).await;
+    clear_share_tools();
+}
+
+#[tokio::test]
+async fn non_root_exports_go_through_the_helper() {
+    let _guard = shelf_lock().lock().await;
+    let _path = RestoreEnv::set("PATH", std::env::var_os("PATH").unwrap_or_default());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shelf = dir.path().join("shares");
+    let exports_path = dir.path().join("pistack.exports");
+    let sudo_log = dir.path().join("sudo.log");
+    let helper_log = dir.path().join("helper.log");
+    let direct = dir.path().join("direct-exportfs");
+    std::env::set_var("PISTACK_SHELF_DIR", &shelf);
+    std::env::set_var("PISTACK_EXPORTS_FILE", &exports_path);
+    std::env::set_var("PISTACK_SHELF_EUID", "1000");
+    std::env::remove_var("PISTACK_SHELF_HELPER");
+    std::env::set_var("PISTACK_CEPH_BIN", dir.path().join("no-ceph"));
+    executable(
+        dir.path(),
+        "exportfs",
+        "#!/bin/sh\ntouch \"$PISTACK_DIRECT_EXPORTFS\"\nexit 1\n",
+    );
+    std::env::set_var("PISTACK_EXPORTFS", dir.path().join("exportfs"));
+    std::env::set_var("PISTACK_DIRECT_EXPORTFS", &direct);
+    let app = router(open_store(dir.path()));
+
+    let (st, blocked) = call(
+        &app,
+        "POST",
+        "/shares",
+        Some(json!({
+            "name": "via-helper",
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 1,
+                "access": [{ "cidr": "10.5.0.0/24", "mode": "read" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{blocked}");
+    assert_eq!(blocked["status"]["phase"], "error");
+    let message = blocked["status"]["message"].as_str().unwrap();
+    assert!(message.contains("PISTACK_SHELF_HELPER"), "{message}");
+    assert!(!direct.exists(), "direct exportfs ran without the helper");
+
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let helper = executable(
+        dir.path(),
+        "helper",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_HELPER_LOG\"\n\
+         file=\nprev=\nfor arg in \"$@\"; do\n\
+         if [ \"$prev\" = \"--file\" ]; then file=$arg; fi\n\
+         prev=$arg\ndone\n\
+         mkdir -p \"$(dirname \"$file\")\"\ncat > \"$file\"\nexit 0\n",
+    );
+    executable(
+        &bin,
+        "sudo",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_SUDO_LOG\"\n\
+         if [ \"$1\" != \"-n\" ]; then echo expected -n >&2; exit 1; fi\n\
+         shift\nprog=$1\nshift\nexec \"$prog\" \"$@\"\n",
+    );
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut prefixed = std::ffi::OsString::from(bin);
+    prefixed.push(":");
+    prefixed.push(path);
+    std::env::set_var("PATH", prefixed);
+    std::env::set_var("PISTACK_SHELF_HELPER", &helper);
+    std::env::set_var("PISTACK_SUDO_LOG", &sudo_log);
+    std::env::set_var("PISTACK_HELPER_LOG", &helper_log);
+
+    let id = blocked["id"].as_str().unwrap();
+    let (st, share) = call(
+        &app,
+        "PUT",
+        &format!("/shares/{id}"),
+        Some(json!({
+            "spec": {
+                "protocol": "nfs",
+                "size_gib": 1,
+                "access": [{ "cidr": "10.5.0.0/24", "mode": "read" }]
+            }
+        })),
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{share}");
+    assert_eq!(share["status"]["phase"], "ready", "{share}");
+    assert!(!direct.exists(), "non-root path called exportfs directly");
+    let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+    assert!(sudo_text.starts_with("-n\n"), "{sudo_text}");
+    assert!(
+        sudo_text.contains(&helper.display().to_string()),
+        "{sudo_text}"
+    );
+    assert!(sudo_text.contains("apply"), "{sudo_text}");
+    assert!(sudo_text.contains("--file"), "{sudo_text}");
+    let helper_text = std::fs::read_to_string(&helper_log).unwrap();
+    assert!(helper_text.contains("apply"), "{helper_text}");
+    assert!(
+        helper_text.contains(&exports_path.display().to_string()),
+        "{helper_text}"
+    );
+    let share_dir = share["status"]["message"].as_str().unwrap();
+    let line = format!("{share_dir} 10.5.0.0/24(ro,sync,no_subtree_check)");
+    let lines = export_lines(&exports_path);
+    assert_eq!(lines, vec![line], "{lines:?}");
+    std::env::remove_var("PISTACK_DIRECT_EXPORTFS");
     clear_share_tools();
 }

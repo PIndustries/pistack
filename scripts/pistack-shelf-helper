@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 P. Industries LLC and PiStack contributors
+# Sample sudoers line for the server user. Name only this command:
+#   pistack ALL=(root) NOPASSWD: /usr/local/sbin/pistack-shelf-helper
+"""Replace one nfs exports file and reload it.
+
+    pistack-shelf-helper apply --file /etc/exports.d/pistack.exports
+
+Stdin is the full file body. The only command is `apply --file <path>`.
+The path must name one file directly under /etc/exports.d and end in
+`.exports`. Any other path is refused. The parent directory is created
+when it is missing. The file is replaced atomically: a temporary file in
+that directory, mode 0644, then rename. `exportfs -ra` runs after the
+rename. The process exits 0 only when the write and `exportfs -ra` both
+succeed. No other file under /etc/exports or /etc/exports.d is edited.
+
+Install for the server user `pistack`:
+
+    install -m 0755 scripts/pistack-shelf-helper /usr/local/sbin/pistack-shelf-helper
+
+    # /etc/sudoers.d/pistack-shelf
+    pistack ALL=(root) NOPASSWD: /usr/local/sbin/pistack-shelf-helper
+
+Leave sudo's environment reset (the default). The server runs with
+PISTACK_SHELF_HELPER=/usr/local/sbin/pistack-shelf-helper.
+
+PISTACK_SHELF_EXPORTS_DIR is a test-only override of /etc/exports.d.
+It is ignored when the process is root. Leave it unset on a server.
+
+CI does not run scripts/pistack-overlay.py. The checks here are
+self_test(). From a checkout:
+
+    python3 -c 'import runpy; runpy.run_path("scripts/pistack-shelf-helper")["self_test"]()'
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import NoReturn, Optional
+
+ALLOWED_DIR = "/etc/exports.d"
+SUFFIX = ".exports"
+TEST_DIR_ENV = "PISTACK_SHELF_EXPORTS_DIR"
+TMP_PREFIX = ".pistack-exports-"
+
+
+def die(msg: str) -> NoReturn:
+    print(f"pistack-shelf-helper: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def fail(msg: str) -> NoReturn:
+    print(f"pistack-shelf-helper: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _bad_text(value: str) -> bool:
+    return "\0" in value or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def allowed_dir() -> str:
+    """Directory one exports file may live in.
+
+    Root always uses /etc/exports.d. A non-root process may set
+    PISTACK_SHELF_EXPORTS_DIR for tests. Sudo resets the environment, and
+    a root process ignores the variable even if it leaks through.
+    """
+    if os.geteuid() == 0:
+        return ALLOWED_DIR
+    raw = os.environ.get(TEST_DIR_ENV, "")
+    if not raw.strip():
+        return ALLOWED_DIR
+    if _bad_text(raw) or not os.path.isabs(raw):
+        die(f"{TEST_DIR_ENV} must be an absolute path")
+    return os.path.normpath(raw)
+
+
+def refuse_path() -> NoReturn:
+    die(
+        "exports path must be one file directly under "
+        "/etc/exports.d and end in .exports"
+    )
+
+
+def check_exports_path(raw: str) -> str:
+    if raw == "" or raw.endswith("/") or _bad_text(raw) or not os.path.isabs(raw):
+        refuse_path()
+    path = os.path.normpath(raw)
+    parent, name = os.path.split(path)
+    if parent != allowed_dir():
+        refuse_path()
+    if name in ("", ".", "..") or "/" in name or not name.endswith(SUFFIX):
+        refuse_path()
+    return path
+
+
+def write_exports(path: str, body: bytes) -> None:
+    if os.path.isdir(path):
+        fail(f"{path} is a directory")
+    parent = os.path.dirname(path)
+    created = not os.path.isdir(parent)
+    try:
+        if created:
+            os.makedirs(parent, mode=0o755, exist_ok=True)
+            os.chmod(parent, 0o755)
+    except OSError as exc:
+        fail(f"cannot create {parent}: {exc}")
+    fd, tmp = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".tmp", dir=parent)
+    try:
+        os.fchmod(fd, 0o644)
+        pending = body
+        while pending:
+            wrote = os.write(fd, pending)
+            if wrote <= 0:
+                raise OSError("short write")
+            pending = pending[wrote:]
+        os.fsync(fd)
+    except OSError as exc:
+        os.close(fd)
+        os.unlink(tmp)
+        fail(f"cannot write {path}: {exc}")
+    os.close(fd)
+    try:
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fail(f"cannot replace {path}: {exc}")
+    try:
+        os.chmod(path, 0o644)
+    except OSError as exc:
+        fail(f"cannot set mode on {path}: {exc}")
+
+
+def run_exportfs() -> None:
+    try:
+        proc = subprocess.run(
+            ["exportfs", "-ra"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        fail(f"cannot run exportfs: {exc}")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        if len(err) > 400:
+            err = err[:400] + "..."
+        suffix = f": {err}" if err else ""
+        fail(f"exportfs -ra failed ({proc.returncode}){suffix}")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) != 3 or argv[0] != "apply" or argv[1] != "--file" or argv[2] == "":
+        die("usage: pistack-shelf-helper apply --file <path>")
+    path = check_exports_path(argv[2])
+    body = sys.stdin.buffer.read()
+    write_exports(path, body)
+    run_exportfs()
+
+
+def _assert(cond: bool, what: str) -> None:
+    if not cond:
+        die(f"self-test: {what}")
+
+
+def _refuses(fn, what: str) -> None:
+    held = sys.stderr
+    buf = io.StringIO()
+    sys.stderr = buf
+    try:
+        fn()
+    except SystemExit as exc:
+        sys.stderr = held
+        if exc.code == 2:
+            return
+        die(f"self-test: {what} exited {exc.code}: {buf.getvalue().strip()}")
+    else:
+        sys.stderr = held
+        die(f"self-test: {what} was accepted")
+    finally:
+        sys.stderr = held
+
+
+def _install_exportfs(bindir: str, log_path: str, code: int) -> None:
+    os.makedirs(bindir, mode=0o755, exist_ok=True)
+    path = os.path.join(bindir, "exportfs")
+    body = (
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" >> {log_path!r}\n"
+        f"exit {code}\n"
+    )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(path, 0o755)
+
+
+def _run(argv: list[str], body: bytes, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [sys.executable, os.path.abspath(__file__), *argv],
+        input=body,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+
+
+def self_test() -> None:
+    """Path refusal, atomic replace, mode 0644, and exportfs success or failure.
+
+    Uses a temp directory and a fake exportfs. Does not touch /etc.
+    """
+    if os.geteuid() == 0:
+        die("self-test: refuses to run as root")
+    td = tempfile.mkdtemp(prefix="pistack-shelf-helper-")
+    saved = os.environ.get(TEST_DIR_ENV)
+    try:
+        _run_self_test(td)
+    finally:
+        if saved is None:
+            os.environ.pop(TEST_DIR_ENV, None)
+        else:
+            os.environ[TEST_DIR_ENV] = saved
+        shutil.rmtree(td, ignore_errors=True)
+    print("pistack-shelf-helper: self-test ok")
+
+
+def _run_self_test(td: str) -> None:
+    os.environ.pop(TEST_DIR_ENV, None)
+    _assert(
+        check_exports_path("/etc/exports.d/pistack.exports")
+        == "/etc/exports.d/pistack.exports",
+        "canonical exports path",
+    )
+    _assert(
+        check_exports_path("/etc/exports.d/foo/../pistack.exports")
+        == "/etc/exports.d/pistack.exports",
+        "dot-dot that stays in the directory",
+    )
+    for raw, what in (
+        ("exports.d/pistack.exports", "relative"),
+        ("/etc/exports", "exports file"),
+        ("/etc/exports.d/nested/a.exports", "nested"),
+        ("/etc/exports.d/a.txt", "suffix"),
+        ("/etc/exports.d/a.EXPORTS", "suffix case"),
+        ("/etc/exports.d/pistack.exports/", "trailing slash"),
+        ("/tmp/pistack.exports", "other directory"),
+        ("/etc/exports.d/../../tmp/x.exports", "escape"),
+        ("/etc/exports.d/bad\nname.exports", "newline"),
+    ):
+        _refuses(lambda raw=raw: check_exports_path(raw), what)
+    _refuses(lambda: main(["apply"]), "missing args")
+    _refuses(lambda: main(["apply", "--file"]), "missing path")
+    _refuses(
+        lambda: main(["apply", "--file", "/etc/exports.d/pistack.exports", "extra"]),
+        "extra arg",
+    )
+    _refuses(lambda: main(["status"]), "other command")
+    _refuses(lambda: main(["--self-test"]), "self-test flag")
+    _refuses(lambda: main(["--help"]), "help flag")
+
+    real_euid = os.geteuid
+    os.geteuid = lambda: 0  # type: ignore[method-assign]
+    try:
+        os.environ[TEST_DIR_ENV] = td
+        _refuses(
+            lambda: check_exports_path(os.path.join(td, "a.exports")),
+            "root ignores the test directory",
+        )
+        _assert(
+            check_exports_path("/etc/exports.d/pistack.exports")
+            == "/etc/exports.d/pistack.exports",
+            "root keeps /etc/exports.d",
+        )
+    finally:
+        os.geteuid = real_euid  # type: ignore[method-assign]
+        os.environ.pop(TEST_DIR_ENV, None)
+
+    exports = os.path.join(td, "exports.d")
+    other = os.path.join(exports, "other.exports")
+    os.makedirs(exports, mode=0o755)
+    with open(other, "wb") as fh:
+        fh.write(b"leave-me\n")
+    os.chmod(exports, 0o700)
+    outside = os.path.join(td, "outside")
+    with open(outside, "wb") as fh:
+        fh.write(b"outside\n")
+    secret = os.path.join(td, "secret")
+    with open(secret, "wb") as fh:
+        fh.write(b"secret")
+    link = os.path.join(exports, "link.exports")
+    os.symlink(secret, link)
+
+    log_path = os.path.join(td, "exportfs.log")
+    bindir = os.path.join(td, "bin")
+    _install_exportfs(bindir, log_path, 0)
+    base_env = os.environ.copy()
+    base_env["PATH"] = bindir
+    base_env[TEST_DIR_ENV] = exports
+    base_env.pop("PISTACK_EXPORTFS", None)
+
+    target = os.path.join(exports, "pistack.exports")
+    body = b"alpha\xff\nno-newline"
+    proc = _run(["apply", "--file", target], body, base_env)
+    _assert(proc.returncode == 0, f"apply failed: {proc.stderr!r}")
+    with open(target, "rb") as fh:
+        _assert(fh.read() == body, "file body")
+    _assert(os.stat(target).st_mode & 0o777 == 0o644, "mode 0644")
+    _assert(os.stat(exports).st_mode & 0o777 == 0o700, "existing dir mode kept")
+    _assert(open(log_path, encoding="utf-8").read() == "-ra\n", "exportfs -ra")
+    _assert(open(other, "rb").read() == b"leave-me\n", "sibling untouched")
+    _assert(open(outside, "rb").read() == b"outside\n", "outside untouched")
+    proc = _run(["apply", "--file", link], b"replaced", base_env)
+    _assert(proc.returncode == 0, f"symlink apply failed: {proc.stderr!r}")
+    _assert(open(secret, "rb").read() == b"secret", "symlink target untouched")
+    _assert(os.path.isfile(link) and not os.path.islink(link), "symlink replaced")
+    _assert(open(link, "rb").read() == b"replaced", "symlink path body")
+    _assert(
+        not any(name.startswith(TMP_PREFIX) for name in os.listdir(exports)),
+        "temp file left behind",
+    )
+
+    proc = _run(["apply", "--file", target], b"", base_env)
+    _assert(proc.returncode == 0, "empty apply failed")
+    _assert(open(target, "rb").read() == b"", "empty body")
+    _assert(
+        open(log_path, encoding="utf-8").read() == "-ra\n-ra\n-ra\n",
+        "exportfs once per successful apply",
+    )
+
+    fresh = os.path.join(td, "new-parent")
+    fresh_file = os.path.join(fresh, "created.exports")
+    env = dict(base_env)
+    env[TEST_DIR_ENV] = fresh
+    proc = _run(["apply", "--file", fresh_file], b"created\n", env)
+    _assert(proc.returncode == 0, f"create parent failed: {proc.stderr!r}")
+    _assert(os.path.isdir(fresh), "parent created")
+    _assert(os.stat(fresh).st_mode & 0o777 == 0o755, "new dir mode 0755")
+    _assert(open(fresh_file, "rb").read() == b"created\n", "created body")
+
+    blocked = os.path.join(td, "not-a-dir")
+    with open(blocked, "wb") as fh:
+        fh.write(b"x")
+    env = dict(base_env)
+    env[TEST_DIR_ENV] = blocked
+    before = open(log_path, encoding="utf-8").read()
+    proc = _run(
+        ["apply", "--file", os.path.join(blocked, "a.exports")],
+        b"nope\n",
+        env,
+    )
+    _assert(proc.returncode != 0, "write onto a file was accepted")
+    _assert(open(log_path, encoding="utf-8").read() == before, "exportfs ran after a bad write")
+
+    as_dir = os.path.join(exports, "dir.exports")
+    os.mkdir(as_dir)
+    proc = _run(["apply", "--file", as_dir], b"nope\n", base_env)
+    _assert(proc.returncode != 0, "directory path was accepted")
+    _assert(os.path.isdir(as_dir), "directory path was replaced")
+
+    fail_bin = os.path.join(td, "failbin")
+    _install_exportfs(fail_bin, log_path, 1)
+    env = dict(base_env)
+    env["PATH"] = fail_bin
+    proc = _run(["apply", "--file", target], b"kept\n", env)
+    _assert(proc.returncode != 0, "failing exportfs exited 0")
+    _assert(open(target, "rb").read() == b"kept\n", "body kept when exportfs fails")
+    _assert(b"exportfs -ra failed" in proc.stderr, proc.stderr)
+
+    env = os.environ.copy()
+    env["PATH"] = bindir
+    env.pop(TEST_DIR_ENV, None)
+    proc = _run(["apply", "--file", target], b"nope\n", env)
+    _assert(proc.returncode != 0, "path outside /etc/exports.d was accepted")
+    _assert(open(target, "rb").read() == b"kept\n", "refused path still wrote")
+
+
+if __name__ == "__main__":
+    main()
