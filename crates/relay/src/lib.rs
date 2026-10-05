@@ -198,8 +198,14 @@ mod backend_tests {
         assert_eq!(RelayBackend::parse(None), Ok(RelayBackend::Mock));
         assert_eq!(RelayBackend::parse(Some("")), Ok(RelayBackend::Mock));
         assert_eq!(RelayBackend::parse(Some("mock")), Ok(RelayBackend::Mock));
-        assert_eq!(RelayBackend::parse(Some("forward")), Ok(RelayBackend::Forward));
-        assert_eq!(RelayBackend::parse(Some(" Forward\n")), Ok(RelayBackend::Forward));
+        assert_eq!(
+            RelayBackend::parse(Some("forward")),
+            Ok(RelayBackend::Forward)
+        );
+        assert_eq!(
+            RelayBackend::parse(Some(" Forward\n")),
+            Ok(RelayBackend::Forward)
+        );
         assert!(RelayBackend::parse(Some("fwd")).is_err());
         assert!(RelayBackend::parse(Some("ovn")).is_err());
     }
