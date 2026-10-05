@@ -13,30 +13,43 @@ use crate::types::{KIND_BACKUP, KIND_SNAPSHOT, KIND_VOLUME};
 
 pub async fn run(
     client: Client,
-    mut events: broadcast::Receiver<Event>,
+    events: broadcast::Sender<Event>,
     shutdown: CancellationToken,
+    leadership: pistack_types::Leadership,
 ) {
-    if let Err(e) = client.reconcile_all().await {
-        tracing::warn!(error = %e, "slab: initial resync failed");
-    }
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                tracing::debug!("slab reconciler stopping");
-                return;
-            }
-            ev = events.recv() => match ev {
-                Ok(ev) => handle(&client, ev).await,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(missed = n, "slab: event stream lagged; resyncing");
-                    if let Err(e) = client.reconcile_all().await {
-                        tracing::warn!(error = %e, "slab: resync failed");
+    leadership
+        .run_while_leader(shutdown, move |active| {
+            let client = client.clone();
+            let events = events.clone();
+            async move {
+                if let Err(e) = client.seed_defaults() {
+                    tracing::warn!(error = %e, "slab: seed defaults");
+                }
+                if let Err(e) = client.reconcile_all().await {
+                    tracing::warn!(error = %e, "slab: initial resync failed");
+                }
+                let mut events = events.subscribe();
+                loop {
+                    tokio::select! {
+                        _ = active.cancelled() => {
+                            tracing::debug!("slab reconciler stopping");
+                            return;
+                        }
+                        ev = events.recv() => match ev {
+                            Ok(ev) => handle(&client, ev).await,
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(missed = n, "slab: event stream lagged; resyncing");
+                                if let Err(e) = client.reconcile_all().await {
+                                    tracing::warn!(error = %e, "slab: resync failed");
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        }
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
             }
-        }
-    }
+        })
+        .await;
 }
 
 async fn handle(client: &Client, ev: Event) {

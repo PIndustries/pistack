@@ -90,7 +90,7 @@ pub struct EnvVar {
     pub name: String,
     #[serde(default)]
     pub value: String,
-    /// Pull the value from a ConfigMap key instead (`{config_map, key}`).
+    /// Pull the value from a ConfigMap or Secret key (`{config_map|secret, name, key}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_from: Option<EnvVarSource>,
 }

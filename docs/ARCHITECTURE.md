@@ -4,7 +4,7 @@
 
 One binary, two roles.
 
-- `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. One process is already a one-voter cluster and announces itself on its private address. A new process with an empty data directory discovers that cluster and adopts it, or `--join URL` names it. `--init` founds a cluster even if peers answer. An existing store never joins away. The second server replicates as a learner. The third makes all three voters. Later servers stay learners until promoted. Writes are accepted by the leader. A learner does not become leader.
+- `pistack server` — control plane. Opens the state store, mounts every module on one API port, runs reconcilers. One process is already a one-voter cluster and announces itself on its private address. A new process with an empty data directory discovers that cluster and adopts it, or `--join URL` names it. `--init` founds a cluster even if peers answer. An existing store never joins away. The second server replicates as a learner. The third makes all three voters. Later servers stay learners until promoted. Writes are accepted by the leader. Controllers and reconcile loops run only on the current leader; followers stay idle and apply the replicated log. A learner does not become leader.
 - `pistack agent` — a host. Runs `anvil`: VMs (libvirt/KVM or Cloud Hypervisor), pods (youki), bare metal (same binary as the provisioning ramdisk), OVN chassis, volume attach, metrics.
 
 Everything a user touches enters the gateway (`bin/pistack/src/gateway.rs`) and is routed to a module by prefix. Modules talk to each other in-process and to hosts through `pistack-rpc`, a typed command queue with JSON-over-HTTP long-poll today (agents call in; no inbound ports on hosts). State changes publish `Event`s on an in-process broadcast bus that reconcilers subscribe to.
@@ -36,7 +36,7 @@ pub trait Module {
 }
 ```
 
-`ModuleContext` carries the store, the event bus, a shutdown token, the public URL and the node name. Modules never bind ports or open files themselves.
+`ModuleContext` carries the store, the event bus, a shutdown token, the public URL, the node name, and cluster leadership. Controllers watch leadership and stay idle on followers. Modules never bind ports or open files themselves (beacon's DNS listener is the documented exception; it defaults to `127.0.0.1:5353` unless `PISTACK_DNS_LISTEN` is set). The node name is `PISTACK_NODE_NAME` when set, otherwise the host name.
 
 ## Who owns what
 

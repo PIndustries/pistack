@@ -215,27 +215,66 @@ impl Module for Forge {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let store = (*ctx.store::<Store>()).clone();
-        let seeded = Self::seed_sizes(&store)?;
-        if seeded > 0 {
-            tracing::info!(count = seeded, "forge: seeded default sizes");
-        }
-        if self.local_host {
-            let h = self.ensure_local_host(&store, &ctx.node_name)?;
-            tracing::info!(host = %h.meta.id, capacity = ?h.spec.capacity, "forge: dev mode, local mock host registered");
-        }
-        if let Some(queue) = &self.queue {
-            let registrar = Registrar::new(store.clone(), self.drivers.clone(), queue.clone());
-            tokio::spawn(registrar.run(ctx.shutdown.clone()));
-            tracing::info!("forge: agent registrar listening");
-        }
+        // Metadata is read-mostly local serving; keep it up on every node.
         let meta_store = store.clone();
         let meta_shutdown = ctx.shutdown.clone();
         tokio::spawn(async move { metadata::serve(meta_store, meta_shutdown).await });
-        let mut reconciler = Reconciler::new(store, self.drivers.clone(), self.strategy);
-        if let Some(queue) = &self.queue {
-            reconciler = reconciler.with_queue(queue.clone());
-        }
-        tokio::spawn(reconciler.run(ctx));
+
+        // Size seed, local host, agent registrar, and the machine reconciler
+        // write to the store. They run only while this node is leader.
+        let drivers = self.drivers.clone();
+        let strategy = self.strategy;
+        let queue = self.queue.clone();
+        let local_host = self.local_host;
+        let node_name = ctx.node_name.clone();
+        let leadership = ctx.leadership.clone();
+        let shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move {
+            leadership
+                .run_while_leader(shutdown, move |active| {
+                    let store = store.clone();
+                    let drivers = drivers.clone();
+                    let queue = queue.clone();
+                    let node_name = node_name.clone();
+                    async move {
+                        match Forge::seed_sizes(&store) {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(count = n, "forge: seeded default sizes")
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "forge: seed sizes"),
+                        }
+                        if local_host {
+                            let forge = Forge::with_registry(drivers.clone()).local_host(true);
+                            match forge.ensure_local_host(&store, &node_name) {
+                                Ok(h) => tracing::info!(
+                                    host = %h.meta.id,
+                                    capacity = ?h.spec.capacity,
+                                    "forge: dev mode, local mock host registered"
+                                ),
+                                Err(e) => tracing::warn!(error = %e, "forge: local host"),
+                            }
+                        }
+                        let registrar = queue.as_ref().map(|q| {
+                            let r = Registrar::new(store.clone(), drivers.clone(), q.clone());
+                            tokio::spawn(r.run(active.clone()))
+                        });
+                        if registrar.is_some() {
+                            tracing::info!("forge: agent registrar listening");
+                        }
+                        let mut reconciler = Reconciler::new(store, drivers, strategy);
+                        if let Some(q) = &queue {
+                            reconciler = reconciler.with_queue(q.clone());
+                        }
+                        // Drive the loop under the child token (demotion cancels it).
+                        reconciler.run_loop(active.clone()).await;
+                        if let Some(h) = registrar {
+                            h.abort();
+                        }
+                    }
+                })
+                .await;
+        });
         Ok(())
     }
 }

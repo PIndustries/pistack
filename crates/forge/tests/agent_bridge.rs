@@ -32,6 +32,7 @@ async fn machine_runs_on_a_joined_agent() {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "control".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let queue = CommandQueue::new(QueueConfig {
         command_timeout: Duration::from_secs(10),
