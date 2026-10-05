@@ -35,17 +35,21 @@ pub struct Mold {
     blobs: Arc<dyn ImageStore>,
 }
 
+/// `$PISTACK_MOLD_DIR`, else `$PISTACK_DATA_DIR/images`, else `./data/images`.
+pub fn default_image_dir() -> PathBuf {
+    std::env::var_os("PISTACK_MOLD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("PISTACK_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("./data"))
+                .join("images")
+        })
+}
+
 impl Default for Mold {
     fn default() -> Self {
-        let dir = std::env::var_os("PISTACK_MOLD_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::var_os("PISTACK_DATA_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("./data"))
-                    .join("images")
-            });
-        Self::new(Arc::new(LocalDirStore::new(dir)))
+        Self::new(Arc::new(LocalDirStore::new(default_image_dir())))
     }
 }
 

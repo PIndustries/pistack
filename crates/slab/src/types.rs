@@ -85,7 +85,8 @@ pub enum VolumeSource {
     /// Blank, zero-filled.
     #[default]
     None,
-    /// Populated from a `mold` image.
+    /// Populated from a ready `mold` image. `size_gib` of 0 uses the image
+    /// virtual size rounded up to the next GiB.
     Image(Id),
     /// Restored from a snapshot of a volume with the same type.
     Snapshot(Id),
@@ -95,6 +96,9 @@ pub enum VolumeSource {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeSpec {
+    /// Size in GiB. `0` is rejected unless `source` is an image, in which
+    /// case the image's virtual size is rounded up to the next GiB.
+    #[serde(default)]
     pub size_gib: u64,
     /// Volume type name or id. Defaults to `standard`.
     #[serde(default = "default_volume_type")]
