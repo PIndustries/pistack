@@ -29,10 +29,10 @@ pub use error::RpcError;
 pub use events::{EventBus, EventStream};
 pub use proto::{
     AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, DiskTarget,
-    EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck, HelloAck, LogText, MachineKind,
-    MachineRef, MachineReport, MachineRequest, PortPlug, PowerState, ProbeReport, ReportAck,
-    RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER, PROBE_LIVENESS,
-    PROBE_READINESS,
+    EnrollRequest, EnrollResponse, ExecEnv, ExecOutput, ExecRequest, Heartbeat, HeartbeatAck,
+    HelloAck, LogText, MachineKind, MachineRef, MachineReport, MachineRequest, PortPlug,
+    PowerState, ProbeReport, ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach,
+    JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
 pub use server::{
@@ -164,6 +164,50 @@ mod loopback {
         assert_eq!(result.payload["domain"], "web");
         assert_eq!(queue.pending_count(), 0);
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_command_round_trips_over_the_command_poll() {
+        let queue = CommandQueue::new(QueueConfig {
+            command_timeout: Duration::from_secs(5),
+            capacity: 4,
+            heartbeat_interval: Duration::from_secs(30),
+        });
+        let (base, server) = serve(queue.clone()).await;
+        let client = AgentClient::new(&base, "host-a").unwrap();
+        let machine = Id::new(kind::MACHINE);
+        let payload = json!({
+            "id": machine.to_string(),
+            "container": "web",
+            "command": ["/bin/echo", "hi"],
+            "timeout_secs": 5
+        });
+        let agent = client.clone();
+        let poller = tokio::spawn(async move { agent.next_commands(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let ticket = queue
+            .enqueue("host-a", CommandKind::Exec, payload.clone())
+            .unwrap();
+        let cmds = poller.await.unwrap().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].id, ticket.id());
+        assert_eq!(cmds[0].kind, CommandKind::Exec);
+        assert_eq!(cmds[0].payload, payload);
+        client
+            .report(&[CommandResult::ok(cmds[0].id).with_payload(json!({
+                "exit_code": 0,
+                "stdout": "hi\n",
+                "stderr": ""
+            }))])
+            .await
+            .unwrap();
+        let result = ticket.wait().await.unwrap();
+        assert!(result.ok);
+        let out: ExecOutput = serde_json::from_value(result.payload).unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout, "hi\n");
+        assert!(out.stderr.is_empty());
         server.abort();
     }
 

@@ -129,7 +129,7 @@ pub async fn run(args: Vec<String>, io: &mut Io<'_>) -> Result<i32> {
 
     let mut ctx = Ctx::from_cli(&cli)?;
     match commands::dispatch(&mut ctx, cli.cmd, io).await {
-        Ok(()) => Ok(0),
+        Ok(code) => Ok(code),
         Err(e) => {
             writeln!(io.stderr, "error: {e}")?;
             if e.is_unauthorized() {

@@ -107,6 +107,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: MachineCmd,
     },
+    /// Run a command in a pod container.
+    Pod {
+        #[command(subcommand)]
+        cmd: PodCmd,
+    },
     /// Sizes (flavors).
     Size {
         #[command(subcommand)]
@@ -464,6 +469,27 @@ crud!(
     /// Reboot.
     Reboot(PowerArgs),
 );
+
+#[derive(Subcommand, Debug)]
+pub enum PodCmd {
+    /// Run a command in one container and print its output.
+    Exec(PodExecArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PodExecArgs {
+    /// Pod name or id.
+    pub pod: String,
+    /// Container name. Required when the pod has more than one.
+    #[arg(short = 'c', long)]
+    pub container: Option<String>,
+    /// Seconds to wait. The server rejects values outside 1..=3600.
+    #[arg(long, default_value_t = 30)]
+    pub timeout: u64,
+    /// Command and arguments. Flags after `--` belong to the command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    pub command: Vec<String>,
+}
 
 #[derive(Args, Debug)]
 pub struct SizeCreate {

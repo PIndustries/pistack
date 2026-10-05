@@ -249,6 +249,58 @@ pub struct LogText {
     pub text: String,
 }
 
+/// Default wait for [`CommandKind::Exec`] when the caller omits a timeout.
+pub const EXEC_TIMEOUT_DEFAULT_SECS: u64 = 30;
+/// Longest [`CommandKind::Exec`] wait the agent will accept.
+pub const EXEC_TIMEOUT_MAX_SECS: u64 = 3600;
+
+/// Turn an optional timeout into a duration. Absent means
+/// [`EXEC_TIMEOUT_DEFAULT_SECS`]. Zero and values above
+/// [`EXEC_TIMEOUT_MAX_SECS`] are rejected.
+pub fn exec_timeout(secs: Option<u64>) -> Result<std::time::Duration, ApiError> {
+    let secs = secs.unwrap_or(EXEC_TIMEOUT_DEFAULT_SECS);
+    if !(1..=EXEC_TIMEOUT_MAX_SECS).contains(&secs) {
+        return Err(ApiError::bad_request(format!(
+            "timeout_secs must be between 1 and {EXEC_TIMEOUT_MAX_SECS}"
+        )));
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// One environment variable for [`CommandKind::Exec`]. The value is literal.
+/// It is not read from a config map or a secret.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecEnv {
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Payload of [`CommandKind::Exec`]. `id` is the pod's machine. `container`
+/// is that sandbox's container name. `command` is argv, not a shell line.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecRequest {
+    pub id: Id,
+    pub container: String,
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<ExecEnv>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Absent means [`EXEC_TIMEOUT_DEFAULT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Result payload of [`CommandKind::Exec`]. A non-zero `exit_code` means the
+/// command ran and failed. It is not a transport error.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// Payload of [`CommandKind::MigrateMachine`]. `dest` is a libvirt URI,
 /// `qemu+ssh://HOST/system`. The source agent live-migrates the domain;
 /// the guest XML is not redefined.
@@ -399,6 +451,10 @@ pub enum CommandKind {
     /// Read the youki bundle log or the libvirt console log. The payload is
     /// [`MachineRef`]. The result is [`LogText`].
     ReadLogs,
+    /// Run a command in one container of a pod sandbox. The payload is
+    /// [`ExecRequest`]. The result is [`ExecOutput`]. It is not a shell
+    /// and it does not attach a terminal.
+    Exec,
     /// Ask an edge host to publish a listener. The payload is the listener
     /// id, the listen port, and the upstream. It does not power a host.
     Publish,
@@ -417,6 +473,7 @@ impl std::fmt::Display for CommandKind {
             CommandKind::SyncOverlay => "sync_overlay",
             CommandKind::MigrateMachine => "migrate_machine",
             CommandKind::ReadLogs => "read_logs",
+            CommandKind::Exec => "exec",
             CommandKind::Publish => "publish",
         };
         f.write_str(s)
@@ -527,8 +584,51 @@ mod tests {
         assert_eq!(CommandKind::ReadLogs.to_string(), "read_logs");
         let back: CommandKind = serde_json::from_value(v).unwrap();
         assert_eq!(back, CommandKind::ReadLogs);
+        let v = serde_json::to_value(CommandKind::Exec).unwrap();
+        assert_eq!(v, serde_json::json!("exec"));
+        assert_eq!(CommandKind::Exec.to_string(), "exec");
+        let back: CommandKind = serde_json::from_value(v).unwrap();
+        assert_eq!(back, CommandKind::Exec);
         assert_eq!(CommandKind::PlugPort.to_string(), "plug_port");
         assert_eq!(CommandKind::UnplugPort.to_string(), "unplug_port");
+    }
+
+    #[test]
+    fn exec_request_round_trips_and_timeout_is_bounded() {
+        let id = sample_id("mach");
+        let req = ExecRequest {
+            id: Id::parse(pistack_types::kind::MACHINE, &id).unwrap(),
+            container: "web".into(),
+            command: vec!["/bin/echo".into(), "hi".into()],
+            env: vec![ExecEnv {
+                name: "MODE".into(),
+                value: "prod".into(),
+            }],
+            cwd: Some("/work".into()),
+            timeout_secs: Some(5),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        let back: ExecRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+        let bare: ExecRequest = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "container": "web",
+            "command": ["/bin/true"]
+        }))
+        .unwrap();
+        assert!(bare.env.is_empty());
+        assert!(bare.cwd.is_none());
+        assert!(bare.timeout_secs.is_none());
+        assert_eq!(
+            exec_timeout(None).unwrap(),
+            std::time::Duration::from_secs(EXEC_TIMEOUT_DEFAULT_SECS)
+        );
+        assert_eq!(
+            exec_timeout(Some(5)).unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        assert!(exec_timeout(Some(0)).is_err());
+        assert!(exec_timeout(Some(EXEC_TIMEOUT_MAX_SECS + 1)).is_err());
     }
 
     fn sample_id(kind: &str) -> String {
