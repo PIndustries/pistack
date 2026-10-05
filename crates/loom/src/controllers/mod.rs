@@ -17,12 +17,14 @@
 //! * Ownership is a label (`OWNER_LABEL` = owner id), never a scan by name.
 
 pub mod cronjob;
+pub mod daemonset;
 pub mod deployment;
 pub mod ingress;
 pub mod job;
 pub mod pod;
 pub mod replicaset;
 pub mod service;
+pub mod statefulset;
 
 use crate::types::{delete_requested, PodTemplate, DELETE_ANNOTATION, OWNER_LABEL};
 use crate::types::{Pod, PodStatus};
