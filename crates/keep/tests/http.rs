@@ -82,6 +82,7 @@ async fn boot() -> (Router, Store) {
         shutdown: CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let keep = Keep::default();
     keep.start(ctx.clone()).await.unwrap();

@@ -37,6 +37,7 @@ async fn harness() -> Harness {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     module.start(ctx.clone()).await.unwrap();
     let dns = module.bound_addr().unwrap();
@@ -358,6 +359,7 @@ async fn missing_caller_is_unauthorized() {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let app = Beacon::default().router(ctx);
     let res = app

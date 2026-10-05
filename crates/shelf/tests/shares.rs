@@ -51,6 +51,7 @@ fn router(store: Store) -> axum::Router {
         shutdown: pistack_types::module::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     Shelf.router(ctx)
 }

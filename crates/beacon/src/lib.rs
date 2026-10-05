@@ -2,7 +2,7 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! `beacon`: DNS zones and record sets, served by an embedded authoritative
-//! server (hickory). Replaces Designate and CoreDNS.
+//! server (hickory).
 //!
 //! Layout:
 //! * [`types`] — `Zone`, `RecordSet`, validation and zone-file export.
@@ -13,9 +13,9 @@
 //!   `pistack.io/auto=true`.
 //! * `api` — HTTP, mounted at `/dns`.
 //!
-//! The serial reconciler runs in [`Module::start`]: every zone or record
-//! change recomputes the zone's content digest and bumps `status.serial`
-//! when it moved, which in turn refreshes the server's cache.
+//! The serial reconciler and auto-record writer run only while this node is
+//! the cluster leader. The authoritative DNS listener stays up on every node
+//! so local lookups keep working from a replicated store.
 
 pub mod api;
 pub mod auto;
@@ -37,7 +37,7 @@ use std::time::Duration;
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The module. `Default` reads the listen address from `PISTACK_DNS_LISTEN`
-/// (default `0.0.0.0:5353`); tests use [`Beacon::with_listen`] and port 0.
+/// (default `127.0.0.1:5353`); tests use [`Beacon::with_listen`] and port 0.
 #[derive(Default)]
 pub struct Beacon {
     listen: Option<SocketAddr>,
@@ -81,7 +81,6 @@ impl Module for Beacon {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
-        client.reconcile_all()?;
 
         let listen = match self.listen {
             Some(a) => a,
@@ -96,42 +95,57 @@ impl Module for Beacon {
         .await?;
         let _ = self.bound.set(bound);
 
-        auto::start(client.clone(), ctx.events.subscribe(), ctx.shutdown.clone());
-
-        let mut rx = ctx.events.subscribe();
+        let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
+        let events = ctx.events.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(RETRY_INTERVAL);
-            tick.tick().await; // the first tick fires immediately; we just did a pass
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!("beacon reconciler stopping");
-                        break;
-                    }
-                    ev = rx.recv() => match ev {
-                        Ok(ev) if ev.kind == pistack_types::kind::ZONE => {
-                            if let Err(e) = client.reconcile_zone(&ev.id) {
-                                tracing::warn!(zone = %ev.id, error = %e, "beacon: reconcile failed");
+            leadership
+                .run_while_leader(shutdown, move |active| {
+                    let client = client.clone();
+                    let events = events.clone();
+                    async move {
+                        if let Err(e) = client.reconcile_all() {
+                            tracing::warn!(error = %e, "beacon: initial reconcile");
+                        }
+                        auto::start(
+                            client.clone(),
+                            events.subscribe(),
+                            active.clone(),
+                        );
+
+                        let mut rx = events.subscribe();
+                        let mut tick = tokio::time::interval(RETRY_INTERVAL);
+                        tick.tick().await;
+                        loop {
+                            tokio::select! {
+                                _ = active.cancelled() => {
+                                    tracing::debug!("beacon reconciler stopping");
+                                    break;
+                                }
+                                ev = rx.recv() => match ev {
+                                    Ok(ev) if ev.kind == pistack_types::kind::ZONE => {
+                                        if let Err(e) = client.reconcile_zone(&ev.id) {
+                                            tracing::warn!(zone = %ev.id, error = %e, "beacon: reconcile failed");
+                                        }
+                                    }
+                                    Ok(ev) if ev.kind == pistack_types::kind::RECORD => {
+                                        let _ = client.reconcile_all();
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(missed = n, "beacon reconciler lagged; full pass");
+                                        let _ = client.reconcile_all();
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = tick.tick() => {
+                                    let _ = client.reconcile_all();
+                                }
                             }
                         }
-                        // A record event carries no zone; a Deleted one has no
-                        // body to look up either. A full pass is cheap.
-                        Ok(ev) if ev.kind == pistack_types::kind::RECORD => {
-                            let _ = client.reconcile_all();
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "beacon reconciler lagged; full pass");
-                            let _ = client.reconcile_all();
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    _ = tick.tick() => {
-                        let _ = client.reconcile_all();
                     }
-                }
-            }
+                })
+                .await;
         });
         Ok(())
     }

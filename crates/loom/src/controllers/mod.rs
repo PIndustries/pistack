@@ -31,6 +31,7 @@ use chrono::Utc;
 use pistack_store::{Collection, StoreError};
 use pistack_types::{Id, Kind, ModuleContext, Resource, Spec};
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -47,28 +48,39 @@ pub trait Controller: Send + Sync + 'static {
     async fn reconcile_once(&self) -> anyhow::Result<()>;
 }
 
-/// Drive `c` until `ctx.shutdown` fires.
+/// Drive `c` only while this node is the cluster leader.
 pub async fn run(c: impl Controller, ctx: ModuleContext) {
-    let mut rx = ctx.events.subscribe();
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let name = c.name();
-    loop {
-        tokio::select! {
-            _ = ctx.shutdown.cancelled() => break,
-            _ = tick.tick() => {}
-            ev = rx.recv() => match ev {
-                Ok(e) if c.watches().contains(&e.kind.as_str()) => {}
-                Ok(_) => continue,
-                Err(RecvError::Lagged(n)) => tracing::debug!(controller = name, skipped = n, "loom: event bus lagged"),
-                Err(RecvError::Closed) => break,
-            },
-        }
-        if let Err(e) = c.reconcile_once().await {
-            tracing::warn!(controller = name, error = %e, "loom: reconcile pass failed");
-        }
-    }
-    tracing::info!(controller = name, "loom: controller stopped");
+    let events = ctx.events.clone();
+    let leadership = ctx.leadership.clone();
+    let c = Arc::new(c);
+    leadership
+        .run_while_leader(ctx.shutdown.clone(), move |active| {
+            let events = events.clone();
+            let c = c.clone();
+            async move {
+                let mut rx = events.subscribe();
+                let mut tick = tokio::time::interval(TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = active.cancelled() => break,
+                        _ = tick.tick() => {}
+                        ev = rx.recv() => match ev {
+                            Ok(e) if c.watches().contains(&e.kind.as_str()) => {}
+                            Ok(_) => continue,
+                            Err(RecvError::Lagged(n)) => tracing::debug!(controller = name, skipped = n, "loom: event bus lagged"),
+                            Err(RecvError::Closed) => break,
+                        },
+                    }
+                    if let Err(e) = c.reconcile_once().await {
+                        tracing::warn!(controller = name, error = %e, "loom: reconcile pass failed");
+                    }
+                }
+                tracing::info!(controller = name, "loom: controller stopped");
+            }
+        })
+        .await;
 }
 
 /// Status types every loom resource uses.
