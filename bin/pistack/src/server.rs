@@ -83,8 +83,9 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
 /// applies that plan. Anything else, including an unset variable, keeps the
 /// mock backend so tests and a laptop server never touch interfaces.
 /// `PISTACK_RELAY_BACKEND=forward` mounts the in-process forwarder and HTTP
-/// proxy. Unset or `mock` keeps the mock. `run` refuses any other value
-/// before it gets here.
+/// proxy, and `mock` keeps the mock. Unset follows the fabric: `hostnat` or
+/// `overlay` gets the forwarder, anything else the mock. `run` refuses any
+/// other value before it gets here.
 fn relay_module() -> relay::Relay {
     let backend = relay::RelayBackend::from_env().unwrap_or_else(|e| {
         tracing::error!(error = %e, "relay: falling back to the mock backend");

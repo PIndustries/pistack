@@ -50,6 +50,7 @@ Each phase ends at a gate an outside tool decides.
 - [x] Command probes: an exec probe runs its argv in the container with youki exec. Exit 0 passes. A non-zero exit or a timeout fails. Other runtimes report the probe unsupported.
 - [x] Stack apply writes `network`, `subnet`, and `machine` rows from the stack document. `pi apply` already writes one resource at a time.
 - [x] L4 forwarder when `PISTACK_RELAY_BACKEND=forward`: a loopback or private listener copies bytes to a pool member.
+- [x] Relay defaults to the forwarder when the fabric backend is `hostnat` or `overlay`; set `PISTACK_RELAY_BACKEND=mock` to opt out.
 - [x] HTTP reverse proxy for the same setting. It answers `GET` from an up member. TLS termination stays unavailable until a certificate is configured. UDP is refused.
 - [x] A listener door runs cloudflared or tailscale when that binary is present and stays unavailable when it is missing. WireGuard and an edge host start no process.
 - [x] A failed live migration sets the machine to `Error` and leaves it on the source host.
