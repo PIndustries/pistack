@@ -271,8 +271,11 @@ def check_id(value: object, what: str) -> str:
 
 
 def note_external_dev(value: object) -> Optional[str]:
-    """Keep the planner's underlay name. Callers must not pass it to ip."""
-    if value is None:
+    """Keep the planner's underlay name. Callers must not pass it to ip.
+
+    Absent or empty means the router has no external veth.
+    """
+    if value is None or value == "":
         return None
     text = expect_str(value, "external_dev")
     if any(ch.isspace() for ch in text) or "/" in text:
@@ -569,7 +572,8 @@ def parse_router(item: object) -> Router:
         external_veth_root=ext_root,
         external_veth_ns=ext_ns,
         external_ip=external_ip,
-        external_dev=note_external_dev(raw.get("external_dev")),
+        # No external address means no external veth, whatever the planner sent.
+        external_dev=None if external_ip is None else note_external_dev(raw.get("external_dev")),
         snat=expect_bool(raw.get("snat"), "snat"),
         dnat=[parse_dnat(rule) for rule in require_list(raw.get("dnat"), "dnat")],
         metadata=expect_bool(raw.get("metadata"), "metadata"),
@@ -2424,6 +2428,20 @@ def _check_refusals() -> None:
     _refuses(lambda: parse_plan(public_v6), "public ipv6 external")
     parse_plan(v6_snat_plan())
     parse_plan(base)
+    for missing in ("", None):
+        no_ext = json.loads(json.dumps(base))
+        rtr = no_ext["networks"][0]["routers"][0]
+        rtr["external_ip"] = None
+        rtr["snat"] = False
+        rtr["dnat"] = []
+        no_ext["networks"][0]["floating"] = []
+        if missing is None:
+            rtr.pop("external_dev", None)
+        else:
+            rtr["external_dev"] = missing
+        got = parse_plan(no_ext).networks[0].routers[0]
+        _assert(got.external_dev is None, "no external_ip keeps no external_dev")
+        _assert(got.external_veth_root is None, "no external_ip has no external veth")
 
 
 def _install_fakes(bindir: str, log_path: str) -> None:
