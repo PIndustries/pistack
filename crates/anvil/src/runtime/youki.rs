@@ -148,11 +148,9 @@ impl MachineRuntime for YoukiRuntime {
             ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
         })?;
         let mut out = Vec::new();
-        loop {
-            let ent = rd.next_entry().await.map_err(|e| {
-                ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
-            })?;
-            let Some(ent) = ent else { break };
+        while let Some(ent) = rd.next_entry().await.map_err(|e| {
+            ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
+        })? {
             let ft = ent.file_type().await.map_err(|e| {
                 ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
             })?;
@@ -853,8 +851,7 @@ fn extract_tar_budget(
         pending_name: None,
         pending_link: None,
     };
-    loop {
-        let Some(ent) = tar.next_entry()? else { break };
+    while let Some(ent) = tar.next_entry()? {
         let rel = match rel_under(&ent.name) {
             Some(rel) => rel,
             None if ent.name.is_empty() || ent.name == "." || ent.name == "./" => {

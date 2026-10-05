@@ -360,10 +360,10 @@ fn kernel_file() -> Option<PathBuf> {
 }
 
 fn protected_name(name: &str) -> bool {
-    match std::env::var("PISTACK_NODE_NAME") {
-        Ok(node) if !node.is_empty() && node == name => true,
-        _ => false,
-    }
+    matches!(
+        std::env::var("PISTACK_NODE_NAME"),
+        Ok(node) if !node.is_empty() && node == name
+    )
 }
 
 fn host_guard() -> ApiError {

@@ -90,11 +90,17 @@ pub fn disk_gib(path: &Path) -> Option<u64> {
         return None;
     }
     let frsize = if st.f_frsize > 0 {
-        st.f_frsize as u64
+        stat_u64(st.f_frsize)
     } else {
-        st.f_bsize as u64
+        stat_u64(st.f_bsize)
     };
-    Some((st.f_bavail as u64).saturating_mul(frsize) / (1024 * 1024 * 1024))
+    Some(stat_u64(st.f_bavail).saturating_mul(frsize) / (1024 * 1024 * 1024))
+}
+
+/// `statvfs` field types differ by OS. Widen through `i128` so the value is
+/// unchanged when it already fits in `u64`.
+fn stat_u64(n: impl Into<i128>) -> u64 {
+    n.into() as u64
 }
 
 /// Which drivers this host can offer.
