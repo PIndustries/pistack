@@ -13,11 +13,14 @@
 //!   `Ready`; delete requests -> `Deleting` -> driver stop/delete -> gone;
 //!   desired power and reboot counters are applied to `Ready` machines;
 //!   machines on an unreachable host get a `HostReachable=false` condition.
+//!   A machine annotated [`WAIT_VOLUME_ANNOTATION`] is left unplaced and
+//!   unstarted. [`NODE_PIN_ANNOTATION`] limits placement to that host.
 
 use crate::driver::{DriverRegistry, HostDriver};
 use crate::scheduler::{self, Allocations, Strategy};
 use crate::types::{
     delete_requested, DesiredPower, Host, Machine, MachineStatus, PowerState, Size,
+    NODE_PIN_ANNOTATION, WAIT_VOLUME_ANNOTATION,
 };
 use chrono::Utc;
 use pistack_rpc::proto::CommandKind;
@@ -321,6 +324,15 @@ impl Reconciler {
 
         match m.status.phase {
             Phase::Pending => {
+                if let Some(msg) = volume_wait(&m) {
+                    let msg = msg.to_string();
+                    self.patch(&m.meta.id, |s| {
+                        s.message = msg.clone();
+                        s.set_condition("Running", false, "VolumeNotAttached", &msg);
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 let Some(size) = size_of(&m) else {
                     self.patch(&m.meta.id, |s| {
                         s.phase = Phase::Error;
@@ -330,10 +342,12 @@ impl Reconciler {
                     return Ok(());
                 };
                 let named_network = m.spec.networks.iter().any(|n| !n.trim().is_empty());
+                let pinned = pinned_hosts(&m, hosts);
+                let candidates = pinned.as_deref().unwrap_or(hosts);
                 let decided = if named_network {
-                    scheduler::place_on_segment(&m.spec, &size, hosts, alloc, self.strategy)
+                    scheduler::place_on_segment(&m.spec, &size, candidates, alloc, self.strategy)
                 } else {
-                    scheduler::place(&m.spec, &size, hosts, alloc, self.strategy)
+                    scheduler::place(&m.spec, &size, candidates, alloc, self.strategy)
                 };
                 let host = match decided {
                     Ok(h) => h,
@@ -393,6 +407,17 @@ impl Reconciler {
     }
 
     async fn start(&self, m: Machine) -> anyhow::Result<()> {
+        // Loom holds the machine here until the slab volume has a host path.
+        // Starting earlier creates the container before the bind source exists.
+        if let Some(msg) = volume_wait(&m) {
+            let msg = msg.to_string();
+            self.patch(&m.meta.id, |s| {
+                s.message = msg.clone();
+                s.set_condition("Running", false, "VolumeNotAttached", &msg);
+            })
+            .await?;
+            return Ok(());
+        }
         let (hid, driver) = match self.driver_for(&m) {
             Ok(x) => x,
             Err(e) => {
@@ -565,5 +590,70 @@ impl Reconciler {
         Err(StoreError::Conflict(format!(
             "machine {id}: too many concurrent writers"
         )))
+    }
+}
+
+fn nonempty_annotation<'a>(m: &'a Machine, key: &str) -> Option<&'a str> {
+    m.meta
+        .annotations
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn volume_wait(m: &Machine) -> Option<&str> {
+    nonempty_annotation(m, WAIT_VOLUME_ANNOTATION)
+}
+
+fn pinned_hosts(m: &Machine, hosts: &[Host]) -> Option<Vec<Host>> {
+    let id = nonempty_annotation(m, NODE_PIN_ANNOTATION)?;
+    Some(
+        hosts
+            .iter()
+            .filter(|h| h.meta.id.to_string() == id)
+            .cloned()
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{pinned_hosts, volume_wait};
+    use crate::types::{
+        new_host, new_machine, MachineSpec, NODE_PIN_ANNOTATION, WAIT_VOLUME_ANNOTATION,
+    };
+    use pistack_types::Resources;
+
+    #[test]
+    fn wait_annotation_is_a_message_and_a_pin_keeps_one_host() {
+        let mut machine = new_machine("pod-web", None, MachineSpec::default());
+        assert!(volume_wait(&machine).is_none());
+        machine.meta.annotations.insert(
+            WAIT_VOLUME_ANNOTATION.into(),
+            "waiting for volume data".into(),
+        );
+        assert_eq!(volume_wait(&machine), Some("waiting for volume data"));
+        machine
+            .meta
+            .annotations
+            .insert(WAIT_VOLUME_ANNOTATION.into(), String::new());
+        assert!(volume_wait(&machine).is_none());
+
+        let cap = Resources {
+            vcpus: 1,
+            memory_mib: 512,
+            ..Resources::default()
+        };
+        let a = new_host("a", "a", cap, vec!["youki".into()], Default::default());
+        let b = new_host("b", "b", cap, vec!["youki".into()], Default::default());
+        let hosts = vec![a.clone(), b];
+        assert!(pinned_hosts(&machine, &hosts).is_none());
+        machine
+            .meta
+            .annotations
+            .insert(NODE_PIN_ANNOTATION.into(), a.meta.id.to_string());
+        let pinned = pinned_hosts(&machine, &hosts).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].meta.id, a.meta.id);
     }
 }

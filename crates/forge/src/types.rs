@@ -68,6 +68,15 @@ pub const SIZE_KIND: &str = "size";
 /// phase to `Deleting`.
 pub const DELETE_ANNOTATION: &str = "pistack.io/delete";
 
+/// While this annotation is non-empty, forge does not place or start the
+/// machine. Loom sets it to the wait message until every slab volume the
+/// pod names is attached on a node.
+pub const WAIT_VOLUME_ANNOTATION: &str = "loom.pistack.io/wait-volume";
+
+/// Host id the pod's slab volumes are attached on. Placement considers
+/// only that host.
+pub const NODE_PIN_ANNOTATION: &str = "loom.pistack.io/node";
+
 // ---- Host ------------------------------------------------------------------
 
 /// What a host *is*: reported by the agent at hello time and on change.

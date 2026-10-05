@@ -57,6 +57,14 @@
 //! with `PISTACK_RBD_SUDO=1` runs map and unmap as `sudo -n`. The sudoers
 //! line allows only those commands. See the `rbdmap` module.
 //!
+//! Before `youki create`, each slab volume a container mounts must name a
+//! host path that exists. A block device must already carry a filesystem
+//! and be mounted; the bind source is that mount directory. A missing
+//! source fails the create. RBD stays on `rbd device map`: a mapped device
+//! is bind-mounted as recorded, and a volume that only names a device is
+//! left for that map. Rewriting `config.json` after attach does not change
+//! this check.
+//!
 //! When the agent is not root and sudo mode is off, the sandbox creates a
 //! user namespace and maps container uid 0 and gid 0 onto the agent's uid and
 //! gid with size 1. That map does not need `newuidmap`. Each pod container
@@ -73,7 +81,7 @@ use pistack_rpc::proto::{DiskTarget, ExecOutput};
 use pistack_types::{kind, ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -840,6 +848,14 @@ struct SandboxDoc {
     config_maps: BTreeMap<String, Projected>,
     #[serde(default)]
     secrets: BTreeMap<String, Projected>,
+    /// Slab volume id to an absolute host path. Loom writes this once the
+    /// volume is attached. Disks recorded in `disks.json` win over this map.
+    #[serde(default)]
+    volume_paths: BTreeMap<String, String>,
+    /// Slab volume id to a device name, used when the volume has no host
+    /// path yet (an RBD image maps onto a device after the bundle exists).
+    #[serde(default)]
+    volume_devices: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -914,6 +930,8 @@ struct PodPlan {
     volumes: Vec<SandboxVolume>,
     config_maps: BTreeMap<String, Projected>,
     secrets: BTreeMap<String, Projected>,
+    volume_paths: BTreeMap<String, String>,
+    volume_devices: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1048,6 +1066,8 @@ fn sandbox_plan(req: &MachineRequest) -> ApiResult<Option<PodPlan>> {
         volumes: doc.volumes,
         config_maps: doc.config_maps,
         secrets: doc.secrets,
+        volume_paths: doc.volume_paths,
+        volume_devices: doc.volume_devices,
     }))
 }
 
@@ -2380,6 +2400,7 @@ impl RunMode {
         fallback_image: &str,
         pid: u32,
     ) -> ApiResult<()> {
+        ensure_slab_sources(plan, &[])?;
         let processes = prepare_pod(bundle, hostname, limits, plan, fallback_image, self)?;
         write_container_configs(bundle, plan, &processes, &[], limits, pid, self)
     }
@@ -2465,7 +2486,7 @@ fn write_container_configs(
             .get(index)
             .map(|container| container.volume_mounts.as_slice())
             .unwrap_or(&[]);
-        let binds = oci_binds(bundle, &plan.volumes, mounts, disks);
+        let binds = pod_binds(bundle, plan, mounts, disks)?;
         let spec = mode.oci_config(
             None,
             limits,
@@ -2630,6 +2651,328 @@ fn oci_binds(
         });
     }
     out
+}
+
+/// Binds for one container at create time. Slab volumes fail when the host
+/// path is missing; other volumes keep the lenient mount plan.
+fn pod_binds(
+    pod: &Path,
+    plan: &PodPlan,
+    mounts: &[SandboxMount],
+    disks: &[AttachedDisk],
+) -> ApiResult<Vec<OciBind>> {
+    let mut out = Vec::new();
+    for mount in mounts {
+        if mount.name.is_empty() || !valid_destination(&mount.mount_path) {
+            continue;
+        }
+        let Some(index) = plan.volumes.iter().position(|v| v.name == mount.name) else {
+            continue;
+        };
+        let vol = &plan.volumes[index];
+        let prepared = match &vol.source {
+            VolumeSrc::Volume(id) => match slab_prepared(vol, id, plan, disks)? {
+                Some(prepared) => prepared,
+                None => continue,
+            },
+            _ => match prepared_volume(pod, index, vol, disks) {
+                Some(prepared) => prepared,
+                None => continue,
+            },
+        };
+        let Some((source, directory)) = mount_source(&prepared, &mount.sub_path) else {
+            continue;
+        };
+        out.push(OciBind {
+            destination: mount.mount_path.clone(),
+            source,
+            read_only: prepared.force_read_only || mount.read_only,
+            directory,
+        });
+    }
+    Ok(out)
+}
+
+/// Every mounted slab volume resolves, or create stops.
+fn ensure_slab_sources(plan: &PodPlan, disks: &[AttachedDisk]) -> ApiResult<()> {
+    for vol in &plan.volumes {
+        let VolumeSrc::Volume(id) = &vol.source else {
+            continue;
+        };
+        let used = plan.containers.iter().any(|container| {
+            container.volume_mounts.iter().any(|mount| {
+                mount.name == vol.name
+                    && !mount.name.is_empty()
+                    && valid_destination(&mount.mount_path)
+            })
+        });
+        if used {
+            slab_prepared(vol, id, plan, disks)?;
+        }
+    }
+    Ok(())
+}
+
+fn slab_prepared(
+    vol: &SandboxVolume,
+    id: &str,
+    plan: &PodPlan,
+    disks: &[AttachedDisk],
+) -> ApiResult<Option<PreparedVolume>> {
+    let disk = disks.iter().find(|d| d.volume == id);
+    let rbd = disk.is_some_and(|d| d.rbd_mapped);
+    let recorded = disk
+        .map(|d| d.path.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .or_else(|| plan.volume_paths.get(id).cloned());
+    if let Some(path) = recorded {
+        let (source, directory) = resolve_slab_source(&path, rbd)?;
+        return Ok(Some(PreparedVolume {
+            host_path: PathBuf::from(source),
+            directory,
+            force_read_only: disk.is_some_and(|d| d.read_only),
+        }));
+    }
+    // A device name and no path is an RBD image. Mapping runs after the
+    // bundle exists and stores the device; create does not invent a bind.
+    if rbd || plan.volume_devices.contains_key(id) {
+        return Ok(None);
+    }
+    let label = if vol.name.is_empty() {
+        id
+    } else {
+        vol.name.as_str()
+    };
+    Err(ApiError::unavailable(format!(
+        "youki runtime: slab volume {label} has no host path"
+    )))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SlabKind {
+    Missing,
+    File,
+    Dir,
+    Block {
+        formatted: bool,
+        mount_point: Option<String>,
+    },
+}
+
+struct SlabNode {
+    kind: SlabKind,
+}
+
+fn resolve_slab_source(path: &str, rbd: bool) -> ApiResult<(String, bool)> {
+    let node = inspect_slab_node(Path::new(path))?;
+    slab_bind(path, &node, rbd)
+}
+
+/// Where a create-time slab bind comes from. `rbd` skips the filesystem
+/// check: the mapped device node is the bind source.
+fn slab_bind(path: &str, node: &SlabNode, rbd: bool) -> ApiResult<(String, bool)> {
+    match &node.kind {
+        SlabKind::Missing => Err(ApiError::unavailable(format!(
+            "youki runtime: slab volume source {path} does not exist"
+        ))),
+        SlabKind::File => Ok((path.to_string(), false)),
+        SlabKind::Dir => Ok((path.to_string(), true)),
+        SlabKind::Block {
+            formatted,
+            mount_point,
+        } => {
+            if rbd {
+                return Ok((path.to_string(), false));
+            }
+            if let Some(mnt) = mount_point {
+                return Ok((mnt.clone(), true));
+            }
+            if *formatted {
+                Err(ApiError::unavailable(format!(
+                    "youki runtime: slab volume source {path} is not mounted"
+                )))
+            } else {
+                Err(ApiError::unavailable(format!(
+                    "youki runtime: slab volume source {path} is not formatted"
+                )))
+            }
+        }
+    }
+}
+
+fn inspect_slab_node(path: &Path) -> ApiResult<SlabNode> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SlabNode {
+                kind: SlabKind::Missing,
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let mount_point = mount_point_of(path);
+            if mount_point.is_some() || path.starts_with("/dev") {
+                return Ok(SlabNode {
+                    kind: SlabKind::Block {
+                        formatted: true,
+                        mount_point,
+                    },
+                });
+            }
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: slab volume source {}: {e}",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: slab volume source {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    if meta.is_dir() {
+        return Ok(SlabNode {
+            kind: SlabKind::Dir,
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if meta.file_type().is_block_device() {
+            return inspect_block(path);
+        }
+    }
+    if meta.is_file() {
+        return Ok(SlabNode {
+            kind: SlabKind::File,
+        });
+    }
+    Err(ApiError::unavailable(format!(
+        "youki runtime: slab volume source {} is not a file or directory",
+        path.display()
+    )))
+}
+
+fn inspect_block(path: &Path) -> ApiResult<SlabNode> {
+    let mount_point = mount_point_of(path);
+    if mount_point.is_some() {
+        return Ok(SlabNode {
+            kind: SlabKind::Block {
+                formatted: true,
+                mount_point,
+            },
+        });
+    }
+    match block_formatted(path) {
+        Ok(formatted) => Ok(SlabNode {
+            kind: SlabKind::Block {
+                formatted,
+                mount_point: None,
+            },
+        }),
+        // A non-root agent can see the device node and still be unable to
+        // read the superblock. The volume is not mounted on this host.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(SlabNode {
+            kind: SlabKind::Block {
+                formatted: true,
+                mount_point: None,
+            },
+        }),
+        Err(e) => Err(ApiError::unavailable(format!(
+            "youki runtime: slab volume source {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+fn block_formatted(path: &Path) -> std::io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    magic_formatted(&mut file)
+}
+
+fn magic_formatted(file: &mut (impl Read + Seek)) -> std::io::Result<bool> {
+    if magic_at(file, 0, b"XFSB")? {
+        return Ok(true);
+    }
+    if magic_at(file, 1080, &[0x53, 0xEF])? {
+        return Ok(true);
+    }
+    if magic_at(file, 0x10040, b"_BHRfS_M")? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn magic_at(file: &mut (impl Read + Seek), at: u64, magic: &[u8]) -> std::io::Result<bool> {
+    file.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; magic.len()];
+    match file.read_exact(&mut buf) {
+        Ok(()) => Ok(buf == magic),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Mount table. Tests point `PISTACK_YOUKI_MOUNTS` at a fixture.
+fn mounts_file() -> PathBuf {
+    match std::env::var_os("PISTACK_YOUKI_MOUNTS") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => PathBuf::from("/proc/mounts"),
+    }
+}
+
+fn mount_point_of(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(mounts_file()).ok()?;
+    let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let want_s = want.to_string_lossy();
+    let raw = path.to_string_lossy();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(dev) = parts.next() else {
+            continue;
+        };
+        let Some(mnt) = parts.next() else {
+            continue;
+        };
+        let dev = unescape_mount(dev);
+        let mnt = unescape_mount(mnt);
+        if dev == raw || dev == want_s {
+            return Some(mnt);
+        }
+        if let Ok(canon) = std::fs::canonicalize(&dev) {
+            if canon == want {
+                return Some(mnt);
+            }
+        }
+    }
+    None
+}
+
+fn unescape_mount(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            let oct = &bytes[i + 1..i + 4];
+            if oct.iter().all(|b| b.is_ascii_digit()) {
+                if let Ok(text) = std::str::from_utf8(oct) {
+                    if let Ok(v) = u8::from_str_radix(text, 8) {
+                        out.push(v);
+                        i += 4;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn host_path_ok(path: &str) -> ApiResult<()> {
@@ -2801,6 +3144,10 @@ async fn start_pod(
     plan: &PodPlan,
     prior: bool,
 ) -> ApiResult<RunningMachine> {
+    // Fail before youki create. A missing bind would otherwise land in
+    // config.json and stay invisible to the live mount namespace.
+    let disks = read_disks(bundle)?;
+    ensure_slab_sources(plan, &disks)?;
     if prior {
         if let Some(saved) = read_state(bundle).await? {
             for cid in saved.containers.iter().rev() {
@@ -3668,6 +4015,12 @@ mod tests {
         fn clear(key: &'static str) -> Self {
             let prev = std::env::var_os(key);
             std::env::remove_var(key);
+            Self { key, prev }
+        }
+
+        fn set(key: &'static str, value: &Path) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
             Self { key, prev }
         }
     }
@@ -4588,7 +4941,8 @@ fi
             },
             "secrets": {
                 "db": {"data": {"password": "s3cret-value"}}
-            }
+            },
+            "volume_paths": { vol_id: disk.to_string_lossy() }
         })
         .to_string();
         let mut request = req("web", "not-a-path", "10.9.0.1");
@@ -4700,11 +5054,12 @@ fi
         );
         let env = web["process"]["env"].as_array().unwrap();
         assert!(env.iter().any(|v| v == "PASSWORD=s3cret-value"));
-        assert!(web["mounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|m| m["destination"] != "/data"));
+        let data = mount_at(&web, "/data");
+        assert_eq!(data["source"], disk.to_string_lossy().as_ref());
+        assert_eq!(
+            data["options"],
+            serde_json::json!(["bind", "rprivate", "rw"])
+        );
         let scratch_mount = mount_at(&web, "/tmp/scratch");
         assert_eq!(scratch_mount["source"], scratch.to_string_lossy().as_ref());
         assert_eq!(
@@ -4772,6 +5127,190 @@ fi
         assert_eq!(
             mode_of(&bundle.join("containers").join("0").join("config.json")),
             0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn slab_bind_source_must_exist_before_create() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-slab-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let missing = tmp.join("missing-slab");
+        let vol_id = "vol-22222222-2222-2222-2222-222222222222";
+        let user_data = serde_json::json!({
+            "kind": "PodSandbox",
+            "containers": [{
+                "name": "web",
+                "volume_mounts": [{"name": "disk", "mount_path": "/data"}]
+            }],
+            "volumes": [{"name": "disk", "source": {"volume": vol_id}}],
+            "volume_paths": { vol_id: missing.to_string_lossy() }
+        })
+        .to_string();
+        let mut request = req("web", "/nope", "10.9.0.1");
+        request.user_data = Some(user_data);
+        let plan = sandbox_plan(&request).unwrap().unwrap();
+        let bundle = tmp.join("pod");
+        let err = RunMode::privileged()
+            .stage_pod_bundles(
+                &bundle,
+                "web",
+                &Limits {
+                    vcpus: 1,
+                    memory_mib: 64,
+                },
+                &plan,
+                "/nope",
+                1,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("does not exist"), "{err}");
+        assert!(err.message.contains(missing.to_str().unwrap()), "{err}");
+        assert!(!bundle.join("config.json").exists());
+        assert!(!bundle.join("containers").exists());
+
+        let bare = serde_json::json!({
+            "kind": "PodSandbox",
+            "containers": [{
+                "name": "web",
+                "volume_mounts": [{"name": "disk", "mount_path": "/data"}]
+            }],
+            "volumes": [{"name": "disk", "source": {"volume": vol_id}}]
+        })
+        .to_string();
+        request.user_data = Some(bare);
+        let plan = sandbox_plan(&request).unwrap().unwrap();
+        let err = ensure_slab_sources(&plan, &[]).unwrap_err();
+        assert!(err.message.contains("has no host path"), "{err}");
+        assert!(err.message.contains("disk"), "{err}");
+    }
+
+    #[test]
+    fn slab_bind_uses_a_mounted_filesystem_and_rejects_a_raw_device() {
+        let missing = slab_bind(
+            "/var/lib/pistack/vol",
+            &SlabNode {
+                kind: SlabKind::Missing,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(missing.message.contains("/var/lib/pistack/vol"));
+        assert!(missing.message.contains("does not exist"));
+
+        let raw = slab_bind(
+            "/dev/vg/lv",
+            &SlabNode {
+                kind: SlabKind::Block {
+                    formatted: false,
+                    mount_point: None,
+                },
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(raw.message.contains("is not formatted"), "{raw}");
+
+        let unmounted = slab_bind(
+            "/dev/vg/lv",
+            &SlabNode {
+                kind: SlabKind::Block {
+                    formatted: true,
+                    mount_point: None,
+                },
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(unmounted.message.contains("is not mounted"), "{unmounted}");
+
+        let (src, directory) = slab_bind(
+            "/dev/vg/lv",
+            &SlabNode {
+                kind: SlabKind::Block {
+                    formatted: true,
+                    mount_point: Some("/var/lib/pistack/mnt/vol".into()),
+                },
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(src, "/var/lib/pistack/mnt/vol");
+        assert!(directory);
+
+        let (src, directory) = slab_bind(
+            "/dev/rbd0",
+            &SlabNode {
+                kind: SlabKind::Block {
+                    formatted: false,
+                    mount_point: None,
+                },
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(src, "/dev/rbd0");
+        assert!(!directory);
+
+        let (src, directory) = slab_bind(
+            "/var/lib/pistack/disk",
+            &SlabNode {
+                kind: SlabKind::File,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(src, "/var/lib/pistack/disk");
+        assert!(!directory);
+
+        let mut xfs = vec![0u8; 4];
+        xfs[..4].copy_from_slice(b"XFSB");
+        assert!(magic_formatted(&mut std::io::Cursor::new(xfs)).unwrap());
+        let mut ext = vec![0u8; 1082];
+        ext[1080] = 0x53;
+        ext[1081] = 0xEF;
+        assert!(magic_formatted(&mut std::io::Cursor::new(ext)).unwrap());
+        let mut btrfs = vec![0u8; 0x10040 + 8];
+        btrfs[0x10040..0x10040 + 8].copy_from_slice(b"_BHRfS_M");
+        assert!(magic_formatted(&mut std::io::Cursor::new(btrfs)).unwrap());
+        assert!(!magic_formatted(&mut std::io::Cursor::new(vec![0u8; 16])).unwrap());
+    }
+
+    #[tokio::test]
+    async fn mount_table_names_the_directory_for_a_device() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-mounts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let table = tmp.join("mounts");
+        std::fs::write(
+            &table,
+            "/dev/vg/lv /var/lib/pistack/mnt/data xfs rw 0 0\n\
+             /dev/mapper/vg-lv /var/lib/pistack/mnt/my\\040vol xfs rw 0 0\n",
+        )
+        .unwrap();
+        let _slot = EnvSlot::set("PISTACK_YOUKI_MOUNTS", &table);
+        assert_eq!(
+            mount_point_of(Path::new("/dev/vg/lv")).as_deref(),
+            Some("/var/lib/pistack/mnt/data")
+        );
+        assert_eq!(
+            mount_point_of(Path::new("/dev/mapper/vg-lv")).as_deref(),
+            Some("/var/lib/pistack/mnt/my vol")
         );
     }
 
