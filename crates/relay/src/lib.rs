@@ -19,7 +19,7 @@
 //! * `api` — HTTP, mounted at `/balancers`.
 
 pub mod api;
-mod bind;
+pub mod bind;
 pub mod client;
 pub mod door;
 pub mod health;

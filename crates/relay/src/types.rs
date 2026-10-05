@@ -84,6 +84,10 @@ pub struct BalancerSpec {
     /// Explicit VIP; allocated by the provider when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip_address: Option<IpAddr>,
+    /// Bind this exact port on the VIP instead of an ephemeral one. Used
+    /// for service node ports; a port already in use stays unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip_port: Option<u16>,
     /// Floating IP (fabric id) to publish the VIP on, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floating_ip: Option<Id>,
@@ -102,6 +106,7 @@ impl Default for BalancerSpec {
         Self {
             vip_network: String::new(),
             vip_address: None,
+            vip_port: None,
             floating_ip: None,
             provider: Provider::Forward,
             admin_up: true,

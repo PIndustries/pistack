@@ -457,9 +457,14 @@ pub struct ServicePort {
     /// Container port to send to; defaults to `port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_port: Option<u16>,
+    /// `NodePort` and `LoadBalancer` only: ask for this node port
+    /// (30000-32767) instead of the next free one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_port: Option<u16>,
 }
+
+/// Node ports a service may hold.
+pub const NODE_PORT_RANGE: std::ops::RangeInclusive<u16> = 30000..=32767;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ServiceSpec {
@@ -495,6 +500,11 @@ pub struct ServiceStatus {
     /// External addresses for `LoadBalancer` services, filled by the realizer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_balancer: Vec<String>,
+    /// Node port held for each service port, keyed by `port`. Set for
+    /// `NodePort` and `LoadBalancer` services: `spec` asks for one, or the
+    /// controller takes the lowest free port in 30000-32767.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_ports: BTreeMap<u16, u16>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
 }

@@ -226,6 +226,7 @@ impl Api for ServiceSpec {
             return Err(ApiError::bad_request("spec.ports must not be empty"));
         }
         let mut seen = BTreeSet::new();
+        let mut node_ports = BTreeSet::new();
         for p in &self.ports {
             if p.port == 0 {
                 return Err(ApiError::bad_request("port must be 1-65535"));
@@ -235,6 +236,25 @@ impl Api for ServiceSpec {
                     "port {} is listed twice",
                     p.port
                 )));
+            }
+            if let Some(node_port) = p.node_port {
+                if self.kind == ServiceKind::ClusterIp {
+                    return Err(ApiError::bad_request(
+                        "node_port needs kind NodePort or LoadBalancer",
+                    ));
+                }
+                if !NODE_PORT_RANGE.contains(&node_port) {
+                    return Err(ApiError::bad_request(format!(
+                        "node_port {node_port} must be {}-{}",
+                        NODE_PORT_RANGE.start(),
+                        NODE_PORT_RANGE.end()
+                    )));
+                }
+                if !node_ports.insert(node_port) {
+                    return Err(ApiError::bad_request(format!(
+                        "node_port {node_port} is listed twice"
+                    )));
+                }
             }
         }
         if let Some(ip) = &self.cluster_ip {
@@ -773,6 +793,40 @@ async fn rollback_deployment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_node_port_validation() {
+        let spec = |kind: ServiceKind, ports: &[(u16, Option<u16>)]| ServiceSpec {
+            ports: ports
+                .iter()
+                .map(|(port, node_port)| ServicePort {
+                    port: *port,
+                    node_port: *node_port,
+                    ..ServicePort::default()
+                })
+                .collect(),
+            kind,
+            ..ServiceSpec::default()
+        };
+        assert!(spec(ServiceKind::NodePort, &[(80, Some(30080))])
+            .validate(None)
+            .is_ok());
+        assert!(spec(ServiceKind::LoadBalancer, &[(80, None)])
+            .validate(None)
+            .is_ok());
+        assert!(spec(ServiceKind::ClusterIp, &[(80, Some(30080))])
+            .validate(None)
+            .is_err());
+        assert!(spec(ServiceKind::NodePort, &[(80, Some(8080))])
+            .validate(None)
+            .is_err());
+        assert!(spec(
+            ServiceKind::NodePort,
+            &[(80, Some(30080)), (81, Some(30080))]
+        )
+        .validate(None)
+        .is_err());
+    }
 
     #[test]
     fn query_parses() {

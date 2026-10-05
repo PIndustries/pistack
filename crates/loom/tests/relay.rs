@@ -494,3 +494,76 @@ async fn ingress_routes_by_host_and_path() {
     assert_eq!(pools.len(), 3, "{names:?}");
     assert!(!names.iter().any(|n| n.ends_with("-route-2")), "{names:?}");
 }
+
+/// A free port in the node-port range on loopback.
+fn free_node_port() -> u16 {
+    (30000..=32767)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .expect("a free node port")
+}
+
+#[tokio::test]
+async fn node_port_listens_on_the_node_address_and_moves() {
+    let store = Store::in_memory().unwrap();
+    let relay =
+        std::sync::Arc::new(RelayRealizer::new().with_node_address("127.0.0.1".parse().unwrap()));
+    relay.bind_store(store.clone());
+    let backend = listen().await;
+    let backend_addr = backend.local_addr().unwrap();
+    spawn_tcp(backend, b"node");
+
+    let mut svc = service(
+        "np",
+        ServiceKind::NodePort,
+        80,
+        backend_addr.port(),
+        Protocol::Tcp,
+        vec![endpoint(backend_addr)],
+    );
+    let first = free_node_port();
+    svc.status.node_ports.insert(80, first);
+    let published = relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    assert!(published.is_empty());
+    let at = format!("127.0.0.1:{first}");
+    assert_eq!(ping(&at).await, b"node");
+
+    // Same pass again keeps the same listener.
+    relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    assert_eq!(ping(&at).await, b"node");
+
+    // A new node port replaces the old listener.
+    let second = (first + 1..=32767)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap();
+    svc.status.node_ports.insert(80, second);
+    relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    let moved = format!("127.0.0.1:{second}");
+    assert_eq!(ping(&moved).await, b"node");
+    closed(&at).await;
+
+    // Back to ClusterIp drops the node listener.
+    svc.spec.kind = ServiceKind::ClusterIp;
+    svc.status.node_ports.clear();
+    relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    closed(&moved).await;
+
+    relay.remove(&svc).await.unwrap();
+    assert!(store
+        .collection::<relay::Balancer>()
+        .list(None)
+        .unwrap()
+        .iter()
+        .all(|lb| lb.meta.labels.get("loom.pistack.io/service") != Some(&svc.meta.id.to_string())));
+}
