@@ -23,9 +23,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use pistack_cluster::{
-    accepts_writes, check_advertise, classify, consider_vote, election_seed, election_timeout,
-    follow_candidate, join_membership, scan_targets, seed_membership, should_campaign, sweep,
-    Announce, Ballot, Formation, JoinRequest, Member, Role, VoteRequest, DISCOVER_PORT,
+    accepts_writes, check_advertise, check_follower_tip, classify, consider_pre_vote,
+    consider_vote, election_seed, election_timeout, follow_candidate, in_leader_lease,
+    join_membership, lost_quorum, pick_leader, scan_targets, seed_membership, should_campaign,
+    sweep, Announce, Ballot, Formation, JoinRequest, Member, PeerView, Role, VoteRequest,
+    VoteResponse, DISCOVER_PORT,
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
@@ -38,6 +40,8 @@ use tokio_util::sync::CancellationToken;
 const FOLLOW_TICK: Duration = Duration::from_millis(200);
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
+/// A peer status probe is best effort. A dark peer must not stall a tick.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
 
 #[derive(Debug)]
 pub struct BootRequest<'a> {
@@ -91,6 +95,13 @@ pub struct ClusterHandle {
     pub last_heard: Mutex<Instant>,
     /// How long a follower waits after [`Self::last_heard`] before campaigning.
     pub election_timeout: Mutex<Duration>,
+    /// Last proof a leader is alive: a pull from it on a follower, a voter
+    /// majority answering on the leader. Votes inside this lease are refused.
+    pub leader_contact: Mutex<Option<Instant>>,
+    /// Serialises read-modify-write of the stored term and vote.
+    pub ballot: Mutex<()>,
+    /// Last replication error, so a stuck follower logs it once per change.
+    pub pull_error: Mutex<Option<String>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -103,12 +114,19 @@ struct ClusterStatus {
     role: Role,
     leader: bool,
     members: Vec<Member>,
+    #[serde(default)]
+    term: u64,
+    #[serde(default)]
+    commit: u64,
 }
 
 #[derive(Deserialize)]
 struct LogQuery {
     #[serde(default)]
     after: u64,
+    /// The follower's term at `after`, 0 when it has no row there.
+    #[serde(default)]
+    term: u64,
 }
 
 /// Private unicast from `host:port`. `0.0.0.0`, public addresses, and names
@@ -252,9 +270,13 @@ pub fn establish_local(
         .iter()
         .filter(|member| member.role == Role::Voter)
         .count();
-    let sole = voters == 1 && me.role == Role::Voter && members.len() == 1;
+    // Only a lone voter resumes leadership from disk. With more voters, a
+    // leader that was stopped may have been replaced while it was down, so it
+    // starts as a follower and finds the current leader or wins a new term.
+    let lone_voter = voters == 1 && me.role == Role::Voter;
+    let sole = lone_voter && members.len() == 1;
     let leader_id: Option<String> = store.get_meta("cluster_leader_id")?;
-    let leader = me.role == Role::Voter && (sole || leader_id.as_deref() == Some(node_id));
+    let leader = sole || (lone_voter && leader_id.as_deref() == Some(node_id));
     let term = store.get_meta::<u64>("cluster_term")?.unwrap_or(0);
     let term = if leader { term.max(1) } else { term };
     store.put_meta("node_id", &node_id)?;
@@ -268,14 +290,16 @@ pub fn establish_local(
     Ok(LocalRole::Ready(Established {
         role: me.role,
         leader,
+        // Empty means unknown: the follow loop asks the voters who leads.
         leader_api: if leader {
             self_api.to_owned()
         } else {
             leader_id
                 .as_deref()
+                .filter(|id| *id != node_id)
                 .and_then(|id| members.iter().find(|member| member.id == id))
                 .map(|member| member.api.clone())
-                .unwrap_or_else(|| self_api.to_owned())
+                .unwrap_or_default()
         },
         term,
         members,
@@ -372,7 +396,7 @@ pub fn handle_from(
     let announce = Announce {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        api: established.leader_api.clone(),
+        api: announced_api(&established.leader_api, &self_api),
         raft: raft.clone(),
     };
     let (tx, _rx) = watch::channel(announce);
@@ -393,6 +417,9 @@ pub fn handle_from(
         leadership,
         last_heard: Mutex::new(Instant::now()),
         election_timeout: Mutex::new(timeout),
+        leader_contact: Mutex::new(None),
+        ballot: Mutex::new(()),
+        pull_error: Mutex::new(None),
     }
 }
 
@@ -511,49 +538,87 @@ async fn log(
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<LogEntry>>, ApiError> {
     enforce_join(&handle.store, &headers)?;
+    if query.after > 0 {
+        let commit = handle.store.commit_index().map_err(store_err)?;
+        let ours = handle.store.log_term_at(query.after).map_err(store_err)?;
+        check_follower_tip(query.after, query.term, commit, ours)
+            .map_err(|err| ApiError::conflict(err.to_string()))?;
+    }
     let entries = handle.store.read_log(query.after, 64).map_err(store_err)?;
     Ok(Json(entries))
 }
 
+/// Pre-vote and vote. While this node has fresh proof of a live leader it
+/// refuses both and keeps its term, so a candidate that cannot reach the
+/// leader does not depose it. A real vote is only asked for after a voter
+/// majority said yes to the pre-vote.
 async fn vote(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
     headers: HeaderMap,
     Json(req): Json<VoteRequest>,
-) -> Result<Json<pistack_cluster::VoteResponse>, ApiError> {
+) -> Result<Json<VoteResponse>, ApiError> {
     enforce_join(&handle.store, &headers)?;
-    if *guard(&handle.role) == Role::Learner {
-        let term = handle.term.load(Ordering::Relaxed);
-        return Ok(Json(pistack_cluster::VoteResponse {
-            term,
+    let refuse = |handle: &ClusterHandle| {
+        Json(VoteResponse {
+            term: handle.term.load(Ordering::Relaxed),
             granted: false,
-        }));
+        })
+    };
+    if *guard(&handle.role) == Role::Learner {
+        return Ok(refuse(&handle));
     }
-    let mut ballot = load_ballot(&handle.store).map_err(store_err)?;
-    let before = ballot.current_term;
-    let response = consider_vote(&mut ballot, &req);
-    save_ballot(&handle.store, &ballot).map_err(store_err)?;
-    handle.term.store(ballot.current_term, Ordering::Relaxed);
-    if req.term >= before {
-        *guard(&handle.last_heard) = Instant::now();
+    if in_leader_lease(since_contact(&handle)) {
+        tracing::debug!(
+            candidate = %req.candidate_id,
+            term = req.term,
+            pre = req.pre,
+            "vote refused: the leader is live"
+        );
+        return Ok(refuse(&handle));
+    }
+    let (before, response) = {
+        let _ballot = guard(&handle.ballot);
+        let mut ballot = load_ballot(&handle.store).map_err(store_err)?;
+        if req.pre {
+            return Ok(Json(consider_pre_vote(&ballot, &req)));
+        }
+        let before = ballot.current_term;
+        let response = consider_vote(&mut ballot, &req);
+        save_ballot(&handle.store, &ballot).map_err(store_err)?;
+        handle.term.store(ballot.current_term, Ordering::Relaxed);
+        (before, response)
+    };
+    if response.term > before && handle.leader.load(Ordering::Relaxed) {
+        stand_down(&handle, "a candidate started a newer term");
     }
     if response.granted {
+        *guard(&handle.last_heard) = Instant::now();
         if let Some(api) = follow_candidate(&members_of(&handle.store)?, &req.candidate_id) {
             *guard(&handle.leader_api) = api;
             publish(&handle);
         }
     }
-    if response.term > before && handle.leader.load(Ordering::Relaxed) {
-        handle.leader.store(false, Ordering::Relaxed);
-        handle.leadership.set(false);
-        handle.store.set_record_log(false);
-    }
     Ok(Json(response))
 }
 
+/// Pull entries after our commit index. The leader checks our term at that
+/// index first and answers 409 when our log forked from its own.
 pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
     let after = store.commit_index()?;
-    let url = format!("{}/cluster/log?after={after}", leader.trim_end_matches('/'));
-    let entries: Vec<LogEntry> = rpc_get_json(&url).await?;
+    let term = store.log_term_at(after)?.unwrap_or(0);
+    let url = format!(
+        "{}/cluster/log?after={after}&term={term}",
+        leader.trim_end_matches('/')
+    );
+    let response = with_join(rpc_client().get(&url))
+        .timeout(RPC_TIMEOUT)
+        .send()
+        .await?;
+    if response.status().as_u16() == StatusCode::CONFLICT.as_u16() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("leader refused the pull: {body}");
+    }
+    let entries: Vec<LogEntry> = response.error_for_status()?.json().await?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -561,10 +626,19 @@ pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pull from the current leader. A dead RPC, an unknown address, or a peer
-/// that is not the leader leaves the election timer running. A successful
-/// pull or an incoming current-term vote resets it. Vote RPCs are one-shot
-/// and sent in parallel so a dark peer cannot stall the election.
+/// One loop per node.
+///
+/// A leader asks the other voters for their status each tick. It steps down
+/// when one reports a newer term, or when no voter majority has answered for
+/// a full election window.
+///
+/// A follower checks that its leader still leads a term at least as new as
+/// its own, then pulls. When that fails it asks every voter and follows the
+/// newest leader it hears, so a node that comes back, or that granted a vote
+/// to a candidate that lost, finds the real leader instead of campaigning.
+/// Hearing from the leader resets the election timer even when a pull
+/// fails; a replication error is logged, it does not start an election.
+/// Elections run a pre-vote first, so a failed attempt does not raise terms.
 async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationToken) {
     loop {
         tokio::select! {
@@ -575,18 +649,35 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
             break;
         }
         if handle.leader.load(Ordering::Relaxed) {
-            *guard(&handle.last_heard) = Instant::now();
+            lead(&handle).await;
             continue;
         }
-        let leader = locked(&handle.leader_api);
-        let pulled = if leader.is_empty() || leader == handle.self_api {
-            Err(anyhow::anyhow!("leader address is not known"))
-        } else {
-            refresh(&handle, &leader).await
-        };
-        match pulled {
-            Ok(()) => *guard(&handle.last_heard) = Instant::now(),
-            Err(err) => tracing::debug!(error = %err, "replication pull failed"),
+        let known = locked(&handle.leader_api);
+        let mut heard = false;
+        if !known.is_empty() && known != handle.self_api {
+            match refresh(&handle, &known).await {
+                Ok(()) => heard = true,
+                Err(err) => tracing::debug!(leader = %known, error = %err, "leader check failed"),
+            }
+        }
+        if !heard {
+            if let Some(found) = find_leader(&handle).await {
+                match refresh(&handle, &found).await {
+                    Ok(()) => {
+                        if found != known {
+                            tracing::info!(
+                                node = %handle.node_id,
+                                leader = %found,
+                                term = handle.term.load(Ordering::Relaxed),
+                                "following the current leader"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(leader = %found, error = %err, "leader check failed")
+                    }
+                }
+            }
         }
         let silent = guard(&handle.last_heard).elapsed();
         let timeout = *guard(&handle.election_timeout);
@@ -604,19 +695,123 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
     }
 }
 
+async fn lead(handle: &ClusterHandle) {
+    *guard(&handle.last_heard) = Instant::now();
+    let voters = members_of(&handle.store)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|member| member.role == Role::Voter)
+                .count()
+        })
+        .unwrap_or(1);
+    if voters <= 1 {
+        *guard(&handle.leader_contact) = Some(Instant::now());
+        return;
+    }
+    let term = handle.term.load(Ordering::Relaxed);
+    let peers = probe_voters(handle).await;
+    if !handle.leader.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(newer) = peers
+        .iter()
+        .filter(|peer| peer.term > term)
+        .max_by_key(|peer| peer.term)
+    {
+        if let Err(err) = adopt_term(handle, newer.term) {
+            tracing::warn!(error = %err, "could not store the newer term");
+        }
+        stand_down(handle, "a voter reports a newer term");
+        if newer.leader {
+            *guard(&handle.leader_api) = newer.api.clone();
+            publish(handle);
+        }
+        return;
+    }
+    let answered = 1 + peers.iter().filter(|peer| peer.term <= term).count();
+    if answered >= majority(voters) {
+        *guard(&handle.leader_contact) = Some(Instant::now());
+        return;
+    }
+    let since = since_contact(handle).unwrap_or(Duration::MAX);
+    if lost_quorum(since) {
+        stand_down(handle, "no voter majority answered");
+    }
+}
+
+/// The newest leader any voter claims to be, at our term or newer.
+async fn find_leader(handle: &ClusterHandle) -> Option<String> {
+    let term = handle.term.load(Ordering::Relaxed);
+    let views: Vec<PeerView> = probe_voters(handle)
+        .await
+        .into_iter()
+        .map(|status| PeerView {
+            api: status.api,
+            term: status.term,
+            leader: status.leader,
+        })
+        .collect();
+    pick_leader(term, &views).map(|view| view.api.clone())
+}
+
+/// `/cluster` from every other voter, in parallel. Silent peers are left out.
+async fn probe_voters(handle: &ClusterHandle) -> Vec<ClusterStatus> {
+    let members = members_of(&handle.store).unwrap_or_default();
+    let mut probes = tokio::task::JoinSet::new();
+    for member in members
+        .into_iter()
+        .filter(|member| member.role == Role::Voter && member.id != handle.node_id)
+    {
+        let url = format!("{}/cluster", member.api.trim_end_matches('/'));
+        probes.spawn(async move {
+            match tokio::time::timeout(PROBE_TIMEOUT, rpc_get_json::<ClusterStatus>(&url)).await {
+                Ok(Ok(status)) if status.node_id == member.id => Some(status),
+                _ => None,
+            }
+        });
+    }
+    let mut heard = Vec::new();
+    while let Some(joined) = probes.join_next().await {
+        if let Ok(Some(status)) = joined {
+            heard.push(status);
+        }
+    }
+    heard
+}
+
+/// Follow `leader` when it leads a term at least as new as ours. That proof
+/// renews the lease and the election timer; a failed pull after it does not
+/// undo either.
 async fn refresh(handle: &ClusterHandle, leader: &str) -> anyhow::Result<()> {
     let url = format!("{}/cluster", leader.trim_end_matches('/'));
     let status: ClusterStatus = rpc_get_json(&url).await?;
     if !status.leader {
         anyhow::bail!("peer is not the leader");
     }
-    if !status.leader_api.is_empty() {
-        *guard(&handle.leader_api) = status.leader_api.clone();
+    let term = handle.term.load(Ordering::Relaxed);
+    if status.term < term {
+        anyhow::bail!(
+            "peer leads term {} but this node is at term {term}",
+            status.term
+        );
     }
-    if !status.leader_id.is_empty() {
-        handle
-            .store
-            .put_meta("cluster_leader_id", &status.leader_id)?;
+    adopt_term(handle, status.term)?;
+    let now = Instant::now();
+    *guard(&handle.last_heard) = now;
+    *guard(&handle.leader_contact) = Some(now);
+    *guard(&handle.leader_api) = if status.api.is_empty() {
+        leader.to_owned()
+    } else {
+        status.api.clone()
+    };
+    let leader_id = if status.node_id.is_empty() {
+        status.leader_id.clone()
+    } else {
+        status.node_id.clone()
+    };
+    if !leader_id.is_empty() {
+        handle.store.put_meta("cluster_leader_id", &leader_id)?;
     }
     if let Some(me) = status
         .members
@@ -627,8 +822,73 @@ async fn refresh(handle: &ClusterHandle, leader: &str) -> anyhow::Result<()> {
         handle.store.put_meta("members", &status.members)?;
     }
     publish(handle);
-    pull_log(leader, &handle.store).await?;
+    let pulled = pull_log(leader, &handle.store).await;
+    note_pull(handle, leader, pulled);
     Ok(())
+}
+
+fn note_pull(handle: &ClusterHandle, leader: &str, pulled: anyhow::Result<()>) {
+    let mut last = guard(&handle.pull_error);
+    match pulled {
+        Ok(()) => {
+            if last.take().is_some() {
+                tracing::info!(leader = %leader, "replication caught up");
+            }
+        }
+        Err(err) => {
+            let text = format!("{err:#}");
+            if last.as_deref() == Some(text.as_str()) {
+                tracing::debug!(leader = %leader, error = %text, "replication pull failed");
+            } else if text.contains("diverged") {
+                tracing::warn!(
+                    leader = %leader,
+                    error = %text,
+                    "replication stopped: this store has entries the leader never had. Stop this node, remove state.redb (keep node.id), and start it with --join <leader api>"
+                );
+            } else {
+                tracing::warn!(leader = %leader, error = %text, "replication pull failed");
+            }
+            *last = Some(text);
+        }
+    }
+}
+
+fn since_contact(handle: &ClusterHandle) -> Option<Duration> {
+    guard(&handle.leader_contact).map(|at| at.elapsed())
+}
+
+/// Move to `term` when it is newer than ours and clear our vote.
+fn adopt_term(handle: &ClusterHandle, term: u64) -> anyhow::Result<bool> {
+    let _ballot = guard(&handle.ballot);
+    let mut ballot = load_ballot(&handle.store)?;
+    if term <= ballot.current_term {
+        return Ok(false);
+    }
+    ballot.current_term = term;
+    ballot.voted_for = None;
+    save_ballot(&handle.store, &ballot)?;
+    handle.term.store(term, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Stop leading. Writes and controllers stop at once; the follow loop finds
+/// who leads now.
+fn stand_down(handle: &ClusterHandle, reason: &str) {
+    if !handle.leader.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    handle.leadership.set(false);
+    handle.store.set_record_log(false);
+    *guard(&handle.leader_contact) = None;
+    *guard(&handle.leader_api) = String::new();
+    *guard(&handle.last_heard) = Instant::now();
+    publish(handle);
+    tracing::warn!(
+        node = %handle.node_id,
+        term = handle.term.load(Ordering::Relaxed),
+        reason,
+        "this node is no longer the leader"
+    );
 }
 
 async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
@@ -649,52 +909,62 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
         become_leader(handle, term)?;
         return Ok(());
     }
-    let mut ballot = load_ballot(&handle.store)?;
-    ballot.current_term += 1;
-    ballot.voted_for = Some(handle.node_id.clone());
-    let term = ballot.current_term;
-    let last_index = ballot.last_index;
-    let last_term = ballot.last_term;
-    save_ballot(&handle.store, &ballot)?;
-    handle.term.store(term, Ordering::Relaxed);
-    let request = VoteRequest {
+    let need = majority(voters.len());
+    let peers: Vec<String> = voters
+        .iter()
+        .filter(|peer| peer.id != handle.node_id)
+        .map(|peer| format!("{}/cluster/vote", peer.api.trim_end_matches('/')))
+        .collect();
+    let ballot = {
+        let _ballot = guard(&handle.ballot);
+        load_ballot(&handle.store)?
+    };
+    let current = ballot.current_term;
+    let term = current + 1;
+    let mut request = VoteRequest {
         term,
         candidate_id: handle.node_id.clone(),
-        last_index,
-        last_term,
+        last_index: ballot.last_index,
+        last_term: ballot.last_term,
+        pre: true,
     };
+    let (grants, newest) = ask_votes(&peers, &request, need).await;
+    if newest > current {
+        adopt_term(handle, newest)?;
+        return Ok(());
+    }
+    if grants < need {
+        tracing::info!(
+            node = %handle.node_id,
+            term,
+            grants,
+            voters = voters.len(),
+            "pre-vote did not win a majority; term unchanged"
+        );
+        return Ok(());
+    }
+    {
+        let _ballot = guard(&handle.ballot);
+        let mut ballot = load_ballot(&handle.store)?;
+        if ballot.current_term != current || handle.leader.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        ballot.current_term = term;
+        ballot.voted_for = Some(handle.node_id.clone());
+        save_ballot(&handle.store, &ballot)?;
+        handle.term.store(term, Ordering::Relaxed);
+    }
+    request.pre = false;
     tracing::info!(node = %handle.node_id, term, "starting election");
-    let mut grants = 1usize;
-    let mut votes = tokio::task::JoinSet::new();
-    for peer in &voters {
-        if peer.id == handle.node_id {
-            continue;
-        }
-        let url = format!("{}/cluster/vote", peer.api.trim_end_matches('/'));
-        let request = request.clone();
-        votes.spawn(async move {
-            let result: anyhow::Result<pistack_cluster::VoteResponse> =
-                rpc_post_json(&url, &request).await;
-            (url, result)
-        });
+    let (grants, newest) = ask_votes(&peers, &request, need).await;
+    if newest > term {
+        adopt_term(handle, newest)?;
+        return Ok(());
     }
-    while let Some(joined) = votes.join_next().await {
-        let Ok((url, result)) = joined else {
-            continue;
-        };
-        match result {
-            Ok(response) if response.granted && response.term == term => grants += 1,
-            Ok(response) if response.term > term => {
-                handle.term.store(response.term, Ordering::Relaxed);
-                handle.store.put_meta("cluster_term", &response.term)?;
-                votes.abort_all();
-                return Ok(());
-            }
-            Ok(_) => {}
-            Err(err) => tracing::debug!(peer = %url, error = %err, "vote request failed"),
-        }
+    if handle.term.load(Ordering::Relaxed) != term || handle.leader.load(Ordering::Relaxed) {
+        return Ok(());
     }
-    if grants >= majority(voters.len()) && accepts_writes(Role::Voter, true) {
+    if grants >= need && accepts_writes(Role::Voter, true) {
         become_leader(handle, term)?;
     } else {
         tracing::info!(
@@ -708,12 +978,50 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Send `request` to every peer at once. Returns the grants including our
+/// own, and the newest term any peer reported. Stops waiting once `need`
+/// grants are in.
+async fn ask_votes(peers: &[String], request: &VoteRequest, need: usize) -> (usize, u64) {
+    let mut grants = 1usize;
+    let mut newest = 0u64;
+    let mut votes = tokio::task::JoinSet::new();
+    for url in peers {
+        let url = url.clone();
+        let request = request.clone();
+        votes.spawn(async move {
+            let result: anyhow::Result<VoteResponse> = rpc_post_json(&url, &request).await;
+            (url, result)
+        });
+    }
+    while let Some(joined) = votes.join_next().await {
+        let Ok((url, result)) = joined else {
+            continue;
+        };
+        match result {
+            Ok(response) => {
+                newest = newest.max(response.term);
+                if response.granted && (request.pre || response.term == request.term) {
+                    grants += 1;
+                }
+            }
+            Err(err) => tracing::debug!(peer = %url, error = %err, "vote request failed"),
+        }
+        if grants >= need {
+            votes.abort_all();
+            break;
+        }
+    }
+    (grants, newest)
+}
+
 fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     handle.term.store(term, Ordering::Relaxed);
     handle.leader.store(true, Ordering::Relaxed);
     handle.leadership.set(true);
     *guard(&handle.leader_api) = handle.self_api.clone();
     *guard(&handle.last_heard) = Instant::now();
+    *guard(&handle.leader_contact) = Some(Instant::now());
+    *guard(&handle.pull_error) = None;
     *guard(&handle.role) = Role::Voter;
     handle.store.set_log_term(term);
     handle.store.set_record_log(true);
@@ -758,10 +1066,20 @@ fn publish(handle: &ClusterHandle) {
     let ann = Announce {
         cluster_id: handle.cluster_id.clone(),
         node_id: handle.node_id.clone(),
-        api: locked(&handle.leader_api),
+        api: announced_api(&locked(&handle.leader_api), &handle.self_api),
         raft: handle.raft.clone(),
     };
     let _ = handle.announce.send(ann);
+}
+
+/// Discovery never announces an empty api. While the leader is unknown a
+/// node names itself; a joiner that reaches a follower is told who leads.
+fn announced_api(leader_api: &str, self_api: &str) -> String {
+    if leader_api.is_empty() {
+        self_api.to_owned()
+    } else {
+        leader_api.to_owned()
+    }
 }
 
 fn status_of(handle: &ClusterHandle, members: &[Member]) -> Result<ClusterStatus, ApiError> {
@@ -784,6 +1102,8 @@ fn status_of(handle: &ClusterHandle, members: &[Member]) -> Result<ClusterStatus
         role,
         leader: handle.leader.load(Ordering::Relaxed),
         members: members.to_vec(),
+        term: handle.term.load(Ordering::Relaxed),
+        commit: handle.store.commit_index().map_err(store_err)?,
     })
 }
 
@@ -812,12 +1132,7 @@ fn save_ballot(store: &Store, ballot: &Ballot) -> anyhow::Result<()> {
 
 fn tip(store: &Store) -> anyhow::Result<(u64, u64)> {
     let index = store.commit_index()?;
-    if index == 0 {
-        return Ok((0, 0));
-    }
-    let entries = store.read_log(index - 1, 1)?;
-    let term = entries.first().map(|entry| entry.term).unwrap_or(0);
-    Ok((index, term))
+    Ok((index, store.log_term_at(index)?.unwrap_or(0)))
 }
 
 fn not_leader(handle: &ClusterHandle) -> ApiError {
@@ -1166,8 +1481,27 @@ mod tests {
     struct LiveVoter {
         handle: Arc<ClusterHandle>,
         api: String,
-        stop: CancellationToken,
-        _dir: tempfile::TempDir,
+        addr: std::net::SocketAddr,
+        /// Stops the HTTP server: the node goes dark to its peers.
+        serve_stop: CancellationToken,
+        /// Stops the follow loop.
+        loop_stop: CancellationToken,
+        dir: tempfile::TempDir,
+    }
+
+    impl LiveVoter {
+        fn kill(&self) {
+            self.serve_stop.cancel();
+            self.loop_stop.cancel();
+        }
+
+        fn leads(&self) -> bool {
+            self.handle.leader.load(Ordering::Relaxed)
+        }
+
+        fn term(&self) -> u64 {
+            self.handle.term.load(Ordering::Relaxed)
+        }
     }
 
     async fn serve_voter(
@@ -1179,7 +1513,6 @@ mod tests {
         leader_api: &str,
     ) -> LiveVoter {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.redb");
         let store = open_store(dir.path());
         store.put_meta("cluster_id", &"c1".to_string()).unwrap();
         store.put_meta("node_id", &id.to_string()).unwrap();
@@ -1195,7 +1528,6 @@ mod tests {
         if leader {
             store.set_record_log(true);
         }
-        let api = format!("http://{}", listener.local_addr().unwrap());
         let ready = Established {
             role: Role::Voter,
             leader,
@@ -1203,40 +1535,59 @@ mod tests {
             term,
             members: members.to_vec(),
         };
+        start_voter(id, listener, store, dir, &ready)
+    }
+
+    fn start_voter(
+        id: &str,
+        listener: tokio::net::TcpListener,
+        store: Store,
+        dir: tempfile::TempDir,
+        ready: &Established,
+    ) -> LiveVoter {
+        let addr = listener.local_addr().unwrap();
+        let api = format!("http://{addr}");
+        let path = dir.path().join("state.redb");
         let handle = Arc::new(handle_from(
             id.into(),
             api.clone(),
             "c1".into(),
             store,
             path,
-            &ready,
+            ready,
             None,
-            Leadership::new(leader),
+            Leadership::new(ready.leader),
         ));
-        let stop = CancellationToken::new();
+        let serve_stop = CancellationToken::new();
         let app = router(handle.clone())
             .route("/mutate", axum::routing::post(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
                 reject_follower_writes,
             ));
-        let serve_stop = stop.clone();
+        let stop = serve_stop.clone();
         tokio::spawn(async move {
             axum::serve(listener, app)
-                .with_graceful_shutdown(async move { serve_stop.cancelled().await })
+                .with_graceful_shutdown(async move { stop.cancelled().await })
                 .await
                 .ok();
         });
         LiveVoter {
             handle,
             api,
-            stop,
-            _dir: dir,
+            addr,
+            serve_stop,
+            loop_stop: CancellationToken::new(),
+            dir,
         }
     }
 
-    #[tokio::test]
-    async fn followers_elect_when_the_leader_rpc_goes_dark() {
+    fn run(voter: &LiveVoter) {
+        spawn_background(voter.handle.clone(), None, voter.loop_stop.clone());
+    }
+
+    /// Three voters at `term`, `sim` leading, every loop running.
+    async fn three_voters(term: u64) -> (LiveVoter, LiveVoter, LiveVoter) {
         let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let third = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1248,15 +1599,35 @@ mod tests {
             Member::voter("sim2", &sim2_api),
             Member::voter("sim3", &sim3_api),
         ];
-        let term = 6u64;
         let sim = serve_voter("sim", first, &members, true, term, &sim_api).await;
         let sim2 = serve_voter("sim2", second, &members, false, term, &sim_api).await;
         let sim3 = serve_voter("sim3", third, &members, false, term, &sim_api).await;
         *guard(&sim2.handle.election_timeout) = Duration::from_millis(80);
         *guard(&sim3.handle.election_timeout) = Duration::from_millis(700);
-        spawn_background(sim.handle.clone(), None, sim.stop.clone());
-        spawn_background(sim2.handle.clone(), None, sim2.stop.clone());
-        spawn_background(sim3.handle.clone(), None, sim3.stop.clone());
+        run(&sim);
+        run(&sim2);
+        run(&sim3);
+        (sim, sim2, sim3)
+    }
+
+    async fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(limit, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting: {what}"));
+    }
+
+    fn marker(store: &Store, key: &str) -> Option<String> {
+        store.get_meta(key).unwrap()
+    }
+
+    #[tokio::test]
+    async fn followers_elect_when_the_leader_rpc_goes_dark() {
+        let term = 6u64;
+        let (sim, sim2, sim3) = three_voters(term).await;
 
         let client = http_client();
         let allowed = client
@@ -1267,32 +1638,23 @@ mod tests {
         assert_eq!(allowed.status(), StatusCode::OK);
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        sim.stop.cancel();
+        sim.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                if sim2.handle.leader.load(Ordering::Relaxed)
-                    || sim3.handle.leader.load(Ordering::Relaxed)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("followers did not elect after the leader RPC went dark");
+        wait_for(
+            "followers elect after the leader RPC went dark",
+            Duration::from_secs(8),
+            || sim2.leads() || sim3.leads(),
+        )
+        .await;
 
-        let (winner, winner_api) = if sim2.handle.leader.load(Ordering::Relaxed) {
+        let (winner, winner_api) = if sim2.leads() {
             (&sim2, sim2.api.as_str())
         } else {
             (&sim3, sim3.api.as_str())
         };
-        assert!(
-            !(sim2.handle.leader.load(Ordering::Relaxed)
-                && sim3.handle.leader.load(Ordering::Relaxed))
-        );
-        assert!(winner.handle.term.load(Ordering::Relaxed) > term);
+        assert!(!(sim2.leads() && sim3.leads()));
+        assert!(winner.term() > term);
         assert_ne!(winner.handle.node_id, "sim");
 
         let dead = client.post(format!("{}/mutate", sim.api)).send().await;
@@ -1320,7 +1682,229 @@ mod tests {
             .unwrap();
         assert!(status.leader);
         assert_ne!(status.leader_id, "sim");
+        assert_eq!(status.term, winner.term());
         assert_eq!(status.members.len(), 3);
+    }
+
+    /// The lab sequence: stop the leader, elect, leave it down, start it
+    /// again from the same store. One leader the whole time, terms stay put,
+    /// the old leader follows and catches up, writes work on the winner.
+    #[tokio::test]
+    async fn a_returning_leader_follows_the_winner_and_terms_settle() {
+        let term = 6u64;
+        let (sim, sim2, sim3) = three_voters(term).await;
+        sim.handle
+            .store
+            .put_meta("before", &"one".to_string())
+            .unwrap();
+        wait_for(
+            "followers copy the first write",
+            Duration::from_secs(3),
+            || {
+                marker(&sim2.handle.store, "before").is_some()
+                    && marker(&sim3.handle.store, "before").is_some()
+            },
+        )
+        .await;
+
+        sim.kill();
+        wait_for("a survivor wins", Duration::from_secs(8), || {
+            sim2.leads() || sim3.leads()
+        })
+        .await;
+        let (winner, loser) = if sim2.leads() {
+            (&sim2, &sim3)
+        } else {
+            (&sim3, &sim2)
+        };
+        winner
+            .handle
+            .store
+            .put_meta("lab-ha-check", &"yes".to_string())
+            .unwrap();
+        wait_for(
+            "the loser copies the marker",
+            Duration::from_secs(3),
+            || marker(&loser.handle.store, "lab-ha-check").is_some(),
+        )
+        .await;
+
+        // The old leader stays down. Survivors hold one term.
+        let settled = winner.term();
+        assert_eq!(loser.term(), settled);
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                winner.leads(),
+                "the winner lost leadership with a stable majority"
+            );
+            assert!(!loser.leads());
+        }
+        assert_eq!(winner.term(), settled, "survivors kept electing");
+        assert_eq!(loser.term(), settled, "survivors kept electing");
+
+        // Restart the old leader on its own store and address. Recording and
+        // the log term are process memory, so a new process starts without them.
+        let store = sim.handle.store.clone();
+        store.set_record_log(false);
+        store.set_log_term(0);
+        let ready = match establish_local(&store, "sim", &sim.api, true).unwrap() {
+            LocalRole::Ready(ready) => ready,
+            LocalRole::NeedJoin => panic!("the old leader lost its membership"),
+        };
+        assert!(
+            !ready.leader,
+            "a returning voter must not resume leadership"
+        );
+        assert_eq!(
+            ready.leader_api, "",
+            "the old leader does not know who leads"
+        );
+        let LiveVoter { addr, dir, .. } = sim;
+        let listener = loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let back = start_voter("sim", listener, store, dir, &ready);
+        run(&back);
+
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let leaders = [&back, &sim2, &sim3]
+                .iter()
+                .filter(|voter| voter.leads())
+                .count();
+            assert_eq!(leaders, 1, "exactly one node may claim leadership");
+            assert!(
+                winner.leads(),
+                "leadership flapped after the old leader returned"
+            );
+        }
+        assert_eq!(winner.term(), settled);
+        assert_eq!(loser.term(), settled);
+        assert_eq!(back.term(), settled);
+        assert_eq!(locked(&back.handle.leader_api), winner.api);
+        assert_eq!(
+            marker(&back.handle.store, "lab-ha-check").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            back.handle.store.commit_index().unwrap(),
+            winner.handle.store.commit_index().unwrap()
+        );
+
+        let client = http_client();
+        let write = client
+            .post(format!("{}/mutate", winner.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::OK);
+        let refused = client
+            .post(format!("{}/mutate", back.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert!(refused.text().await.unwrap().contains(&winner.api));
+    }
+
+    /// A leader whose API went dark but whose process kept running learns the
+    /// newer term from the voters, stops leading, and follows the winner.
+    #[tokio::test]
+    async fn a_leader_that_was_dark_steps_down_for_a_newer_term() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        sim.serve_stop.cancel();
+        wait_for("a survivor wins", Duration::from_secs(8), || {
+            sim2.leads() || sim3.leads()
+        })
+        .await;
+        let winner = if sim2.leads() { &sim2 } else { &sim3 };
+        wait_for(
+            "the dark leader stands down",
+            Duration::from_secs(3),
+            || !sim.leads(),
+        )
+        .await;
+        assert!(!sim.handle.leadership.is_leader());
+        wait_for("the dark leader follows", Duration::from_secs(3), || {
+            locked(&sim.handle.leader_api) == winner.api
+        })
+        .await;
+        assert_eq!(sim.term(), winner.term());
+        assert!(winner.leads());
+        sim.loop_stop.cancel();
+    }
+
+    /// A pre-vote moves no term, and a node with a live leader refuses it.
+    #[tokio::test]
+    async fn a_live_leader_lease_refuses_votes_without_moving_the_term() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        *guard(&sim2.handle.election_timeout) = Duration::from_secs(60);
+        *guard(&sim3.handle.election_timeout) = Duration::from_secs(60);
+        wait_for("followers hear the leader", Duration::from_secs(3), || {
+            since_contact(&sim3.handle).is_some()
+        })
+        .await;
+        let client = http_client();
+        let ask = |pre| VoteRequest {
+            term: 9,
+            candidate_id: "sim2".into(),
+            last_index: 99,
+            last_term: 99,
+            pre,
+        };
+        for (api, pre) in [(&sim3.api, true), (&sim3.api, false), (&sim.api, false)] {
+            let reply: VoteResponse = client
+                .post(format!("{api}/cluster/vote"))
+                .json(&ask(pre))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(!reply.granted);
+            assert_eq!(reply.term, 6);
+        }
+        assert!(sim.leads());
+        assert_eq!(sim.term(), 6);
+        assert_eq!(sim3.term(), 6);
+        sim.kill();
+        sim2.kill();
+        sim3.kill();
+    }
+
+    #[test]
+    fn a_voter_in_a_three_voter_cluster_starts_as_a_follower() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let members = vec![
+            Member::voter("sim", "http://sim"),
+            Member::voter("sim2", "http://sim2"),
+            Member::voter("sim3", "http://sim3"),
+        ];
+        store.put_meta("members", &members).unwrap();
+        store
+            .put_meta("cluster_leader_id", &"sim".to_string())
+            .unwrap();
+        store.put_meta("cluster_term", &6u64).unwrap();
+        let LocalRole::Ready(old) = establish_local(&store, "sim", "http://sim", true).unwrap()
+        else {
+            panic!("member had to join");
+        };
+        assert!(!old.leader);
+        assert_eq!(old.leader_api, "");
+        assert_eq!(old.term, 6);
+        let LocalRole::Ready(peer) = establish_local(&store, "sim2", "http://sim2", true).unwrap()
+        else {
+            panic!("member had to join");
+        };
+        assert!(!peer.leader);
+        assert_eq!(peer.leader_api, "http://sim");
     }
 
     #[test]

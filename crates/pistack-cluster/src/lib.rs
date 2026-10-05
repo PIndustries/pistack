@@ -18,9 +18,10 @@ pub use discover::{
 };
 pub use group::{admit, campaign, catch_up, propose, Member, Node, Role};
 pub use replicate::{
-    accepts_writes, classify, consider_vote, election_seed, election_timeout, entries_after,
-    follow_candidate, join_membership, seed_membership, should_campaign, should_discover, Ballot,
-    Formation, JoinRequest, StoredEntry, StoredOp, VoteRequest, VoteResponse, ELECTION_TIMEOUT_MIN,
+    accepts_writes, check_follower_tip, classify, consider_pre_vote, consider_vote, election_seed,
+    election_timeout, entries_after, follow_candidate, in_leader_lease, join_membership,
+    lost_quorum, pick_leader, seed_membership, should_campaign, should_discover, Ballot, Formation,
+    JoinRequest, PeerView, StoredEntry, StoredOp, VoteRequest, VoteResponse, ELECTION_TIMEOUT_MIN,
     ELECTION_TIMEOUT_SPAN,
 };
 
