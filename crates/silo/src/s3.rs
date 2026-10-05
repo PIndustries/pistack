@@ -38,8 +38,10 @@
 //! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
 //! ListObjectsV2 and ListMultipartUploads support `delimiter` /
 //! `CommonPrefixes` (any non-empty delimiter; shared helpers in
-//! [`crate::delimiter`]). `encoding-type` is not supported. `fetch-owner`
-//! is ignored. Initiator/Owner are not reported.
+//! [`crate::delimiter`]) and `encoding-type=url` (percent-encode key-name
+//! fields; echo `<EncodingType>url</EncodingType>`). Other non-empty
+//! encoding-type values are `InvalidArgument`. `fetch-owner` is ignored.
+//! Initiator/Owner are not reported.
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
@@ -57,6 +59,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures::StreamExt;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use pistack_types::{ApiError, ApiResult, Caller};
 use serde::Deserialize;
 use std::io::SeekFrom;
@@ -99,6 +102,8 @@ pub struct ListQuery {
     #[serde(rename = "max-uploads")]
     pub max_uploads: Option<String>,
     pub delimiter: Option<String>,
+    #[serde(rename = "encoding-type")]
+    pub encoding_type: Option<String>,
 }
 
 pub async fn put_object(
@@ -747,6 +752,7 @@ async fn list_or_bucket_inner(
     }
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket_name)?;
+    let encode_url = parse_encoding_type(q.encoding_type.as_deref())?;
     let max_keys = parse_max_keys(q.max_keys.as_deref())?;
     let prefix = q.prefix.as_deref().unwrap_or("");
     let after = q
@@ -764,11 +770,13 @@ async fn list_or_bucket_inner(
         bucket: &bucket.meta.name,
         prefix,
         delimiter: delimiter.unwrap_or(""),
+        start_after: q.start_after.as_deref().unwrap_or(""),
         max_keys,
         entries: &items,
         truncated,
         next_token: next.as_deref(),
         continuation: q.continuation_token.as_deref(),
+        encode_url,
     });
     let mut resp = (
         StatusCode::OK,
@@ -791,6 +799,7 @@ async fn list_uploads_inner(
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket_name)?;
+    let encode_url = parse_encoding_type(q.encoding_type.as_deref())?;
     let max_uploads = parse_limit(q.max_uploads.as_deref(), "max-uploads", S3_MAX_UPLOADS)?;
     let prefix = q.prefix.as_deref().unwrap_or("");
     let key_marker = q.key_marker.as_deref().unwrap_or("");
@@ -820,6 +829,7 @@ async fn list_uploads_inner(
         max_uploads,
         entries: &entries,
         truncated,
+        encode_url,
     });
     Ok((
         StatusCode::OK,
@@ -838,16 +848,18 @@ struct ListUploadsPage<'a> {
     max_uploads: usize,
     entries: &'a [multipart::ListUploadEntry],
     truncated: bool,
+    encode_url: bool,
 }
 
 fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
+    let enc = page.encode_url;
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     body.push_str("<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     body.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(page.bucket)));
     body.push_str(&format!(
         "<KeyMarker>{}</KeyMarker>",
-        xml_escape(page.key_marker)
+        xml_list_value(page.key_marker, enc)
     ));
     body.push_str(&format!(
         "<UploadIdMarker>{}</UploadIdMarker>",
@@ -859,7 +871,7 @@ fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
                 multipart::ListUploadEntry::Upload(u) => {
                     body.push_str(&format!(
                         "<NextKeyMarker>{}</NextKeyMarker>",
-                        xml_escape(&u.key)
+                        xml_list_value(&u.key, enc)
                     ));
                     body.push_str(&format!(
                         "<NextUploadIdMarker>{}</NextUploadIdMarker>",
@@ -869,19 +881,25 @@ fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
                 multipart::ListUploadEntry::CommonPrefix(cp) => {
                     body.push_str(&format!(
                         "<NextKeyMarker>{}</NextKeyMarker>",
-                        xml_escape(cp)
+                        xml_list_value(cp, enc)
                     ));
                     body.push_str("<NextUploadIdMarker></NextUploadIdMarker>");
                 }
             }
         }
     }
-    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(page.prefix)));
+    body.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        xml_list_value(page.prefix, enc)
+    ));
     if !page.delimiter.is_empty() {
         body.push_str(&format!(
             "<Delimiter>{}</Delimiter>",
-            xml_escape(page.delimiter)
+            xml_list_value(page.delimiter, enc)
         ));
+    }
+    if enc {
+        body.push_str("<EncodingType>url</EncodingType>");
     }
     body.push_str(&format!("<MaxUploads>{}</MaxUploads>", page.max_uploads));
     body.push_str(&format!(
@@ -892,7 +910,7 @@ fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
         match e {
             multipart::ListUploadEntry::Upload(u) => {
                 body.push_str("<Upload>");
-                body.push_str(&format!("<Key>{}</Key>", xml_escape(&u.key)));
+                body.push_str(&format!("<Key>{}</Key>", xml_list_value(&u.key, enc)));
                 body.push_str(&format!(
                     "<UploadId>{}</UploadId>",
                     xml_escape(&u.upload_id)
@@ -906,7 +924,7 @@ fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
             }
             multipart::ListUploadEntry::CommonPrefix(cp) => {
                 body.push_str("<CommonPrefixes><Prefix>");
-                body.push_str(&xml_escape(cp));
+                body.push_str(&xml_list_value(cp, enc));
                 body.push_str("</Prefix></CommonPrefixes>");
             }
         }
@@ -1019,27 +1037,66 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// S3 `encoding-type=url`: percent-encode UTF-8 like `urllib.parse.quote(s, safe="/")`
+/// (botocore unquotes with `urllib.parse.unquote`). `/` is left intact.
+const S3_URL_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+
+fn s3_url_encode(s: &str) -> String {
+    utf8_percent_encode(s, S3_URL_ENCODE).to_string()
+}
+
+/// XML-escape a list key-name field, optionally after `encoding-type=url`.
+fn xml_list_value(s: &str, encode_url: bool) -> String {
+    if encode_url {
+        xml_escape(&s3_url_encode(s))
+    } else {
+        xml_escape(s)
+    }
+}
+
+/// `None`/empty → no encoding; `url` → encode; anything else → 400.
+fn parse_encoding_type(raw: Option<&str>) -> ApiResult<bool> {
+    match raw {
+        None | Some("") => Ok(false),
+        Some("url") => Ok(true),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "encoding-type must be url, got '{other}'"
+        ))),
+    }
+}
+
 struct ListBucketPage<'a> {
     bucket: &'a str,
     prefix: &'a str,
     delimiter: &'a str,
+    start_after: &'a str,
     max_keys: usize,
     entries: &'a [crate::client::ListObjectEntry],
     truncated: bool,
     next_token: Option<&'a str>,
     continuation: Option<&'a str>,
+    encode_url: bool,
 }
 
 fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
+    let enc = page.encode_url;
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     body.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     body.push_str(&format!("<Name>{}</Name>", xml_escape(page.bucket)));
-    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(page.prefix)));
+    body.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        xml_list_value(page.prefix, enc)
+    ));
     if !page.delimiter.is_empty() {
         body.push_str(&format!(
             "<Delimiter>{}</Delimiter>",
-            xml_escape(page.delimiter)
+            xml_list_value(page.delimiter, enc)
         ));
     }
     body.push_str(&format!("<MaxKeys>{}</MaxKeys>", page.max_keys));
@@ -1050,13 +1107,24 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
     body.push_str("<KeyCount>");
     body.push_str(&page.entries.len().to_string());
     body.push_str("</KeyCount>");
+    if enc {
+        body.push_str("<EncodingType>url</EncodingType>");
+    }
     if let Some(t) = page.continuation {
+        // Continuation tokens stay opaque (not percent-encoded).
         body.push_str(&format!(
             "<ContinuationToken>{}</ContinuationToken>",
             xml_escape(t)
         ));
     }
+    if !page.start_after.is_empty() && page.continuation.is_none() {
+        body.push_str(&format!(
+            "<StartAfter>{}</StartAfter>",
+            xml_list_value(page.start_after, enc)
+        ));
+    }
     if let Some(t) = page.next_token {
+        // Opaque, like ContinuationToken.
         body.push_str(&format!(
             "<NextContinuationToken>{}</NextContinuationToken>",
             xml_escape(t)
@@ -1072,7 +1140,10 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
                     &obj.status.sha256
                 };
                 body.push_str("<Contents>");
-                body.push_str(&format!("<Key>{}</Key>", xml_escape(&obj.spec.key)));
+                body.push_str(&format!(
+                    "<Key>{}</Key>",
+                    xml_list_value(&obj.spec.key, enc)
+                ));
                 body.push_str(&format!("<Size>{}</Size>", obj.status.size_bytes));
                 body.push_str(&format!("<ETag>&quot;{}&quot;</ETag>", xml_escape(etag)));
                 body.push_str(&format!(
@@ -1084,7 +1155,7 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
             }
             crate::client::ListObjectEntry::CommonPrefix(cp) => {
                 body.push_str("<CommonPrefixes><Prefix>");
-                body.push_str(&xml_escape(cp));
+                body.push_str(&xml_list_value(cp, enc));
                 body.push_str("</Prefix></CommonPrefixes>");
             }
         }
@@ -1117,4 +1188,22 @@ fn s3_error(err: ApiError) -> Response {
         xml_escape(&err.message)
     );
     (status, [(header::CONTENT_TYPE, "application/xml")], xml).into_response()
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn s3_url_encode_matches_botocore_quote_safe_slash() {
+        assert_eq!(s3_url_encode("a b"), "a%20b");
+        assert_eq!(s3_url_encode("a+b"), "a%2Bb");
+        assert_eq!(s3_url_encode("a%b"), "a%25b");
+        assert_eq!(s3_url_encode("a&b"), "a%26b");
+        assert_eq!(s3_url_encode("café"), "caf%C3%A9");
+        assert_eq!(s3_url_encode("a/b"), "a/b");
+        assert_eq!(s3_url_encode("test_file(3).png"), "test_file%283%29.png");
+        assert_eq!(s3_url_encode("x%2Fy"), "x%252Fy");
+        assert_eq!(s3_url_encode("a b/"), "a%20b/");
+    }
 }
