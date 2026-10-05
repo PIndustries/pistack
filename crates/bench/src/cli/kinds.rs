@@ -129,6 +129,30 @@ macro_rules! col {
     };
 }
 
+fn service_ports(v: &Value, _: DateTime<Utc>) -> String {
+    v.pointer("/spec/ports")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("port").map(scalar))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+fn ingress_hosts(v: &Value, _: DateTime<Utc>) -> String {
+    v.pointer("/spec/rules")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.get("host").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 const WIDE_PROJECT: &[Column] = &[
     col!("FULL-ID", full_id),
     col!("PROJECT", project),
@@ -504,6 +528,100 @@ pub static KINDS: &[KindDef] = &[
         ],
     },
     KindDef {
+        noun: "pod",
+        aliases: &["pods"],
+        path: "/loom/pods",
+        id_prefix: "pod",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("PHASE", phase),
+            col!("ADDRESS", "/status/pod_ip"),
+            col!("HOST", short "/status/host"),
+            col!("MACHINE", short "/status/machine"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
+        noun: "deployment",
+        aliases: &["deployments", "deploy"],
+        path: "/loom/deployments",
+        id_prefix: "deploy",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("REPLICAS", "/spec/replicas"),
+            col!("READY", "/status/ready"),
+            col!("AVAILABLE", "/status/available"),
+            col!("UPDATED", "/status/updated"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("REVISION", "/status/revision"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "service",
+        aliases: &["services", "svc"],
+        path: "/loom/services",
+        id_prefix: "svc",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("KIND", "/spec/kind"),
+            col!("CLUSTER-IP", "/status/cluster_ip"),
+            col!("PORTS", service_ports),
+            col!("ENDPOINTS", count "/status/endpoints"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
+        noun: "job",
+        aliases: &["jobs"],
+        path: "/loom/jobs",
+        id_prefix: "job",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("COMPLETIONS", "/spec/completions"),
+            col!("PARALLELISM", "/spec/parallelism"),
+            col!("ACTIVE", "/status/active"),
+            col!("SUCCEEDED", "/status/succeeded"),
+            col!("FAILED", "/status/failed"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
+        noun: "ingress",
+        aliases: &["ingresses", "ing"],
+        path: "/loom/ingresses",
+        id_prefix: "ing",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("HOSTS", ingress_hosts),
+            col!("LOAD-BALANCER", list "/status/load_balancer"),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
         noun: "statefulset",
         aliases: &["statefulsets", "sts"],
         path: "/loom/statefulsets",
@@ -610,6 +728,11 @@ mod tests {
         assert_eq!(by_noun("floating_ip").unwrap().noun, "fip");
         assert_eq!(by_noun("VolumeType").unwrap().noun, "voltype");
         assert_eq!(by_noun("principal").unwrap().noun, "user");
+        assert_eq!(by_noun("pod").unwrap().path, "/loom/pods");
+        assert_eq!(by_noun("deploy").unwrap().noun, "deployment");
+        assert_eq!(by_noun("svc").unwrap().path, "/loom/services");
+        assert_eq!(by_noun("Job").unwrap().noun, "job");
+        assert_eq!(by_noun("ing").unwrap().noun, "ingress");
         assert_eq!(by_noun("sts").unwrap().path, "/loom/statefulsets");
         assert_eq!(by_noun("DaemonSet").unwrap().noun, "daemonset");
         assert_eq!(by_noun("hpa").unwrap().noun, "autoscaler");

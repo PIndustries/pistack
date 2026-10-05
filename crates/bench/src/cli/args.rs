@@ -107,7 +107,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: MachineCmd,
     },
-    /// Run a command in a pod container.
+    /// Pods (loom).
     Pod {
         #[command(subcommand)]
         cmd: PodCmd,
@@ -171,6 +171,26 @@ pub enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: ImageCmd,
+    },
+    /// Deployments (loom).
+    Deployment {
+        #[command(subcommand)]
+        cmd: DeploymentCmd,
+    },
+    /// Services (loom).
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Jobs (loom).
+    Job {
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
+    /// Ingresses (loom).
+    Ingress {
+        #[command(subcommand)]
+        cmd: IngressCmd,
     },
     /// StatefulSets (loom).
     Statefulset {
@@ -470,10 +490,20 @@ crud!(
     Reboot(PowerArgs),
 );
 
-#[derive(Subcommand, Debug)]
-pub enum PodCmd {
-    /// Run a command in one container and print its output.
-    Exec(PodExecArgs),
+#[derive(Args, Debug)]
+pub struct PodCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Container image.
+    #[arg(long)]
+    pub image: String,
+    /// Container name (default: the pod name).
+    #[arg(long)]
+    pub container: Option<String>,
+    /// Network to attach (repeatable). Empty means the project's default.
+    #[arg(long = "network")]
+    pub networks: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -490,6 +520,13 @@ pub struct PodExecArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     pub command: Vec<String>,
 }
+
+crud!(
+    PodCmd,
+    PodCreate,
+    /// Run a command in one container and print its output.
+    Exec(PodExecArgs),
+);
 
 #[derive(Args, Debug)]
 pub struct SizeCreate {
@@ -916,6 +953,104 @@ crud!(
     /// Scale replicas.
     Scale(ScaleArgs),
 );
+
+#[derive(Args, Debug)]
+pub struct DeploymentCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Container image.
+    #[arg(long)]
+    pub image: String,
+    /// Container name (default: the Deployment name).
+    #[arg(long)]
+    pub container: Option<String>,
+    /// Desired replicas.
+    #[arg(long, default_value_t = 1)]
+    pub replicas: u32,
+}
+
+crud!(
+    DeploymentCmd,
+    DeploymentCreate,
+    /// Scale replicas.
+    Scale(ScaleArgs),
+);
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum ServiceKindArg {
+    #[default]
+    ClusterIp,
+    NodePort,
+    LoadBalancer,
+}
+
+#[derive(Args, Debug)]
+pub struct ServiceCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Service kind.
+    #[arg(long, value_enum, default_value_t = ServiceKindArg::ClusterIp)]
+    pub kind: ServiceKindArg,
+    /// Port to expose.
+    #[arg(long)]
+    pub port: u16,
+    /// Selector `key=value` (optional; both halves required when set).
+    #[arg(long = "selector", value_name = "K=V")]
+    pub selector: Option<String>,
+}
+crud!(ServiceCmd, ServiceCreate);
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum JobRestartPolicyArg {
+    #[default]
+    Never,
+    OnFailure,
+}
+
+#[derive(Args, Debug)]
+pub struct JobCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Container image.
+    #[arg(long)]
+    pub image: String,
+    /// Container name (default: the Job name).
+    #[arg(long)]
+    pub container: Option<String>,
+    /// Successful completions required.
+    #[arg(long, default_value_t = 1)]
+    pub completions: u32,
+    /// Max pods running at once.
+    #[arg(long, default_value_t = 1)]
+    pub parallelism: u32,
+    /// Pod restart policy (Never or OnFailure).
+    #[arg(long = "restart", value_enum, default_value_t = JobRestartPolicyArg::Never)]
+    pub restart: JobRestartPolicyArg,
+}
+crud!(JobCmd, JobCreate);
+
+#[derive(Args, Debug)]
+pub struct IngressCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Optional host for the rule.
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Path (must start with /).
+    #[arg(long, default_value = "/")]
+    pub path: String,
+    /// Backend service name.
+    #[arg(long)]
+    pub service: String,
+    /// Backend service port.
+    #[arg(long, default_value_t = 80)]
+    pub port: u16,
+}
+crud!(IngressCmd, IngressCreate);
 
 #[derive(Args, Debug)]
 pub struct DaemonsetCreate {
