@@ -26,6 +26,7 @@ fn harness() -> Harness {
         shutdown: CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     assert_eq!(gauge.info().name, "gauge");
     assert_eq!(gauge.info().prefix, "gauge");

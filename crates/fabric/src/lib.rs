@@ -17,6 +17,9 @@
 //!
 //! Other modules never touch fabric's collections directly; they call
 //! [`Client::create_port_for_device`] and [`Client::release_device_ports`].
+//!
+//! The reconciler and auto-floating-IP loop run only while this node is the
+//! cluster leader. Followers stay idle so they never write a local copy.
 
 pub mod api;
 pub mod backend;
@@ -106,42 +109,56 @@ impl Module for Fabric {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
-        client.ensure_default_template()?;
-        tracing::info!(backend = self.backend.name(), "fabric: initial reconcile");
-        client.reconcile_all().await;
-        run_auto_fips(&client);
-
-        let mut rx = ctx.events.subscribe();
+        let backend_name = self.backend.name();
+        let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
+        let events = ctx.events.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(RETRY_INTERVAL);
-            tick.tick().await; // the first tick fires immediately; we just did a pass
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!("fabric reconciler stopping");
-                        break;
-                    }
-                    ev = rx.recv() => match ev {
-                        Ok(ev) => {
-                            if ev.kind == kind::MACHINE {
-                                run_auto_fips(&client);
-                            }
-                            client.handle_event(&ev).await;
+            leadership
+                .run_while_leader(shutdown, move |active| {
+                    let client = client.clone();
+                    let events = events.clone();
+                    let backend_name = backend_name;
+                    async move {
+                        if let Err(e) = client.ensure_default_template() {
+                            tracing::warn!(error = %e, "fabric: default template");
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "fabric reconciler lagged; full pass");
-                            run_auto_fips(&client);
-                            client.reconcile_pending().await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    _ = tick.tick() => {
+                        tracing::info!(backend = backend_name, "fabric: initial reconcile");
+                        client.reconcile_all().await;
                         run_auto_fips(&client);
-                        client.reconcile_pending().await;
-                    },
-                }
-            }
+
+                        let mut rx = events.subscribe();
+                        let mut tick = tokio::time::interval(RETRY_INTERVAL);
+                        tick.tick().await; // the first tick fires immediately; we just did a pass
+                        loop {
+                            tokio::select! {
+                                _ = active.cancelled() => {
+                                    tracing::debug!("fabric reconciler stopping");
+                                    break;
+                                }
+                                ev = rx.recv() => match ev {
+                                    Ok(ev) => {
+                                        if ev.kind == kind::MACHINE {
+                                            run_auto_fips(&client);
+                                        }
+                                        client.handle_event(&ev).await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(missed = n, "fabric reconciler lagged; full pass");
+                                        run_auto_fips(&client);
+                                        client.reconcile_pending().await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = tick.tick() => {
+                                    run_auto_fips(&client);
+                                    client.reconcile_pending().await;
+                                },
+                            }
+                        }
+                    }
+                })
+                .await;
         });
         Ok(())
     }

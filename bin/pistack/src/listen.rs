@@ -239,6 +239,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             public_url: "http://127.0.0.1".into(),
             node_name: "test".into(),
+            leadership: pistack_types::Leadership::always(),
         };
         let app = axum::Router::new()
             .route("/healthz", get(|| async { "ok" }))

@@ -123,11 +123,11 @@ impl Module for Slab {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client_from(&ctx);
-        client.seed_defaults()?;
         tokio::spawn(reconcile::run(
             client,
-            ctx.events.subscribe(),
+            ctx.events.clone(),
             ctx.shutdown.clone(),
+            ctx.leadership.clone(),
         ));
         Ok(())
     }

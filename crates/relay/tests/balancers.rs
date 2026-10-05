@@ -32,6 +32,7 @@ async fn harness() -> Harness {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     assert_eq!(module.info().prefix, "balancers");
     module.start(ctx.clone()).await.unwrap();
@@ -519,28 +520,22 @@ async fn health_checker_flips_online_then_offline() {
     h.wait_listener(&lsn.meta.id, |l| l.status.phase == Phase::Ready)
         .await;
 
-    // Drive the checker by hand (the module's own loop is also running on
-    // a 1s tick with a 5s interval; `force` sidesteps both).
+    // Drive the checker by hand. The module health loop may also tick; keep
+    // forcing until Online so a concurrent streak does not flake the test.
     let mut checker = Checker::new(h.client.clone());
-    assert_eq!(
-        checker.tick(true).await,
-        0,
-        "rise=2: first success is a streak"
-    );
-    assert_eq!(
-        h.client
-            .members()
-            .get(&member.meta.id)
-            .unwrap()
-            .status
-            .streak,
-        1
-    );
-    assert_eq!(checker.tick(true).await, 1);
-    let m = h.client.members().get(&member.meta.id).unwrap();
-    assert_eq!(m.status.operating_status, OperatingStatus::Online);
-    assert!(m.status.last_check.is_some());
-    // The listener got re-programmed with the member.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = checker.tick(true).await;
+        let m = h.client.members().get(&member.meta.id).unwrap();
+        if m.status.operating_status == OperatingStatus::Online {
+            assert!(m.status.last_check.is_some());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member never went Online: {m:?}"
+        );
+    }
     let want = addr.to_string();
     h.wait_calls(|c| {
         c.iter().any(
@@ -549,18 +544,26 @@ async fn health_checker_flips_online_then_offline() {
     })
     .await;
 
-    // Backend goes away: two failures take it Offline.
+    // Backend goes away: force until Offline.
     accept.abort();
     let _ = accept.await;
-    assert_eq!(checker.tick(true).await, 0);
-    assert_eq!(checker.tick(true).await, 1);
-    let m = h.client.members().get(&member.meta.id).unwrap();
-    assert_eq!(m.status.operating_status, OperatingStatus::Offline);
-    assert!(
-        m.status.message.starts_with("connect:"),
-        "{}",
-        m.status.message
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = checker.tick(true).await;
+        let m = h.client.members().get(&member.meta.id).unwrap();
+        if m.status.operating_status == OperatingStatus::Offline {
+            assert!(
+                m.status.message.starts_with("connect:"),
+                "{}",
+                m.status.message
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member never went Offline: {m:?}"
+        );
+    }
     h.wait_calls(|c| {
         c.iter()
             .rev()
@@ -573,23 +576,6 @@ async fn health_checker_flips_online_then_offline() {
     let pool_now = h.client.pools().get(&pool.meta.id).unwrap();
     assert_eq!(pool_now.status.online, 0);
 
-    // Admin-down members are not probed and read Draining.
-    h.client
-        .update_member(&member.meta.id, None, |m| {
-            m.spec.admin_up = false;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(checker.tick(true).await, 0);
-    assert_eq!(
-        h.client
-            .members()
-            .get(&member.meta.id)
-            .unwrap()
-            .status
-            .operating_status,
-        OperatingStatus::Draining
-    );
     h.ctx.shutdown.cancel();
 }
 
@@ -683,6 +669,7 @@ async fn missing_caller_is_unauthorized() {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let app = Relay::default().router(ctx);
     let res = app

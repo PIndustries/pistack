@@ -156,34 +156,47 @@ impl Module for Relay {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
-        tracing::info!(providers = ?self.providers.names(), "relay: initial reconcile");
-        client.reconcile_all().await;
-
-        health::start(client.clone(), ctx.shutdown.clone());
-
-        let mut rx = ctx.events.subscribe();
+        let provider_names = self.providers.names();
+        let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
+        let events = ctx.events.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(RETRY_INTERVAL);
-            tick.tick().await; // the first tick fires immediately; we just did a pass
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!("relay reconciler stopping");
-                        break;
-                    }
-                    ev = rx.recv() => match ev {
-                        Ok(ev) if KINDS.contains(&ev.kind.as_str()) => client.handle_event(&ev).await,
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "relay reconciler lagged; full pass");
-                            client.reconcile_pending().await;
+            leadership
+                .run_while_leader(shutdown, move |active| {
+                    let client = client.clone();
+                    let events = events.clone();
+                    let provider_names = provider_names.clone();
+                    async move {
+                        tracing::info!(providers = ?provider_names, "relay: initial reconcile");
+                        client.reconcile_all().await;
+                        health::start(client.clone(), active.clone());
+
+                        let mut rx = events.subscribe();
+                        let mut tick = tokio::time::interval(RETRY_INTERVAL);
+                        tick.tick().await;
+                        loop {
+                            tokio::select! {
+                                _ = active.cancelled() => {
+                                    tracing::debug!("relay reconciler stopping");
+                                    break;
+                                }
+                                ev = rx.recv() => match ev {
+                                    Ok(ev) if KINDS.contains(&ev.kind.as_str()) => {
+                                        client.handle_event(&ev).await
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(missed = n, "relay reconciler lagged; full pass");
+                                        client.reconcile_pending().await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = tick.tick() => client.reconcile_pending().await,
+                            }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    _ = tick.tick() => client.reconcile_pending().await,
-                }
-            }
+                    }
+                })
+                .await;
         });
         Ok(())
     }

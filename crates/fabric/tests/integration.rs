@@ -693,16 +693,28 @@ async fn module_start_reconciles_on_events_and_stops_on_shutdown() {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     assert_eq!(module.info().prefix, "network");
     module.start(ctx.clone()).await.unwrap();
 
     let client = module.client(&ctx);
-    // start() created the template.
-    assert!(client
-        .security_groups()
-        .get_by_name(None, DEFAULT_SG)
-        .is_ok());
+    // start() seeds the template once leadership is held.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if client
+            .security_groups()
+            .get_by_name(None, DEFAULT_SG)
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader never seeded the default security group"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let project = Id::new(kind::PROJECT);
     let net = client
@@ -1138,4 +1150,88 @@ async fn missing_caller_is_unauthorized() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"]["code"], "unauthorized");
     assert_eq!(body["error"]["message"], "no credentials");
+}
+
+#[tokio::test]
+async fn controllers_idle_until_leader_then_run() {
+    use pistack_types::Leadership;
+
+    let store = Store::in_memory().unwrap();
+    let backend = Arc::new(MockBackend::new());
+    let module = Fabric::with_backend(backend.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let leadership = Leadership::new(false);
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: shutdown.clone(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: leadership.clone(),
+    };
+    module.start(ctx.clone()).await.unwrap();
+    let client = module.client(&ctx);
+
+    // Not leader: no default template, no reconcile writes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        client
+            .security_groups()
+            .get_by_name(None, DEFAULT_SG)
+            .is_err(),
+        "follower must not seed template"
+    );
+
+    let project = Id::new(kind::PROJECT);
+    let net = client
+        .create_network(
+            Meta::new(kind::NETWORK, "idle", Some(project.clone())),
+            NetworkSpec::default(),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !backend.has_network(&net.meta.id),
+        "follower must not reconcile"
+    );
+    assert_ne!(
+        client.networks().get(&net.meta.id).unwrap().status.phase,
+        Phase::Ready
+    );
+
+    // Promote: controllers start and catch up.
+    leadership.set(true);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ready_sg = client
+            .security_groups()
+            .get_by_name(None, DEFAULT_SG)
+            .is_ok();
+        let ready_net = client.networks().get(&net.meta.id).unwrap().status.phase == Phase::Ready;
+        if ready_sg && ready_net && backend.has_network(&net.meta.id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader never started controllers"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Demote: further changes stay unreconciled.
+    leadership.set(false);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let net2 = client
+        .create_network(
+            Meta::new(kind::NETWORK, "after-demote", Some(project)),
+            NetworkSpec::default(),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !backend.has_network(&net2.meta.id),
+        "demoted node must idle again"
+    );
+
+    shutdown.cancel();
 }

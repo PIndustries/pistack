@@ -8,8 +8,9 @@
 //! away whenever a `zone` or `rec` event arrives, so an answer is never
 //! staler than the last store write. SOA and apex NS records are synthesised
 //! from the zone spec and its reconciled serial. UDP and TCP share one port,
-//! `PISTACK_DNS_LISTEN` (default `0.0.0.0:5353`; set `:53` in production,
-//! where the binary needs `CAP_NET_BIND_SERVICE`).
+//! `PISTACK_DNS_LISTEN` (default `127.0.0.1:5353` so an unset variable does
+//! not expose DNS on every interface; set `0.0.0.0:53` in production, where
+//! the binary needs `CAP_NET_BIND_SERVICE`).
 //!
 //! Only queries are served: updates, notifies and zone transfers get NOTIMP.
 
@@ -35,8 +36,9 @@ use tokio::sync::broadcast;
 
 /// Environment variable naming the listen address.
 pub const LISTEN_ENV: &str = "PISTACK_DNS_LISTEN";
-/// Unprivileged default for development; production uses port 53.
-pub const DEFAULT_LISTEN: &str = "0.0.0.0:5353";
+/// Unprivileged loopback default when `PISTACK_DNS_LISTEN` is unset.
+/// Production should set an explicit address such as `0.0.0.0:53`.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:5353";
 /// How long an idle TCP client may hold a connection.
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest CNAME chain followed inside one zone.

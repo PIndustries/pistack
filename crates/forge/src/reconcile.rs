@@ -61,14 +61,26 @@ impl Reconciler {
         self
     }
 
-    /// Run until `ctx.shutdown` fires.
+    /// Run only while this node is the cluster leader. Idle on followers;
+    /// restart on promotion; stop on demotion or shutdown.
     pub async fn run(self, ctx: ModuleContext) {
+        let this = std::sync::Arc::new(self);
+        let leadership = ctx.leadership.clone();
+        leadership
+            .run_while_leader(ctx.shutdown.clone(), move |active| {
+                let this = this.clone();
+                async move { this.run_loop(active).await }
+            })
+            .await;
+    }
+
+    pub(crate) async fn run_loop(&self, active: pistack_types::CancellationToken) {
         let mut rx = self.store.events().subscribe();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = ctx.shutdown.cancelled() => break,
+                _ = active.cancelled() => break,
                 _ = tick.tick() => {}
                 ev = rx.recv() => match ev {
                     Ok(e) if e.kind == kind::MACHINE => {}
@@ -439,7 +451,7 @@ impl Reconciler {
         let want_restart = m.spec.restarts > m.status.restarts;
         let want_off = m.spec.power == DesiredPower::Off;
         let is_on = m.status.power == PowerState::On;
-        if !want_restart && want_off == !is_on {
+        if !want_restart && want_off != is_on {
             return Ok(());
         }
         let (_, driver) = match self.driver_for(&m) {

@@ -26,6 +26,7 @@ async fn boot() -> Router {
         shutdown: CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let gate = Gate::default();
     gate.start(ctx.clone()).await.unwrap();
