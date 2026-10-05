@@ -95,7 +95,7 @@ fn bind_target(lb: &Balancer) -> ApiResult<SocketAddr> {
             )));
         }
     };
-    Ok(SocketAddr::new(ip, 0))
+    Ok(SocketAddr::new(ip, lb.spec.vip_port.unwrap_or(0)))
 }
 
 fn realized(bound: SocketAddr) -> Realized {
@@ -287,6 +287,7 @@ mod tests {
             spec: BalancerSpec {
                 vip_network: "net".into(),
                 vip_address: vip,
+                vip_port: None,
                 floating_ip: None,
                 provider: Provider::Forward,
                 admin_up: true,

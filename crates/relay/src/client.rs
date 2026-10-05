@@ -602,6 +602,9 @@ fn validate_balancer(spec: &BalancerSpec) -> ApiResult<()> {
     if spec.vip_network.trim().is_empty() {
         return Err(ApiError::bad_request("balancer needs a vip_network"));
     }
+    if spec.vip_port == Some(0) {
+        return Err(ApiError::bad_request("vip_port must be 1-65535"));
+    }
     if let Some(IpAddr::V4(a)) = spec.vip_address {
         if a.is_unspecified() || a.is_broadcast() || a.is_multicast() {
             return Err(ApiError::bad_request(format!("{a} is not a usable vip")));

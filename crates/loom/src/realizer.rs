@@ -23,6 +23,27 @@ use tokio::net::TcpStream;
 const SERVICE_LABEL: &str = "loom.pistack.io/service";
 const INGRESS_LABEL: &str = "loom.pistack.io/ingress";
 const VIP_NETWORK: &str = "cluster";
+/// Private or loopback address service node ports bind on.
+pub const NODE_PORT_ADDRESS_ENV: &str = "PISTACK_NODE_PORT_ADDRESS";
+
+/// `PISTACK_NODE_PORT_ADDRESS` when it is a loopback or private address,
+/// otherwise loopback.
+fn node_port_address() -> IpAddr {
+    let loopback = IpAddr::from([127, 0, 0, 1]);
+    let Ok(raw) = std::env::var(NODE_PORT_ADDRESS_ENV) else {
+        return loopback;
+    };
+    match raw.trim().parse::<IpAddr>() {
+        Ok(ip) if relay::bind::allowed(ip) => ip,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "loom: {NODE_PORT_ADDRESS_ENV} must be a loopback or private address; node ports bind on 127.0.0.1"
+            );
+            loopback
+        }
+    }
+}
 
 #[async_trait]
 pub trait ServiceRealizer: Send + Sync + 'static {
@@ -54,6 +75,7 @@ impl ServiceRealizer for NoopRealizer {
 pub struct RelayRealizer {
     store: OnceLock<Store>,
     providers: Providers,
+    node_address: IpAddr,
 }
 
 impl RelayRealizer {
@@ -64,7 +86,19 @@ impl RelayRealizer {
                 Arc::new(ForwardProvider::new()),
                 Arc::new(RelayL7Provider::new()),
             ]),
+            node_address: node_port_address(),
         }
+    }
+
+    /// Bind node ports on `ip` instead of the address from the environment.
+    pub fn with_node_address(mut self, ip: IpAddr) -> Self {
+        self.node_address = ip;
+        self
+    }
+
+    /// Address node ports bind on.
+    pub fn node_address(&self) -> IpAddr {
+        self.node_address
     }
 
     /// Attach the store opened during module start. Later calls are ignored.
@@ -115,6 +149,7 @@ impl RelayRealizer {
                 ListenerProtocol::Tcp,
                 PoolProtocol::Tcp,
                 port.port,
+                None,
                 &members,
                 &[],
             )
@@ -122,6 +157,29 @@ impl RelayRealizer {
             if service.spec.kind == ServiceKind::LoadBalancer {
                 addrs.push(bound);
             }
+            if service.spec.kind == ServiceKind::ClusterIp {
+                continue;
+            }
+            let Some(&node_port) = service.status.node_ports.get(&port.port) else {
+                continue;
+            };
+            let name = format!("svc-{}-{}-node-{node_port}", service.meta.id, port.port);
+            keep.push(name.clone());
+            ensure_forward(
+                &client,
+                service.meta.project.clone(),
+                &name,
+                SERVICE_LABEL,
+                &service.meta.id.to_string(),
+                Provider::Forward,
+                ListenerProtocol::Tcp,
+                PoolProtocol::Tcp,
+                node_port,
+                Some(SocketAddr::new(self.node_address, node_port)),
+                &members,
+                &[],
+            )
+            .await?;
         }
         delete_unnamed(&client, SERVICE_LABEL, &service.meta.id.to_string(), &keep).await?;
         Ok(addrs)
@@ -157,6 +215,7 @@ impl RelayRealizer {
             ListenerProtocol::Http,
             PoolProtocol::Http,
             80,
+            None,
             &members,
             &routes,
         )
@@ -340,12 +399,17 @@ async fn ensure_forward(
     listener_protocol: ListenerProtocol,
     pool_protocol: PoolProtocol,
     port: u16,
+    bind: Option<SocketAddr>,
     members: &[SocketAddr],
     routes: &[RoutePlan],
 ) -> ApiResult<String> {
     let lb = match client.balancers().get_by_name(project.as_ref(), name) {
         Ok(lb) => {
-            if lb.spec.vip_network != VIP_NETWORK || lb.spec.provider != provider {
+            if lb.spec.vip_network != VIP_NETWORK
+                || lb.spec.provider != provider
+                || lb.spec.vip_address != bind.map(|b| b.ip())
+                || lb.spec.vip_port != bind.map(|b| b.port())
+            {
                 return Err(ApiError::unavailable("listener is not available"));
             }
             lb
@@ -358,6 +422,8 @@ async fn ensure_forward(
                 meta,
                 BalancerSpec {
                     vip_network: VIP_NETWORK.into(),
+                    vip_address: bind.map(|b| b.ip()),
+                    vip_port: bind.map(|b| b.port()),
                     provider,
                     admin_up: true,
                     ..BalancerSpec::default()
