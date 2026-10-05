@@ -109,6 +109,9 @@ pub struct RouterNamespace {
     /// (`/32` or `/128`) in the namespace. IPv6 is unique-local (`fc00::/7`).
     pub external_ip: Option<String>,
     /// Recorded only. The agent must not move, enslave, or address this device.
+    /// Empty, and left out of the document, when the router has no external
+    /// address: that router gets no external veth.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub external_dev: String,
     /// True only when [`Self::external_ip`] is set.
     pub snat: bool,
@@ -277,9 +280,7 @@ struct PendingRouter {
 /// `net-01a10318-a507-74fd-a86e-5acbda974722` yields `01a10318a507`.
 pub fn device_hex(id: &str) -> Result<String, PlanError> {
     let source = match id.split_once('-') {
-        Some((kind, rest))
-            if !rest.is_empty() && kind.chars().all(|c| c.is_ascii_alphabetic()) =>
-        {
+        Some((kind, rest)) if !rest.is_empty() && kind.chars().all(|c| c.is_ascii_alphabetic()) => {
             rest
         }
         _ => id,
@@ -397,7 +398,11 @@ pub fn plan(
             seg.peers.clone_from(&peer_list);
         }
     }
-    for router in pending {
+    for mut router in pending {
+        if router.ns.external_ip.is_none() {
+            // No external address means no external veth, so no underlay to record.
+            router.ns.external_dev.clear();
+        }
         segments[router.at].routers.push(router.ns);
     }
     for seg in &segments {
@@ -473,9 +478,10 @@ fn attach_router(
     net_hex: &str,
     router: &PlanRouter,
 ) -> Result<(), PlanError> {
-    if pending.iter().any(|p| {
-        p.ns.id == router.id && p.ns.interfaces.iter().any(|i| i.network_id == network_id)
-    }) {
+    if pending
+        .iter()
+        .any(|p| p.ns.id == router.id && p.ns.interfaces.iter().any(|i| i.network_id == network_id))
+    {
         return Err(PlanError::Invalid(format!(
             "router {} is listed twice on {network_id}",
             router.id
@@ -672,9 +678,9 @@ fn plan_floating(
 }
 
 fn canonical_dhcp(leases: &[DhcpLease], cidr: &str) -> Result<Vec<DhcpLease>, PlanError> {
-    let net: IpNet = cidr.parse().map_err(|_| {
-        PlanError::Invalid(format!("cidr {cidr} is not an ip network"))
-    })?;
+    let net: IpNet = cidr
+        .parse()
+        .map_err(|_| PlanError::Invalid(format!("cidr {cidr} is not an ip network")))?;
     let mut seen_mac = BTreeSet::new();
     let mut seen_addr = BTreeSet::new();
     let mut out = Vec::with_capacity(leases.len());
@@ -812,14 +818,12 @@ fn v6_snat_agrees(ns: &RouterNamespace) -> Result<(), PlanError> {
 }
 
 fn canonical_cidr(role: &str, raw: &str) -> Result<String, PlanError> {
-    let net: IpNet = raw.parse().map_err(|_| {
-        PlanError::Invalid(format!("{role} {raw} is not an ip network"))
-    })?;
+    let net: IpNet = raw
+        .parse()
+        .map_err(|_| PlanError::Invalid(format!("{role} {raw} is not an ip network")))?;
     let canonical = net.trunc().to_string();
     if canonical != raw {
-        return Err(PlanError::Invalid(format!(
-            "{role} {raw} is not canonical"
-        )));
+        return Err(PlanError::Invalid(format!("{role} {raw} is not canonical")));
     }
     Ok(canonical)
 }
@@ -850,9 +854,9 @@ fn gateway_in_cidr(gateway: &str, prefix: u8, cidr: &str) -> Result<(String, Str
                     "prefix {prefix} is outside 1..=30"
                 )));
             }
-            let net: Ipv4Net = cidr.parse().map_err(|_| {
-                PlanError::Invalid(format!("cidr {cidr} is not an ipv4 network"))
-            })?;
+            let net: Ipv4Net = cidr
+                .parse()
+                .map_err(|_| PlanError::Invalid(format!("cidr {cidr} is not an ipv4 network")))?;
             if net.prefix_len() != prefix {
                 return Err(PlanError::Invalid(format!(
                     "prefix {prefix} does not match cidr {cidr}"
@@ -871,9 +875,9 @@ fn gateway_in_cidr(gateway: &str, prefix: u8, cidr: &str) -> Result<(String, Str
                     "prefix {prefix} is outside 1..=128"
                 )));
             }
-            let net: Ipv6Net = cidr.parse().map_err(|_| {
-                PlanError::Invalid(format!("cidr {cidr} is not an ipv6 network"))
-            })?;
+            let net: Ipv6Net = cidr
+                .parse()
+                .map_err(|_| PlanError::Invalid(format!("cidr {cidr} is not an ipv6 network")))?;
             if net.prefix_len() != prefix {
                 return Err(PlanError::Invalid(format!(
                     "prefix {prefix} does not match cidr {cidr}"
@@ -971,10 +975,7 @@ fn claim(names: &mut BTreeSet<String>, name: String, prefix: &str) -> Result<Str
 fn is_hex_suffix(name: &str, prefix: &str) -> bool {
     match name.strip_prefix(prefix) {
         Some(rest) => {
-            rest.len() == 12
-                && rest
-                    .bytes()
-                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            rest.len() == 12 && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         }
         None => false,
     }
@@ -1211,7 +1212,10 @@ mod tests {
             PlanError::Vni(16_777_216)
         ));
         let max = [network(NET_A, 16_777_215, vec![], vec![])];
-        assert_eq!(plan(&host("10.0.0.1"), &max, &[]).unwrap().networks[0].vni, 16_777_215);
+        assert_eq!(
+            plan(&host("10.0.0.1"), &max, &[]).unwrap().networks[0].vni,
+            16_777_215
+        );
     }
 
     #[test]
@@ -1345,10 +1349,7 @@ mod tests {
         h.underlay_mtu = 1500;
         assert_eq!(plan(&h, &[n.clone()], &[]).unwrap().networks[0].mtu, 1400);
         n.mtu = 0;
-        assert!(matches!(
-            plan(&h, &[n], &[]).unwrap_err(),
-            PlanError::Mtu
-        ));
+        assert!(matches!(plan(&h, &[n], &[]).unwrap_err(), PlanError::Mtu));
     }
 
     #[test]
@@ -1577,6 +1578,23 @@ mod tests {
         let nets = [network(NET_A, 14, vec![mixed], vec![])];
         let err = plan(&host("10.0.0.1"), &nets, &[]).unwrap_err();
         assert!(matches!(err, PlanError::Invalid(ref msg) if msg.contains("snat family")));
+    }
+
+    #[test]
+    fn router_without_external_ip_sends_no_external_dev() {
+        let mut leg = router(RTR_A, "10.90.0.1", "10.90.0.0/24");
+        leg.external_dev = "external".into();
+        let nets = [network(NET_A, 3, vec![leg], vec![])];
+        let plan = plan(&host("10.0.0.1"), &nets, &[]).unwrap();
+        let ns = &plan.networks[0].routers[0];
+        assert!(ns.external_ip.is_none());
+        assert!(!ns.snat);
+        assert!(ns.external_dev.is_empty());
+        let value = serde_json::to_value(&plan).unwrap();
+        let doc = &value["networks"][0]["routers"][0];
+        assert!(doc.get("external_dev").is_none(), "{doc}");
+        let back: OverlayPlan = serde_json::from_value(value).unwrap();
+        assert!(back.networks[0].routers[0].external_dev.is_empty());
     }
 
     #[test]

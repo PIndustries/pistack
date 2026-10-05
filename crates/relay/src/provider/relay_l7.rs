@@ -89,9 +89,9 @@ impl RelayL7Provider {
         }
         let ip = {
             let slots = self.slots.lock();
-            let slot = slots.get(&id).ok_or_else(|| {
-                ApiError::bad_request("http balancer is not bound")
-            })?;
+            let slot = slots
+                .get(&id)
+                .ok_or_else(|| ApiError::bad_request("http balancer is not bound"))?;
             if let Some(udp) = &slot.udp {
                 udp.set_members(targets);
                 return Ok(udp.bound().to_string());
@@ -101,9 +101,9 @@ impl RelayL7Provider {
         let udp = crate::udp::UdpForward::bind(ip, targets).await?;
         let bound = udp.bound().to_string();
         let mut slots = self.slots.lock();
-        let slot = slots.get_mut(&id).ok_or_else(|| {
-            ApiError::bad_request("http balancer is not bound")
-        })?;
+        let slot = slots
+            .get_mut(&id)
+            .ok_or_else(|| ApiError::bad_request("http balancer is not bound"))?;
         if let Some(existing) = &slot.udp {
             existing.set_members(crate::udp::targets(view));
             drop(udp);
@@ -316,18 +316,16 @@ async fn proxy_http<S>(
         let _ = refuse(inbound).await;
         return;
     };
-    let mut outbound = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TcpStream::connect(dest),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        _ => {
-            let _ = refuse(inbound).await;
-            return;
-        }
-    };
+    let mut outbound =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(dest))
+            .await
+        {
+            Ok(Ok(stream)) => stream,
+            _ => {
+                let _ = refuse(inbound).await;
+                return;
+            }
+        };
     let _ = outbound.set_nodelay(true);
     if outbound.write_all(&rewritten).await.is_err() {
         return;
@@ -522,9 +520,10 @@ impl LbProvider for RelayL7Provider {
         let serve = match &view.listener.spec.protocol {
             ListenerProtocol::Udp => unreachable!("udp returned above"),
             ListenerProtocol::Terminated { .. } => {
-                let material = view.tls.as_ref().ok_or_else(|| {
-                    ApiError::unavailable("no certificate for this listener")
-                })?;
+                let material = view
+                    .tls
+                    .as_ref()
+                    .ok_or_else(|| ApiError::unavailable("no certificate for this listener"))?;
                 Serve::Tls(crate::tls::server_config(material)?)
             }
             ListenerProtocol::Http => Serve::Http,
@@ -534,9 +533,9 @@ impl LbProvider for RelayL7Provider {
         let limit = view.listener.spec.connection_limit as usize;
         let id = view.balancer.meta.id.clone();
         let mut slots = self.slots.lock();
-        let slot = slots.get_mut(&id).ok_or_else(|| {
-            ApiError::bad_request("http balancer is not bound")
-        })?;
+        let slot = slots
+            .get_mut(&id)
+            .ok_or_else(|| ApiError::bad_request("http balancer is not bound"))?;
         *slot.members.lock() = addrs;
         slot.limit.store(limit, Ordering::Relaxed);
         *slot.mode.lock() = serve;
@@ -640,7 +639,7 @@ mod tests {
         let p = RelayL7Provider::new();
         assert_eq!(p.name(), "http");
         assert!(p.serves(Provider::Relay));
-        assert!(!p.serves(Provider::Ovn));
+        assert!(!p.serves(Provider::Forward));
     }
 
     #[tokio::test]
@@ -728,7 +727,9 @@ mod tests {
         p.delete_listener(&lb.meta.id, &Id::new(kinds::LISTENER))
             .await
             .unwrap();
-        let err = TcpStream::connect(&realized.provider_ref).await.unwrap_err();
+        let err = TcpStream::connect(&realized.provider_ref)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 }

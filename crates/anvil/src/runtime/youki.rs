@@ -90,8 +90,8 @@ impl MachineRuntime for YoukiRuntime {
                 let _ = exec_youki(&bin, &["delete", &id_str]).await;
                 return Err(e);
             }
-        } else if let Err(e) = exec_youki(&bin, &["start", &id_str]).await {
-            return Err(e);
+        } else {
+            exec_youki(&bin, &["start", &id_str]).await?;
         }
         let addresses = nic_addresses(req);
         write_state(
@@ -230,11 +230,9 @@ impl MachineRuntime for YoukiRuntime {
             ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
         })?;
         let mut out = Vec::new();
-        loop {
-            let ent = rd.next_entry().await.map_err(|e| {
-                ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
-            })?;
-            let Some(ent) = ent else { break };
+        while let Some(ent) = rd.next_entry().await.map_err(|e| {
+            ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
+        })? {
             let ft = ent.file_type().await.map_err(|e| {
                 ApiError::unavailable(format!("youki runtime: reading {}: {e}", root.display()))
             })?;
@@ -1092,8 +1090,7 @@ fn extract_tar_budget(
         pending_name: None,
         pending_link: None,
     };
-    loop {
-        let Some(ent) = tar.next_entry()? else { break };
+    while let Some(ent) = tar.next_entry()? {
         let rel = match rel_under(&ent.name) {
             Some(rel) => rel,
             None if ent.name.is_empty() || ent.name == "." || ent.name == "./" => {
@@ -2590,9 +2587,9 @@ mod tests {
             buf.extend_from_slice(&tar_header(name, data.len() as u64, b'0'));
             buf.extend_from_slice(data);
             let pad = (512 - (data.len() % 512)) % 512;
-            buf.extend(std::iter::repeat(0u8).take(pad));
+            buf.extend(std::iter::repeat_n(0u8, pad));
         }
-        buf.extend(std::iter::repeat(0u8).take(1024));
+        buf.extend(std::iter::repeat_n(0u8, 1024));
         buf
     }
 

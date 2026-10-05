@@ -259,6 +259,17 @@ fn validate_name(name: &str) -> ApiResult<()> {
     Ok(())
 }
 
+fn validate_alarm(spec: &AlarmSpec) -> ApiResult<()> {
+    validate_name(&spec.name)?;
+    if spec.metric.is_empty() || spec.metric.len() > 256 {
+        return Err(ApiError::bad_request("metric must be 1-256 characters"));
+    }
+    if !spec.threshold.is_finite() {
+        return Err(ApiError::bad_request("threshold must be finite"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,15 +296,4 @@ mod tests {
             "{text}"
         );
     }
-}
-
-fn validate_alarm(spec: &AlarmSpec) -> ApiResult<()> {
-    validate_name(&spec.name)?;
-    if spec.metric.is_empty() || spec.metric.len() > 256 {
-        return Err(ApiError::bad_request("metric must be 1-256 characters"));
-    }
-    if !spec.threshold.is_finite() {
-        return Err(ApiError::bad_request("threshold must be finite"));
-    }
-    Ok(())
 }

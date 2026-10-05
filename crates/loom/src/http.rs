@@ -652,12 +652,16 @@ async fn pod_logs(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let pod = load::<PodSpec>(&s, &scope, &id)?;
-    let machine = pod.status.machine.clone().ok_or_else(|| {
-        ApiError::unavailable("pod logs are not available")
-    })?;
-    let host_id = pod.status.host.clone().ok_or_else(|| {
-        ApiError::unavailable("pod logs are not available")
-    })?;
+    let machine = pod
+        .status
+        .machine
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("pod logs are not available"))?;
+    let host_id = pod
+        .status
+        .host
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("pod logs are not available"))?;
     let host = s
         .store
         .collection::<forge::Host>()
@@ -666,9 +670,10 @@ async fn pod_logs(
     if host.spec.node_name.is_empty() {
         return Err(ApiError::unavailable("pod logs are not available"));
     }
-    let queue = s.queue.clone().ok_or_else(|| {
-        ApiError::unavailable("pod logs are not configured")
-    })?;
+    let queue = s
+        .queue
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("pod logs are not configured"))?;
     let ticket = queue.enqueue(
         &host.spec.node_name,
         CommandKind::ReadLogs,
@@ -679,11 +684,7 @@ async fn pod_logs(
         Some(text) => text.to_owned(),
         None => return Err(ApiError::unavailable("pod log text is missing")),
     };
-    Ok((
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        text,
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
 }
 
 /// The document the pod's machine carries to anvil; handy for debugging.

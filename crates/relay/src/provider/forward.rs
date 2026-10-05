@@ -36,7 +36,7 @@ struct Slot {
     udp: Option<crate::udp::UdpForward>,
 }
 
-/// Local TCP forwarder. Serves [`Provider::Ovn`] (L4). HTTP stays on
+/// Local TCP forwarder. Serves [`Provider::Forward`] (L4). HTTP stays on
 /// [`super::RelayL7Provider`].
 pub struct ForwardProvider {
     slots: parking_lot::Mutex<HashMap<Id, Slot>>,
@@ -163,7 +163,7 @@ impl LbProvider for ForwardProvider {
     }
 
     fn serves(&self, provider: Provider) -> bool {
-        provider == Provider::Ovn
+        provider == Provider::Forward
     }
 
     async fn ensure_balancer(&self, lb: &Balancer) -> ApiResult<Realized> {
@@ -171,12 +171,12 @@ impl LbProvider for ForwardProvider {
             return Ok(realized(bound));
         }
         let target = bind_target(lb)?;
-        let listener = TcpListener::bind(target).await.map_err(|e| {
-            ApiError::unavailable(format!("forward bind {target}: {e}"))
-        })?;
-        let bound = listener.local_addr().map_err(|e| {
-            ApiError::unavailable(format!("forward local address: {e}"))
-        })?;
+        let listener = TcpListener::bind(target)
+            .await
+            .map_err(|e| ApiError::unavailable(format!("forward bind {target}: {e}")))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| ApiError::unavailable(format!("forward local address: {e}")))?;
         let mut slots = self.slots.lock();
         if let Some(existing) = slots.get(&lb.meta.id) {
             return Ok(realized(existing.bound));
@@ -207,14 +207,15 @@ impl LbProvider for ForwardProvider {
         let addrs = member_addrs(view);
         let id = view.balancer.meta.id.clone();
         let mut slots = self.slots.lock();
-        let slot = slots.get_mut(&id).ok_or_else(|| {
-            ApiError::bad_request("forward balancer is not bound")
-        })?;
+        let slot = slots
+            .get_mut(&id)
+            .ok_or_else(|| ApiError::bad_request("forward balancer is not bound"))?;
         *slot.members.lock() = addrs;
         if slot.task.is_none() {
-            let listener = slot.listener.take().ok_or_else(|| {
-                ApiError::internal("forward socket is missing")
-            })?;
+            let listener = slot
+                .listener
+                .take()
+                .ok_or_else(|| ApiError::internal("forward socket is missing"))?;
             let members = slot.members.clone();
             let cancel = slot.cancel.clone();
             slot.task = Some(tokio::spawn(async move {
@@ -244,9 +245,9 @@ impl ForwardProvider {
         }
         let ip = {
             let slots = self.slots.lock();
-            let slot = slots.get(&id).ok_or_else(|| {
-                ApiError::bad_request("forward balancer is not bound")
-            })?;
+            let slot = slots
+                .get(&id)
+                .ok_or_else(|| ApiError::bad_request("forward balancer is not bound"))?;
             if let Some(udp) = &slot.udp {
                 udp.set_members(targets);
                 return Ok(udp.bound().to_string());
@@ -256,9 +257,9 @@ impl ForwardProvider {
         let udp = crate::udp::UdpForward::bind(ip, targets).await?;
         let bound = udp.bound().to_string();
         let mut slots = self.slots.lock();
-        let slot = slots.get_mut(&id).ok_or_else(|| {
-            ApiError::bad_request("forward balancer is not bound")
-        })?;
+        let slot = slots
+            .get_mut(&id)
+            .ok_or_else(|| ApiError::bad_request("forward balancer is not bound"))?;
         if let Some(existing) = &slot.udp {
             existing.set_members(crate::udp::targets(view));
             drop(udp);
@@ -287,7 +288,7 @@ mod tests {
                 vip_network: "net".into(),
                 vip_address: vip,
                 floating_ip: None,
-                provider: Provider::Ovn,
+                provider: Provider::Forward,
                 admin_up: true,
             },
             status: BalancerStatus::default(),
@@ -378,7 +379,7 @@ mod tests {
     fn serves_l4_not_pingora() {
         let p = ForwardProvider::new();
         assert_eq!(p.name(), "forward");
-        assert!(p.serves(Provider::Ovn));
+        assert!(p.serves(Provider::Forward));
         assert!(!p.serves(Provider::Relay));
     }
 
@@ -444,7 +445,9 @@ mod tests {
         p.delete_listener(&lb.meta.id, &view.listener.meta.id)
             .await
             .unwrap();
-        let err = TcpStream::connect(&realized.provider_ref).await.unwrap_err();
+        let err = TcpStream::connect(&realized.provider_ref)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 
@@ -469,7 +472,9 @@ mod tests {
         p.ensure_listener(&view).await.unwrap();
         assert_eq!(read_n(&realized.provider_ref, 4).await, b"two!");
         p.delete_balancer(&lb.meta.id).await.unwrap();
-        let err = TcpStream::connect(&realized.provider_ref).await.unwrap_err();
+        let err = TcpStream::connect(&realized.provider_ref)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 

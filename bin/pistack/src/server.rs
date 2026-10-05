@@ -52,20 +52,17 @@ pub fn assemble(dev: bool) -> Assembly {
     let modules: Vec<Arc<dyn Module>> = vec![
         gate_m.clone(),
         forge_m.clone(),
-        Arc::new(loom::Loom::configured(loom::LoomConfig::production(dev, queue.clone()))),
+        Arc::new(loom::Loom::configured(loom::LoomConfig::production(
+            dev,
+            queue.clone(),
+        ))),
         Arc::new(fabric_module()),
         Arc::new(slab::Slab::default().with_queue(queue.clone())),
         Arc::new(mold::Mold::default()),
         Arc::new(silo::Silo),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),
-        Arc::new(
-            match std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref() {
-                Some("forward") => relay::Relay::forward(),
-                _ => relay::Relay::default(),
-            }
-            .with_queue(queue.clone()),
-        ),
+        Arc::new(relay_module().with_queue(queue.clone())),
         Arc::new(keep::Keep::default()),
         Arc::new(blueprint::Blueprint),
         Arc::new(gauge::Gauge),
@@ -83,6 +80,18 @@ pub fn assemble(dev: bool) -> Assembly {
 /// `PISTACK_FABRIC_BACKEND=overlay` is the VXLAN segment datapath. The agent
 /// applies that plan. Anything else, including an unset variable, keeps the
 /// mock backend so tests and a laptop server never touch interfaces.
+/// `PISTACK_RELAY_BACKEND=forward` mounts the in-process forwarder and HTTP
+/// proxy. Unset or `mock` keeps the mock. `run` refuses any other value
+/// before it gets here.
+fn relay_module() -> relay::Relay {
+    let backend = relay::RelayBackend::from_env().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "relay: falling back to the mock backend");
+        relay::RelayBackend::Mock
+    });
+    tracing::info!(backend = backend.name(), "relay: backend");
+    relay::Relay::for_backend(backend)
+}
+
 fn fabric_module() -> fabric::Fabric {
     match std::env::var("PISTACK_FABRIC_BACKEND").ok().as_deref() {
         Some("hostnat") => fabric::Fabric::hostnat(),
@@ -145,30 +154,28 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
     let node_id = crate::cluster::load_or_create_node_id(&opts.data_dir)?;
     let allow_seed = !matches!(boot, crate::cluster::BootKind::Joined);
-    let established = match crate::cluster::establish_local(
-        &store,
-        &node_id,
-        &public_url,
-        allow_seed,
-    ) {
-        Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
-        Ok(crate::cluster::LocalRole::NeedJoin) => {
-            let hint = crate::cluster::leader_hint(&store, &node_id)?
+    let established =
+        match crate::cluster::establish_local(&store, &node_id, &public_url, allow_seed) {
+            Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
+            Ok(crate::cluster::LocalRole::NeedJoin) => {
+                let hint = crate::cluster::leader_hint(&store, &node_id)?
                 .or_else(|| crate::cluster::remembered_leader(&opts.data_dir))
-                .context("store belongs to a cluster and no leader address is known; pass --join URL")?;
-            match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
-                Ok(ready) => ready,
-                Err(err) => {
-                    if matches!(boot, crate::cluster::BootKind::Joined) {
-                        drop(store);
-                        let _ = std::fs::remove_file(&store_path);
+                .context(
+                    "store belongs to a cluster and no leader address is known; pass --join URL",
+                )?;
+                match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
+                    Ok(ready) => ready,
+                    Err(err) => {
+                        if matches!(boot, crate::cluster::BootKind::Joined) {
+                            drop(store);
+                            let _ = std::fs::remove_file(&store_path);
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
             }
-        }
-        Err(err) => return Err(err),
-    };
+            Err(err) => return Err(err),
+        };
     crate::cluster::clear_remembered_leader(&opts.data_dir);
     let cluster_id: String = store
         .get_meta("cluster_id")?
@@ -201,6 +208,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         );
     }
 
+    relay::RelayBackend::from_env().map_err(anyhow::Error::msg)?;
     let asm = assemble(opts.dev);
 
     // Start modules first so gate has generated its signing key before the

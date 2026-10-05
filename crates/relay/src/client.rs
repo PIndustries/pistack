@@ -249,9 +249,9 @@ impl Client {
         if spec.port == 0 {
             return Err(ApiError::bad_request("listener port must be 1-65535"));
         }
-        if lb.spec.provider == Provider::Ovn && spec.protocol.is_l7() {
+        if lb.spec.provider == Provider::Forward && spec.protocol.is_l7() {
             return Err(ApiError::bad_request(
-                "provider ovn balances L4 only; http listeners need provider relay",
+                "provider forward balances L4 only; http listeners need provider relay",
             ));
         }
         let udp = matches!(spec.protocol, ListenerProtocol::Udp);

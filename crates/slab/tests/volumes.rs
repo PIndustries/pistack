@@ -8,9 +8,13 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use pistack_types::{kind, Caller, Id, Phase};
+use pistack_rpc::{
+    CommandKind, CommandQueue, CommandResult, QueueConfig, VolumeAttach, VolumeDetach,
+};
+use pistack_types::{kind, Caller, Id, Phase, Resource, Spec};
 use serde_json::{json, Value};
 use slab::{Client, Create, LocalFileBackend, Protocol, SnapshotSpec, VolumeSource, VolumeSpec};
+use std::time::Duration;
 use tower::ServiceExt;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -204,6 +208,134 @@ async fn attach_detach_rules() {
     assert!(v.status.attached_to.is_none());
     c.request_delete_volume(&vol.meta.id)
         .expect("delete after detach");
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+struct HostSpec {
+    node_name: String,
+}
+
+impl Spec for HostSpec {
+    const KIND: &'static str = kind::HOST;
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+struct HostStatus {}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+struct MachineSpec {}
+
+impl Spec for MachineSpec {
+    const KIND: &'static str = kind::MACHINE;
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+struct MachineStatus {
+    #[serde(default)]
+    host: Option<Id>,
+}
+
+fn place_machine(c: &Client, node: &str) -> Id {
+    let host = c
+        .store()
+        .collection::<Resource<HostSpec, HostStatus>>()
+        .create(Resource::new(
+            node,
+            None,
+            HostSpec {
+                node_name: node.into(),
+            },
+        ))
+        .expect("host");
+    let mut machine = Resource::<MachineSpec, MachineStatus>::new(
+        "guest",
+        Some(Id::new(kind::PROJECT)),
+        MachineSpec {},
+    );
+    machine.status.host = Some(host.meta.id);
+    c.store()
+        .collection::<Resource<MachineSpec, MachineStatus>>()
+        .create(machine)
+        .expect("machine")
+        .meta
+        .id
+}
+
+#[tokio::test]
+async fn local_file_attach_and_detach_use_the_agent_queue() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(5),
+        ..QueueConfig::default()
+    });
+    let c = client(&dir).with_queue(queue.clone());
+    let vol = c
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let path = LocalFileBackend::new(dir.path())
+        .volume_path(&vol)
+        .to_string_lossy()
+        .into_owned();
+    let machine = place_machine(&c, "fleet");
+
+    let agent = tokio::spawn({
+        let queue = queue.clone();
+        async move {
+            let cmds = queue.next("fleet", Duration::from_secs(5), 1).await;
+            let cmd = cmds.into_iter().next().expect("attach command");
+            assert_eq!(cmd.kind, CommandKind::AttachVolume);
+            let payload = cmd.payload.clone();
+            queue
+                .ack(
+                    "fleet",
+                    CommandResult::ok(cmd.id).with_payload(json!({"device": "vdb"})),
+                )
+                .expect("ack attach");
+            payload
+        }
+    });
+    let device = c
+        .plug_volume(&vol.meta.id, &machine, Some("vdb".into()))
+        .await
+        .expect("plug");
+    assert_eq!(device, "vdb");
+    let payload = agent.await.expect("agent");
+    let attach: VolumeAttach = serde_json::from_value(payload).expect("attach payload");
+    assert_eq!(attach.machine, machine);
+    assert_eq!(attach.volume, vol.meta.id);
+    assert_eq!(attach.path, path);
+    assert!(attach.target.is_none());
+    assert_eq!(attach.device.as_deref(), Some("vdb"));
+    assert!(!attach.read_only);
+
+    let agent = tokio::spawn({
+        let queue = queue.clone();
+        async move {
+            let cmds = queue.next("fleet", Duration::from_secs(5), 1).await;
+            let cmd = cmds.into_iter().next().expect("detach command");
+            assert_eq!(cmd.kind, CommandKind::DetachVolume);
+            let payload = cmd.payload.clone();
+            queue
+                .ack("fleet", CommandResult::ok(cmd.id))
+                .expect("ack detach");
+            payload
+        }
+    });
+    c.unplug_volume(&vol.meta.id, &machine, Some("vdb".into()))
+        .await
+        .expect("unplug");
+    let payload = agent.await.expect("agent");
+    let detach: VolumeDetach = serde_json::from_value(payload).expect("detach payload");
+    assert_eq!(detach.path, path);
+    assert!(detach.target.is_none());
+    assert_eq!(detach.device.as_deref(), Some("vdb"));
+    assert_eq!(detach.volume, vol.meta.id);
 }
 
 async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -446,7 +578,11 @@ async fn reconciler_loop_drives_volume_to_ready() {
     task.await.expect("reconciler exits");
 }
 
-fn type_create(name: &str, backend: &str, params: serde_json::Value) -> Create<slab::VolumeTypeSpec> {
+fn type_create(
+    name: &str,
+    backend: &str,
+    params: serde_json::Value,
+) -> Create<slab::VolumeTypeSpec> {
     let mut map = std::collections::BTreeMap::new();
     if let Some(obj) = params.as_object() {
         for (k, v) in obj {
@@ -590,10 +726,7 @@ async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
     assert_ne!(rbd.status.phase, Phase::Ready);
     assert!(rbd.status.backend_ref.is_none());
     let logged = std::fs::read_to_string(&rbd_log).unwrap_or_default();
-    assert!(
-        !logged.lines().any(|line| line == "create"),
-        "{logged}"
-    );
+    assert!(!logged.lines().any(|line| line == "create"), "{logged}");
 
     c.create_volume_type(type_create("nomon", "rbd", json!({"pool": "volumes"})))
         .expect("rbd type without monitors");
@@ -623,10 +756,7 @@ async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
         .expect("reconcile")
         .expect("exists");
     assert_ne!(bare.status.phase, Phase::Ready);
-    assert!(
-        !quiet.exists(),
-        "missing monitors must not run rbd"
-    );
+    assert!(!quiet.exists(), "missing monitors must not run rbd");
 }
 
 #[tokio::test]
@@ -685,8 +815,7 @@ async fn backup_round_trip_and_oversize_refusal() {
     assert_ne!(restored.meta.id, vol.meta.id);
     let restored_path = LocalFileBackend::new(dir.path()).volume_path(&restored);
     let mut got = vec![0u8; payload.len()];
-    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got)
-        .unwrap();
+    std::io::Read::read_exact(&mut std::fs::File::open(&restored_path).unwrap(), &mut got).unwrap();
     assert_eq!(got, payload);
 
     let huge = silo::MAX_OBJECT_BYTES as u64 + 1;
@@ -714,7 +843,11 @@ async fn backup_round_trip_and_oversize_refusal() {
         .reconcile_backup(&big.meta.id)
         .await
         .expect_err("oversize");
-    assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+    assert_eq!(
+        err.code,
+        pistack_types::error::ErrorCode::Unavailable,
+        "{err}"
+    );
     assert!(err.message.contains(&huge.to_string()), "{err}");
     let big = c.backups().get(&big.meta.id).expect("big");
     assert_ne!(big.status.phase, Phase::Ready);

@@ -143,9 +143,7 @@ fn is_pw(name: &str) -> bool {
 /// side is used.
 fn device_hex(id: &str) -> Result<String, ApiError> {
     let source = match id.split_once('-') {
-        Some((kind, rest))
-            if !rest.is_empty() && kind.chars().all(|c| c.is_ascii_alphabetic()) =>
-        {
+        Some((kind, rest)) if !rest.is_empty() && kind.chars().all(|c| c.is_ascii_alphabetic()) => {
             rest
         }
         _ => id,
@@ -247,9 +245,8 @@ fn resolve_bin(kind: DoorKind, fallback: &str) -> Result<PathBuf, ApiError> {
         Some(_) => Err(ApiError::unavailable(format!(
             "{fallback} is not installed"
         ))),
-        None => which(fallback).ok_or_else(|| {
-            ApiError::unavailable(format!("{fallback} is not installed"))
-        }),
+        None => which(fallback)
+            .ok_or_else(|| ApiError::unavailable(format!("{fallback} is not installed"))),
     }
 }
 
@@ -300,9 +297,8 @@ pub async fn apply(
                     return Ok(plan);
                 }
                 if let Some(child) = slot.child.as_mut() {
-                    match child.try_wait() {
-                        Ok(None) => return Ok(plan),
-                        Ok(Some(_)) | Err(_) => {}
+                    if let Ok(None) = child.try_wait() {
+                        return Ok(plan);
                     }
                 }
             }
@@ -321,9 +317,9 @@ pub async fn apply(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(|e| {
-        ApiError::unavailable(format!("{} failed to start: {e}", plan.bin))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ApiError::unavailable(format!("{} failed to start: {e}", plan.bin)))?;
     match kind {
         DoorKind::Tailscale | DoorKind::Wireguard => {
             let status = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
@@ -331,7 +327,7 @@ pub async fn apply(
                 Ok(Err(e)) => {
                     return Err(ApiError::unavailable(format!(
                         "{} failed to start: {e}",
-                    plan.bin
+                        plan.bin
                     )));
                 }
                 Err(_) => {
@@ -541,7 +537,13 @@ mod tests {
 
     #[test]
     fn cloudflared_argv_and_refusals() {
-        let got = plan(DoorKind::Cloudflared, "cf", "not-a-port", "http://127.0.0.1:8080").unwrap();
+        let got = plan(
+            DoorKind::Cloudflared,
+            "cf",
+            "not-a-port",
+            "http://127.0.0.1:8080",
+        )
+        .unwrap();
         assert_eq!(got.bin, "cloudflared");
         assert!(got.note.is_empty());
         assert_eq!(
@@ -603,7 +605,13 @@ mod tests {
             vec!["serve", "--bg", "443", "http://10.1.0.2:8080"]
         );
         assert!(got.note.is_empty());
-        assert!(plan(DoorKind::Tailscale, "ts", "notaport", "http://10.1.0.2:8080").is_err());
+        assert!(plan(
+            DoorKind::Tailscale,
+            "ts",
+            "notaport",
+            "http://10.1.0.2:8080"
+        )
+        .is_err());
         assert!(plan(DoorKind::Tailscale, "ts", "0", "http://10.1.0.2:8080").is_err());
         assert!(plan(DoorKind::Tailscale, "ts", "443", "http://1.2.3.4:80").is_err());
     }
@@ -629,9 +637,9 @@ mod tests {
     }
 
     /// Door tests publish binaries through process environment variables.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     fn script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -649,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_runs_cloudflared_fails_closed_and_skips_wireguard() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let dir = std::env::temp_dir().join(format!(
             "pistack-door-{}-{}",
             std::process::id(),
@@ -739,9 +747,15 @@ mod tests {
             wg_missing.message
         );
 
-        let edge = apply("door-edge", DoorKind::Edge, "80", "http://127.0.0.1:80", side)
-            .await
-            .unwrap_err();
+        let edge = apply(
+            "door-edge",
+            DoorKind::Edge,
+            "80",
+            "http://127.0.0.1:80",
+            side,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(edge.code, pistack_types::error::ErrorCode::Unavailable);
         assert!(edge.message.contains("no edge host"));
 
@@ -803,7 +817,7 @@ mod tests {
 
     #[tokio::test]
     async fn wireguard_creates_only_pw_and_edge_enqueues_publish() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let dir = std::env::temp_dir().join(format!(
             "pistack-wg-{}-{}",
             std::process::id(),
@@ -865,9 +879,15 @@ mod tests {
         let again = std::fs::read_to_string(&ip_log).unwrap();
         assert_eq!(again, ip_text, "wireguard create ran twice");
 
-        let no_edge = apply("edge-none", DoorKind::Edge, "80", "http://127.0.0.1:9", side)
-            .await
-            .unwrap_err();
+        let no_edge = apply(
+            "edge-none",
+            DoorKind::Edge,
+            "80",
+            "http://127.0.0.1:9",
+            side,
+        )
+        .await
+        .unwrap_err();
         assert!(no_edge.message.contains("no edge host"));
         assert_eq!(queue.pending_count(), 0);
 
@@ -880,14 +900,26 @@ mod tests {
 
         host(&store, "b-edge", &["edge"]);
         host(&store, "a-edge", &["kvm", "edge"]);
-        let published = apply("edge-ok", DoorKind::Edge, "443", "http://10.1.0.2:8080", side)
-            .await
-            .unwrap();
+        let published = apply(
+            "edge-ok",
+            DoorKind::Edge,
+            "443",
+            "http://10.1.0.2:8080",
+            side,
+        )
+        .await
+        .unwrap();
         assert!(published.bin.is_empty());
         assert!(published.note.contains("a-edge"));
-        apply("edge-ok", DoorKind::Edge, "443", "http://10.1.0.2:8080", side)
-            .await
-            .unwrap();
+        apply(
+            "edge-ok",
+            DoorKind::Edge,
+            "443",
+            "http://10.1.0.2:8080",
+            side,
+        )
+        .await
+        .unwrap();
         assert_eq!(queue.pending_count(), 1);
         let cmds = queue
             .next("a-edge", std::time::Duration::from_millis(200), 4)
@@ -900,7 +932,10 @@ mod tests {
         assert!(body.contains("edge-ok"), "{body}");
         assert!(!body.contains("ssh"), "{body}");
         assert!(!body.contains("wg-fleet"), "{body}");
-        assert!(queue.next("b-edge", std::time::Duration::from_millis(50), 4).await.is_empty());
+        assert!(queue
+            .next("b-edge", std::time::Duration::from_millis(50), 4)
+            .await
+            .is_empty());
         stop(id);
         stop("edge-ok");
 

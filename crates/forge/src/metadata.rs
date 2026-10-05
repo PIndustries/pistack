@@ -290,8 +290,10 @@ mod tests {
         let (_, data) = answer(&store, peer, "/latest/user-data");
         assert_eq!(data, b"#cloud-config\n");
 
-        let mut ext = NetworkSpec::default();
-        ext.external = true;
+        let ext = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let fleet = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),

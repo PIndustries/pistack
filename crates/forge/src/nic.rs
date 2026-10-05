@@ -265,8 +265,10 @@ mod tests {
         assert!(nics[0].mac.contains(':'));
         assert_eq!(nics[0].network_id, net.meta.id.to_string());
 
-        let mut ext = NetworkSpec::default();
-        ext.external = true;
+        let ext = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let fleet = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),

@@ -86,9 +86,7 @@ impl RbdBackend {
     pub async fn require_available(&self) -> ApiResult<()> {
         let pool = self.pool()?.to_owned();
         if !self.monitors.iter().any(|m| !m.trim().is_empty()) {
-            return Err(ApiError::unavailable(
-                "rbd monitors are not configured",
-            ));
+            return Err(ApiError::unavailable("rbd monitors are not configured"));
         }
         let bin = super::configured_bin_ready(ENV_BIN, "rbd")?;
         run(&bin, &["pool".into(), "stats".into(), pool.clone()], false)
@@ -170,7 +168,12 @@ impl BlockBackend for RbdBackend {
         let spec = format!("{pool}/{vol_id}@{snap_id}");
         let bin = super::configured_bin(ENV_BIN, "rbd");
         run(&bin, &["snap".into(), "create".into(), spec.clone()], false).await?;
-        run(&bin, &["snap".into(), "protect".into(), spec.clone()], false).await?;
+        run(
+            &bin,
+            &["snap".into(), "protect".into(), spec.clone()],
+            false,
+        )
+        .await?;
         Ok(BackendRef::new(spec))
     }
 
@@ -288,11 +291,7 @@ async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
         .kill_on_drop(true);
     let finished = tokio::time::timeout(TIMEOUT, cmd.output()).await;
     let output = match finished {
-        Err(_) => {
-            return Err(ApiError::unavailable(format!(
-                "{bin} timed out after 30s"
-            )))
-        }
+        Err(_) => return Err(ApiError::unavailable(format!("{bin} timed out after 30s"))),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ApiError::unavailable(format!("{bin} is not available")))
         }
@@ -331,9 +330,9 @@ mod tests {
     use super::*;
     use crate::types::{VolumeSpec, VolumeStatus};
     use pistack_types::{kind, Meta};
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
-    static LOCK: Mutex<()> = Mutex::new(());
+    static LOCK: Mutex<()> = Mutex::const_new(());
 
     fn volume(size: u64) -> Volume {
         Volume {
@@ -351,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_argv_contains_id_and_size() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv.log");
         let script = dir.path().join("rbd");
@@ -387,18 +386,26 @@ mod tests {
 
         std::env::set_var(ENV_BIN, dir.path().join("missing-rbd"));
         let err = backend.create(&vol).await.unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn missing_monitors_or_pool_does_not_create() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LOCK.lock().await;
         let vol = volume(4);
         let err = RbdBackend::new("volumes", "pistack", Vec::new())
             .create(&vol)
             .await
             .unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
         assert!(err.message.contains("monitor"), "{err}");
 
         let dir = tempfile::tempdir().unwrap();
@@ -427,7 +434,11 @@ mod tests {
             .create(&vol)
             .await
             .unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable, "{err}");
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::Unavailable,
+            "{err}"
+        );
         assert!(err.message.contains("not available"), "{err}");
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.lines().any(|line| line == "create"), "{logged}");

@@ -266,20 +266,15 @@ impl Client {
             .list(None)
             .unwrap_or_default()
             .iter()
-            .any(|s| &s.spec.network == &net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24");
-        let hostnat_port = self
-            .ports()
-            .list(None)
-            .unwrap_or_default()
-            .iter()
-            .any(|p| {
-                &p.spec.network == &net.meta.id
-                    && !p.is_router_port()
-                    && p.status
-                        .binding
-                        .as_ref()
-                        .is_some_and(|b| b.vif_type == "hostnat")
-            });
+            .any(|s| s.spec.network == net.meta.id && s.spec.cidr.to_string() == "10.88.0.0/24");
+        let hostnat_port = self.ports().list(None).unwrap_or_default().iter().any(|p| {
+            p.spec.network == net.meta.id
+                && !p.is_router_port()
+                && p.status
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| b.vif_type == "hostnat")
+        });
         if shared || hostnat_port || self.backend().name() == "hostnat" {
             return Some("hostnat".into());
         }
@@ -613,8 +608,10 @@ mod tests {
         let client = Client::new(store, gate.clone());
         client.ensure_default_template().unwrap();
         let project = Id::new(kind::PROJECT);
-        let mut ext = NetworkSpec::default();
-        ext.external = true;
+        let ext = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let net = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),

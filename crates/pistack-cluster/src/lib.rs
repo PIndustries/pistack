@@ -58,10 +58,7 @@ pub fn choose(
             raft: String::new(),
         });
     }
-    let mut clusters: Vec<String> = heard
-        .iter()
-        .map(|a| a.cluster_id.clone())
-        .collect();
+    let mut clusters: Vec<String> = heard.iter().map(|a| a.cluster_id.clone()).collect();
     clusters.sort();
     clusters.dedup();
     match clusters.as_slice() {

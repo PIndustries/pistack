@@ -42,9 +42,7 @@ fn state_name(id: &Id) -> ApiResult<String> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
-        return Err(ApiError::bad_request(
-            "machine id is not a state file name",
-        ));
+        return Err(ApiError::bad_request("machine id is not a state file name"));
     }
     Ok(name)
 }
@@ -162,9 +160,8 @@ fn pass_file(id: &Id) -> ApiResult<PathBuf> {
         ));
     }
     let path = dir.join(name);
-    let meta = std::fs::symlink_metadata(&path).map_err(|_| {
-        ApiError::unavailable("bmc password file is missing")
-    })?;
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|_| ApiError::unavailable("bmc password file is missing"))?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Err(ApiError::unavailable("bmc password file is missing"));
     }
@@ -185,10 +182,7 @@ fn bmc_host(raw: &str) -> ApiResult<(String, Option<u16>)> {
         return Err(ApiError::bad_request("bmc address is not a host"));
     }
     if let Some((host, port)) = raw.rsplit_once(':') {
-        if !host.is_empty()
-            && !host.contains(':')
-            && port.chars().all(|c| c.is_ascii_digit())
-        {
+        if !host.is_empty() && !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(port) = port.parse::<u16>() {
                 if port > 0 {
                     return Ok((host.to_owned(), Some(port)));
@@ -324,12 +318,14 @@ impl MachineRuntime for MetalRuntime {
                 "this host is not powered off by the agent",
             )),
             Some(record) => {
-                let address = record.bmc_address.as_deref().ok_or_else(|| {
-                    ApiError::unavailable("bmc address is missing")
-                })?;
-                let user = record.bmc_user.as_deref().ok_or_else(|| {
-                    ApiError::unavailable("bmc user is missing")
-                })?;
+                let address = record
+                    .bmc_address
+                    .as_deref()
+                    .ok_or_else(|| ApiError::unavailable("bmc address is missing"))?;
+                let user = record
+                    .bmc_user
+                    .as_deref()
+                    .ok_or_else(|| ApiError::unavailable("bmc user is missing"))?;
                 ipmitool_bin()?;
                 let pass = pass_file(id)?;
                 chassis("off", address, user, &pass).await?;
@@ -454,14 +450,14 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
     async fn fleet_starts_other_does_not_and_selects_metal() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let dir: PathBuf = std::env::temp_dir().join(format!(
             "pistack-metal-{}-{}",
             std::process::id(),
@@ -523,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_chassis_uses_ipmitool_and_this_host_does_not() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!(
             "pistack-ipmi-{}-{}",
             std::process::id(),
@@ -569,7 +565,11 @@ mod tests {
 
         let mut remote = req("shelf");
         let missing_tool = rt.start(&remote).await.unwrap_err();
-        assert!(missing_tool.message.contains("not shelf"), "{}", missing_tool.message);
+        assert!(
+            missing_tool.message.contains("not shelf"),
+            "{}",
+            missing_tool.message
+        );
 
         remote.bmc_address = Some("10.9.1.8".into());
         remote.bmc_user = Some("root".into());
@@ -600,7 +600,9 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("off"), "{text}");
         let listed = rt.list().await.unwrap();
-        assert!(listed.iter().any(|m| m.id == local.id && m.power == PowerState::On));
+        assert!(listed
+            .iter()
+            .any(|m| m.id == local.id && m.power == PowerState::On));
         assert!(listed
             .iter()
             .any(|m| m.id == remote.id && m.power == PowerState::Off));

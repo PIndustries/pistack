@@ -360,10 +360,10 @@ fn kernel_file() -> Option<PathBuf> {
 }
 
 fn protected_name(name: &str) -> bool {
-    match std::env::var("PISTACK_NODE_NAME") {
-        Ok(node) if !node.is_empty() && node == name => true,
-        _ => false,
-    }
+    matches!(
+        std::env::var("PISTACK_NODE_NAME"),
+        Ok(node) if !node.is_empty() && node == name
+    )
 }
 
 fn host_guard() -> ApiError {
@@ -711,7 +711,9 @@ mod tests {
         }
         let youki = ["youki".to_owned(), "cloud-hypervisor".to_owned()];
         assert_eq!(
-            select(MachineKind::Container, &youki, false).unwrap().name(),
+            select(MachineKind::Container, &youki, false)
+                .unwrap()
+                .name(),
             "youki"
         );
     }
@@ -772,18 +774,28 @@ mod tests {
         assert!(sock_name.ends_with(".sock"), "{sock_name}");
         assert!(!sock_name.starts_with("pi"), "{sock_name}");
         assert!(sock_path.starts_with(std::env::temp_dir()) || sock_path.starts_with("/tmp"));
-        assert!(lines.windows(2).any(|w| w[0] == "--disk"
-            && w[1] == format!("path={}", disk.display())));
-        assert!(lines.windows(2).any(|w| w[0] == "--cpus" && w[1] == "boot=1"));
+        assert!(lines
+            .windows(2)
+            .any(|w| w[0] == "--disk" && w[1] == format!("path={}", disk.display())));
+        assert!(lines
+            .windows(2)
+            .any(|w| w[0] == "--cpus" && w[1] == "boot=1"));
         assert!(lines
             .windows(2)
             .any(|w| w[0] == "--memory" && w[1] == "size=128M"));
-        assert!(lines.windows(2).any(|w| w[0] == "--console" && w[1] == "off"));
-        assert!(lines.windows(2).any(|w| w[0] == "--serial" && w[1] == "off"));
-        assert!(lines.windows(2).any(|w| w[0] == "--kernel" && w[1] == kernel.display().to_string()));
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(state.join(request.id.to_string()).join("state.json")).unwrap())
-                .unwrap();
+        assert!(lines
+            .windows(2)
+            .any(|w| w[0] == "--console" && w[1] == "off"));
+        assert!(lines
+            .windows(2)
+            .any(|w| w[0] == "--serial" && w[1] == "off"));
+        assert!(lines
+            .windows(2)
+            .any(|w| w[0] == "--kernel" && w[1] == kernel.display().to_string()));
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join(request.id.to_string()).join("state.json")).unwrap(),
+        )
+        .unwrap();
         assert!(!saved.to_string().contains("do-not-log-user-data"));
         assert!(!saved.to_string().contains("do-not-log-ssh-key"));
 
@@ -807,7 +819,12 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Unavailable);
         assert!(!err.message.contains("do-not-log"));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
-        assert!(rt.list().await.unwrap().iter().all(|m| m.id != missing_img.id));
+        assert!(rt
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.id != missing_img.id));
 
         std::os::unix::fs::symlink(&disk, tmp.join("link-disk")).unwrap();
         let link_req = req("link", tmp.join("link-disk").to_str().unwrap());
@@ -860,6 +877,11 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Unavailable);
         assert!(err.message.contains("exploded"), "{}", err.message);
         assert!(!state.join(bad.id.to_string()).join("state.json").exists());
-        assert!(rt.list().await.unwrap().iter().all(|m| m.power != PowerState::On));
+        assert!(rt
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.power != PowerState::On));
     }
 }

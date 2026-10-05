@@ -375,8 +375,10 @@ mod tests {
             "10.88.0.0/24",
             "10.88.0.1",
         );
-        let mut ext_spec = NetworkSpec::default();
-        ext_spec.external = true;
+        let ext_spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let ext = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),
@@ -458,8 +460,10 @@ mod tests {
             "10.88.0.128/25",
             "10.88.0.129",
         );
-        let mut ext_spec = NetworkSpec::default();
-        ext_spec.external = true;
+        let ext_spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let ext = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),
@@ -496,8 +500,10 @@ mod tests {
     #[test]
     fn missing_subnet_and_missing_address_are_errors() {
         let (store, client, project) = client();
-        let mut ext_spec = NetworkSpec::default();
-        ext_spec.external = true;
+        let ext_spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let ext = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),
@@ -538,8 +544,10 @@ mod tests {
     }
 
     fn external(client: &Client, project: &Id, name: &str, cidr: &str, gw: &str) -> Id {
-        let mut spec = NetworkSpec::default();
-        spec.external = true;
+        let spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let net = client
             .create_network(Meta::new(kind::NETWORK, name, Some(project.clone())), spec)
             .unwrap();
@@ -658,11 +666,7 @@ mod tests {
             .collect();
         assert_eq!(demo_fips.len(), 1);
         assert_eq!(demo_fips[0].meta.id, manual.meta.id);
-        assert!(demo_fips[0]
-            .meta
-            .labels
-            .get(super::AUTO_FIP_LABEL)
-            .is_none());
+        assert!(!demo_fips[0].meta.labels.contains_key(super::AUTO_FIP_LABEL));
         assert_eq!(client.floating_ips().list(None).unwrap().len(), 3);
 
         let web_id = web_fip.meta.id.clone();
@@ -682,7 +686,7 @@ mod tests {
         assert!(client.floating_ips().try_get(&web_id).unwrap().is_none());
         assert!(client.ports().try_get(&web_port.meta.id).unwrap().is_none());
         let kept = client.floating_ips().get(&manual.meta.id).unwrap();
-        assert!(kept.meta.labels.get(super::AUTO_FIP_LABEL).is_none());
+        assert!(!kept.meta.labels.contains_key(super::AUTO_FIP_LABEL));
         assert_eq!(kept.spec.port.as_ref(), Some(&manual_port));
         assert!(client.ports().get(&manual_port).is_ok());
         assert!(client.floating_ips().get(&stay_id).is_ok());
@@ -717,7 +721,7 @@ mod tests {
         let left = client.floating_ips().list(Some(&project)).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].meta.name, "box");
-        assert!(left[0].meta.labels.get(super::AUTO_FIP_LABEL).is_none());
+        assert!(!left[0].meta.labels.contains_key(super::AUTO_FIP_LABEL));
     }
 
     #[test]
