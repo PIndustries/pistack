@@ -39,6 +39,13 @@
 //! bumps only that container's restart count. `http_get`, `tcp_socket`, and
 //! `exec` all use those thresholds. An exec probe the runtime cannot run is
 //! reported unsupported and does not restart the container.
+//!
+//! A pod that names a slab volume stays Pending until every such volume is
+//! attached on one node and the status records a host path or a device.
+//! The machine is created only then, pinned to that node, with the path in
+//! the sandbox document. If a volume attaches after the pod is already
+//! running without it, the pod is marked not Ready and the machine restart
+//! counter is bumped so the runtime creates the containers again.
 
 use super::{delete_quietly, patch_status, request_delete, Controller};
 use crate::types::{
@@ -49,7 +56,7 @@ use chrono::{Duration, Utc};
 use forge::{Machine, MachineKind, MachineSpec, PowerState, Size};
 use pistack_rpc::proto::{ProbeReport, PROBE_LIVENESS, PROBE_READINESS};
 use pistack_store::{Collection, Store, StoreError};
-use pistack_types::{Id, Phase, Resources};
+use pistack_types::{Id, Phase, Resource, Resources, Spec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -75,6 +82,15 @@ pub struct PodSandbox {
     /// [`Self::config_maps`]. Payloads are not part of the pod spec.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: BTreeMap<String, ProjectedFiles>,
+    /// Slab volume id to the absolute host path recorded at attach.
+    /// Empty until the volume is attached. The youki runtime bind-mounts
+    /// these paths when it creates the containers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub volume_paths: BTreeMap<String, String>,
+    /// Slab volume id to a device name, when the volume has no host path
+    /// (an RBD image is mapped to a device after the bundle exists).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub volume_devices: BTreeMap<String, String>,
 }
 
 /// File bodies for one ConfigMap or Secret. `binary_data` values are base64.
@@ -129,8 +145,73 @@ impl PodSandbox {
             networks: networks_of(pod),
             config_maps: BTreeMap::new(),
             secrets: BTreeMap::new(),
+            volume_paths: BTreeMap::new(),
+            volume_devices: BTreeMap::new(),
         }
     }
+}
+
+/// Slab volume ids included in the sandbox the agent was asked to start.
+const MOUNTED_VOLUMES: &str = "loom.pistack.io/mounted-volumes";
+
+/// Wire view of a slab volume. Loom does not depend on the slab crate.
+/// Unknown spec fields are ignored so a volume written by slab still reads.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct SlabVolSpec {
+    #[serde(default)]
+    size_gib: u64,
+}
+
+impl Spec for SlabVolSpec {
+    const KIND: &'static str = pistack_types::kind::VOLUME;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct SlabCondition {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    status: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct SlabVolStatus {
+    #[serde(default)]
+    phase: Phase,
+    #[serde(default)]
+    attached_to: Option<Id>,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    backend_ref: Option<String>,
+    /// Host path, when storage records it separately from `backend_ref`.
+    #[serde(default)]
+    host_path: Option<String>,
+    /// Host id the volume is attached on, when storage records one.
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    conditions: Vec<SlabCondition>,
+}
+
+type SlabVolume = Resource<SlabVolSpec, SlabVolStatus>;
+
+/// Paths and the node to pin, once every slab volume on the pod is attached.
+struct SlabBind {
+    paths: BTreeMap<String, String>,
+    devices: BTreeMap<String, String>,
+    node: Id,
+    /// Sorted volume ids, comma-separated.
+    mounted: String,
+    names: BTreeMap<String, String>,
+}
+
+enum SlabHold {
+    /// The pod names no slab volume.
+    None,
+    /// Do not create or start. The message names the volume.
+    Wait(String),
+    Ready(SlabBind),
 }
 
 /// Copy ConfigMap and Secret bodies the pod references into the sandbox
@@ -330,6 +411,195 @@ pub fn exact_size_name(r: &Resources) -> String {
     format!("pod-{}x{}", r.vcpus.max(1), r.memory_mib.max(1))
 }
 
+fn slab_refs(pod: &Pod) -> Vec<(&str, &Id)> {
+    pod.spec
+        .volumes
+        .iter()
+        .filter_map(|v| match &v.source {
+            VolumeSource::Volume(id) => Some((v.name.as_str(), id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn absolute_host_path(raw: &str) -> Option<&str> {
+    if raw.starts_with('/') && !raw.contains('\0') && !raw.split('/').any(|part| part == "..") {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+fn host_id(raw: &str) -> Option<Id> {
+    Id::parse(pistack_types::kind::HOST, raw)
+}
+
+fn machine_live(m: &Machine) -> bool {
+    m.status.phase == Phase::Ready
+        && m.status.power != PowerState::Off
+        && m.spec.restarts <= m.status.restarts
+}
+
+fn mounted_set(m: &Machine) -> BTreeSet<String> {
+    m.meta
+        .annotations
+        .get(MOUNTED_VOLUMES)
+        .map(|raw| {
+            raw.split(',')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+struct PublishedVol {
+    id: String,
+    name: String,
+    path: Option<String>,
+    device: Option<String>,
+    node: Option<Id>,
+    attached_here: bool,
+}
+
+fn publish_volume(
+    vol: &SlabVolume,
+    pod_name: &str,
+    machine: Option<&Machine>,
+    machines: &[Machine],
+) -> Result<PublishedVol, String> {
+    let name = if vol.meta.name.is_empty() {
+        pod_name.to_string()
+    } else {
+        vol.meta.name.clone()
+    };
+    let wait = format!("waiting for volume {name}");
+    if vol.status.phase != Phase::Ready {
+        return Err(wait);
+    }
+    let attached = vol.status.attached_to.is_some()
+        || vol
+            .status
+            .conditions
+            .iter()
+            .any(|c| c.kind == "Attached" && c.status);
+    if !attached {
+        return Err(wait);
+    }
+    let path = vol
+        .status
+        .host_path
+        .as_deref()
+        .and_then(absolute_host_path)
+        .or_else(|| {
+            vol.status
+                .backend_ref
+                .as_deref()
+                .and_then(absolute_host_path)
+        })
+        .map(str::to_string);
+    let device = vol
+        .status
+        .device
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+    if path.is_none() && device.is_none() {
+        return Err(wait);
+    }
+    let attached_here =
+        machine.is_some_and(|m| vol.status.attached_to.as_ref() == Some(&m.meta.id));
+    let node = vol.status.host.as_deref().and_then(host_id).or_else(|| {
+        let mid = vol.status.attached_to.as_ref()?;
+        machines
+            .iter()
+            .find(|m| &m.meta.id == mid)
+            .and_then(|m| m.status.host.clone())
+    });
+    Ok(PublishedVol {
+        id: vol.meta.id.to_string(),
+        name,
+        path,
+        device,
+        node,
+        attached_here,
+    })
+}
+
+fn decide_slab(
+    pod: &Pod,
+    machine: Option<&Machine>,
+    machines: &[Machine],
+    vols: &[SlabVolume],
+) -> SlabHold {
+    let named = slab_refs(pod);
+    if named.is_empty() {
+        return SlabHold::None;
+    }
+    let mut published = Vec::new();
+    for (pod_name, id) in named {
+        let Some(vol) = vols.iter().find(|v| &v.meta.id == id) else {
+            return SlabHold::Wait(format!("waiting for volume {pod_name}"));
+        };
+        match publish_volume(vol, pod_name, machine, machines) {
+            Ok(item) => published.push(item),
+            Err(message) => return SlabHold::Wait(message),
+        }
+    }
+    let placed = machine.and_then(|m| m.status.host.clone());
+    let mut node = placed.clone();
+    for item in &published {
+        if let Some(host) = &placed {
+            let here = item.attached_here || item.node.as_ref() == Some(host);
+            if !here {
+                return SlabHold::Wait(format!(
+                    "volume {} is not attached on this node",
+                    item.name
+                ));
+            }
+            node = Some(host.clone());
+        } else if let Some(found) = &item.node {
+            match &node {
+                None => node = Some(found.clone()),
+                Some(have) if have == found => {}
+                Some(_) => {
+                    return SlabHold::Wait(format!(
+                        "volume {} is not attached on this node",
+                        item.name
+                    ));
+                }
+            }
+        } else {
+            return SlabHold::Wait(format!("waiting for volume {}", item.name));
+        }
+    }
+    let Some(node) = node else {
+        return SlabHold::Wait(format!("waiting for volume {}", published[0].name));
+    };
+    let mut paths = BTreeMap::new();
+    let mut devices = BTreeMap::new();
+    let mut ids = Vec::new();
+    let mut names = BTreeMap::new();
+    for item in &published {
+        ids.push(item.id.clone());
+        names.insert(item.id.clone(), item.name.clone());
+        if let Some(path) = &item.path {
+            paths.insert(item.id.clone(), path.clone());
+        } else if let Some(dev) = &item.device {
+            devices.insert(item.id.clone(), dev.clone());
+        }
+    }
+    ids.sort();
+    SlabHold::Ready(SlabBind {
+        paths,
+        devices,
+        node,
+        mounted: ids.join(","),
+        names,
+    })
+}
+
 pub struct PodController {
     store: Store,
 }
@@ -346,6 +616,189 @@ impl PodController {
     }
     fn sizes(&self) -> Collection<Size> {
         self.store.collection::<Size>()
+    }
+    fn slab_volumes(&self) -> Collection<SlabVolume> {
+        self.store.collection::<SlabVolume>()
+    }
+
+    fn slab_hold(
+        &self,
+        pod: &Pod,
+        machine: Option<&Machine>,
+        machines: &[Machine],
+    ) -> Result<SlabHold, StoreError> {
+        if slab_refs(pod).is_empty() {
+            return Ok(SlabHold::None);
+        }
+        let vols = self.slab_volumes().list(None)?;
+        Ok(decide_slab(pod, machine, machines, &vols))
+    }
+
+    fn sandbox_json(
+        &self,
+        pod: &Pod,
+        networks: &[String],
+        bind: &SlabBind,
+    ) -> Result<String, StoreError> {
+        let mut sandbox = PodSandbox::from_pod(pod);
+        sandbox.networks = networks.to_vec();
+        fill_projections(&self.store, &mut sandbox);
+        sandbox.volume_paths = bind.paths.clone();
+        sandbox.volume_devices = bind.devices.clone();
+        Ok(serde_json::to_string(&sandbox)?)
+    }
+
+    fn mark_waiting(&self, pod: &Pod, message: &str) -> Result<(), StoreError> {
+        patch_status(&self.pods(), &pod.meta.id, |s| {
+            if !s.phase.is_terminal() {
+                s.phase = PodPhase::Pending;
+            }
+            s.message = message.to_string();
+            for c in &mut s.container_statuses {
+                c.ready = false;
+                c.state = ContainerState::Waiting {
+                    reason: "VolumeNotAttached".into(),
+                };
+            }
+            set_condition(
+                &mut s.conditions,
+                POD_READY,
+                false,
+                "VolumeNotAttached",
+                message,
+            );
+        })?;
+        Ok(())
+    }
+
+    fn hold_for_volume(
+        &self,
+        pod: &Pod,
+        machine: &Machine,
+        message: &str,
+    ) -> Result<(), StoreError> {
+        if !machine_live(machine) {
+            let current = machine
+                .meta
+                .annotations
+                .get(forge::WAIT_VOLUME_ANNOTATION)
+                .map(String::as_str);
+            if current != Some(message) {
+                match self.machines().modify(&machine.meta.id, |m| {
+                    m.meta
+                        .annotations
+                        .insert(forge::WAIT_VOLUME_ANNOTATION.into(), message.to_string());
+                    Ok(())
+                }) {
+                    Ok(_) | Err(StoreError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        self.mark_waiting(pod, message)
+    }
+
+    /// Write the attached paths onto the machine. A volume that showed up
+    /// after the containers were created bumps the restart counter.
+    /// Returns true when the pod was marked not Ready for that restart.
+    fn sync_mounted(
+        &self,
+        pod: &Pod,
+        machine: &Machine,
+        bind: &SlabBind,
+    ) -> Result<bool, StoreError> {
+        let mounted = mounted_set(machine);
+        let missing: Vec<&str> = bind
+            .mounted
+            .split(',')
+            .filter(|id| !id.is_empty() && !mounted.contains(*id))
+            .collect();
+        let networks = if machine.spec.networks.is_empty() {
+            networks_of(pod)
+        } else {
+            machine.spec.networks.clone()
+        };
+        let user_data = self.sandbox_json(pod, &networks, bind)?;
+        let node = bind.node.to_string();
+        if machine_live(machine) && !missing.is_empty() {
+            let id = missing[0];
+            let name = bind.names.get(id).map(String::as_str).unwrap_or(id);
+            let message = format!("volume {name} attached after the pod started");
+            match self.machines().modify(&machine.meta.id, |m| {
+                m.spec.user_data = Some(user_data.clone());
+                m.spec.restarts += 1;
+                m.spec.power = forge::DesiredPower::On;
+                m.meta
+                    .annotations
+                    .insert(MOUNTED_VOLUMES.into(), bind.mounted.clone());
+                m.meta
+                    .annotations
+                    .insert(forge::NODE_PIN_ANNOTATION.into(), node.clone());
+                m.meta.annotations.remove(forge::WAIT_VOLUME_ANNOTATION);
+                Ok(())
+            }) {
+                Ok(_) | Err(StoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            patch_status(&self.pods(), &pod.meta.id, |s| {
+                s.phase = PodPhase::Pending;
+                s.message = message.clone();
+                for c in &mut s.container_statuses {
+                    c.ready = false;
+                    c.state = ContainerState::Waiting {
+                        reason: "VolumeAttached".into(),
+                    };
+                }
+                set_condition(
+                    &mut s.conditions,
+                    POD_READY,
+                    false,
+                    "VolumeAttached",
+                    &message,
+                );
+            })?;
+            tracing::info!(pod = %pod.meta.id, %message, "loom: recreating pod for a late slab volume");
+            return Ok(true);
+        }
+        let pin_now = machine
+            .meta
+            .annotations
+            .get(forge::NODE_PIN_ANNOTATION)
+            .map(String::as_str);
+        let mounted_now = machine
+            .meta
+            .annotations
+            .get(MOUNTED_VOLUMES)
+            .map(String::as_str);
+        let waiting = machine
+            .meta
+            .annotations
+            .contains_key(forge::WAIT_VOLUME_ANNOTATION);
+        let data_now = machine.spec.user_data.as_deref();
+        if pin_now == Some(node.as_str())
+            && mounted_now == Some(bind.mounted.as_str())
+            && !waiting
+            && data_now == Some(user_data.as_str())
+        {
+            return Ok(false);
+        }
+        match self.machines().modify(&machine.meta.id, |m| {
+            m.spec.user_data = Some(user_data.clone());
+            m.meta
+                .annotations
+                .insert(MOUNTED_VOLUMES.into(), bind.mounted.clone());
+            m.meta
+                .annotations
+                .insert(forge::NODE_PIN_ANNOTATION.into(), node.clone());
+            let old = m.meta.annotations.remove(forge::WAIT_VOLUME_ANNOTATION);
+            if old.as_deref() == Some(m.status.message.as_str()) {
+                m.status.message.clear();
+            }
+            Ok(())
+        }) {
+            Ok(_) | Err(StoreError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Smallest existing size the pod fits, else create `pod-<v>x<m>`.
@@ -384,7 +837,12 @@ impl PodController {
             })
     }
 
-    fn create_machine(&self, pod: &Pod, networks: Vec<String>) -> Result<Machine, StoreError> {
+    fn create_machine(
+        &self,
+        pod: &Pod,
+        networks: Vec<String>,
+        bind: Option<&SlabBind>,
+    ) -> Result<Machine, StoreError> {
         let want = pod.spec.resources();
         let size = self.size_for(&want)?;
         let image = pod
@@ -396,6 +854,10 @@ impl PodController {
         let mut sandbox = PodSandbox::from_pod(pod);
         sandbox.networks = networks.clone();
         fill_projections(&self.store, &mut sandbox);
+        if let Some(bind) = bind {
+            sandbox.volume_paths = bind.paths.clone();
+            sandbox.volume_devices = bind.devices.clone();
+        }
         let user_data = serde_json::to_string(&sandbox)?;
         let volumes = pod
             .spec
@@ -425,6 +887,14 @@ impl PodController {
         m.meta
             .labels
             .insert(MACHINE_POD_LABEL.into(), pod.meta.id.to_string());
+        if let Some(bind) = bind {
+            m.meta
+                .annotations
+                .insert(forge::NODE_PIN_ANNOTATION.into(), bind.node.to_string());
+            m.meta
+                .annotations
+                .insert(MOUNTED_VOLUMES.into(), bind.mounted.clone());
+        }
         m.meta.description = format!("pod {}", pod.meta.name);
         match self.machines().create(m) {
             Ok(m) => Ok(m),
@@ -461,7 +931,7 @@ impl PodController {
 
     async fn converge(&self, pod: &Pod, machines: &[Machine]) -> anyhow::Result<()> {
         let Some(m) = self.machine_of(pod, machines) else {
-            return self.without_machine(pod).await;
+            return self.without_machine(pod, machines).await;
         };
         if forge::delete_requested(m) {
             patch_status(&self.pods(), &pod.meta.id, |s| {
@@ -469,6 +939,24 @@ impl PodController {
             })?;
             return Ok(());
         }
+        match self.slab_hold(pod, Some(m), machines)? {
+            SlabHold::Wait(message) => {
+                self.hold_for_volume(pod, m, &message)?;
+                return Ok(());
+            }
+            SlabHold::Ready(bind) => {
+                if self.sync_mounted(pod, m, &bind)? {
+                    return Ok(());
+                }
+            }
+            SlabHold::None => {}
+        }
+        let mid_now = m.meta.id.clone();
+        let m = match self.machines().get(&mid_now) {
+            Ok(m) => m,
+            Err(StoreError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
         let host = m.status.host.clone();
         let addr = m.status.addresses.first().cloned();
         let mid = m.meta.id.clone();
@@ -651,7 +1139,7 @@ impl PodController {
         Ok(())
     }
 
-    async fn without_machine(&self, pod: &Pod) -> anyhow::Result<()> {
+    async fn without_machine(&self, pod: &Pod, machines: &[Machine]) -> anyhow::Result<()> {
         let vanished = pod.status.machine.is_some();
         let recreate = match pod.spec.restart_policy {
             RestartPolicy::Always => true,
@@ -676,6 +1164,14 @@ impl PodController {
         if !recreate {
             return Ok(());
         }
+        let bind = match self.slab_hold(pod, None, machines)? {
+            SlabHold::Wait(message) => {
+                self.mark_waiting(pod, &message)?;
+                return Ok(());
+            }
+            SlabHold::None => None,
+            SlabHold::Ready(bind) => Some(bind),
+        };
         let networks = match pick_networks(&self.store, pod) {
             Ok(networks) => networks,
             Err(message) => {
@@ -696,7 +1192,7 @@ impl PodController {
                 return Ok(());
             }
         };
-        let m = self.create_machine(pod, networks)?;
+        let m = self.create_machine(pod, networks, bind.as_ref())?;
         let mid = m.meta.id.clone();
         let names: Vec<(String, String)> = pod
             .spec
@@ -947,7 +1443,11 @@ impl Controller for PodController {
         "pod"
     }
     fn watches(&self) -> &'static [&'static str] {
-        &[crate::types::kinds::POD, pistack_types::kind::MACHINE]
+        &[
+            crate::types::kinds::POD,
+            pistack_types::kind::MACHINE,
+            pistack_types::kind::VOLUME,
+        ]
     }
     async fn reconcile_once(&self) -> anyhow::Result<()> {
         let pods = self.pods().list(None)?;
@@ -1629,6 +2129,364 @@ mod tests {
         let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
         assert_eq!(machine.spec.restarts, 1);
         assert_eq!(machine.status.restarts, 0);
+    }
+
+    fn put_volume(
+        store: &Store,
+        name: &str,
+        phase: Phase,
+        attached: bool,
+        device: Option<&str>,
+        backend_ref: Option<&str>,
+        host: Option<&Id>,
+    ) -> Id {
+        let vol = store
+            .collection::<super::SlabVolume>()
+            .create(pistack_types::Resource::new(
+                name,
+                None,
+                super::SlabVolSpec { size_gib: 1 },
+            ))
+            .unwrap();
+        store
+            .collection::<super::SlabVolume>()
+            .modify(&vol.meta.id, |v| {
+                v.status.phase = phase;
+                if attached {
+                    v.status.attached_to = Some(Id::new(kind::MACHINE));
+                    v.status.conditions.push(super::SlabCondition {
+                        kind: "Attached".into(),
+                        status: true,
+                    });
+                }
+                v.status.device = device.map(str::to_string);
+                v.status.backend_ref = backend_ref.map(str::to_string);
+                v.status.host = host.map(|id| id.to_string());
+                Ok(())
+            })
+            .unwrap();
+        vol.meta.id
+    }
+
+    fn pod_with_volume(store: &Store, vol: Id) -> Id {
+        let pod = Pod::new(
+            "web",
+            None,
+            PodSpec {
+                containers: vec![ctr("web", None, None)],
+                volumes: vec![PodVolume {
+                    name: "data".into(),
+                    source: VolumeSource::Volume(vol),
+                }],
+                networks: vec!["default".into()],
+                ..PodSpec::default()
+            },
+        );
+        store.collection::<Pod>().create(pod).unwrap().meta.id
+    }
+
+    #[tokio::test]
+    async fn pod_waits_until_the_slab_volume_is_attached() {
+        let store = Store::in_memory().unwrap();
+        let vol = put_volume(&store, "data", Phase::Pending, false, None, None, None);
+        let pod = pod_with_volume(&store, vol.clone());
+        pass(&store).await;
+        let got = load(&store, &pod);
+        assert_eq!(got.status.phase, PodPhase::Pending);
+        assert!(
+            got.status.message.contains("data"),
+            "{}",
+            got.status.message
+        );
+        assert!(
+            got.status.message.contains("waiting for volume"),
+            "{}",
+            got.status.message
+        );
+        assert!(store.collection::<Machine>().list(None).unwrap().is_empty());
+
+        store
+            .collection::<super::SlabVolume>()
+            .modify(&vol, |v| {
+                v.status.phase = Phase::Ready;
+                v.status.attached_to = Some(Id::new(kind::MACHINE));
+                v.status.conditions.push(super::SlabCondition {
+                    kind: "Attached".into(),
+                    status: true,
+                });
+                Ok(())
+            })
+            .unwrap();
+        pass(&store).await;
+        let got = load(&store, &pod);
+        assert!(
+            got.status.message.contains("data"),
+            "{}",
+            got.status.message
+        );
+        assert!(store.collection::<Machine>().list(None).unwrap().is_empty());
+
+        let host = Id::new(kind::HOST);
+        let path = "/var/lib/pistack/volumes/data";
+        store
+            .collection::<super::SlabVolume>()
+            .modify(&vol, |v| {
+                v.status.backend_ref = Some(path.into());
+                v.status.host = Some(host.to_string());
+                Ok(())
+            })
+            .unwrap();
+        pass(&store).await;
+        let machines = store.collection::<Machine>().list(None).unwrap();
+        assert_eq!(machines.len(), 1);
+        let machine = &machines[0];
+        let pin = host.to_string();
+        assert_eq!(
+            machine
+                .meta
+                .annotations
+                .get(forge::NODE_PIN_ANNOTATION)
+                .map(String::as_str),
+            Some(pin.as_str())
+        );
+        assert!(machine
+            .meta
+            .annotations
+            .get(super::MOUNTED_VOLUMES)
+            .unwrap()
+            .contains(&vol.to_string()));
+        let sandbox: PodSandbox =
+            serde_json::from_str(machine.spec.user_data.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sandbox
+                .volume_paths
+                .get(&vol.to_string())
+                .map(String::as_str),
+            Some(path)
+        );
+        assert!(!sandbox.volume_devices.contains_key(&vol.to_string()));
+    }
+
+    #[tokio::test]
+    async fn device_only_slab_volume_starts_without_a_host_path() {
+        let store = Store::in_memory().unwrap();
+        let host = Id::new(kind::HOST);
+        let vol = put_volume(
+            &store,
+            "data",
+            Phase::Ready,
+            true,
+            Some("vdb"),
+            Some("rbd-image"),
+            Some(&host),
+        );
+        let pod = pod_with_volume(&store, vol.clone());
+        pass(&store).await;
+        let machines = store.collection::<Machine>().list(None).unwrap();
+        assert_eq!(machines.len(), 1);
+        let sandbox: PodSandbox =
+            serde_json::from_str(machines[0].spec.user_data.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sandbox
+                .volume_devices
+                .get(&vol.to_string())
+                .map(String::as_str),
+            Some("vdb")
+        );
+        assert!(sandbox.volume_paths.is_empty());
+        let got = load(&store, &pod);
+        assert_eq!(got.status.machine.as_ref(), Some(&machines[0].meta.id));
+    }
+
+    #[tokio::test]
+    async fn late_slab_attach_recreates_a_running_pod() {
+        let store = Store::in_memory().unwrap();
+        let host = Id::new(kind::HOST);
+        let vol = put_volume(
+            &store,
+            "data",
+            Phase::Ready,
+            true,
+            Some("vdb"),
+            Some("/var/lib/pistack/volumes/data"),
+            Some(&host),
+        );
+        let pod_id = pod_with_volume(&store, vol.clone());
+        let mut machine = new_machine(
+            "pod-web",
+            None,
+            MachineSpec {
+                kind: MachineKind::Container,
+                size: "small".into(),
+                image: "img".into(),
+                networks: vec!["default".into()],
+                user_data: Some("{}".into()),
+                ..MachineSpec::default()
+            },
+        );
+        machine
+            .meta
+            .labels
+            .insert(MACHINE_POD_LABEL.into(), pod_id.to_string());
+        machine.status.phase = Phase::Ready;
+        machine.status.power = PowerState::On;
+        machine.status.host = Some(host);
+        let machine = store.collection::<Machine>().create(machine).unwrap();
+        pass(&store).await;
+        let pod = load(&store, &pod_id);
+        assert_eq!(pod.status.phase, PodPhase::Pending);
+        assert!(
+            pod.status.message.contains("data"),
+            "{}",
+            pod.status.message
+        );
+        assert!(!pod.status.is_ready());
+        let machine = store.collection::<Machine>().get(&machine.meta.id).unwrap();
+        assert_eq!(machine.spec.restarts, 1);
+        let sandbox: PodSandbox =
+            serde_json::from_str(machine.spec.user_data.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sandbox
+                .volume_paths
+                .get(&vol.to_string())
+                .map(String::as_str),
+            Some("/var/lib/pistack/volumes/data")
+        );
+        pass(&store).await;
+        let machine = store.collection::<Machine>().get(&machine.meta.id).unwrap();
+        assert_eq!(machine.spec.restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn slab_volume_on_another_node_is_not_accepted() {
+        let store = Store::in_memory().unwrap();
+        let here = Id::new(kind::HOST);
+        let there = Id::new(kind::HOST);
+        let vol = put_volume(
+            &store,
+            "data",
+            Phase::Ready,
+            true,
+            None,
+            Some("/var/lib/pistack/volumes/data"),
+            Some(&there),
+        );
+        let pod_id = pod_with_volume(&store, vol);
+        let mut machine = new_machine(
+            "pod-web",
+            None,
+            MachineSpec {
+                kind: MachineKind::Container,
+                size: "small".into(),
+                image: "img".into(),
+                networks: vec!["default".into()],
+                ..MachineSpec::default()
+            },
+        );
+        machine
+            .meta
+            .labels
+            .insert(MACHINE_POD_LABEL.into(), pod_id.to_string());
+        machine.status.phase = Phase::Ready;
+        machine.status.power = PowerState::On;
+        machine.status.host = Some(here);
+        let machine = store.collection::<Machine>().create(machine).unwrap();
+        pass(&store).await;
+        let pod = load(&store, &pod_id);
+        assert_eq!(pod.status.phase, PodPhase::Pending);
+        assert!(
+            pod.status.message.contains("not attached on this node"),
+            "{}",
+            pod.status.message
+        );
+        assert!(
+            pod.status.message.contains("data"),
+            "{}",
+            pod.status.message
+        );
+        let machine = store.collection::<Machine>().get(&machine.meta.id).unwrap();
+        assert_eq!(machine.spec.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn existing_machine_waits_until_the_volume_has_a_path() {
+        let store = Store::in_memory().unwrap();
+        let vol = put_volume(&store, "data", Phase::Pending, false, None, None, None);
+        let pod_id = pod_with_volume(&store, vol.clone());
+        let mut machine = new_machine(
+            "pod-web",
+            None,
+            MachineSpec {
+                kind: MachineKind::Container,
+                size: "small".into(),
+                image: "img".into(),
+                networks: vec!["default".into()],
+                ..MachineSpec::default()
+            },
+        );
+        machine
+            .meta
+            .labels
+            .insert(MACHINE_POD_LABEL.into(), pod_id.to_string());
+        let machine = store.collection::<Machine>().create(machine).unwrap();
+        pass(&store).await;
+        let pod = load(&store, &pod_id);
+        assert!(
+            pod.status.message.contains("waiting for volume data"),
+            "{}",
+            pod.status.message
+        );
+        let machine = store.collection::<Machine>().get(&machine.meta.id).unwrap();
+        assert_eq!(
+            machine
+                .meta
+                .annotations
+                .get(forge::WAIT_VOLUME_ANNOTATION)
+                .map(String::as_str),
+            Some("waiting for volume data")
+        );
+        assert_eq!(machine.spec.restarts, 0);
+
+        let host = Id::new(kind::HOST);
+        store
+            .collection::<super::SlabVolume>()
+            .modify(&vol, |v| {
+                v.status.phase = Phase::Ready;
+                v.status.attached_to = Some(machine.meta.id.clone());
+                v.status.backend_ref = Some("/var/lib/pistack/volumes/data".into());
+                v.status.host = Some(host.to_string());
+                v.status.conditions.push(super::SlabCondition {
+                    kind: "Attached".into(),
+                    status: true,
+                });
+                Ok(())
+            })
+            .unwrap();
+        pass(&store).await;
+        let machine = store.collection::<Machine>().get(&machine.meta.id).unwrap();
+        assert!(!machine
+            .meta
+            .annotations
+            .contains_key(forge::WAIT_VOLUME_ANNOTATION));
+        assert_eq!(machine.spec.restarts, 0);
+        let sandbox: PodSandbox =
+            serde_json::from_str(machine.spec.user_data.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sandbox
+                .volume_paths
+                .get(&vol.to_string())
+                .map(String::as_str),
+            Some("/var/lib/pistack/volumes/data")
+        );
+        let pin = host.to_string();
+        assert_eq!(
+            machine
+                .meta
+                .annotations
+                .get(forge::NODE_PIN_ANNOTATION)
+                .map(String::as_str),
+            Some(pin.as_str())
+        );
     }
 }
 
