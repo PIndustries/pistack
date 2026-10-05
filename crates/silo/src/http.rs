@@ -13,6 +13,7 @@
 //! S3 path-style (same router, same auth):
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}  (POST: multipart create/complete)
 //! GET                       /{bucket}?list-type=2&…
+//! GET                       /{bucket}?uploads&…  (ListMultipartUploads)
 //! ```
 //!
 //! `{id}` is a bucket id or name. Object puts stream the body to disk and

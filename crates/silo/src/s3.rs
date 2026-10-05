@@ -6,6 +6,8 @@
 //! ```text
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}
 //! GET                       /{bucket}?list-type=2&prefix=&continuation-token=&max-keys=
+//! GET                       /{bucket}?uploads&prefix=&key-marker=&upload-id-marker=&max-uploads=
+//!                                     ListMultipartUploads
 //!
 //! Multipart (query on the object path):
 //! POST   ?uploads                         CreateMultipartUpload
@@ -21,8 +23,10 @@
 //! unauthorized. Single-PUT ETag is the content MD5 hex (quoted);
 //! completed multipart ETag is `{md5-of-part-md5s}-{n}` (quoted).
 //!
-//! Staging dirs under `.uploads/` are removed on abort and complete.
-//! Stale uploads left by crashed clients are **not** garbage-collected yet.
+//! Staging dirs under `.uploads/` are removed on abort and complete, and
+//! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
+//! ListMultipartUploads does not support `delimiter` (no CommonPrefixes)
+//! and does not report Initiator/Owner.
 
 use crate::client::Client;
 use crate::http::{content_type_header, load_bucket};
@@ -40,6 +44,7 @@ use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 
 const S3_MAX_KEYS: usize = 1000;
+const S3_MAX_UPLOADS: usize = 1000;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ObjectQuery {
@@ -62,6 +67,15 @@ pub struct ListQuery {
     pub max_keys: Option<String>,
     #[serde(rename = "start-after")]
     pub start_after: Option<String>,
+    /// Presence of `uploads` (even empty) means ListMultipartUploads.
+    pub uploads: Option<String>,
+    #[serde(rename = "key-marker")]
+    pub key_marker: Option<String>,
+    #[serde(rename = "upload-id-marker")]
+    pub upload_id_marker: Option<String>,
+    #[serde(rename = "max-uploads")]
+    pub max_uploads: Option<String>,
+    pub delimiter: Option<String>,
 }
 
 pub async fn put_object(
@@ -346,9 +360,12 @@ async fn list_or_bucket_inner(
     bucket_name: String,
     q: ListQuery,
 ) -> ApiResult<Response> {
+    if q.uploads.is_some() {
+        return list_uploads_inner(c, ext, bucket_name, q).await;
+    }
     if q.list_type.as_deref() != Some("2") {
         return Err(ApiError::bad_request(
-            "only ListObjectsV2 (list-type=2) is supported on this path",
+            "only ListObjectsV2 (list-type=2) and ListMultipartUploads (?uploads) are supported on this path",
         ));
     }
     let who = caller(ext)?;
@@ -382,17 +399,131 @@ async fn list_or_bucket_inner(
     Ok(resp)
 }
 
+async fn list_uploads_inner(
+    c: Client,
+    ext: Option<Extension<Caller>>,
+    bucket_name: String,
+    q: ListQuery,
+) -> ApiResult<Response> {
+    let who = caller(ext)?;
+    let bucket = load_bucket(&c, &who, &bucket_name)?;
+    if q.delimiter.as_deref().is_some_and(|d| !d.is_empty()) {
+        return Err(multipart::s3_err(
+            "InvalidArgument",
+            "delimiter is not supported for ListMultipartUploads",
+        ));
+    }
+    let max_uploads = parse_limit(q.max_uploads.as_deref(), "max-uploads", S3_MAX_UPLOADS)?;
+    let prefix = q.prefix.as_deref().unwrap_or("");
+    let key_marker = q.key_marker.as_deref().unwrap_or("");
+    // S3 ignores upload-id-marker unless key-marker is set.
+    let upload_id_marker = if key_marker.is_empty() {
+        ""
+    } else {
+        q.upload_id_marker.as_deref().unwrap_or("")
+    };
+    let (uploads, truncated) = c
+        .list_multipart_uploads(
+            &bucket.meta.id,
+            Some(prefix),
+            Some(key_marker),
+            Some(upload_id_marker),
+            max_uploads,
+        )
+        .await?;
+    let xml = list_uploads_xml(&ListUploadsPage {
+        bucket: &bucket.meta.name,
+        prefix,
+        key_marker,
+        upload_id_marker,
+        max_uploads,
+        uploads: &uploads,
+        truncated,
+    });
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        xml,
+    )
+        .into_response())
+}
+
+struct ListUploadsPage<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
+    key_marker: &'a str,
+    upload_id_marker: &'a str,
+    max_uploads: usize,
+    uploads: &'a [multipart::UploadSummary],
+    truncated: bool,
+}
+
+fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
+    let mut body = String::new();
+    body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    body.push_str("<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    body.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(page.bucket)));
+    body.push_str(&format!(
+        "<KeyMarker>{}</KeyMarker>",
+        xml_escape(page.key_marker)
+    ));
+    body.push_str(&format!(
+        "<UploadIdMarker>{}</UploadIdMarker>",
+        xml_escape(page.upload_id_marker)
+    ));
+    if page.truncated {
+        if let Some(last) = page.uploads.last() {
+            body.push_str(&format!(
+                "<NextKeyMarker>{}</NextKeyMarker>",
+                xml_escape(&last.key)
+            ));
+            body.push_str(&format!(
+                "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+                xml_escape(&last.upload_id)
+            ));
+        }
+    }
+    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(page.prefix)));
+    body.push_str(&format!("<MaxUploads>{}</MaxUploads>", page.max_uploads));
+    body.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        if page.truncated { "true" } else { "false" }
+    ));
+    for u in page.uploads {
+        body.push_str("<Upload>");
+        body.push_str(&format!("<Key>{}</Key>", xml_escape(&u.key)));
+        body.push_str(&format!(
+            "<UploadId>{}</UploadId>",
+            xml_escape(&u.upload_id)
+        ));
+        body.push_str("<StorageClass>STANDARD</StorageClass>");
+        body.push_str(&format!(
+            "<Initiated>{}</Initiated>",
+            u.initiated.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        ));
+        body.push_str("</Upload>");
+    }
+    body.push_str("</ListMultipartUploadsResult>");
+    body
+}
+
 fn parse_max_keys(raw: Option<&str>) -> ApiResult<usize> {
+    parse_limit(raw, "max-keys", S3_MAX_KEYS)
+}
+
+/// `None`/empty → `max`; negative or non-numeric → 400; else clamp to
+/// `1..=max`.
+fn parse_limit(raw: Option<&str>, name: &str, max: usize) -> ApiResult<usize> {
     match raw {
-        None | Some("") => Ok(S3_MAX_KEYS),
+        None | Some("") => Ok(max),
         Some(s) => {
             let n: i64 = s
                 .parse()
-                .map_err(|_| ApiError::bad_request("max-keys must be a number"))?;
+                .map_err(|_| ApiError::bad_request(format!("{name} must be a number")))?;
             if n < 0 {
-                return Err(ApiError::bad_request("max-keys must be >= 0"));
+                return Err(ApiError::bad_request(format!("{name} must be >= 0")));
             }
-            Ok((n as usize).clamp(1, S3_MAX_KEYS))
+            Ok((n as usize).clamp(1, max))
         }
     }
 }
