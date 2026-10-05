@@ -16,7 +16,9 @@
 //! ([`sigv4`]): header auth, presigned GET/PUT, and aws-chunked streaming
 //! PutObject/UploadPart (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
 //! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
-//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`). Region comes from
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`). **UploadPartCopy**
+//! (`x-amz-copy-source` on `PUT …?partNumber=&uploadId=`) is supported;
+//! CopyObject is not implemented yet. Region comes from
 //! `[modules.silo] region` (default `pistack`).
 //!
 //! Multipart staging lives under `{data}/silo/{bucket}/.uploads/{uploadId}/`.
@@ -33,6 +35,7 @@
 //! * [`multipart`] — Create/Upload/Complete/Abort/List multipart helpers.
 //! * [`gc`] — the abandoned-upload sweep.
 //! * [`sigv4`] — AWS Signature Version 4 verification (in-process via keep).
+//! * [`copy`] — UploadPartCopy source/range/conditional helpers.
 //! * [`chunked`] — aws-chunked body decode (signed chunks and trailers).
 
 use async_trait::async_trait;
@@ -43,6 +46,7 @@ use std::path::PathBuf;
 
 pub mod chunked;
 pub mod client;
+pub mod copy;
 pub mod gc;
 pub mod http;
 pub mod multipart;

@@ -577,6 +577,7 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         | "InvalidPartOrder"
         | "InvalidArgument"
         | "InvalidRequest"
+        | "InvalidRange"
         | "MalformedXML"
         | "AuthorizationHeaderMalformed"
         | "IncompleteBody"
@@ -587,6 +588,8 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         | "SignatureDoesNotMatch"
         | "AccessDenied"
         | "RequestTimeTooSkewed" => ApiError::forbidden(message),
+        // S3 uses HTTP 412; pistack ErrorCode has no 412, so Conflict (409).
+        "PreconditionFailed" => ApiError::conflict(message),
         "NotImplemented" => ApiError::not_implemented(message),
         _ => ApiError::internal(message),
     };

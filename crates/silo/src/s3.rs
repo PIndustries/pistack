@@ -12,6 +12,7 @@
 //! Multipart (query on the object path):
 //! POST   ?uploads                         CreateMultipartUpload
 //! PUT    ?partNumber=N&uploadId=X         UploadPart
+//! PUT    ?partNumber=N&uploadId=X         UploadPartCopy (`x-amz-copy-source`)
 //! POST   ?uploadId=X  (XML body)          CompleteMultipartUpload
 //! DELETE ?uploadId=X                      AbortMultipartUpload
 //! GET    ?uploadId=X                      ListParts
@@ -22,9 +23,15 @@
 //! presigned GET/PUT, and aws-chunked streaming PutObject/UploadPart
 //! (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
 //! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
-//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) are supported. Single-PUT
-//! ETag is the content MD5 hex (quoted); completed multipart ETag is
-//! `{md5-of-part-md5s}-{n}` (quoted).
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) are supported.
+//! **UploadPartCopy** (`x-amz-copy-source` on UploadPart) streams from a
+//! source object in a bucket visible to the caller. A foreign-project or
+//! nonexistent copy-source bucket returns `AccessDenied` (existence is not
+//! leaked); a missing key in a visible bucket is still `NoSuchKey`.
+//! CopyObject (copy-source without `partNumber`) and copy-source
+//! `versionId` are `NotImplemented`. Single-PUT ETag is the content MD5
+//! hex (quoted); completed multipart ETag is `{md5-of-part-md5s}-{n}`
+//! (quoted).
 //!
 //! Staging dirs under `.uploads/` are removed on abort and complete, and
 //! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
@@ -33,7 +40,8 @@
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
-use crate::http::{content_type_header, load_bucket};
+use crate::copy;
+use crate::http::{content_type_header, load_bucket, load_copy_source_bucket};
 use crate::multipart::{self, s3_code_of};
 use crate::sigv4::{self, ExpectedPayloadSha256};
 use crate::types::*;
@@ -44,8 +52,12 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
+use chrono::Utc;
+use futures::StreamExt;
 use pistack_types::{ApiError, ApiResult, Caller};
 use serde::Deserialize;
+use std::io::SeekFrom;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 type DecodedBodyStream =
@@ -132,6 +144,22 @@ async fn put_object_inner(
         .as_ref()
         .map(|s| Some(s.decoded_content_length))
         .unwrap_or(wire_len);
+
+    let copy_raw = header_str(&headers, "x-amz-copy-source");
+    if let Some(copy_raw) = copy_raw {
+        return upload_part_copy_inner(
+            c,
+            &who,
+            bucket,
+            key,
+            q,
+            &headers,
+            copy_raw,
+            streaming.is_some(),
+        )
+        .await;
+    }
+
     if let (Some(upload_id), Some(part_raw)) = (q.upload_id.as_deref(), q.part_number.as_deref()) {
         let part_number: u32 = part_raw
             .parse()
@@ -176,6 +204,141 @@ async fn put_object_inner(
     resp.headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     Ok(resp)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_part_copy_inner(
+    c: Client,
+    who: &Caller,
+    dest_bucket: crate::types::Bucket,
+    key: String,
+    q: ObjectQuery,
+    headers: &HeaderMap,
+    copy_raw: &str,
+    streaming: bool,
+) -> ApiResult<Response> {
+    // CopyObject (no multipart query) is intentionally not implemented.
+    let (Some(upload_id), Some(part_raw)) = (q.upload_id.as_deref(), q.part_number.as_deref())
+    else {
+        if q.upload_id.is_none() && q.part_number.is_none() {
+            return Err(multipart::s3_err(
+                "NotImplemented",
+                "CopyObject is not implemented; use UploadPartCopy with partNumber and uploadId",
+            ));
+        }
+        return Err(multipart::s3_err(
+            "InvalidArgument",
+            "UploadPartCopy requires both partNumber and uploadId",
+        ));
+    };
+    if streaming {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "UploadPartCopy cannot use STREAMING-* payload signing",
+        ));
+    }
+    let wire_len = content_length(headers)?;
+    if wire_len.is_some_and(|n| n > 0) {
+        return Err(multipart::s3_err(
+            "InvalidRequest",
+            "UploadPartCopy must not include a request body",
+        ));
+    }
+
+    let src = copy::parse_copy_source(copy_raw)?;
+    if src.version_id.is_some() {
+        return Err(multipart::s3_err(
+            "NotImplemented",
+            "object versioning is not supported for UploadPartCopy",
+        ));
+    }
+    let part_number: u32 = part_raw
+        .parse()
+        .map_err(|_| multipart::s3_err("InvalidArgument", "partNumber must be a number"))?;
+
+    // Visibility before any dest part file is opened/created. Foreign or
+    // nonexistent source buckets → AccessDenied (do not leak existence).
+    let src_bucket = load_copy_source_bucket(&c, who, &src.bucket)?;
+    let (src_obj, mut file) = match c.open_object(&src_bucket.meta.id, &src.key).await {
+        Ok(v) => v,
+        Err(e) if e.status() == StatusCode::NOT_FOUND => {
+            return Err(multipart::s3_err(
+                "NoSuchKey",
+                format!(
+                    "The specified key does not exist: {}/{}",
+                    src.bucket, src.key
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+
+    copy::check_copy_source_conditions(
+        &src_obj,
+        header_str(headers, "x-amz-copy-source-if-match"),
+        header_str(headers, "x-amz-copy-source-if-none-match"),
+        header_str(headers, "x-amz-copy-source-if-unmodified-since"),
+        header_str(headers, "x-amz-copy-source-if-modified-since"),
+    )?;
+
+    let (offset, len) = match header_str(headers, "x-amz-copy-source-range") {
+        Some(raw) => copy::parse_copy_source_range(raw, src_obj.status.size_bytes)?,
+        None => (0, src_obj.status.size_bytes),
+    };
+    if len > c.max_object_bytes() as u64 {
+        return Err(multipart::s3_err(
+            "EntityTooLarge",
+            format!(
+                "copied part exceeds configured max_object_bytes ({})",
+                c.max_object_bytes()
+            ),
+        ));
+    }
+    if offset > 0 || len < src_obj.status.size_bytes {
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(multipart::io_err)?;
+    }
+    let limited = file.take(len);
+    let stream = ReaderStream::new(limited);
+    let etag = c
+        .upload_part(
+            &dest_bucket.meta.id,
+            &key,
+            upload_id,
+            part_number,
+            stream,
+            Some(len),
+            None,
+        )
+        .await?;
+    let last_mod = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<LastModified>{last_mod}</LastModified>\
+<ETag>&quot;{}&quot;</ETag>\
+</CopyPartResult>",
+        xml_escape(&etag)
+    );
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        xml,
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    Ok(resp)
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 pub async fn get_object(
@@ -624,7 +787,6 @@ where
     S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    use futures::StreamExt;
     Ok(match streaming {
         Some(auth) => chunked::decode_stream(body, auth).boxed(),
         None => body
