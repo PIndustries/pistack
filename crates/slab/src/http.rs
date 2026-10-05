@@ -280,15 +280,10 @@ async fn attach_volume(
     if body.machine.kind != "mach" {
         return Err(ApiError::bad_request("machine must be a mach-… id"));
     }
-    let device = if c.has_queue() {
-        Some(
-            c.plug_volume(&v.meta.id, &body.machine, body.device)
-                .await?,
-        )
-    } else {
-        body.device
-    };
-    Ok(Json(c.mark_attached(&v.meta.id, &body.machine, device)?))
+    Ok(Json(
+        c.attach_volume(&v.meta.id, &body.machine, body.device)
+            .await?,
+    ))
 }
 
 async fn detach_volume(

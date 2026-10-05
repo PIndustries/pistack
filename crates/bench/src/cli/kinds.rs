@@ -86,6 +86,30 @@ fn phase(v: &Value, _: DateTime<Utc>) -> String {
     str_at(v, "/status/phase")
 }
 
+/// `Attaching` until the host path is confirmed, then `Attached`.
+fn attach_state(v: &Value, _: DateTime<Utc>) -> String {
+    let Some(items) = v.pointer("/status/conditions").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let Some(cond) = items
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("Attached"))
+    else {
+        return String::new();
+    };
+    if cond.get("status").and_then(Value::as_bool).unwrap_or(false) {
+        return "Attached".to_owned();
+    }
+    match cond.get("reason").and_then(Value::as_str).unwrap_or("") {
+        "" => String::new(),
+        reason => reason.to_owned(),
+    }
+}
+
+fn host_path(v: &Value, _: DateTime<Utc>) -> String {
+    str_at(v, "/status/host_path")
+}
+
 macro_rules! col {
     ($h:literal, $f:ident) => {
         Column {
@@ -495,8 +519,10 @@ pub static KINDS: &[KindDef] = &[
             col!("SIZE-GIB", "/spec/size_gib"),
             col!("TYPE", "/spec/volume_type"),
             col!("BOOTABLE", "/spec/bootable"),
+            col!("ATTACH", attach_state),
             col!("ATTACHED-TO", short "/status/attached_to"),
             col!("DEVICE", "/status/device"),
+            col!("HOST-PATH", host_path),
             col!("AGE", created),
         ],
         wide: &[
