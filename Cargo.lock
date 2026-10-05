@@ -1922,6 +1922,7 @@ dependencies = [
  "axum",
  "chrono",
  "gate",
+ "mold",
  "pistack-rpc",
  "pistack-store",
  "pistack-types",

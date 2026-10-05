@@ -49,6 +49,8 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig) -> Assembly {
             .dev_admin(dev),
     );
 
+    let images: Arc<dyn mold::ImageStore> =
+        Arc::new(mold::LocalDirStore::new(mold::default_image_dir()));
     let modules: Vec<Arc<dyn Module>> = vec![
         gate_m.clone(),
         forge_m.clone(),
@@ -57,8 +59,12 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig) -> Assembly {
             queue.clone(),
         ))),
         Arc::new(fabric_module()),
-        Arc::new(slab::Slab::default().with_queue(queue.clone())),
-        Arc::new(mold::Mold::default()),
+        Arc::new(
+            slab::Slab::default()
+                .with_queue(queue.clone())
+                .with_images(images.clone()),
+        ),
+        Arc::new(mold::Mold::new(images)),
         Arc::new(silo::Silo::configured(silo_cfg)),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),

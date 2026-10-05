@@ -1349,13 +1349,15 @@ async fn volume(ctx: &Ctx, cmd: VolumeCmd, io: &mut Io<'_>) -> CliResult<()> {
             } else {
                 json!({"kind": "none"})
             };
-            let spec = json!({
-                "size_gib": a.size_gib,
+            let mut spec = json!({
                 "volume_type": a.volume_type,
                 "source": source,
                 "bootable": a.bootable,
                 "encrypted": a.encrypted,
             });
+            if let Some(size) = a.size_gib {
+                spec["size_gib"] = json!(size);
+            }
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, a.wait).await.map(|_| ())
         }

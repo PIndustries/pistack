@@ -85,6 +85,12 @@ fn created(v: &Value, now: DateTime<Utc>) -> String {
 fn phase(v: &Value, _: DateTime<Utc>) -> String {
     str_at(v, "/status/phase")
 }
+fn source_image(v: &Value, _: DateTime<Utc>) -> String {
+    if str_at(v, "/spec/source/kind") != "image" {
+        return String::new();
+    }
+    short_id(&str_at(v, "/spec/source/id"))
+}
 
 macro_rules! col {
     ($h:literal, $f:ident) => {
@@ -458,6 +464,7 @@ pub static KINDS: &[KindDef] = &[
             col!("BOOTABLE", "/spec/bootable"),
             col!("ATTACHED-TO", short "/status/attached_to"),
             col!("DEVICE", "/status/device"),
+            col!("IMAGE", source_image),
             col!("AGE", created),
         ],
         wide: &[
@@ -756,5 +763,36 @@ mod tests {
             let last = k.columns.last().unwrap().header;
             assert!(last == "AGE" || last == "LAST-SEEN", "{}: {last}", k.noun);
         }
+    }
+
+    #[test]
+    fn volume_list_shows_the_source_image() {
+        let kind = by_noun("volume").unwrap();
+        let column = kind
+            .columns
+            .iter()
+            .find(|c| c.header == "IMAGE")
+            .expect("IMAGE column");
+        let now = Utc::now();
+        let image = serde_json::json!({
+            "spec": {
+                "source": {
+                    "kind": "image",
+                    "id": "img-0199a5e0-1111-7000-8000-0000000000ab"
+                }
+            }
+        });
+        assert_eq!((column.get)(&image, now), "img-000000ab");
+        let blank = serde_json::json!({ "spec": { "source": { "kind": "none" } } });
+        assert_eq!((column.get)(&blank, now), "");
+        let snap = serde_json::json!({
+            "spec": {
+                "source": {
+                    "kind": "snapshot",
+                    "id": "snap-0199a5e0-1111-7000-8000-0000000000ab"
+                }
+            }
+        });
+        assert_eq!((column.get)(&snap, now), "");
     }
 }

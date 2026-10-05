@@ -775,9 +775,10 @@ pub struct VolumeCreate {
     pub name: String,
     #[command(flatten)]
     pub meta: MetaArgs,
-    /// Size in GiB.
-    #[arg(long = "size", value_name = "GIB")]
-    pub size_gib: u64,
+    /// Size in GiB. With `--image` and no size, the image virtual size is
+    /// rounded up to the next GiB.
+    #[arg(long = "size", value_name = "GIB", required_unless_present = "image")]
+    pub size_gib: Option<u64>,
     /// Volume type.
     #[arg(long = "type", default_value = "standard")]
     pub volume_type: String,
@@ -1136,3 +1137,25 @@ crud!(
     /// Re-apply an earlier revision.
     Rollback(StackRollback),
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn volume_create_size_is_optional_with_an_image() {
+        let cli = Cli::try_parse_from(["pi", "volume", "create", "boot", "--image", "ubuntu"])
+            .expect("image without size");
+        match cli.cmd {
+            Cmd::Volume {
+                cmd: VolumeCmd::Create(create),
+            } => {
+                assert!(create.size_gib.is_none());
+                assert_eq!(create.image.as_deref(), Some("ubuntu"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["pi", "volume", "create", "boot"]).is_err());
+    }
+}

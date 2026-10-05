@@ -16,6 +16,14 @@
 //! | restore         | `rbd clone {pool}/{vol_id}@{snap_id} {pool}/{new_vol_id}` |
 //! | extend          | `rbd resize --size {new_size_gib}G {pool}/{vol_id}` |
 //! | attach_info     | `Rbd { pool, image: vol_id, monitors, user }` |
+//! | image           | `qemu-img convert -O raw -f <fmt> -n <src> rbd:{pool}/{vol_id}` |
+//!
+//! The image is created with `rbd create` first. `qemu-img convert -n`
+//! then writes raw bytes into that image (`-n` is qemu-img's "do not
+//! create the target", and its help cites rbd). `rbd import` would store
+//! a qcow2 file's bytes unchanged and would not fill the image `rbd
+//! create` just made. Monitors stay in the host ceph config, the same way
+//! `rbd create` is invoked.
 //!
 //! Parameters from `VolumeTypeSpec::params`: `pool` (default `volumes`),
 //! `user` (default `pistack`), `monitors` (comma separated).
@@ -29,6 +37,7 @@ use async_trait::async_trait;
 use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
@@ -118,6 +127,17 @@ impl RbdBackend {
             self.user.clone()
         }
     }
+
+    /// `qemu-img convert -O raw -f <format> -n <src> rbd:{pool}/{id}`.
+    fn image_convert_args(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<Vec<String>> {
+        let pool = self.pool()?;
+        let id = vol_id(vol)?;
+        Ok(super::qemu_img_convert_argv(
+            format,
+            src,
+            &format!("rbd:{pool}/{id}"),
+        ))
+    }
 }
 
 #[async_trait]
@@ -146,6 +166,11 @@ impl BlockBackend for RbdBackend {
         )
         .await?;
         Ok(BackendRef::new(image))
+    }
+
+    async fn write_image(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<()> {
+        let args = self.image_convert_args(vol, src, format)?;
+        super::run_qemu_img(src, &args).await
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
@@ -442,5 +467,57 @@ mod tests {
         assert!(err.message.contains("not available"), "{err}");
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.lines().any(|line| line == "create"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn image_convert_command_targets_rbd() {
+        let _guard = LOCK.lock().await;
+        let _qemu = super::super::QEMU_IMG_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("qemu-img");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\nexit 0\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(super::super::ENV_QEMU_IMG, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(super::super::ENV_QEMU_IMG);
+            }
+        }
+        let _reset = Reset;
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let vol = volume(8);
+        let src = dir.path().join("seed.qcow2");
+        std::fs::write(&src, b"seed").unwrap();
+        let id = vol.meta.id.to_string();
+        let args = backend.image_convert_args(&vol, &src, "qcow2").unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "convert".to_owned(),
+                "-O".to_owned(),
+                "raw".to_owned(),
+                "-f".to_owned(),
+                "qcow2".to_owned(),
+                "-n".to_owned(),
+                src.display().to_string(),
+                format!("rbd:volumes/{id}"),
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "import"));
+        backend.write_image(&vol, &src, "qcow2").await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            logged,
+            args.iter().map(|a| format!("{a}\n")).collect::<String>()
+        );
     }
 }
