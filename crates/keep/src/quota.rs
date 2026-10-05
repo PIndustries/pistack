@@ -3,15 +3,16 @@
 
 //! Count limits on what `keep` stores.
 //!
-//! Secrets and certificates are project resources and use gate's project
-//! quotas: the limit for `secrets` or `certificates` is the project's
-//! `spec.quotas` entry (set with `pi project` / `PUT /identity/projects`)
-//! and, when the project has none, the module default from
-//! [`KeepConfig`]. Usage is counted from the stored rows at admission, so it
-//! cannot drift, and is mirrored into the project's `status.usage` for
-//! display. A disabled project refuses creates. Key secrets that belong to
-//! a certificate count against `certificates`, not `secrets`. Cloud-scoped
-//! rows (no project) are not limited, as elsewhere.
+//! Secrets, certificates and access keys are project resources and use
+//! gate's project quotas: the limit for `secrets`, `certificates` or
+//! `access_keys` is the project's `spec.quotas` entry (set with
+//! `pi project` / `PUT /identity/projects`) and, when the project has none,
+//! the module default from [`KeepConfig`]. Usage is counted from the stored
+//! rows at admission, so it cannot drift, and is mirrored into the
+//! project's `status.usage` for display. A disabled project refuses
+//! creates. A certificate's key secret counts against `certificates` and an
+//! access key against `access_keys`, not `secrets`. Cloud-scoped rows (no
+//! project) are not limited, as elsewhere.
 //!
 //! Join tokens are cloud-scoped, so their limits are cloud-wide: at most
 //! [`KeepConfig::max_live_join_tokens`] unexpired, unspent tokens at once,
@@ -36,6 +37,7 @@ pub const CERTIFICATES: &str = "certificates";
 
 pub const DEFAULT_MAX_SECRETS_PER_PROJECT: u64 = 1000;
 pub const DEFAULT_MAX_CERTIFICATES_PER_PROJECT: u64 = 500;
+pub const DEFAULT_MAX_ACCESS_KEYS_PER_PROJECT: u64 = 100;
 pub const DEFAULT_MAX_LIVE_JOIN_TOKENS: u64 = 100;
 pub const DEFAULT_MAX_JOIN_TOKEN_USES: u64 = 100;
 
@@ -47,6 +49,8 @@ pub struct KeepConfig {
     pub max_secrets_per_project: u64,
     /// `certificates` limit for a project whose quotas do not name one.
     pub max_certificates_per_project: u64,
+    /// `access_keys` limit for a project whose quotas do not name one.
+    pub max_access_keys_per_project: u64,
     /// Unexpired, unspent join tokens allowed at once, cloud-wide.
     pub max_live_join_tokens: u64,
     /// Most redemptions a multi-use join token may allow (and its default).
@@ -58,6 +62,7 @@ impl Default for KeepConfig {
         Self {
             max_secrets_per_project: DEFAULT_MAX_SECRETS_PER_PROJECT,
             max_certificates_per_project: DEFAULT_MAX_CERTIFICATES_PER_PROJECT,
+            max_access_keys_per_project: DEFAULT_MAX_ACCESS_KEYS_PER_PROJECT,
             max_live_join_tokens: DEFAULT_MAX_LIVE_JOIN_TOKENS,
             max_join_token_uses: DEFAULT_MAX_JOIN_TOKEN_USES,
         }
