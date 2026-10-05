@@ -784,3 +784,68 @@ async fn udp_and_tcp_on_one_port_share_a_node_port() {
         .iter()
         .all(|lb| lb.meta.labels.get("loom.pistack.io/service") != Some(&svc.meta.id.to_string())));
 }
+
+#[tokio::test]
+async fn node_port_opens_on_the_new_leader_after_a_handoff() {
+    use loom::controllers::service::{ServiceController, DEFAULT_SERVICE_CIDR};
+    let store = Store::in_memory().unwrap();
+    let node_port = free_node_port();
+    let mut svc = service(
+        "np-handoff",
+        ServiceKind::NodePort,
+        80,
+        8080,
+        Protocol::Tcp,
+        vec![],
+    );
+    svc.spec.ports[0].node_port = Some(node_port);
+    let id = store.collection::<Service>().create(svc).unwrap().meta.id;
+    let at = format!("127.0.0.1:{node_port}");
+    let leader = |store: &Store| {
+        let relay = std::sync::Arc::new(
+            RelayRealizer::new().with_node_address("127.0.0.1".parse().unwrap()),
+        );
+        relay.bind_store(store.clone());
+        ServiceController::new(
+            store.clone(),
+            DEFAULT_SERVICE_CIDR.parse().unwrap(),
+            relay as std::sync::Arc<dyn ServiceRealizer>,
+        )
+    };
+
+    // The first leader opens the node port.
+    let first = leader(&store);
+    first.reconcile_once().await.unwrap();
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+    let before = store.collection::<Service>().get(&id).unwrap().status;
+
+    // It goes dark. Its node port was on another server's address.
+    drop(first);
+    closed(&at).await;
+    let balancers = store.collection::<relay::Balancer>();
+    let mut node = balancers
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .find(|lb| lb.meta.name.ends_with(&format!("-node-{node_port}")))
+        .expect("node port balancer");
+    node.spec.vip_address = Some("10.89.0.10".parse().unwrap());
+    node.status.vip = node.spec.vip_address;
+    balancers.update(node, None).unwrap();
+
+    // The new leader sees a status that already matches and still opens
+    // the node port on its own address.
+    let second = leader(&store);
+    second.reconcile_once().await.unwrap();
+    let after = store.collection::<Service>().get(&id).unwrap().status;
+    assert_eq!(after.node_ports, before.node_ports);
+    assert_eq!(after.cluster_ip, before.cluster_ip);
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+    let moved = balancers
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .find(|lb| lb.meta.name.ends_with(&format!("-node-{node_port}")))
+        .expect("node port balancer");
+    assert_eq!(moved.spec.vip_address, Some("127.0.0.1".parse().unwrap()));
+}

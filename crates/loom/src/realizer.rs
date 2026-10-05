@@ -15,8 +15,9 @@ use relay::{
     Algorithm, BalancerSpec, Client, ForwardProvider, ListenerProtocol, ListenerSpec, MemberSpec,
     PathMatch, PoolProtocol, PoolSpec, Provider, Providers, RelayL7Provider, Route, MANAGED_LABEL,
 };
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -76,6 +77,10 @@ pub struct RelayRealizer {
     store: OnceLock<Store>,
     providers: Providers,
     node_address: IpAddr,
+    /// Balancers this process has programmed. Sockets live in the process
+    /// that bound them, so a balancer another server (or an earlier run)
+    /// marked ready is programmed here once before it counts as live.
+    local: Mutex<HashSet<Id>>,
 }
 
 impl RelayRealizer {
@@ -87,6 +92,7 @@ impl RelayRealizer {
                 Arc::new(RelayL7Provider::new()),
             ]),
             node_address: node_port_address(),
+            local: Mutex::new(HashSet::new()),
         }
     }
 
@@ -151,6 +157,7 @@ impl RelayRealizer {
             keep.push(name.clone());
             let members = endpoint_addrs(endpoints, port)?;
             let bound = ensure_forward(
+                &self.local,
                 &client,
                 service.meta.project.clone(),
                 &name,
@@ -177,6 +184,7 @@ impl RelayRealizer {
             let name = format!("{base}-node-{node_port}");
             keep.push(name.clone());
             ensure_forward(
+                &self.local,
                 &client,
                 service.meta.project.clone(),
                 &name,
@@ -218,6 +226,7 @@ impl RelayRealizer {
         let name = format!("ing-{}", ingress.meta.id);
         let id = ingress.meta.id.to_string();
         let bound = ensure_forward(
+            &self.local,
             &client,
             ingress.meta.project.clone(),
             &name,
@@ -246,6 +255,7 @@ impl RelayRealizer {
             }
         };
         let tls = ensure_forward(
+            &self.local,
             &client,
             ingress.meta.project.clone(),
             &format!("{name}-tls"),
@@ -430,6 +440,7 @@ fn projects_match(a: &Option<Id>, b: &Option<Id>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn ensure_forward(
+    local: &Mutex<HashSet<Id>>,
     client: &Client,
     project: Option<Id>,
     name: &str,
@@ -443,18 +454,33 @@ async fn ensure_forward(
     members: &[SocketAddr],
     routes: &[RoutePlan],
 ) -> ApiResult<String> {
-    let lb = match client.balancers().get_by_name(project.as_ref(), name) {
-        Ok(lb) => {
-            if lb.spec.vip_network != VIP_NETWORK
-                || lb.spec.provider != provider
-                || lb.spec.vip_address != bind.map(|b| b.ip())
-                || lb.spec.vip_port != bind.map(|b| b.port())
-            {
-                return Err(ApiError::unavailable("listener is not available"));
-            }
-            lb
+    let existing = match client.balancers().get_by_name(project.as_ref(), name) {
+        Ok(lb) if lb.spec.vip_network != VIP_NETWORK || lb.spec.provider != provider => {
+            return Err(ApiError::unavailable("listener is not available"));
         }
-        Err(StoreError::NotFound(_)) => {
+        Ok(lb)
+            if bind.is_some()
+                && (lb.spec.vip_address != bind.map(|b| b.ip())
+                    || lb.spec.vip_port != bind.map(|b| b.port())) =>
+        {
+            // A node port another server bound (the old leader, or this
+            // server under an old address) is rebuilt on this server.
+            tracing::info!(balancer = %lb.meta.id, name, "loom: node port moves to this server");
+            client.delete_balancer(&lb.meta.id).await?;
+            None
+        }
+        Ok(lb)
+            if bind.is_none() && (lb.spec.vip_address.is_some() || lb.spec.vip_port.is_some()) =>
+        {
+            return Err(ApiError::unavailable("listener is not available"));
+        }
+        Ok(lb) => Some(lb),
+        Err(StoreError::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let lb = match existing {
+        Some(lb) => lb,
+        None => {
             let mut meta = Meta::new(kind::BALANCER, name, project.clone());
             meta.labels.insert(MANAGED_LABEL.into(), "loom".into());
             meta.labels.insert(owner_label.into(), owner_id.to_owned());
@@ -470,7 +496,6 @@ async fn ensure_forward(
                 },
             )?
         }
-        Err(e) => return Err(e.into()),
     };
 
     let pools = client.pools_of(&lb.meta.id)?;
@@ -585,7 +610,12 @@ async fn ensure_forward(
         .listeners()
         .get(&listener.meta.id)
         .map_err(ApiError::from)?;
-    let aligned = lb.status.phase == Phase::Ready
+    let programmed_here = local
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&lb.meta.id);
+    let aligned = programmed_here
+        && lb.status.phase == Phase::Ready
         && lb.status.provider_ref.as_deref() == Some(live.provider_ref.as_str())
         && listener.status.phase == Phase::Ready
         && listener.status.provider_ref.as_deref() == Some(live.provider_ref.as_str());
@@ -622,6 +652,10 @@ async fn ensure_forward(
         };
         return Err(ApiError::unavailable(msg));
     }
+    local
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(lb.meta.id.clone());
     let addr = listener
         .status
         .provider_ref
