@@ -61,6 +61,10 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Snapshot { cmd } => snapshot(ctx, cmd, io).await,
         Cmd::Voltype { cmd } => voltype(ctx, cmd, io).await,
         Cmd::Image { cmd } => image(ctx, cmd, io).await,
+        Cmd::Deployment { cmd } => deployment(ctx, cmd, io).await,
+        Cmd::Service { cmd } => service(ctx, cmd, io).await,
+        Cmd::Job { cmd } => job(ctx, cmd, io).await,
+        Cmd::Ingress { cmd } => ingress(ctx, cmd, io).await,
         Cmd::Statefulset { cmd } => statefulset(ctx, cmd, io).await,
         Cmd::Daemonset { cmd } => daemonset(ctx, cmd, io).await,
         Cmd::Autoscaler { cmd } => autoscaler(ctx, cmd, io).await,
@@ -1493,6 +1497,39 @@ async fn upload(
 async fn pod(ctx: &Ctx, cmd: PodCmd, io: &mut Io<'_>) -> CliResult<i32> {
     match cmd {
         PodCmd::Exec(args) => pod_exec(ctx, args, io).await,
+        other => {
+            pod_rest(ctx, other, io).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn pod_rest(ctx: &Ctx, cmd: PodCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("pod");
+    match cmd {
+        PodCmd::List(a) => do_list(ctx, io, k, a).await,
+        PodCmd::Show(a) => do_show(ctx, io, k, a).await,
+        PodCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        PodCmd::Create(a) => {
+            let c = ctx.client()?;
+            let mut spec = json!({
+                "containers": [{
+                    "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                    "image": a.image,
+                }]
+            });
+            if !a.networks.is_empty() {
+                spec.as_object_mut()
+                    .unwrap()
+                    .insert("networks".into(), json!(a.networks));
+            }
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+        PodCmd::Exec(_) => Err(CliError::usage(
+            "pod exec is handled before the other pod commands",
+        )),
     }
 }
 
@@ -1557,6 +1594,143 @@ fn pick_container(names: &[String], requested: Option<&str>) -> CliResult<String
                 many.join(", ")
             ))),
         },
+    }
+}
+
+async fn deployment(ctx: &Ctx, cmd: DeploymentCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("deployment");
+    match cmd {
+        DeploymentCmd::List(a) => do_list(ctx, io, k, a).await,
+        DeploymentCmd::Show(a) => do_show(ctx, io, k, a).await,
+        DeploymentCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        DeploymentCmd::Create(a) => {
+            let c = ctx.client()?;
+            let spec = json!({
+                "replicas": a.replicas,
+                "template": {
+                    "labels": { "app": a.name },
+                    "spec": {
+                        "containers": [{
+                            "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                            "image": a.image,
+                        }]
+                    }
+                }
+            });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+        DeploymentCmd::Scale(a) => {
+            let c = ctx.client()?;
+            let id = resolve(&c, k, &a.name).await?;
+            let v = c
+                .post(
+                    &format!("{}/{}/scale", k.path, id),
+                    &json!({ "replicas": a.replicas }),
+                )
+                .await?;
+            report(ctx, io, k, &v, "scaled")
+        }
+    }
+}
+
+async fn service(ctx: &Ctx, cmd: ServiceCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("service");
+    match cmd {
+        ServiceCmd::List(a) => do_list(ctx, io, k, a).await,
+        ServiceCmd::Show(a) => do_show(ctx, io, k, a).await,
+        ServiceCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        ServiceCmd::Create(a) => {
+            let c = ctx.client()?;
+            let kind_s = match a.kind {
+                ServiceKindArg::ClusterIp => "ClusterIp",
+                ServiceKindArg::NodePort => "NodePort",
+                ServiceKindArg::LoadBalancer => "LoadBalancer",
+            };
+            let mut spec = json!({
+                "ports": [{ "port": a.port }],
+                "kind": kind_s,
+            });
+            if let Some(sel) = a.selector {
+                let (key, value) = sel
+                    .split_once('=')
+                    .ok_or_else(|| CliError::usage("selector must be key=value"))?;
+                let key = key.trim();
+                let value = value.trim();
+                if key.is_empty() || value.is_empty() {
+                    return Err(CliError::usage("selector needs both a key and a value"));
+                }
+                spec.as_object_mut()
+                    .unwrap()
+                    .insert("selector".into(), json!({ key: value }));
+            }
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+    }
+}
+
+async fn job(ctx: &Ctx, cmd: JobCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("job");
+    match cmd {
+        JobCmd::List(a) => do_list(ctx, io, k, a).await,
+        JobCmd::Show(a) => do_show(ctx, io, k, a).await,
+        JobCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        JobCmd::Create(a) => {
+            let c = ctx.client()?;
+            let restart = match a.restart {
+                JobRestartPolicyArg::Never => "Never",
+                JobRestartPolicyArg::OnFailure => "OnFailure",
+            };
+            let spec = json!({
+                "completions": a.completions,
+                "parallelism": a.parallelism,
+                "template": {
+                    "spec": {
+                        "restart_policy": restart,
+                        "containers": [{
+                            "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                            "image": a.image,
+                        }]
+                    }
+                }
+            });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+    }
+}
+
+async fn ingress(ctx: &Ctx, cmd: IngressCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("ingress");
+    match cmd {
+        IngressCmd::List(a) => do_list(ctx, io, k, a).await,
+        IngressCmd::Show(a) => do_show(ctx, io, k, a).await,
+        IngressCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        IngressCmd::Create(a) => {
+            let c = ctx.client()?;
+            if !a.path.starts_with('/') {
+                return Err(CliError::usage("path must start with /"));
+            }
+            let mut rule = json!({
+                "paths": [{
+                    "path": a.path,
+                    "backend": { "service": a.service, "port": a.port },
+                }]
+            });
+            if let Some(host) = a.host.filter(|s| !s.is_empty()) {
+                rule.as_object_mut()
+                    .unwrap()
+                    .insert("host".into(), json!(host));
+            }
+            let spec = json!({ "rules": [rule] });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
     }
 }
 
