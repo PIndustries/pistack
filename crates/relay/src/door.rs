@@ -637,9 +637,9 @@ mod tests {
     }
 
     /// Door tests publish binaries through process environment variables.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     fn script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -657,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_runs_cloudflared_fails_closed_and_skips_wireguard() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let dir = std::env::temp_dir().join(format!(
             "pistack-door-{}-{}",
             std::process::id(),
@@ -817,7 +817,7 @@ mod tests {
 
     #[tokio::test]
     async fn wireguard_creates_only_pw_and_edge_enqueues_publish() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let dir = std::env::temp_dir().join(format!(
             "pistack-wg-{}-{}",
             std::process::id(),
