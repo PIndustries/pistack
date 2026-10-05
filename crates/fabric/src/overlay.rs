@@ -84,6 +84,21 @@ pub struct PortEndpoint {
     pub underlay: String,
     pub ingress: Vec<SgRule>,
     pub egress: Vec<SgRule>,
+    /// The port's other fixed addresses, each filtered with the rules for
+    /// its own family. Empty for a port with one address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<PortAddress>,
+}
+
+/// Another fixed address on a port and the security-group rules for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortAddress {
+    /// No prefix. IPv4 or IPv6.
+    pub address: String,
+    #[serde(default)]
+    pub ingress: Vec<SgRule>,
+    #[serde(default)]
+    pub egress: Vec<SgRule>,
 }
 
 /// One security-group match. `proto` is `tcp`, `udp`, `icmp`, or `any`.
@@ -228,6 +243,9 @@ pub struct PlanPort {
     pub underlay: String,
     pub ingress: Vec<SgRule>,
     pub egress: Vec<SgRule>,
+    /// Other fixed addresses on the port, for example the IPv6 address of a
+    /// port that also has an IPv4 one.
+    pub extra: Vec<PortAddress>,
 }
 
 /// A router leg on the network that contains it.
@@ -458,6 +476,33 @@ fn plan_ports(
                 net.id
             )));
         }
+        let mut extra = Vec::with_capacity(port.extra.len());
+        for more in &port.extra {
+            let ip = canonical_ip("port extra address", &more.address)?;
+            if !seen_addr.insert(ip) {
+                return Err(PlanError::Invalid(format!(
+                    "duplicate address {ip} on {}",
+                    net.id
+                )));
+            }
+            let ingress = canonical_rules(&more.ingress)?;
+            let egress = canonical_rules(&more.egress)?;
+            if ingress
+                .iter()
+                .chain(&egress)
+                .any(|rule| rule.cidr.contains(':') != ip.is_ipv6())
+            {
+                return Err(PlanError::Invalid(format!(
+                    "port {} address {ip} has a rule in the other family",
+                    port.id
+                )));
+            }
+            extra.push(PortAddress {
+                address: ip.to_string(),
+                ingress,
+                egress,
+            });
+        }
         ports.push(PortEndpoint {
             id: port.id.clone(),
             mac,
@@ -465,6 +510,7 @@ fn plan_ports(
             underlay: owned.to_string(),
             ingress: canonical_rules(&port.ingress)?,
             egress: canonical_rules(&port.egress)?,
+            extra,
         });
     }
     Ok(ports)
@@ -1031,7 +1077,47 @@ mod tests {
             underlay: underlay.into(),
             ingress: Vec::new(),
             egress: Vec::new(),
+            extra: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dual_stack_port_carries_its_other_address_and_rules() {
+        let mut guest = port(
+            "port-01a50318-a507-74fd-a86e-5acbda974701",
+            "52:54:00:00:00:11",
+            "10.0.0.1",
+            "10.90.0.5",
+        );
+        guest.extra = vec![PortAddress {
+            address: "2001:0db8::5".into(),
+            ingress: vec![SgRule {
+                proto: "tcp".into(),
+                port_min: 443,
+                port_max: 443,
+                cidr: "::/0".into(),
+            }],
+            egress: vec![],
+        }];
+        let nets = [network(NET_A, 1, vec![], vec![guest.clone()])];
+        let got = plan(&host("10.0.0.1"), &nets, &[]).unwrap();
+        let out = &got.networks[0].ports[0];
+        assert_eq!(out.extra.len(), 1);
+        assert_eq!(out.extra[0].address, "2001:db8::5");
+        assert_eq!(out.extra[0].ingress[0].port_min, 443);
+        let text = serde_json::to_string(&got).unwrap();
+        assert!(text.contains("\"extra\""), "{text}");
+
+        let mut wrong = guest.clone();
+        wrong.extra[0].ingress[0].cidr = "10.0.0.0/8".into();
+        let nets = [network(NET_A, 1, vec![], vec![wrong])];
+        assert!(plan(&host("10.0.0.1"), &nets, &[]).is_err());
+
+        let mut twice = guest;
+        twice.extra[0].address = "10.90.0.5".into();
+        twice.extra[0].ingress.clear();
+        let nets = [network(NET_A, 1, vec![], vec![twice])];
+        assert!(plan(&host("10.0.0.1"), &nets, &[]).is_err());
     }
 
     #[test]

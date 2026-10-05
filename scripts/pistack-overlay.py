@@ -58,7 +58,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NoReturn, Optional
 
 DEFAULT_STATE_DIR = "/var/lib/pistack/overlay"
@@ -298,6 +298,15 @@ class SgRule:
 
 
 @dataclass
+class PortAddress:
+    """Another fixed address on a port, with the rules for its family."""
+
+    address: str
+    ingress: list[SgRule]
+    egress: list[SgRule]
+
+
+@dataclass
 class Port:
     id: str
     mac: str
@@ -305,6 +314,11 @@ class Port:
     underlay: str
     ingress: list[SgRule]
     egress: list[SgRule]
+    extra: list[PortAddress] = field(default_factory=list)
+
+    def addresses(self) -> list[PortAddress]:
+        """Every address on the port, the primary first, each with its rules."""
+        return [PortAddress(self.address, self.ingress, self.egress), *self.extra]
 
 
 @dataclass
@@ -455,6 +469,15 @@ def _family_of_cidr(cidr: str) -> int:
     return ipaddress.ip_network(cidr).version
 
 
+def parse_port_address(item: object) -> PortAddress:
+    raw = require_mapping(item, "port extra address")
+    return PortAddress(
+        address=check_addr(raw.get("address"), "port extra address"),
+        ingress=parse_sg_list(raw.get("ingress", []), "extra ingress"),
+        egress=parse_sg_list(raw.get("egress", []), "extra egress"),
+    )
+
+
 def parse_port(item: object) -> Port:
     raw = require_mapping(item, "port")
     address = check_addr(raw.get("address"), "port address")
@@ -465,11 +488,18 @@ def parse_port(item: object) -> Port:
         underlay=check_ip(raw.get("underlay"), "port underlay"),
         ingress=parse_sg_list(raw.get("ingress"), "ingress"),
         egress=parse_sg_list(raw.get("egress"), "egress"),
+        extra=[parse_port_address(x) for x in require_list(raw.get("extra", []), "port extra")],
     )
-    fam = addr_version(address)
-    for rule in port.ingress + port.egress:
-        if rule.cidr is not None and _family_of_cidr(rule.cidr) != fam:
-            die("cidr family does not match port address")
+    seen: set[str] = set()
+    for entry in port.addresses():
+        key = str(ipaddress.ip_address(entry.address))
+        if key in seen:
+            die(f"port {port.id} lists address {entry.address} twice")
+        seen.add(key)
+        fam = addr_version(entry.address)
+        for rule in entry.ingress + entry.egress:
+            if rule.cidr is not None and _family_of_cidr(rule.cidr) != fam:
+                die("cidr family does not match port address")
     return port
 
 
@@ -1124,13 +1154,22 @@ def sg_match(bridge: str, address: str, direction: str, rule: Optional[SgRule]) 
     return spec
 
 
-def sg_rules_for_port(bridge: str, port: Port, comment_on: bool) -> list[tuple[str, ...]]:
+def sg_rules_for_port(bridge: str, port: Port, comment_v4: bool, comment_v6: bool) -> list[tuple[str, ...]]:
+    """Rules for every address on the port, each in its own family."""
+    specs: list[tuple[str, ...]] = []
+    for entry in port.addresses():
+        on = comment_v6 if addr_version(entry.address) == 6 else comment_v4
+        specs += sg_rules_for_address(bridge, port.id, entry, on)
+    return specs
+
+
+def sg_rules_for_address(bridge: str, port_id: str, port: PortAddress, comment_on: bool) -> list[tuple[str, ...]]:
     """Accept listed flows. A non-empty direction ends in DROP for the rest.
 
     ESTABLISHED,RELATED is accepted first so the ingress DROP does not cut
     replies to flows the guest opened.
     """
-    comment = f"{COMMENT_PREFIX}{port.id}" if comment_on else None
+    comment = f"{COMMENT_PREFIX}{port_id}" if comment_on else None
     host = host_cidr(port.address)
     specs: list[tuple[str, ...]] = []
     if port.ingress:
@@ -1199,7 +1238,7 @@ def local_underlay(underlay: str, host: str, local: str) -> bool:
 def plan_uses_v6(plan: Plan) -> bool:
     for net in plan.networks:
         for port in net.ports:
-            if addr_version(port.address) == 6:
+            if any(addr_version(entry.address) == 6 for entry in port.addresses()):
                 return True
         for entry in net.floating:
             if addr_version(entry.floating) == 6:
@@ -1248,8 +1287,7 @@ def build_desired(plan: Plan, comment_v4: bool, comment_v6: bool) -> Desired:
                 if not local_underlay(port.underlay, plan.host, net.local):
                     add_fdb(net.vxlan, port.mac, port.underlay)
         for port in net.ports:
-            comment_on = comment_v6 if addr_version(port.address) == 6 else comment_v4
-            for spec in sg_rules_for_port(net.bridge, port, comment_on):
+            for spec in sg_rules_for_port(net.bridge, port, comment_v4, comment_v6):
                 rules.append(("", "filter", SG_CHAIN, spec))
         if net.metadata and net.bridge not in seen_meta:
             seen_meta.add(net.bridge)
@@ -2258,6 +2296,13 @@ def sample_plan(with_peer: bool) -> dict:
         "underlay": "10.0.0.1",
         "ingress": [],
         "egress": [],
+        "extra": [
+            {
+                "address": "2001:db8::3",
+                "ingress": [{"proto": "tcp", "port_min": 443, "port_max": 443, "cidr": "2001:db8::/64"}],
+                "egress": [],
+            }
+        ],
     }
     v6_port = {
         "id": "port-v6",
@@ -2354,6 +2399,12 @@ def _check_refusals() -> None:
     bad_cidr = json.loads(json.dumps(base))
     bad_cidr["networks"][0]["ports"][0]["ingress"][0]["cidr"] = "not-a-cidr"
     _refuses(lambda: parse_plan(bad_cidr), "bad cidr")
+    bad_extra = json.loads(json.dumps(base))
+    bad_extra["networks"][0]["ports"][1]["extra"][0]["ingress"][0]["cidr"] = "10.0.0.0/8"
+    _refuses(lambda: parse_plan(bad_extra), "extra address rule in the wrong family")
+    dup_extra = json.loads(json.dumps(base))
+    dup_extra["networks"][0]["ports"][1]["extra"][0]["address"] = "10.90.0.3"
+    _refuses(lambda: parse_plan(dup_extra), "extra address repeats the primary")
     bad_phys = json.loads(json.dumps(base))
     bad_phys["networks"][0]["provider"] = {
         "physnet": "pi0123456789ab",
@@ -2582,6 +2633,14 @@ def _check_log(first: list[list[str]], second: list[list[str]]) -> None:
     v6 = [argv for argv in entries if any(tok == "ip6tables" or tok.endswith("/ip6tables") for tok in argv)]
     _assert(v6, "ipv6 rules use ip6tables")
     _assert(any("2001:db8::10/128" in argv for argv in v6), "v6 host prefix")
+    _assert(
+        any("2001:db8::3/128" in argv and "443" in argv for argv in v6),
+        "extra v6 address on a dual-stack port gets its own rules",
+    )
+    _assert(
+        any("2001:db8::3/128" in argv and "DROP" in argv for argv in v6),
+        "extra v6 address drops what its rules do not allow",
+    )
     _assert(any("ipv6-icmp" in argv for argv in v6), "v6 icmp")
     _assert(
         not any("--dport" in argv and "ipv6-icmp" in argv for argv in v6),
