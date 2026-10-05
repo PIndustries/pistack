@@ -286,7 +286,7 @@ async fn missing_caller_is_unauthorized() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (events, _rx) = tokio::sync::broadcast::channel(16);
     let store = Store::open(dir.path().join("state.redb"), events).expect("open store");
-    let app = http::router(Client::new(store, &dir.path().join("silo")));
+    let app = http::router(Client::new(store, dir.path().join("silo")));
     let (status, body, _) = call(&app, "GET", "/buckets", None, "application/json", None).await;
     let err: Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{err}");

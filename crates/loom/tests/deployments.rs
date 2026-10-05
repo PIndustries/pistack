@@ -67,15 +67,12 @@ async fn harness() -> Harness {
     // Pod machines join the network named "default" and need a project
     // before a port can be allocated.
     let project = Id::new(kind::PROJECT);
-    fabric::Client::new(
-        store.clone(),
-        Arc::new(fabric::MockBackend::new()),
-    )
-    .create_network(
-        Meta::new(kind::NETWORK, "default", None),
-        fabric::NetworkSpec::default(),
-    )
-    .unwrap();
+    fabric::Client::new(store.clone(), Arc::new(fabric::MockBackend::new()))
+        .create_network(
+            Meta::new(kind::NETWORK, "default", None),
+            fabric::NetworkSpec::default(),
+        )
+        .unwrap();
     let caller = Caller {
         principal: Id::new(kind::PRINCIPAL),
         principal_name: "loom-test".into(),

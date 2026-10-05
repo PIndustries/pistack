@@ -1123,7 +1123,8 @@ impl Client {
         network: &str,
         device: Id,
     ) -> ApiResult<Port> {
-        self.create_port_for_device_with(project, network, device, &[]).await
+        self.create_port_for_device_with(project, network, device, &[])
+            .await
     }
 
     /// Like [`Self::create_port_for_device`]. `groups` replaces the default

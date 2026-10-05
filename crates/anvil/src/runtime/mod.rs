@@ -28,8 +28,8 @@ pub use youki::YoukiRuntime;
 /// The request/result shapes are the wire types from `pistack-rpc`, so a
 /// `Command` payload deserialises straight into what a runtime executes.
 pub use pistack_rpc::proto::{
-    MachineKind, MachineRef, MachineRequest, NicAttachment, PowerState, RunningMachine, VolumeAttach,
-    VolumeDetach,
+    MachineKind, MachineRef, MachineRequest, NicAttachment, PowerState, RunningMachine,
+    VolumeAttach, VolumeDetach,
 };
 
 /// One per machine kind the host supports. Same semantics as

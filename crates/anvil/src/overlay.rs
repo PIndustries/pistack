@@ -53,7 +53,9 @@ pub async fn apply_plan(plan: &serde_json::Value) -> ApiResult<()> {
                 format!("overlay helper failed: {msg}")
             }))
         }
-        Ok(Err(e)) => Err(ApiError::unavailable(format!("overlay helper did not run: {e}"))),
+        Ok(Err(e)) => Err(ApiError::unavailable(format!(
+            "overlay helper did not run: {e}"
+        ))),
         Err(_) => Err(ApiError::unavailable("overlay helper timed out")),
     }
 }

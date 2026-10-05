@@ -167,7 +167,8 @@ async fn run(
         };
         let fresh = sessions.get(&peer).map(|session| session.dest) != Some(dest);
         if fresh {
-            let Some(session) = open_session(bind_ip, dest, peer, listen.clone(), cancel.clone()).await
+            let Some(session) =
+                open_session(bind_ip, dest, peer, listen.clone(), cancel.clone()).await
             else {
                 continue;
             };

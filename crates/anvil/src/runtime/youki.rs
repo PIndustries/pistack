@@ -81,8 +81,8 @@ impl MachineRuntime for YoukiRuntime {
                 let _ = exec_youki(&bin, &["delete", &id_str]).await;
                 return Err(e);
             }
-        } else if let Err(e) = exec_youki(&bin, &["start", &id_str]).await {
-            return Err(e);
+        } else {
+            exec_youki(&bin, &["start", &id_str]).await?;
         }
         let addresses = nic_addresses(req);
         write_state(
@@ -467,7 +467,9 @@ fn oci_config(
 
 fn process_spec(launch: Option<&Launch>, cfg: &ImageConfig) -> (Vec<String>, Vec<String>, String) {
     let (cmd, args) = match launch {
-        Some(l) if !l.command.is_empty() && !l.args.is_empty() => (l.command.clone(), l.args.clone()),
+        Some(l) if !l.command.is_empty() && !l.args.is_empty() => {
+            (l.command.clone(), l.args.clone())
+        }
         Some(l) if !l.command.is_empty() => (l.command.clone(), Vec::new()),
         Some(l) if !l.args.is_empty() => (cfg.entrypoint.clone(), l.args.clone()),
         _ => (cfg.entrypoint.clone(), cfg.cmd.clone()),
@@ -525,9 +527,11 @@ async fn write_bundle(bundle: &Path, req: &MachineRequest) -> ApiResult<()> {
         req.name.clone()
     };
     let bundle = bundle.to_path_buf();
-    tokio::task::spawn_blocking(move || install_bundle(&bundle, &image, &hostname, &limits, launch.as_ref()))
-        .await
-        .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
+    tokio::task::spawn_blocking(move || {
+        install_bundle(&bundle, &image, &hostname, &limits, launch.as_ref())
+    })
+    .await
+    .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
 }
 
 fn install_bundle(
@@ -544,7 +548,9 @@ fn install_bundle(
     reset_dir(&rootfs)?;
     let cfg = unpack_image(image, &rootfs)?;
     if rootfs_empty(&rootfs) {
-        return Err(ApiError::unavailable("youki runtime: image rootfs is empty"));
+        return Err(ApiError::unavailable(
+            "youki runtime: image rootfs is empty",
+        ));
     }
     let image_note = bundle.join("image");
     if std::fs::symlink_metadata(&image_note).is_ok() {
@@ -553,9 +559,8 @@ fn install_bundle(
     let (args, env, cwd) = process_spec(launch, &cfg);
     let text = serde_json::to_vec_pretty(&oci_config(hostname, limits, &args, &env, &cwd))
         .map_err(|e| ApiError::internal(format!("youki runtime: encoding config: {e}")))?;
-    std::fs::write(bundle.join("config.json"), text).map_err(|e| {
-        ApiError::unavailable(format!("youki runtime: writing config.json: {e}"))
-    })
+    std::fs::write(bundle.join("config.json"), text)
+        .map_err(|e| ApiError::unavailable(format!("youki runtime: writing config.json: {e}")))
 }
 
 fn rootfs_empty(rootfs: &Path) -> bool {
@@ -660,9 +665,8 @@ fn decompress_to_tar(src: &Path) -> ApiResult<OwnedTar> {
 }
 
 fn gunzip(src: &Path, dst: &Path) -> ApiResult<()> {
-    let out = std::fs::File::create(dst).map_err(|_| {
-        ApiError::unavailable("youki runtime: gzip is not available")
-    })?;
+    let out = std::fs::File::create(dst)
+        .map_err(|_| ApiError::unavailable("youki runtime: gzip is not available"))?;
     match std::process::Command::new("gzip")
         .arg("-dc")
         .arg(src)
@@ -670,7 +674,9 @@ fn gunzip(src: &Path, dst: &Path) -> ApiResult<()> {
         .stderr(Stdio::null())
         .status()
     {
-        Err(_) => Err(ApiError::unavailable("youki runtime: gzip is not available")),
+        Err(_) => Err(ApiError::unavailable(
+            "youki runtime: gzip is not available",
+        )),
         Ok(status) if status.success() => Ok(()),
         Ok(_) => Err(cannot_unpack()),
     }
@@ -702,7 +708,10 @@ fn docker_manifest(staging: &Path) -> bool {
 fn apply_docker(staging: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
     let bytes = std::fs::read(staging.join("manifest.json")).map_err(|_| cannot_unpack())?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| cannot_unpack())?;
-    let entry = value.as_array().and_then(|a| a.first()).ok_or_else(cannot_unpack)?;
+    let entry = value
+        .as_array()
+        .and_then(|a| a.first())
+        .ok_or_else(cannot_unpack)?;
     let cfg = match entry.get("Config").and_then(|v| v.as_str()) {
         Some(path) => read_config_file(&staging.join(safe_rel(path)?))?,
         None => ImageConfig::default(),
@@ -730,7 +739,11 @@ fn apply_oci(layout: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
         .and_then(|d| d.as_str())
         .ok_or_else(cannot_unpack)?;
     let manifest = read_json(&blob_file(layout, digest)?)?;
-    let cfg = match manifest.get("config").and_then(|c| c.get("digest")).and_then(|d| d.as_str()) {
+    let cfg = match manifest
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+    {
         Some(digest) => read_config_file(&blob_file(layout, digest)?)?,
         None => ImageConfig::default(),
     };
@@ -750,7 +763,10 @@ fn apply_oci(layout: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
                 "youki runtime: image layer compression is not available",
             ));
         }
-        let digest = layer.get("digest").and_then(|d| d.as_str()).ok_or_else(cannot_unpack)?;
+        let digest = layer
+            .get("digest")
+            .and_then(|d| d.as_str())
+            .ok_or_else(cannot_unpack)?;
         apply_layer(&blob_file(layout, digest)?, rootfs, &mut budget)?;
     }
     Ok(cfg)
@@ -825,9 +841,18 @@ fn extract_tar(path: &Path, dest: &Path, whiteouts: bool) -> ApiResult<()> {
     extract_tar_budget(path, dest, whiteouts, &mut budget)
 }
 
-fn extract_tar_budget(path: &Path, dest: &Path, whiteouts: bool, budget: &mut u64) -> ApiResult<()> {
+fn extract_tar_budget(
+    path: &Path,
+    dest: &Path,
+    whiteouts: bool,
+    budget: &mut u64,
+) -> ApiResult<()> {
     let file = std::fs::File::open(path).map_err(|_| cannot_unpack())?;
-    let mut tar = TarReader { inner: file, pending_name: None, pending_link: None };
+    let mut tar = TarReader {
+        inner: file,
+        pending_name: None,
+        pending_link: None,
+    };
     loop {
         let Some(ent) = tar.next_entry()? else { break };
         let rel = match rel_under(&ent.name) {
@@ -1082,7 +1107,12 @@ impl<R: Read> TarReader<R> {
             if let Some(over) = self.pending_link.take() {
                 link = over;
             }
-            return Ok(Some(TarEntry { name, link, size, flag }));
+            return Ok(Some(TarEntry {
+                name,
+                link,
+                size,
+                flag,
+            }));
         }
     }
 
@@ -1097,7 +1127,9 @@ impl<R: Read> TarReader<R> {
             return Err(cannot_unpack());
         }
         let mut buf = vec![0u8; size as usize];
-        self.inner.read_exact(&mut buf).map_err(|_| cannot_unpack())?;
+        self.inner
+            .read_exact(&mut buf)
+            .map_err(|_| cannot_unpack())?;
         self.skip_pad(size)?;
         Ok(buf)
     }
@@ -1111,7 +1143,9 @@ impl<R: Read> TarReader<R> {
         let mut buf = [0u8; 8192];
         while left > 0 {
             let n = left.min(buf.len() as u64) as usize;
-            self.inner.read_exact(&mut buf[..n]).map_err(|_| cannot_unpack())?;
+            self.inner
+                .read_exact(&mut buf[..n])
+                .map_err(|_| cannot_unpack())?;
             out.write_all(&buf[..n]).map_err(|_| cannot_unpack())?;
             left -= n as u64;
         }
@@ -1123,7 +1157,9 @@ impl<R: Read> TarReader<R> {
         let mut buf = [0u8; 8192];
         while left > 0 {
             let n = left.min(buf.len() as u64) as usize;
-            self.inner.read_exact(&mut buf[..n]).map_err(|_| cannot_unpack())?;
+            self.inner
+                .read_exact(&mut buf[..n])
+                .map_err(|_| cannot_unpack())?;
             left -= n as u64;
         }
         self.skip_pad(size)
@@ -1135,7 +1171,9 @@ impl<R: Read> TarReader<R> {
             return Ok(());
         }
         let mut buf = vec![0u8; pad];
-        self.inner.read_exact(&mut buf).map_err(|_| cannot_unpack())?;
+        self.inner
+            .read_exact(&mut buf)
+            .map_err(|_| cannot_unpack())?;
         Ok(())
     }
 }
@@ -1153,7 +1191,9 @@ fn tar_name(header: &[u8]) -> String {
 
 fn cstr(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).trim_end_matches(' ').to_owned()
+    String::from_utf8_lossy(&bytes[..end])
+        .trim_end_matches(' ')
+        .to_owned()
 }
 
 fn checksum_ok(header: &[u8]) -> bool {
@@ -1204,7 +1244,10 @@ fn parse_pax(data: &[u8]) -> (Option<String>, Option<String>) {
         let Some(sp) = rest.iter().position(|b| *b == b' ') else {
             break;
         };
-        let Ok(len) = std::str::from_utf8(&rest[..sp]).unwrap_or("").parse::<usize>() else {
+        let Ok(len) = std::str::from_utf8(&rest[..sp])
+            .unwrap_or("")
+            .parse::<usize>()
+        else {
             break;
         };
         if len <= sp || i + len > data.len() {
@@ -1541,9 +1584,9 @@ mod tests {
             buf.extend_from_slice(&tar_header(name, data.len() as u64, b'0'));
             buf.extend_from_slice(data);
             let pad = (512 - (data.len() % 512)) % 512;
-            buf.extend(std::iter::repeat(0u8).take(pad));
+            buf.extend(std::iter::repeat_n(0u8, pad));
         }
-        buf.extend(std::iter::repeat(0u8).take(1024));
+        buf.extend(std::iter::repeat_n(0u8, 1024));
         buf
     }
 
@@ -1602,7 +1645,10 @@ mod tests {
             command: vec!["/cmd".into()],
             ..Launch::default()
         };
-        assert_eq!(process_spec(Some(&cmd_only), &cfg).0, vec!["/cmd".to_string()]);
+        assert_eq!(
+            process_spec(Some(&cmd_only), &cfg).0,
+            vec!["/cmd".to_string()]
+        );
         let args_only = Launch {
             args: vec!["--only".into()],
             ..Launch::default()
@@ -1766,8 +1812,16 @@ mod tests {
         let err = rt.start(&empty_req).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
         assert!(err.message.contains("image rootfs is empty"), "{err}");
-        assert!(!state.join(empty_req.id.to_string()).join("state.json").exists());
-        assert!(rt.list().await.unwrap().iter().all(|m| m.id != empty_req.id));
+        assert!(!state
+            .join(empty_req.id.to_string())
+            .join("state.json")
+            .exists());
+        assert!(rt
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.id != empty_req.id));
 
         let link = tmp.join("link-rootfs");
         std::os::unix::fs::symlink(&external, &link).unwrap();
@@ -1796,14 +1850,18 @@ mod tests {
         rt.start(&tar_req).await.unwrap();
         let tar_bundle = state.join(tar_req.id.to_string());
         let tar_cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(tar_bundle.join("config.json")).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(tar_bundle.join("config.json")).unwrap())
+                .unwrap();
         assert_eq!(
             tar_cfg["process"]["args"],
             serde_json::json!(["/bin/app", "serve"])
         );
         assert_eq!(tar_cfg["process"]["cwd"], "/app");
         let tar_root = tar_bundle.join("rootfs");
-        assert_eq!(std::fs::read_to_string(tar_root.join("keep")).unwrap(), "yes");
+        assert_eq!(
+            std::fs::read_to_string(tar_root.join("keep")).unwrap(),
+            "yes"
+        );
         assert!(!tar_root.join("gone").exists());
         assert!(!tar_root.join("sub").join("old").exists());
         assert_eq!(
@@ -1888,7 +1946,11 @@ mod tests {
         let layout = tmp.join("oci");
         let blobs = layout.join("blobs").join("sha256");
         std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::write(layout.join("oci-layout"), b"{\"imageLayoutVersion\":\"1.0.0\"}").unwrap();
+        std::fs::write(
+            layout.join("oci-layout"),
+            b"{\"imageLayoutVersion\":\"1.0.0\"}",
+        )
+        .unwrap();
         std::fs::write(
             layout.join("index.json"),
             format!(r#"{{"manifests":[{{"digest":"sha256:{manifest}"}}]}}"#),
@@ -1925,7 +1987,10 @@ mod tests {
         assert_eq!(cfg.entrypoint, vec!["/bin/app".to_string()]);
         assert_eq!(cfg.cmd, vec!["serve".to_string()]);
         assert_eq!(cfg.working_dir, "/app");
-        assert_eq!(std::fs::read_to_string(docker_root.join("keep")).unwrap(), "yes");
+        assert_eq!(
+            std::fs::read_to_string(docker_root.join("keep")).unwrap(),
+            "yes"
+        );
         assert!(!docker_root.join("gone").exists());
         assert!(!docker_root.join("sub").join("old").exists());
         assert_eq!(
@@ -1945,7 +2010,8 @@ mod tests {
         std::fs::write(tmp.join("zstd.bin"), [0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0]).unwrap();
         let err = unpack_image(&tmp.join("zstd.bin"), &slip_root).unwrap_err();
         assert!(
-            err.message.contains("image layer compression is not available"),
+            err.message
+                .contains("image layer compression is not available"),
             "{err}"
         );
 
@@ -1965,8 +2031,14 @@ mod tests {
         let copied = tmp.join("copied");
         std::fs::create_dir(&copied).unwrap();
         unpack_image(&src, &copied).unwrap();
-        assert_eq!(std::fs::read_to_string(copied.join("marker")).unwrap(), "keep");
-        assert!(std::fs::symlink_metadata(copied.join("abs")).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(copied.join("marker")).unwrap(),
+            "keep"
+        );
+        assert!(std::fs::symlink_metadata(copied.join("abs"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_link(copied.join("abs")).unwrap(), outside);
         assert_ne!(
             std::fs::read_to_string(copied.join("marker")).unwrap(),

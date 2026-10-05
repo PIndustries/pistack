@@ -87,9 +87,7 @@ fn existing_root(store: &Store) -> ApiResult<keep::RootKey> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|_| ApiError::unavailable(NO_CERT))?;
-    let bytes: [u8; 32] = raw
-        .try_into()
-        .map_err(|_| ApiError::unavailable(NO_CERT))?;
+    let bytes: [u8; 32] = raw.try_into().map_err(|_| ApiError::unavailable(NO_CERT))?;
     Ok(keep::RootKey::from_bytes(bytes))
 }
 

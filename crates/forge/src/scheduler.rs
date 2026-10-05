@@ -465,7 +465,7 @@ mod tests {
         let err = place_on_segment(
             &spec(MachineKind::Vm),
             &SIZE,
-            &[h.clone()],
+            std::slice::from_ref(&h),
             &Allocations::new(),
             Strategy::Spread,
         )
