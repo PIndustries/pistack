@@ -608,8 +608,10 @@ mod tests {
         let client = Client::new(store, gate.clone());
         client.ensure_default_template().unwrap();
         let project = Id::new(kind::PROJECT);
-        let mut ext = NetworkSpec::default();
-        ext.external = true;
+        let ext = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let net = client
             .create_network(
                 Meta::new(kind::NETWORK, "fleet", Some(project.clone())),

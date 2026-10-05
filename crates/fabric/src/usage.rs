@@ -139,8 +139,10 @@ mod tests {
     }
 
     fn external(client: &Client, project: &Id) -> Id {
-        let mut spec = NetworkSpec::default();
-        spec.external = true;
+        let spec = NetworkSpec {
+            external: true,
+            ..Default::default()
+        };
         let net = client
             .create_network(
                 Meta::new(kind::NETWORK, "public", Some(project.clone())),
