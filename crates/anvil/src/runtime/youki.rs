@@ -3,21 +3,23 @@
 
 //! youki (OCI) container runtime.
 //!
-//! One bundle per machine under `$PISTACK_YOUKI_STATE` (default
-//! `/var/lib/pistack/youki`): `config.json`, a `rootfs`, and a `state.json`
-//! this runtime writes after a successful start. The binary is
-//! `$PISTACK_YOUKI_BIN` when that is set, otherwise `youki` on `PATH`.
-//! A pod image that exists as a mold blob or an OCI directory is unpacked
-//! into `rootfs`. The sandbox command is the process recorded in
-//! `config.json`. `user_data` and ssh keys are not logged and are not
-//! placed on the youki argv. A missing youki binary, an image that cannot
-//! be unpacked, or an empty rootfs is unavailable and is not recorded as
-//! running.
+//! One directory per machine under `$PISTACK_YOUKI_STATE` (default
+//! `/var/lib/pistack/youki`). A pod is a sandbox bundle plus one bundle per
+//! container, in spec order. The sandbox holds the pid, network, ipc and uts
+//! namespaces; each container joins those and keeps its own mount namespace
+//! so it has its own rootfs. `config.json` is the OCI spec, `rootfs` is the
+//! unpacked image or the sandbox pause program, and `state.json` is written
+//! after a successful start. The binary is `$PISTACK_YOUKI_BIN` when that is
+//! set, otherwise `youki` on `PATH`. `user_data` and ssh keys are not logged
+//! and are not placed on the youki argv. A missing youki binary, an image
+//! that cannot be unpacked, or an empty rootfs is unavailable and is not
+//! recorded as running.
 
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
 use pistack_types::{kind, ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -39,6 +41,10 @@ struct Saved {
     addresses: Vec<String>,
     #[serde(default)]
     power: PowerState,
+    /// youki ids of the pod's containers, in spec order. Empty for a
+    /// machine that is not a pod sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    containers: Vec<String>,
 }
 
 #[async_trait]
@@ -65,6 +71,9 @@ impl MachineRuntime for YoukiRuntime {
             }
         }
         // user_data and ssh_keys are not written, logged, or passed to youki.
+        if let Some(plan) = sandbox_plan(req)? {
+            return start_pod(&bin, &bundle, req, &plan, prior.is_some()).await;
+        }
         if let Err(e) = write_bundle(&bundle, req).await {
             if prior.is_none() {
                 let _ = remove_bundle(&bundle).await;
@@ -91,6 +100,7 @@ impl MachineRuntime for YoukiRuntime {
                 id: id_str,
                 addresses: addresses.clone(),
                 power: PowerState::On,
+                containers: Vec::new(),
             },
         )
         .await?;
@@ -113,7 +123,12 @@ impl MachineRuntime for YoukiRuntime {
         if saved.power == PowerState::Off {
             return Ok(());
         }
-        exec_youki(&bin, &["kill", &id.to_string(), "SIGTERM"]).await?;
+        // Containers first, then the sandbox that owns their namespaces.
+        let mut order: Vec<String> = saved.containers.iter().rev().cloned().collect();
+        order.push(id.to_string());
+        for cid in &order {
+            exec_youki(&bin, &["kill", cid, "SIGTERM"]).await?;
+        }
         saved.power = PowerState::Off;
         write_state(&bundle, &saved).await
     }
@@ -125,16 +140,83 @@ impl MachineRuntime for YoukiRuntime {
         if !bundle.exists() {
             return Ok(());
         }
-        let had_state = read_state(&bundle).await?.is_some();
-        if let Err(e) = exec_youki(&bin, &["delete", &id.to_string()]).await {
-            // A bundle with no state was never created in youki. A container
-            // youki has already forgotten is gone too. Anything else stays on
-            // disk so a later delete can retry.
-            if had_state && !container_missing(&e) {
-                return Err(e);
+        let saved = read_state(&bundle).await?;
+        let had_state = saved.is_some();
+        let mut order: Vec<String> = saved
+            .map(|s| s.containers)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .collect();
+        order.push(id.to_string());
+        for cid in &order {
+            if let Err(e) = exec_youki(&bin, &["delete", cid]).await {
+                // A bundle with no state was never created in youki. A container
+                // youki has already forgotten is gone too. Anything else stays on
+                // disk so a later delete can retry.
+                if had_state && !container_missing(&e) {
+                    return Err(e);
+                }
             }
         }
         remove_bundle(&bundle).await
+    }
+
+    async fn attach_volume(&self, req: &super::VolumeAttach) -> ApiResult<String> {
+        let _guard = lock().lock().await;
+        let bundle = bundle_dir(&req.machine)?;
+        if !bundle.join("config.json").exists() && read_state(&bundle).await?.is_none() {
+            return Err(ApiError::not_found(format!(
+                "youki runtime: machine {} is not on this host",
+                req.machine
+            )));
+        }
+        host_path_ok(&req.path)?;
+        let mut disks = read_disks(&bundle)?;
+        let vol = req.volume.to_string();
+        let device = if let Some(name) = req.device.as_deref() {
+            check_device_name(name)?;
+            name.to_owned()
+        } else if let Some(existing) = disks.iter().find(|d| d.volume == vol) {
+            existing.device.clone()
+        } else {
+            next_device(&disks)?
+        };
+        if let Some(slot) = disks.iter_mut().find(|d| d.volume == vol) {
+            slot.path = req.path.clone();
+            slot.device = device.clone();
+            slot.read_only = req.read_only;
+        } else {
+            disks.push(AttachedDisk {
+                volume: vol,
+                path: req.path.clone(),
+                device: device.clone(),
+                read_only: req.read_only,
+            });
+        }
+        write_disks(&bundle, &disks)?;
+        refresh_disk_mounts(&bundle)?;
+        Ok(device)
+    }
+
+    async fn detach_volume(&self, req: &super::VolumeDetach) -> ApiResult<()> {
+        let _guard = lock().lock().await;
+        let bundle = bundle_dir(&req.machine)?;
+        if !bundle.join("config.json").exists() && read_state(&bundle).await?.is_none() {
+            return Err(ApiError::not_found(format!(
+                "youki runtime: machine {} is not on this host",
+                req.machine
+            )));
+        }
+        let vol = req.volume.to_string();
+        let mut disks = read_disks(&bundle)?;
+        let before = disks.len();
+        disks.retain(|d| d.volume != vol);
+        if disks.len() != before {
+            write_disks(&bundle, &disks)?;
+            refresh_disk_mounts(&bundle)?;
+        }
+        Ok(())
     }
 
     async fn list(&self) -> ApiResult<Vec<RunningMachine>> {
@@ -260,16 +342,24 @@ struct ImageConfig {
     working_dir: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SandboxDoc {
     #[serde(default)]
     kind: String,
     #[serde(default)]
     containers: Vec<SandboxContainer>,
+    #[serde(default)]
+    volumes: Vec<SandboxVolume>,
+    #[serde(default)]
+    config_maps: BTreeMap<String, Projected>,
+    #[serde(default)]
+    secrets: BTreeMap<String, Projected>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct SandboxContainer {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     image: String,
     #[serde(default)]
@@ -280,9 +370,11 @@ struct SandboxContainer {
     env: Vec<SandboxEnv>,
     #[serde(default)]
     working_dir: String,
+    #[serde(default)]
+    volume_mounts: Vec<SandboxMount>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct SandboxEnv {
     #[serde(default)]
     name: String,
@@ -292,6 +384,87 @@ struct SandboxEnv {
     value_from: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SandboxMount {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mount_path: String,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    sub_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SandboxVolume {
+    name: String,
+    source: VolumeSrc,
+}
+
+/// Same JSON shape as loom's volume source: `"empty_dir"`,
+/// `{"config_map":"<name>"}`, `{"secret":"<name>"}`, `{"volume":"<id>"}`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum VolumeSrc {
+    EmptyDir,
+    Secret(String),
+    ConfigMap(String),
+    Volume(String),
+}
+
+/// File bodies carried on the sandbox document. `binary_data` is base64.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct Projected {
+    #[serde(default)]
+    data: BTreeMap<String, String>,
+    #[serde(default)]
+    binary_data: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct PodPlan {
+    containers: Vec<SandboxContainer>,
+    volumes: Vec<SandboxVolume>,
+    config_maps: BTreeMap<String, Projected>,
+    secrets: BTreeMap<String, Projected>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AttachedDisk {
+    volume: String,
+    path: String,
+    device: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+struct PreparedVolume {
+    host_path: PathBuf,
+    directory: bool,
+    force_read_only: bool,
+}
+
+struct OciBind {
+    destination: String,
+    source: String,
+    read_only: bool,
+    directory: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct MountPlan {
+    volumes: Vec<SandboxVolume>,
+    containers: Vec<PlannedMounts>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PlannedMounts {
+    index: usize,
+    mounts: Vec<SandboxMount>,
+}
+
+#[derive(Clone, Copy)]
 struct Limits {
     vcpus: u32,
     memory_mib: u64,
@@ -304,18 +477,13 @@ fn cannot_unpack() -> ApiError {
 /// Pod sandbox JSON is the only `user_data` this runtime reads. Anything
 /// else, including a raw secret, is ignored and never written down.
 fn launch_from(req: &MachineRequest) -> Option<Launch> {
-    let raw = req.user_data.as_deref()?;
-    let doc: SandboxDoc = serde_json::from_str(raw).ok()?;
-    if doc.kind != "PodSandbox" {
-        return None;
-    }
-    let c = doc.containers.into_iter().next().unwrap_or_default();
-    let env = c
-        .env
-        .into_iter()
-        .filter(|e| e.value_from.is_none() && !e.name.is_empty())
-        .map(|e| (e.name, e.value))
-        .collect();
+    let plan = sandbox_plan(req).ok()??;
+    let env = plan
+        .containers
+        .first()
+        .map(|c| resolve_env_pairs(&c.env, &plan.config_maps, &plan.secrets))
+        .unwrap_or_default();
+    let c = plan.containers.into_iter().next().unwrap_or_default();
     Some(Launch {
         image: c.image,
         command: c.command,
@@ -323,6 +491,33 @@ fn launch_from(req: &MachineRequest) -> Option<Launch> {
         env,
         cwd: c.working_dir,
     })
+}
+
+fn sandbox_plan(req: &MachineRequest) -> ApiResult<Option<PodPlan>> {
+    let Some(raw) = req.user_data.as_deref() else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if value.get("kind").and_then(|k| k.as_str()) != Some("PodSandbox") {
+        return Ok(None);
+    }
+    let doc: SandboxDoc = serde_json::from_value(value)
+        .map_err(|_| ApiError::unavailable("youki runtime: sandbox document is invalid"))?;
+    if doc.kind != "PodSandbox" {
+        return Ok(None);
+    }
+    Ok(Some(PodPlan {
+        containers: doc.containers,
+        volumes: doc.volumes,
+        config_maps: doc.config_maps,
+        secrets: doc.secrets,
+    }))
 }
 
 fn choose_image(req: &MachineRequest, launch: Option<&Launch>) -> ApiResult<PathBuf> {
@@ -401,22 +596,39 @@ fn has_parent_dir(path: &Path) -> bool {
         || path.to_string_lossy().split('/').any(|p| p == "..")
 }
 
+fn sandbox_namespaces() -> Vec<serde_json::Value> {
+    ["pid", "network", "ipc", "uts", "mount"]
+        .into_iter()
+        .map(|kind| serde_json::json!({ "type": kind }))
+        .collect()
+}
+
+fn container_namespaces(pid: u32) -> Vec<serde_json::Value> {
+    let join = |kind: &str, name: &str| {
+        serde_json::json!({
+            "type": kind,
+            "path": format!("/proc/{pid}/ns/{name}"),
+        })
+    };
+    vec![
+        join("pid", "pid"),
+        join("network", "net"),
+        join("ipc", "ipc"),
+        join("uts", "uts"),
+        serde_json::json!({ "type": "mount" }),
+    ]
+}
+
 fn oci_config(
-    hostname: &str,
+    hostname: Option<&str>,
     limits: &Limits,
     args: &[String],
     env: &[String],
     cwd: &str,
+    namespaces: &[serde_json::Value],
+    binds: &[OciBind],
 ) -> serde_json::Value {
-    let mut linux = serde_json::json!({
-        "namespaces": [
-            {"type": "pid"},
-            {"type": "network"},
-            {"type": "ipc"},
-            {"type": "uts"},
-            {"type": "mount"}
-        ]
-    });
+    let mut linux = serde_json::json!({ "namespaces": namespaces });
     let mut resources = serde_json::Map::new();
     if limits.memory_mib > 0 {
         let bytes = limits.memory_mib.saturating_mul(1024 * 1024);
@@ -433,9 +645,12 @@ fn oci_config(
     if !resources.is_empty() {
         linux["resources"] = serde_json::Value::Object(resources);
     }
-    serde_json::json!({
+    let mut mounts = default_mounts();
+    for bind in binds {
+        mounts.push(bind_mount(bind));
+    }
+    let mut spec = serde_json::json!({
         "ociVersion": "1.0.2",
-        "hostname": hostname,
         "process": {
             "terminal": false,
             "user": {"uid": 0, "gid": 0},
@@ -444,22 +659,41 @@ fn oci_config(
             "cwd": cwd
         },
         "root": {"path": "rootfs", "readonly": false},
-        "mounts": [
-            {"destination": "/proc", "type": "proc", "source": "proc"},
-            {
-                "destination": "/dev",
-                "type": "tmpfs",
-                "source": "tmpfs",
-                "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
-            },
-            {
-                "destination": "/sys",
-                "type": "sysfs",
-                "source": "sysfs",
-                "options": ["nosuid", "noexec", "nodev", "ro"]
-            }
-        ],
+        "mounts": mounts,
         "linux": linux
+    });
+    if let Some(host) = hostname {
+        spec["hostname"] = serde_json::Value::String(host.to_owned());
+    }
+    spec
+}
+
+fn default_mounts() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"destination": "/proc", "type": "proc", "source": "proc"}),
+        serde_json::json!({
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+        }),
+        serde_json::json!({
+            "destination": "/sys",
+            "type": "sysfs",
+            "source": "sysfs",
+            "options": ["nosuid", "noexec", "nodev", "ro"]
+        }),
+    ]
+}
+
+fn bind_mount(bind: &OciBind) -> serde_json::Value {
+    let kind = if bind.directory { "rbind" } else { "bind" };
+    let flag = if bind.read_only { "ro" } else { "rw" };
+    serde_json::json!({
+        "destination": bind.destination,
+        "type": "bind",
+        "source": bind.source,
+        "options": [kind, "rprivate", flag],
     })
 }
 
@@ -478,10 +712,7 @@ fn process_spec(launch: Option<&Launch>, cfg: &ImageConfig) -> (Vec<String>, Vec
         proc.push("/bin/sh".into());
     }
     let mut env_map = std::collections::BTreeMap::new();
-    env_map.insert(
-        "PATH".into(),
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-    );
+    env_map.insert("PATH".into(), DEFAULT_PATH.into());
     for entry in &cfg.env {
         if let Some((k, v)) = entry.split_once('=') {
             if !k.is_empty() {
@@ -555,8 +786,16 @@ fn install_bundle(
         let _ = std::fs::remove_file(&image_note);
     }
     let (args, env, cwd) = process_spec(launch, &cfg);
-    let text = serde_json::to_vec_pretty(&oci_config(hostname, limits, &args, &env, &cwd))
-        .map_err(|e| ApiError::internal(format!("youki runtime: encoding config: {e}")))?;
+    let text = serde_json::to_vec_pretty(&oci_config(
+        Some(hostname),
+        limits,
+        &args,
+        &env,
+        &cwd,
+        &sandbox_namespaces(),
+        &[],
+    ))
+    .map_err(|e| ApiError::internal(format!("youki runtime: encoding config: {e}")))?;
     std::fs::write(bundle.join("config.json"), text)
         .map_err(|e| ApiError::unavailable(format!("youki runtime: writing config.json: {e}")))
 }
@@ -1343,7 +1582,750 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Static x86_64 program: sleep 3600s, then again. It is pid 1 of the sandbox
+/// and is not executed by the tests.
+const PAUSE_ELF: &[u8] = &[
+    0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x9a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x3d, 0x0b, 0x00, 0x00, 0x00, 0x31,
+    0xf6, 0xb8, 0x23, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xee, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EnvSource {
+    ConfigMap { name: String, key: String },
+    Secret { name: String, key: String },
+}
+
+struct PreparedProcess {
+    args: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+}
+
+fn resolve_env_pairs(
+    env: &[SandboxEnv],
+    config_maps: &BTreeMap<String, Projected>,
+    secrets: &BTreeMap<String, Projected>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in env {
+        if entry.name.is_empty() {
+            continue;
+        }
+        // A present value_from replaces the literal, even when the ref is unusable.
+        if let Some(value) = entry.value_from.as_ref() {
+            let Some(source) = parse_env_source(value) else {
+                continue;
+            };
+            let Some(resolved) = lookup_env(&source, config_maps, secrets) else {
+                continue;
+            };
+            out.push((entry.name.clone(), resolved));
+        } else {
+            out.push((entry.name.clone(), entry.value.clone()));
+        }
+    }
+    out
+}
+
+fn parse_env_source(value: &serde_json::Value) -> Option<EnvSource> {
+    let source: EnvSource = serde_json::from_value(value.clone()).ok()?;
+    let (name, key) = match &source {
+        EnvSource::ConfigMap { name, key } | EnvSource::Secret { name, key } => (name, key),
+    };
+    if name.is_empty() || key.is_empty() {
+        None
+    } else {
+        Some(source)
+    }
+}
+
+fn lookup_env(
+    source: &EnvSource,
+    config_maps: &BTreeMap<String, Projected>,
+    secrets: &BTreeMap<String, Projected>,
+) -> Option<String> {
+    let (projected, key) = match source {
+        EnvSource::ConfigMap { name, key } => (config_maps.get(name)?, key),
+        EnvSource::Secret { name, key } => (secrets.get(name)?, key),
+    };
+    lookup_projected(projected, key)
+}
+
+fn lookup_projected(projected: &Projected, key: &str) -> Option<String> {
+    if let Some(text) = projected.data.get(key) {
+        return Some(text.clone());
+    }
+    let bytes = decode_b64(projected.binary_data.get(key)?)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn decode_b64(text: &str) -> Option<Vec<u8>> {
+    use base64::{
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+        Engine,
+    };
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    STANDARD
+        .decode(compact.as_bytes())
+        .or_else(|_| STANDARD_NO_PAD.decode(compact.as_bytes()))
+        .ok()
+}
+
+#[cfg(test)]
+fn resolve_process_env(
+    image_env: &[String],
+    container_env: &[SandboxEnv],
+    config_maps: &BTreeMap<String, Projected>,
+    secrets: &BTreeMap<String, Projected>,
+) -> Vec<String> {
+    let launch = Launch {
+        env: resolve_env_pairs(container_env, config_maps, secrets),
+        ..Launch::default()
+    };
+    let cfg = ImageConfig {
+        env: image_env.to_vec(),
+        ..ImageConfig::default()
+    };
+    process_spec(Some(&launch), &cfg).1
+}
+
+fn container_youki_id(machine: &Id, index: usize) -> String {
+    format!("{machine}-{index}")
+}
+
+fn container_dir(pod: &Path, index: usize) -> PathBuf {
+    pod.join("containers").join(index.to_string())
+}
+
+fn volume_dir_name(index: usize, name: &str) -> String {
+    if name.is_empty() || name == "." || name == ".." {
+        return format!("{index}-vol");
+    }
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() { "vol" } else { &safe };
+    format!("{index}-{safe}")
+}
+
+fn volume_host_dir(pod: &Path, index: usize, name: &str) -> PathBuf {
+    pod.join("volumes").join(volume_dir_name(index, name))
+}
+
+fn valid_destination(path: &str) -> bool {
+    if path.len() < 2 || !path.starts_with('/') || path.contains('\0') {
+        return false;
+    }
+    if path == "/proc" || path == "/dev" || path == "/sys" {
+        return false;
+    }
+    !has_parent_dir(Path::new(path))
+}
+
+fn choose_container_image(index: usize, image: &str, fallback: &str) -> ApiResult<PathBuf> {
+    if let Some(path) = absolute_image(image).or_else(|| digest_image(image)) {
+        return Ok(path);
+    }
+    if index != 0 {
+        return Err(cannot_unpack());
+    }
+    absolute_image(fallback)
+        .or_else(|| digest_image(fallback))
+        .ok_or_else(cannot_unpack)
+}
+
+fn cannot_unpack_container(container: &SandboxContainer, index: usize) -> ApiError {
+    let who = if container.name.is_empty() {
+        format!("container {index}")
+    } else {
+        format!("container {}", container.name)
+    };
+    ApiError::unavailable(format!("youki runtime: image for {who} cannot be unpacked"))
+}
+
+/// Sandbox bundle plus one bundle per container. Does not call youki.
+/// Container configs join `pid`'s namespaces; the sandbox config does not.
+#[cfg(test)]
+fn stage_pod_bundles(
+    bundle: &Path,
+    hostname: &str,
+    limits: &Limits,
+    plan: &PodPlan,
+    disks: &[AttachedDisk],
+    fallback_image: &str,
+    pid: u32,
+) -> ApiResult<()> {
+    let processes = prepare_pod(bundle, hostname, limits, plan, fallback_image)?;
+    write_container_configs(bundle, plan, &processes, disks, limits, pid)
+}
+
+fn prepare_pod(
+    bundle: &Path,
+    hostname: &str,
+    limits: &Limits,
+    plan: &PodPlan,
+    fallback_image: &str,
+) -> ApiResult<Vec<PreparedProcess>> {
+    std::fs::create_dir_all(bundle).map_err(|e| volume_io(bundle, e))?;
+    materialize_volumes(bundle, plan)?;
+    write_mount_plan(bundle, plan)?;
+    write_pause_rootfs(bundle, hostname, limits)?;
+    let mut processes = Vec::new();
+    for (index, container) in plan.containers.iter().enumerate() {
+        let image = choose_container_image(index, &container.image, fallback_image)
+            .map_err(|_| cannot_unpack_container(container, index))?;
+        let dir = container_dir(bundle, index);
+        std::fs::create_dir_all(&dir).map_err(|e| volume_io(&dir, e))?;
+        let rootfs = dir.join("rootfs");
+        reset_dir(&rootfs)?;
+        let cfg = unpack_image(&image, &rootfs)?;
+        if rootfs_empty(&rootfs) {
+            return Err(ApiError::unavailable(
+                "youki runtime: image rootfs is empty",
+            ));
+        }
+        let launch = Launch {
+            image: container.image.clone(),
+            command: container.command.clone(),
+            args: container.args.clone(),
+            env: resolve_env_pairs(&container.env, &plan.config_maps, &plan.secrets),
+            cwd: container.working_dir.clone(),
+        };
+        let (args, env, cwd) = process_spec(Some(&launch), &cfg);
+        processes.push(PreparedProcess { args, env, cwd });
+    }
+    Ok(processes)
+}
+
+fn write_pause_rootfs(bundle: &Path, hostname: &str, limits: &Limits) -> ApiResult<()> {
+    let rootfs = bundle.join("rootfs");
+    reset_dir(&rootfs)?;
+    write_mode(&rootfs.join("pause"), PAUSE_ELF, 0o755)?;
+    let args = vec!["/pause".to_string()];
+    let env = vec![format!("PATH={DEFAULT_PATH}")];
+    let spec = oci_config(
+        Some(hostname),
+        limits,
+        &args,
+        &env,
+        "/",
+        &sandbox_namespaces(),
+        &[],
+    );
+    write_json(&bundle.join("config.json"), &spec, 0o644)
+}
+
+fn write_container_configs(
+    bundle: &Path,
+    plan: &PodPlan,
+    processes: &[PreparedProcess],
+    disks: &[AttachedDisk],
+    limits: &Limits,
+    pid: u32,
+) -> ApiResult<()> {
+    // Projected dirs are rewritten; EmptyDir and container rootfs are not.
+    materialize_volumes(bundle, plan)?;
+    let namespaces = container_namespaces(pid);
+    for (index, process) in processes.iter().enumerate() {
+        let mounts = plan
+            .containers
+            .get(index)
+            .map(|container| container.volume_mounts.as_slice())
+            .unwrap_or(&[]);
+        let binds = oci_binds(bundle, &plan.volumes, mounts, disks);
+        let spec = oci_config(
+            None,
+            limits,
+            &process.args,
+            &process.env,
+            &process.cwd,
+            &namespaces,
+            &binds,
+        );
+        write_json(
+            &container_dir(bundle, index).join("config.json"),
+            &spec,
+            0o600,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mount_plan(pod: &Path, plan: &PodPlan) -> ApiResult<()> {
+    let planned = MountPlan {
+        volumes: plan.volumes.clone(),
+        containers: plan
+            .containers
+            .iter()
+            .enumerate()
+            .map(|(index, container)| PlannedMounts {
+                index,
+                mounts: container.volume_mounts.clone(),
+            })
+            .collect(),
+    };
+    write_json(&pod.join("mount-plan.json"), &planned, 0o644)
+}
+
+/// ConfigMap and Secret directories are replaced. EmptyDir is created once
+/// and kept. Slab volumes are not files on the pod directory.
+fn materialize_volumes(pod: &Path, plan: &PodPlan) -> ApiResult<()> {
+    for (index, vol) in plan.volumes.iter().enumerate() {
+        match &vol.source {
+            VolumeSrc::EmptyDir => {
+                let dir = volume_host_dir(pod, index, &vol.name);
+                std::fs::create_dir_all(&dir).map_err(|e| volume_io(&dir, e))?;
+            }
+            VolumeSrc::ConfigMap(name) => {
+                let dir = volume_host_dir(pod, index, &vol.name);
+                match plan.config_maps.get(name) {
+                    Some(files) => write_projected(&dir, files, 0o644, 0o755)?,
+                    None => reset_dir(&dir)?,
+                }
+            }
+            VolumeSrc::Secret(name) => {
+                let dir = volume_host_dir(pod, index, &vol.name);
+                match plan.secrets.get(name) {
+                    Some(files) => write_projected(&dir, files, 0o400, 0o700)?,
+                    None => {
+                        reset_dir(&dir)?;
+                        set_mode(&dir, 0o700)?;
+                    }
+                }
+            }
+            VolumeSrc::Volume(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn write_projected(dir: &Path, files: &Projected, file_mode: u32, dir_mode: u32) -> ApiResult<()> {
+    reset_dir(dir)?;
+    set_mode(dir, dir_mode)?;
+    let mut keys: Vec<&String> = files.data.keys().collect();
+    for key in files.binary_data.keys() {
+        if !files.data.contains_key(key) {
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    for key in keys {
+        let Some(rel) = rel_under(key) else {
+            continue;
+        };
+        let Some(bytes) = projected_bytes(files, key) else {
+            continue;
+        };
+        write_mode(&dir.join(rel), &bytes, file_mode)?;
+    }
+    Ok(())
+}
+
+fn projected_bytes(files: &Projected, key: &str) -> Option<Vec<u8>> {
+    if let Some(text) = files.data.get(key) {
+        return Some(text.as_bytes().to_vec());
+    }
+    decode_b64(files.binary_data.get(key)?)
+}
+
+fn prepared_volume(
+    pod: &Path,
+    index: usize,
+    vol: &SandboxVolume,
+    disks: &[AttachedDisk],
+) -> Option<PreparedVolume> {
+    match &vol.source {
+        VolumeSrc::EmptyDir | VolumeSrc::ConfigMap(_) | VolumeSrc::Secret(_) => {
+            Some(PreparedVolume {
+                host_path: volume_host_dir(pod, index, &vol.name),
+                directory: true,
+                force_read_only: false,
+            })
+        }
+        VolumeSrc::Volume(id) => {
+            let disk = disks.iter().find(|d| &d.volume == id)?;
+            let host_path = PathBuf::from(&disk.path);
+            let directory = std::fs::metadata(&host_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            Some(PreparedVolume {
+                host_path,
+                directory,
+                force_read_only: disk.read_only,
+            })
+        }
+    }
+}
+
+fn mount_source(prepared: &PreparedVolume, sub_path: &str) -> Option<(String, bool)> {
+    let (source, directory) = if sub_path.is_empty() {
+        (prepared.host_path.clone(), prepared.directory)
+    } else {
+        let rel = rel_under(sub_path)?;
+        let source = prepared.host_path.join(rel);
+        let directory = std::fs::metadata(&source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        (source, directory)
+    };
+    Some((source.to_string_lossy().into_owned(), directory))
+}
+
+fn oci_binds(
+    pod: &Path,
+    volumes: &[SandboxVolume],
+    mounts: &[SandboxMount],
+    disks: &[AttachedDisk],
+) -> Vec<OciBind> {
+    let mut out = Vec::new();
+    for mount in mounts {
+        if mount.name.is_empty() || !valid_destination(&mount.mount_path) {
+            continue;
+        }
+        let Some(index) = volumes.iter().position(|v| v.name == mount.name) else {
+            continue;
+        };
+        let Some(prepared) = prepared_volume(pod, index, &volumes[index], disks) else {
+            continue;
+        };
+        let Some((source, directory)) = mount_source(&prepared, &mount.sub_path) else {
+            continue;
+        };
+        out.push(OciBind {
+            destination: mount.mount_path.clone(),
+            source,
+            read_only: prepared.force_read_only || mount.read_only,
+            directory,
+        });
+    }
+    out
+}
+
+fn host_path_ok(path: &str) -> ApiResult<()> {
+    let p = Path::new(path);
+    if path.is_empty() || path.contains('\0') || !p.is_absolute() || has_parent_dir(p) {
+        return Err(ApiError::bad_request(
+            "volume path must be an absolute path",
+        ));
+    }
+    Ok(())
+}
+
+fn check_device_name(name: &str) -> ApiResult<()> {
+    let b = name.as_bytes();
+    if b.len() == 3 && b[0] == b'v' && b[1] == b'd' && (b'b'..=b'z').contains(&b[2]) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "device must be a virtio name from vdb to vdz",
+    ))
+}
+
+fn next_device(disks: &[AttachedDisk]) -> ApiResult<String> {
+    for c in b'b'..=b'z' {
+        let name = format!("vd{}", c as char);
+        if disks.iter().all(|d| d.device != name) {
+            return Ok(name);
+        }
+    }
+    Err(ApiError::unprocessable("no free virtio device name"))
+}
+
+fn disks_path(bundle: &Path) -> PathBuf {
+    bundle.join("disks.json")
+}
+
+fn read_disks(bundle: &Path) -> ApiResult<Vec<AttachedDisk>> {
+    let path = disks_path(bundle);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            ApiError::unavailable(format!("youki runtime: reading {}: {e}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(read_io(&path, e)),
+    }
+}
+
+fn write_disks(bundle: &Path, disks: &[AttachedDisk]) -> ApiResult<()> {
+    write_json(&disks_path(bundle), &disks, 0o644)
+}
+
+fn refresh_disk_mounts(bundle: &Path) -> ApiResult<()> {
+    let path = bundle.join("mount-plan.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(read_io(&path, e)),
+    };
+    let plan: MountPlan = serde_json::from_slice(&bytes).map_err(|e| {
+        ApiError::unavailable(format!("youki runtime: reading {}: {e}", path.display()))
+    })?;
+    let disks = read_disks(bundle)?;
+    for container in &plan.containers {
+        let binds = oci_binds(bundle, &plan.volumes, &container.mounts, &disks);
+        let config = container_dir(bundle, container.index).join("config.json");
+        patch_mounts(&config, &binds)?;
+    }
+    Ok(())
+}
+
+fn patch_mounts(config: &Path, binds: &[OciBind]) -> ApiResult<()> {
+    let bytes = match std::fs::read(config) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(read_io(config, e)),
+    };
+    let mut spec: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        ApiError::unavailable(format!("youki runtime: reading {}: {e}", config.display()))
+    })?;
+    let mut mounts = Vec::new();
+    if let Some(existing) = spec.get("mounts").and_then(|m| m.as_array()) {
+        for mount in existing {
+            let dest = mount
+                .get("destination")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            if dest == "/proc" || dest == "/dev" || dest == "/sys" {
+                mounts.push(mount.clone());
+            }
+        }
+    }
+    for bind in binds {
+        mounts.push(bind_mount(bind));
+    }
+    let obj = spec.as_object_mut().ok_or_else(|| {
+        ApiError::unavailable(format!(
+            "youki runtime: reading {}: config is not an object",
+            config.display()
+        ))
+    })?;
+    obj.insert("mounts".into(), serde_json::Value::Array(mounts));
+    write_json(config, &spec, 0o600)
+}
+
+fn write_json(path: &Path, value: &impl Serialize, mode: u32) -> ApiResult<()> {
+    let text = serde_json::to_vec_pretty(value).map_err(|e| {
+        ApiError::internal(format!("youki runtime: encoding {}: {e}", path.display()))
+    })?;
+    write_mode(path, &text, mode)
+}
+
+fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> ApiResult<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| volume_io(parent, e))?;
+        }
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        let ft = meta.file_type();
+        let removed = if ft.is_symlink() || !ft.is_dir() {
+            std::fs::remove_file(path)
+        } else {
+            std::fs::remove_dir_all(path)
+        };
+        removed.map_err(|e| volume_io(path, e))?;
+    }
+    std::fs::write(path, bytes).map_err(|e| volume_io(path, e))?;
+    set_mode(path, mode)
+}
+
+fn set_mode(path: &Path, mode: u32) -> ApiResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)
+            .map_err(|e| volume_io(path, e))?
+            .permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(path, perms).map_err(|e| volume_io(path, e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+fn volume_io(path: &Path, err: std::io::Error) -> ApiError {
+    ApiError::unavailable(format!("youki runtime: writing {}: {err}", path.display()))
+}
+
+fn read_io(path: &Path, err: std::io::Error) -> ApiError {
+    ApiError::unavailable(format!("youki runtime: reading {}: {err}", path.display()))
+}
+
+fn parse_state_pid(stdout: &[u8]) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let pid = value.get("pid")?.as_u64()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+/// Create the sandbox, then every container, joining the sandbox pid, network,
+/// ipc and uts namespaces. `state.json` is written only after they are running.
+async fn start_pod(
+    bin: &Path,
+    bundle: &Path,
+    req: &MachineRequest,
+    plan: &PodPlan,
+    prior: bool,
+) -> ApiResult<RunningMachine> {
+    if prior {
+        if let Some(saved) = read_state(bundle).await? {
+            for cid in saved.containers.iter().rev() {
+                if let Err(e) = exec_youki(bin, &["delete", cid]).await {
+                    if !container_missing(&e) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    let limits = Limits {
+        vcpus: req.resources.vcpus,
+        memory_mib: req.resources.memory_mib,
+    };
+    let hostname = if req.name.is_empty() {
+        req.id.to_string()
+    } else {
+        req.name.clone()
+    };
+    let id = req.id.clone();
+    let addresses = nic_addresses(req);
+    let bundle_prep = bundle.to_path_buf();
+    let plan_prep = plan.clone();
+    let host_prep = hostname;
+    let image = req.image.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_pod(&bundle_prep, &host_prep, &limits, &plan_prep, &image)
+    })
+    .await
+    .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?;
+    let processes = match prepared {
+        Ok(processes) => processes,
+        Err(e) => {
+            if !prior {
+                let _ = remove_bundle(bundle).await;
+            }
+            return Err(e);
+        }
+    };
+    let id_str = id.to_string();
+    let bundle_str = path_arg(bundle);
+    if !prior {
+        if let Err(e) = exec_youki(bin, &["create", "--bundle", &bundle_str, &id_str]).await {
+            let _ = remove_bundle(bundle).await;
+            return Err(e);
+        }
+        if let Err(e) = exec_youki(bin, &["start", &id_str]).await {
+            let _ = exec_youki(bin, &["delete", &id_str]).await;
+            let _ = remove_bundle(bundle).await;
+            return Err(e);
+        }
+    } else {
+        exec_youki(bin, &["start", &id_str]).await?;
+    }
+    let state = match run_youki(bin, &["state", &id_str]).await {
+        Ok(output) => output,
+        Err(e) => {
+            if !prior {
+                abort_new_pod(bin, bundle, &id_str, &[]).await;
+            }
+            return Err(e);
+        }
+    };
+    let Some(pid) = parse_state_pid(&state.stdout) else {
+        if !prior {
+            abort_new_pod(bin, bundle, &id_str, &[]).await;
+        }
+        return Err(ApiError::unavailable(
+            "youki runtime: sandbox state has no pid",
+        ));
+    };
+    let bundle_cfg = bundle.to_path_buf();
+    let plan_cfg = plan.clone();
+    let limits_cfg = limits;
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        let disks = read_disks(&bundle_cfg)?;
+        write_container_configs(&bundle_cfg, &plan_cfg, &processes, &disks, &limits_cfg, pid)
+    })
+    .await
+    .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
+    {
+        if !prior {
+            abort_new_pod(bin, bundle, &id_str, &[]).await;
+        }
+        return Err(e);
+    }
+    let mut started = Vec::new();
+    for index in 0..plan.containers.len() {
+        let cid = container_youki_id(&id, index);
+        let cdir = path_arg(&container_dir(bundle, index));
+        if let Err(e) = exec_youki(bin, &["create", "--bundle", &cdir, &cid]).await {
+            if !prior {
+                abort_new_pod(bin, bundle, &id_str, &started).await;
+            }
+            return Err(e);
+        }
+        if let Err(e) = exec_youki(bin, &["start", &cid]).await {
+            if !prior {
+                let _ = exec_youki(bin, &["delete", &cid]).await;
+                abort_new_pod(bin, bundle, &id_str, &started).await;
+            }
+            return Err(e);
+        }
+        started.push(cid);
+    }
+    write_state(
+        bundle,
+        &Saved {
+            id: id_str,
+            addresses: addresses.clone(),
+            power: PowerState::On,
+            containers: started,
+        },
+    )
+    .await?;
+    Ok(RunningMachine {
+        id,
+        addresses,
+        power: PowerState::On,
+    })
+}
+
+async fn abort_new_pod(bin: &Path, bundle: &Path, sandbox_id: &str, created: &[String]) {
+    for cid in created.iter().rev() {
+        let _ = exec_youki(bin, &["delete", cid]).await;
+    }
+    let _ = exec_youki(bin, &["delete", sandbox_id]).await;
+    let _ = remove_bundle(bundle).await;
+}
+
 async fn exec_youki(bin: &Path, args: &[&str]) -> ApiResult<()> {
+    run_youki(bin, args).await.map(|_| ())
+}
+
+async fn run_youki(bin: &Path, args: &[&str]) -> ApiResult<std::process::Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .kill_on_drop(true)
@@ -1369,7 +2351,7 @@ async fn exec_youki(bin: &Path, args: &[&str]) -> ApiResult<()> {
         }
     };
     if output.status.success() {
-        return Ok(());
+        return Ok(output);
     }
     let op = args.first().copied().unwrap_or("youki");
     Err(ApiError::unavailable(format!(
@@ -1456,7 +2438,7 @@ mod tests {
             "echo 'youki exploded' >&2\n".to_owned()
         };
         let body = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {quoted}\nprintf '\\n' >> {quoted}\n{stderr}exit {exit_code}\n"
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {quoted}\nprintf '\\n' >> {quoted}\nif [ \"$1\" = state ]; then\n  printf '%s\\n' '{{\"pid\":4242,\"status\":\"running\"}}'\nfi\n{stderr}exit {exit_code}\n"
         );
         std::fs::write(path, body).unwrap();
         let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -1504,18 +2486,42 @@ mod tests {
     fn sandbox_doc(image: &str) -> String {
         serde_json::json!({
             "kind": "PodSandbox",
-            "containers": [{
-                "image": image,
-                "command": ["/usr/bin/web"],
-                "args": ["--serve"],
-                "working_dir": "/work",
-                "env": [
-                    {"name": "APP_MODE", "value": "prod"},
-                    {"name": "SECRET", "value_from": {"secret": "do-not-log-user-data"}}
-                ]
-            }]
+            "containers": [
+                {
+                    "name": "web",
+                    "image": image,
+                    "command": ["/usr/bin/web"],
+                    "args": ["--serve"],
+                    "working_dir": "/work",
+                    "env": [
+                        {"name": "APP_MODE", "value": "prod"},
+                        {"name": "SECRET", "value_from": {"secret": "do-not-log-user-data"}}
+                    ]
+                },
+                {
+                    "name": "side",
+                    "image": image,
+                    "command": ["/usr/bin/side"],
+                    "args": ["--watch"]
+                }
+            ]
         })
         .to_string()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn ns_path(cfg: &serde_json::Value, kind: &str) -> Option<String> {
+        cfg["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == kind)
+            .and_then(|n| n.get("path"))
+            .and_then(|p| p.as_str())
+            .map(str::to_owned)
     }
 
     fn tree_text(root: &Path) -> String {
@@ -1678,6 +2684,11 @@ mod tests {
         assert!(launch_from(&request).is_none());
         request.user_data = Some(r#"{"kind":"Other"}"#.into());
         assert!(launch_from(&request).is_none());
+        request.user_data = Some(r#"{"kind":"PodSandbox","containers":"no"}"#.into());
+        let err = sandbox_plan(&request).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(err.message.contains("sandbox document is invalid"), "{err}");
+        assert!(!err.message.contains("do-not-log"), "{err}");
     }
 
     #[tokio::test]
@@ -1725,25 +2736,66 @@ mod tests {
         assert_eq!(cfg["root"]["path"], "rootfs");
         assert_eq!(cfg["root"]["readonly"], false);
         assert_eq!(cfg["hostname"], "web");
-        assert!(cfg["linux"]["namespaces"].is_array());
-        assert_eq!(
-            cfg["process"]["args"],
-            serde_json::json!(["/usr/bin/web", "--serve"])
-        );
-        assert_eq!(cfg["process"]["cwd"], "/work");
-        let env = cfg["process"]["env"].as_array().unwrap();
-        assert!(env.iter().any(|v| v == "APP_MODE=prod"));
+        assert_eq!(cfg["process"]["args"], serde_json::json!(["/pause"]));
+        assert_eq!(cfg["process"]["cwd"], "/");
+        let sandbox_ns = cfg["linux"]["namespaces"].as_array().unwrap();
+        assert!(sandbox_ns.iter().all(|n| n.get("path").is_none()));
+        assert_eq!(mode_of(&bundle.join("rootfs").join("pause")), 0o755);
         assert!(!bundle.join("image").exists());
         let rootfs_meta = std::fs::symlink_metadata(bundle.join("rootfs")).unwrap();
         assert!(rootfs_meta.file_type().is_dir());
         assert!(!rootfs_meta.file_type().is_symlink());
+        assert!(!bundle.join("rootfs").join("marker").exists());
+
+        let c0 = bundle.join("containers").join("0");
+        let c1 = bundle.join("containers").join("1");
+        let web: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(c0.join("config.json")).unwrap()).unwrap();
+        let side: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(c1.join("config.json")).unwrap()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(bundle.join("rootfs").join("marker")).unwrap(),
+            web["process"]["args"],
+            serde_json::json!(["/usr/bin/web", "--serve"])
+        );
+        assert_eq!(web["process"]["cwd"], "/work");
+        assert!(web.get("hostname").is_none());
+        let env = web["process"]["env"].as_array().unwrap();
+        assert!(env.iter().any(|v| v == "APP_MODE=prod"));
+        assert!(env.iter().all(|v| {
+            let text = v.as_str().unwrap_or("");
+            !text.contains("do-not-log")
+        }));
+        assert_eq!(
+            side["process"]["args"],
+            serde_json::json!(["/usr/bin/side", "--watch"])
+        );
+        assert!(side.get("hostname").is_none());
+        for cfg in [&web, &side] {
+            assert_eq!(
+                ns_path(cfg, "network").as_deref(),
+                Some("/proc/4242/ns/net")
+            );
+            assert_eq!(ns_path(cfg, "pid").as_deref(), Some("/proc/4242/ns/pid"));
+            assert_eq!(ns_path(cfg, "ipc").as_deref(), Some("/proc/4242/ns/ipc"));
+            assert_eq!(ns_path(cfg, "uts").as_deref(), Some("/proc/4242/ns/uts"));
+            assert_eq!(ns_path(cfg, "mount"), None);
+        }
+        assert_eq!(mode_of(&c0.join("config.json")), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(c0.join("rootfs").join("marker")).unwrap(),
             "keep"
         );
-        let bundle_text = std::fs::read_to_string(bundle.join("config.json")).unwrap()
-            + &std::fs::read_to_string(bundle.join("state.json")).unwrap()
-            + &tree_text(&bundle.join("rootfs"));
+        assert_eq!(
+            std::fs::read_to_string(c1.join("rootfs").join("marker")).unwrap(),
+            "keep"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["containers"],
+            serde_json::json!([format!("{}-0", request.id), format!("{}-1", request.id)])
+        );
+        let bundle_text = tree_text(&bundle);
         assert!(!bundle_text.contains("do-not-log-user-data"));
         assert!(!bundle_text.contains("do-not-log-ssh-key"));
 
@@ -1751,13 +2803,21 @@ mod tests {
         assert!(!after_first.contains("do-not-log-user-data"));
         assert!(!after_first.contains("do-not-log-ssh-key"));
         let lines = arg_lines(&after_first);
-        assert_eq!(count_arg(&lines, "create"), 1);
-        assert_eq!(count_arg(&lines, "start"), 1);
+        assert_eq!(count_arg(&lines, "create"), 3);
+        assert_eq!(count_arg(&lines, "start"), 3);
+        assert_eq!(count_arg(&lines, "state"), 1);
         assert_eq!(count_arg(&lines, "kill"), 0);
         let bundle_arg = bundle.to_string_lossy().into_owned();
         let id_arg = request.id.to_string();
         assert!(lines.windows(4).any(|w| {
             w[0] == "create" && w[1] == "--bundle" && w[2] == bundle_arg && w[3] == id_arg
+        }));
+        let c0_arg = c0.to_string_lossy().into_owned();
+        assert!(lines.windows(4).any(|w| {
+            w[0] == "create"
+                && w[1] == "--bundle"
+                && w[2] == c0_arg
+                && w[3] == format!("{}-0", request.id)
         }));
 
         let again = rt.start(&request).await.unwrap();
@@ -1776,11 +2836,21 @@ mod tests {
 
         rt.stop(&request.id).await.unwrap();
         let after_stop = arg_lines(&std::fs::read_to_string(&log).unwrap());
-        assert_eq!(count_arg(&after_stop, "kill"), 1);
-        assert_eq!(count_arg(&after_stop, "SIGTERM"), 1);
-        assert!(after_stop
+        assert_eq!(count_arg(&after_stop, "kill"), 3);
+        assert_eq!(count_arg(&after_stop, "SIGTERM"), 3);
+        let kill_ids: Vec<String> = after_stop
             .windows(3)
-            .any(|w| { w[0] == "kill" && w[1] == request.id.to_string() && w[2] == "SIGTERM" }));
+            .filter(|w| w[0] == "kill" && w[2] == "SIGTERM")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(
+            kill_ids,
+            vec![
+                format!("{}-1", request.id),
+                format!("{}-0", request.id),
+                request.id.to_string(),
+            ]
+        );
         assert_eq!(rt.list().await.unwrap()[0].power, PowerState::Off);
 
         let missing = tmp.join("missing-youki");
@@ -2061,6 +3131,421 @@ mod tests {
             Some(v) => std::env::set_var("PISTACK_MOLD_DIR", v),
             None => std::env::remove_var("PISTACK_MOLD_DIR"),
         }
+    }
+
+    #[test]
+    fn resolves_env_from_config_map_and_secret() {
+        let mut app = Projected::default();
+        app.data.insert("MODE".into(), "from-data".into());
+        app.binary_data.insert("MODE".into(), "aWdub3JlZA==".into());
+        app.binary_data.insert("token".into(), "c2VjcmV0".into());
+        app.binary_data.insert("raw".into(), "/w==".into());
+        let mut db = Projected::default();
+        db.data.insert("password".into(), "s3cret-value".into());
+        let mut config_maps = BTreeMap::new();
+        config_maps.insert("app".into(), app);
+        let mut secrets = BTreeMap::new();
+        secrets.insert("db".into(), db);
+        let env: Vec<SandboxEnv> = serde_json::from_value(serde_json::json!([
+            {"name": "APP_MODE", "value": "prod"},
+            {"name": "MODE", "value": "nope", "value_from": {"config_map": {"name": "app", "key": "MODE"}}},
+            {"name": "TOKEN", "value_from": {"config_map": {"name": "app", "key": "token"}}},
+            {"name": "PASSWORD", "value": "nope", "value_from": {"secret": {"name": "db", "key": "password"}}},
+            {"name": "MISSING", "value": "nope", "value_from": {"secret": {"name": "db", "key": "nope"}}},
+            {"name": "RAW", "value": "nope", "value_from": {"config_map": {"name": "app", "key": "raw"}}},
+            {"name": "BAD", "value": "do-not-log-user-data", "value_from": {"secret": "do-not-log-user-data"}},
+            {"name": "", "value": "skip"}
+        ]))
+        .unwrap();
+        let resolved = resolve_process_env(
+            &["FROM=image".into(), "APP_MODE=image".into()],
+            &env,
+            &config_maps,
+            &secrets,
+        );
+        assert!(resolved
+            .iter()
+            .any(|e| e == &format!("PATH={DEFAULT_PATH}")));
+        assert!(resolved.iter().any(|e| e == "FROM=image"));
+        assert!(resolved.iter().any(|e| e == "APP_MODE=prod"));
+        assert!(resolved.iter().any(|e| e == "MODE=from-data"));
+        assert!(resolved.iter().any(|e| e == "TOKEN=secret"));
+        assert!(resolved.iter().any(|e| e == "PASSWORD=s3cret-value"));
+        assert!(resolved.iter().all(|e| !e.starts_with("MISSING=")));
+        assert!(resolved.iter().all(|e| !e.starts_with("RAW=")));
+        assert!(resolved.iter().all(|e| !e.starts_with("BAD=")));
+        assert!(resolved.iter().all(|e| !e.contains("do-not-log")));
+        assert_eq!(
+            parse_state_pid(br#"{"pid":4242,"status":"running"}"#),
+            Some(4242)
+        );
+        assert_eq!(parse_state_pid(br#"{"pid":0}"#), None);
+        assert_eq!(parse_state_pid(br"not json"), None);
+    }
+
+    #[test]
+    fn device_names_and_host_paths() {
+        assert!(host_path_ok("/var/lib/pistack/vol").is_ok());
+        assert_eq!(host_path_ok("rel").unwrap_err().code, ErrorCode::BadRequest);
+        assert!(host_path_ok("").is_err());
+        assert!(host_path_ok("/tmp/../etc").is_err());
+        assert!(host_path_ok("/ok\0").is_err());
+        assert!(check_device_name("vdb").is_ok());
+        assert!(check_device_name("vdz").is_ok());
+        assert!(check_device_name("vda").is_err());
+        assert!(check_device_name("vd").is_err());
+        assert!(check_device_name("/dev/vdb").is_err());
+        let mut disks = Vec::new();
+        for c in b'b'..=b'z' {
+            let name = next_device(&disks).unwrap();
+            assert_eq!(name, format!("vd{}", c as char));
+            disks.push(AttachedDisk {
+                volume: format!("vol-{c}"),
+                path: "/dev/null".into(),
+                device: name,
+                read_only: false,
+            });
+        }
+        assert_eq!(
+            next_device(&disks).unwrap_err().code,
+            ErrorCode::Unprocessable
+        );
+        assert_eq!(PAUSE_ELF.len(), 154);
+        assert_eq!(&PAUSE_ELF[..4], b"\x7fELF");
+        assert_eq!(&PAUSE_ELF[24..32], &0x400078u64.to_le_bytes());
+    }
+
+    #[test]
+    fn pod_bundles_mount_every_container() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-pod-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let image_a = tmp.join("image-a");
+        let image_b = tmp.join("image-b");
+        std::fs::create_dir_all(image_a.join("bin")).unwrap();
+        std::fs::create_dir_all(&image_b).unwrap();
+        std::fs::write(image_a.join("marker"), "a").unwrap();
+        std::fs::write(image_b.join("marker"), "b").unwrap();
+        let disk = tmp.join("slab-file");
+        std::fs::write(&disk, "block").unwrap();
+        let vol_id = "vol-11111111-1111-1111-1111-111111111111";
+        let user_data = serde_json::json!({
+            "kind": "PodSandbox",
+            "containers": [
+                {
+                    "name": "web",
+                    "image": image_a,
+                    "command": ["/usr/bin/web"],
+                    "args": ["--serve"],
+                    "working_dir": "/work",
+                    "env": [
+                        {"name": "PASSWORD", "value_from": {"secret": {"name": "db", "key": "password"}}}
+                    ],
+                    "volume_mounts": [
+                        {"name": "scratch", "mount_path": "/tmp/scratch"},
+                        {"name": "cfg", "mount_path": "/etc/cfg", "read_only": true},
+                        {"name": "cfg", "mount_path": "/etc/hello", "sub_path": "hello", "read_only": true},
+                        {"name": "sec", "mount_path": "/run/sec", "read_only": true},
+                        {"name": "disk", "mount_path": "/data"},
+                        {"name": "scratch", "mount_path": "/tmp/../escape"},
+                        {"name": "cfg", "mount_path": "/etc/slip", "sub_path": "../escape"}
+                    ]
+                },
+                {
+                    "name": "side",
+                    "image": image_b,
+                    "command": ["/usr/bin/side"],
+                    "args": ["--watch"],
+                    "volume_mounts": [
+                        {"name": "scratch", "mount_path": "/cache", "read_only": true}
+                    ]
+                }
+            ],
+            "volumes": [
+                {"name": "scratch", "source": "empty_dir"},
+                {"name": "cfg", "source": {"config_map": "app"}},
+                {"name": "sec", "source": {"secret": "db"}},
+                {"name": "disk", "source": {"volume": vol_id}}
+            ],
+            "config_maps": {
+                "app": {
+                    "data": {"MODE": "prod", "hello": "world"},
+                    "binary_data": {"MODE": "aWdub3JlZA==", "blob": "Ymlu"}
+                }
+            },
+            "secrets": {
+                "db": {"data": {"password": "s3cret-value"}}
+            }
+        })
+        .to_string();
+        let mut request = req("web", "not-a-path", "10.9.0.1");
+        request.user_data = Some(user_data);
+        let plan = sandbox_plan(&request).unwrap().unwrap();
+        let bundle = tmp.join("pod");
+        let limits = Limits {
+            vcpus: 1,
+            memory_mib: 64,
+        };
+        stage_pod_bundles(&bundle, "web", &limits, &plan, &[], "not-a-path", 4242).unwrap();
+        let scratch = bundle.join("volumes").join("0-scratch");
+        std::fs::write(scratch.join("keep-me"), "yes").unwrap();
+        stage_pod_bundles(&bundle, "web", &limits, &plan, &[], "not-a-path", 4242).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("keep-me")).unwrap(),
+            "yes"
+        );
+
+        let cfg_dir = bundle.join("volumes").join("1-cfg");
+        let sec_dir = bundle.join("volumes").join("2-sec");
+        assert_eq!(
+            std::fs::read_to_string(cfg_dir.join("MODE")).unwrap(),
+            "prod"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg_dir.join("hello")).unwrap(),
+            "world"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg_dir.join("blob")).unwrap(),
+            "bin"
+        );
+        assert_eq!(mode_of(&cfg_dir.join("MODE")), 0o644);
+        assert_eq!(
+            std::fs::read_to_string(sec_dir.join("password")).unwrap(),
+            "s3cret-value"
+        );
+        assert_eq!(mode_of(&sec_dir.join("password")), 0o400);
+        assert_eq!(mode_of(&sec_dir), 0o700);
+        std::fs::write(cfg_dir.join("extra"), "gone").unwrap();
+        stage_pod_bundles(&bundle, "web", &limits, &plan, &[], "not-a-path", 4242).unwrap();
+        assert!(!cfg_dir.join("extra").exists());
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("keep-me")).unwrap(),
+            "yes"
+        );
+
+        let web: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("containers").join("0").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let side: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("containers").join("1").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            web["process"]["args"],
+            serde_json::json!(["/usr/bin/web", "--serve"])
+        );
+        assert_eq!(
+            side["process"]["args"],
+            serde_json::json!(["/usr/bin/side", "--watch"])
+        );
+        assert_eq!(
+            ns_path(&web, "network").as_deref(),
+            Some("/proc/4242/ns/net")
+        );
+        assert_eq!(
+            ns_path(&side, "network").as_deref(),
+            Some("/proc/4242/ns/net")
+        );
+        assert!(web.get("hostname").is_none());
+        let sandbox: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap()).unwrap();
+        assert!(sandbox["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n.get("path").is_none()));
+        assert_eq!(
+            std::fs::read_to_string(
+                bundle
+                    .join("containers")
+                    .join("0")
+                    .join("rootfs")
+                    .join("marker")
+            )
+            .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                bundle
+                    .join("containers")
+                    .join("1")
+                    .join("rootfs")
+                    .join("marker")
+            )
+            .unwrap(),
+            "b"
+        );
+        let env = web["process"]["env"].as_array().unwrap();
+        assert!(env.iter().any(|v| v == "PASSWORD=s3cret-value"));
+        assert!(web["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["destination"] != "/data"));
+        let scratch_mount = mount_at(&web, "/tmp/scratch");
+        assert_eq!(scratch_mount["source"], scratch.to_string_lossy().as_ref());
+        assert_eq!(
+            scratch_mount["options"],
+            serde_json::json!(["rbind", "rprivate", "rw"])
+        );
+        let hello = mount_at(&web, "/etc/hello");
+        assert_eq!(
+            hello["source"],
+            cfg_dir.join("hello").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            hello["options"],
+            serde_json::json!(["bind", "rprivate", "ro"])
+        );
+        let sec = mount_at(&web, "/run/sec");
+        assert_eq!(
+            sec["options"],
+            serde_json::json!(["rbind", "rprivate", "ro"])
+        );
+        let cache = mount_at(&side, "/cache");
+        assert_eq!(cache["source"], scratch.to_string_lossy().as_ref());
+        assert_eq!(
+            cache["options"],
+            serde_json::json!(["rbind", "rprivate", "ro"])
+        );
+        assert!(web["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["destination"] != "/tmp/../escape" && m["destination"] != "/etc/slip"));
+        let plan_text = std::fs::read_to_string(bundle.join("mount-plan.json")).unwrap();
+        assert!(!plan_text.contains("s3cret-value"));
+        assert!(!plan_text.contains("do-not-log-user-data"));
+        assert!(!std::fs::read_to_string(bundle.join("config.json"))
+            .unwrap()
+            .contains("s3cret-value"));
+
+        write_disks(
+            &bundle,
+            &[AttachedDisk {
+                volume: vol_id.into(),
+                path: disk.to_string_lossy().into_owned(),
+                device: "vdb".into(),
+                read_only: true,
+            }],
+        )
+        .unwrap();
+        refresh_disk_mounts(&bundle).unwrap();
+        let web: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("containers").join("0").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let data = mount_at(&web, "/data");
+        assert_eq!(data["source"], disk.to_string_lossy().as_ref());
+        assert_eq!(
+            data["options"],
+            serde_json::json!(["bind", "rprivate", "ro"])
+        );
+        assert_eq!(
+            web["process"]["args"],
+            serde_json::json!(["/usr/bin/web", "--serve"])
+        );
+        assert_eq!(
+            mode_of(&bundle.join("containers").join("0").join("config.json")),
+            0o600
+        );
+    }
+
+    fn mount_at<'a>(cfg: &'a serde_json::Value, dest: &str) -> &'a serde_json::Value {
+        cfg["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["destination"] == dest)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn attach_is_not_found_until_the_bundle_exists() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-attach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let _env = EnvGuard::set(&tmp.join("youki"), &tmp.join("state"));
+        let rt = YoukiRuntime;
+        let machine = Id::new(kind::MACHINE);
+        let volume = Id::new(kind::VOLUME);
+        let attach = crate::runtime::VolumeAttach {
+            machine: machine.clone(),
+            volume: volume.clone(),
+            path: "/var/lib/pistack/volumes/disk".into(),
+            device: None,
+            read_only: false,
+            target: None,
+        };
+        assert_eq!(
+            rt.attach_volume(&attach).await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        let bundle = tmp.join("state").join(machine.to_string());
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), b"{}").unwrap();
+        let mut bad = attach.clone();
+        bad.path = "relative".into();
+        assert_eq!(
+            rt.attach_volume(&bad).await.unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+        assert_eq!(rt.attach_volume(&attach).await.unwrap(), "vdb");
+        let mut moved = attach.clone();
+        moved.path = "/var/lib/pistack/volumes/disk2".into();
+        assert_eq!(rt.attach_volume(&moved).await.unwrap(), "vdb");
+        let mut second = attach.clone();
+        second.volume = Id::new(kind::VOLUME);
+        assert_eq!(rt.attach_volume(&second).await.unwrap(), "vdc");
+        let mut named = attach.clone();
+        named.volume = Id::new(kind::VOLUME);
+        named.device = Some("vdk".into());
+        assert_eq!(rt.attach_volume(&named).await.unwrap(), "vdk");
+        named.device = Some("vda".into());
+        named.volume = Id::new(kind::VOLUME);
+        assert_eq!(
+            rt.attach_volume(&named).await.unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+        rt.detach_volume(&crate::runtime::VolumeDetach {
+            machine: machine.clone(),
+            volume,
+            path: attach.path.clone(),
+            device: None,
+            target: None,
+        })
+        .await
+        .unwrap();
+        let disks = read_disks(&bundle).unwrap();
+        assert!(disks.iter().all(|d| d.device != "vdb"));
+        assert_eq!(disks.len(), 2);
+        rt.detach_volume(&crate::runtime::VolumeDetach {
+            machine,
+            volume: second.volume,
+            path: second.path,
+            device: None,
+            target: None,
+        })
+        .await
+        .unwrap();
     }
 
     struct DirGuard(PathBuf);

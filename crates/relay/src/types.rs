@@ -84,6 +84,10 @@ pub struct BalancerSpec {
     /// Explicit VIP; allocated by the provider when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip_address: Option<IpAddr>,
+    /// Bind this exact port on the VIP instead of an ephemeral one. Used
+    /// for service node ports; a port already in use stays unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip_port: Option<u16>,
     /// Floating IP (fabric id) to publish the VIP on, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floating_ip: Option<Id>,
@@ -102,6 +106,7 @@ impl Default for BalancerSpec {
         Self {
             vip_network: String::new(),
             vip_address: None,
+            vip_port: None,
             floating_ip: None,
             provider: Provider::Forward,
             admin_up: true,
@@ -173,6 +178,44 @@ pub struct ListenerSpec {
     /// Edge queues a publish and starts no process on this server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub door: Option<DoorKind>,
+    /// HTTP routes, tried before the default pool. A request goes to the
+    /// route whose host matches most specifically, then the longest
+    /// matching path. When no route matches, the default pool serves it;
+    /// without a default member the answer is 404. Only `Http` and
+    /// `Terminated` listeners may carry routes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<Route>,
+}
+
+/// How a route's path is compared with the request path.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PathMatch {
+    /// Whole path segments: `/app` matches `/app` and `/app/x`, not `/apps`.
+    #[default]
+    Prefix,
+    /// The request path must equal `path`.
+    Exact,
+}
+
+/// One host and path rule on an HTTP listener.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Route {
+    /// Exact host name, or `*.example.com` for any single leading label.
+    /// Absent matches every host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Starts with `/`.
+    #[serde(default = "root_path")]
+    pub path: String,
+    #[serde(default)]
+    pub path_match: PathMatch,
+    /// Pool on the same balancer that takes matching requests.
+    pub pool: Id,
+}
+
+fn root_path() -> String {
+    "/".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]

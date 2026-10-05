@@ -6,9 +6,19 @@
 //! Certificate files live in `data_dir/tls/`. When `cert.pem`, `key.pem`,
 //! and `ca.pem` are all present and non-empty they are reused. Otherwise
 //! `keep` issues a server certificate for CN `pistack`.
+//!
+//! The TLS listener requests client certificates and verifies any that are
+//! offered against the cloud CA. Verified peer identity is published as
+//! [`keep::PeerIdentity`] via axum `ConnectInfo` so `/rpc` can require mTLS.
 
 use anyhow::Context;
-use axum::serve::Listener;
+use axum::extract::connect_info::Connected;
+use axum::extract::ConnectInfo;
+use axum::extract::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use axum::serve::{IncomingStream, Listener};
+use keep::PeerIdentity;
 use pistack_store::Store;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -16,6 +26,10 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+
+/// Local wrapper so we can implement axum `Connected` (orphan rules).
+#[derive(Clone, Debug)]
+struct GatewayPeer(PeerIdentity);
 
 /// HTTPS bind plus the store whose CA signs a missing certificate.
 pub struct TlsListen {
@@ -39,7 +53,7 @@ struct TlsListener {
 
 impl Listener for TlsListener {
     type Io = tokio_rustls::server::TlsStream<TcpStream>;
-    type Addr = SocketAddr;
+    type Addr = GatewayPeer;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
@@ -52,7 +66,10 @@ impl Listener for TlsListener {
                 }
             };
             match self.acceptor.accept(sock).await {
-                Ok(tls) => return (tls, addr),
+                Ok(tls) => {
+                    let peer = PeerIdentity::from_tls(addr, tls.get_ref().1);
+                    return (tls, GatewayPeer(peer));
+                }
                 Err(e) => {
                     tracing::debug!(%addr, error = %e, "tls handshake failed");
                 }
@@ -60,9 +77,34 @@ impl Listener for TlsListener {
         }
     }
 
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.tcp.local_addr()
+    fn local_addr(&self) -> std::io::Result<GatewayPeer> {
+        Ok(GatewayPeer(PeerIdentity {
+            addr: Some(self.tcp.local_addr()?),
+            common_name: None,
+        }))
     }
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for GatewayPeer {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        stream.remote_addr().clone()
+    }
+}
+
+impl Connected<IncomingStream<'_, TcpListener>> for GatewayPeer {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        GatewayPeer(PeerIdentity::plain(*stream.remote_addr()))
+    }
+}
+
+/// Copy [`PeerIdentity`] into request extensions for `/rpc` middleware.
+async fn publish_peer(
+    ConnectInfo(peer): ConnectInfo<GatewayPeer>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    req.extensions_mut().insert(peer.0);
+    next.run(req).await
 }
 
 /// Bind plain HTTP, and TLS when `tls` is set. A wildcard TLS address or a
@@ -107,13 +149,18 @@ pub async fn bind_listeners(
 impl BoundListeners {
     /// Serve until `shutdown` is cancelled. Both listeners watch that token.
     pub async fn serve(self, shutdown: CancellationToken) -> anyhow::Result<()> {
+        let app = self.app.layer(middleware::from_fn(publish_peer));
         let http_sd = shutdown.clone();
-        let http = axum::serve(self.http_listener, self.app.clone())
+        let http_svc = app
+            .clone()
+            .into_make_service_with_connect_info::<GatewayPeer>();
+        let http = axum::serve(self.http_listener, http_svc)
             .with_graceful_shutdown(async move { http_sd.cancelled().await });
         match self.tls_listener {
             Some(tls_listener) => {
                 let tls_sd = shutdown;
-                let tls = axum::serve(tls_listener, self.app)
+                let tls_svc = app.into_make_service_with_connect_info::<GatewayPeer>();
+                let tls = axum::serve(tls_listener, tls_svc)
                     .with_graceful_shutdown(async move { tls_sd.cancelled().await });
                 let (http_res, tls_res) = tokio::join!(http, tls);
                 http_res.context("http listener")?;
@@ -239,6 +286,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             public_url: "http://127.0.0.1".into(),
             node_name: "test".into(),
+            leadership: pistack_types::Leadership::always(),
         };
         let app = axum::Router::new()
             .route("/healthz", get(|| async { "ok" }))
@@ -295,6 +343,57 @@ mod tests {
         task.await.expect("serve task").expect("serve");
     }
 
+    #[tokio::test]
+    async fn tls_peer_identity_exposes_client_cn() {
+        use axum::routing::get;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().to_path_buf();
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let store = Store::open(data.join("state.redb"), events).expect("store");
+        keep::Client::open(&store).expect("ca");
+
+        let app = axum::Router::new().route(
+            "/whoami",
+            get(
+                |axum::Extension(peer): axum::Extension<PeerIdentity>| async move {
+                    peer.common_name.unwrap_or_else(|| "none".into())
+                },
+            ),
+        );
+
+        let shutdown = CancellationToken::new();
+        let bound = bind_listeners(
+            app,
+            "127.0.0.1:0",
+            Some(TlsListen {
+                addr: "127.0.0.1:0".into(),
+                data_dir: data.clone(),
+                store: store.clone(),
+            }),
+        )
+        .await
+        .expect("bind");
+        let tls = bound.tls.expect("tls addr");
+        let sd = shutdown.clone();
+        let task = tokio::spawn(async move { bound.serve(sd).await });
+
+        let ca = std::fs::read_to_string(data.join("tls/ca.pem")).expect("ca.pem");
+        let keep = keep::Client::open(&store).expect("keep");
+        let client_pki = keep.issue_client_cert("agent-who").expect("client cert");
+
+        let (status, body) = https_get_with_client(tls, &ca, Some(&client_pki), "/whoami").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("agent-who"), "{body}");
+
+        let (status, body) = https_get_with_client(tls, &ca, None, "/whoami").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("none"), "{body}");
+
+        shutdown.cancel();
+        task.await.expect("serve task").expect("serve");
+    }
+
     async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
         let mut tcp = TcpStream::connect(addr).await.expect("http connect");
         let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -308,7 +407,16 @@ mod tests {
     }
 
     async fn https_get(addr: SocketAddr, ca_pem: &str, path: &str) -> (u16, String) {
-        let cfg = keep::tls::client_config(ca_pem, None).expect("client config");
+        https_get_with_client(addr, ca_pem, None, path).await
+    }
+
+    async fn https_get_with_client(
+        addr: SocketAddr,
+        ca_pem: &str,
+        client: Option<&keep::Pki>,
+        path: &str,
+    ) -> (u16, String) {
+        let cfg = keep::tls::client_config(ca_pem, client).expect("client config");
         let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
         let tcp = TcpStream::connect(addr).await.expect("tls connect");
         let name =

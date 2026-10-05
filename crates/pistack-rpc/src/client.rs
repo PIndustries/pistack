@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::error::RpcError;
 use crate::proto::{
-    AgentHello, Command, CommandResult, Heartbeat, HeartbeatAck, HelloAck, ReportAck,
-    DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
+    AgentHello, Command, CommandResult, EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck,
+    HelloAck, ReportAck, DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
 };
 
 /// Slack added to a long-poll's request timeout so a server that honours
@@ -86,6 +86,31 @@ impl AgentClient {
             Some(trimmed.to_owned())
         };
         self
+    }
+
+    /// Build a client that presents `client` over TLS and trusts `ca_pem`.
+    ///
+    /// Used after [`Self::enroll`] so hello/heartbeat/command calls speak mTLS.
+    pub fn with_mtls(
+        base_url: impl Into<String>,
+        node_name: impl Into<String>,
+        ca_pem: &str,
+        client: &keep::Pki,
+    ) -> Result<Self, RpcError> {
+        let http = mtls_http_client(ca_pem, client)?;
+        Self::with_http(http, base_url, node_name)
+    }
+
+    /// Spend the join token once and receive a CA-signed client certificate.
+    pub async fn enroll(&self, node_name: &str) -> Result<EnrollResponse, RpcError> {
+        let rb = self
+            .http
+            .post(self.url("/agents/enroll"))
+            .json(&EnrollRequest {
+                node_name: node_name.to_owned(),
+            })
+            .timeout(Duration::from_secs(30));
+        decode(self.prepare(rb).send().await?).await
     }
 
     pub fn node_name(&self) -> &str {
@@ -160,6 +185,24 @@ impl AgentClient {
     pub async fn report_one(&self, result: CommandResult) -> Result<ReportAck, RpcError> {
         self.report(std::slice::from_ref(&result)).await
     }
+}
+
+fn mtls_http_client(ca_pem: &str, client: &keep::Pki) -> Result<reqwest::Client, RpcError> {
+    let mut identity = String::new();
+    identity.push_str(&client.cert_pem);
+    if !identity.ends_with('\n') {
+        identity.push('\n');
+    }
+    identity.push_str(&client.key_pem);
+    let identity = reqwest::Identity::from_pem(identity.as_bytes()).map_err(RpcError::Http)?;
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
+        .identity(identity);
+    for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).map_err(RpcError::Http)? {
+        builder = builder.add_root_certificate(cert);
+    }
+    Ok(builder.build()?)
 }
 
 #[derive(Deserialize)]

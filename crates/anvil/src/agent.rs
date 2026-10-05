@@ -18,12 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use keep::Pki;
 use pistack_rpc::proto::{
-    AgentHello, Command, CommandKind, CommandResult, Heartbeat, LogText, MachineRef, MachineReport,
-    MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached, VolumeDetach,
-    MAX_LONG_POLL_SECS,
+    AgentHello, Command, CommandKind, CommandResult, Heartbeat, LogText, MachineKind, MachineRef,
+    MachineReport, MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached,
+    VolumeDetach, MAX_LONG_POLL_SECS,
 };
-use pistack_rpc::{AgentClient, RpcError};
+use pistack_rpc::{AgentClient, RpcError, RPC_INSECURE_ENV};
 use pistack_types::{ApiError, Phase, Resources};
 use tokio_util::sync::CancellationToken;
 
@@ -79,7 +80,7 @@ pub async fn run_agent(opts: AgentOpts) -> anyhow::Result<()> {
         "anvil agent starting"
     );
 
-    let client = connect(&opts.join, &facts.node_name, opts.token)?;
+    let client = connect_and_enroll(&opts, &facts.node_name).await?;
 
     let shutdown = CancellationToken::new();
     let sd = shutdown.clone();
@@ -124,6 +125,52 @@ fn normalize_join_token(token: Option<String>) -> Option<String> {
     }
 }
 
+/// Build the agent client. Prefer a persisted client certificate; otherwise
+/// enroll with the join token when present. Plain HTTP without a certificate
+/// only works when the control plane sets `PISTACK_RPC_INSECURE=1`.
+async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<AgentClient> {
+    let base = join_url(&opts.join);
+    let token = normalize_join_token(opts.token.clone());
+    let cert_dir = opts.data_dir.join("agent");
+
+    if let Some(pki) = load_agent_pki(&cert_dir)? {
+        tracing::info!("using persisted agent client certificate");
+        let mut client = AgentClient::with_mtls(&base, node, &pki.ca_pem, &pki)?;
+        if let Some(t) = token {
+            client = client.with_token(t);
+        }
+        return Ok(client);
+    }
+
+    if let Some(t) = token.clone() {
+        let bootstrap = AgentClient::new(&base, node)?.with_token(t);
+        match bootstrap.enroll(node).await {
+            Ok(enrolled) => {
+                let pki = Pki {
+                    cert_pem: enrolled.cert_pem,
+                    key_pem: enrolled.key_pem,
+                    ca_pem: enrolled.ca_pem,
+                };
+                save_agent_pki(&cert_dir, &pki)?;
+                tracing::info!("enrolled agent client certificate");
+                return Ok(AgentClient::with_mtls(&base, node, &pki.ca_pem, &pki)?);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "agent enroll failed; continuing without a client certificate"
+                );
+            }
+        }
+    } else if !rpc_insecure() {
+        tracing::warn!(
+            "no agent certificate and no join token; /rpc will reject this agent unless {RPC_INSECURE_ENV}=1"
+        );
+    }
+
+    Ok(connect(&opts.join, node, opts.token.clone())?)
+}
+
 /// Build the agent client. The join token is attached only when it is non-empty.
 fn connect(join: &str, node: &str, token: Option<String>) -> Result<AgentClient, RpcError> {
     let mut client = AgentClient::new(join_url(join), node)?;
@@ -131,6 +178,52 @@ fn connect(join: &str, node: &str, token: Option<String>) -> Result<AgentClient,
         client = client.with_token(t);
     }
     Ok(client)
+}
+
+fn rpc_insecure() -> bool {
+    std::env::var(RPC_INSECURE_ENV)
+        .ok()
+        .as_deref()
+        .is_some_and(|v| v.trim() == "1")
+}
+
+fn load_agent_pki(dir: &std::path::Path) -> anyhow::Result<Option<Pki>> {
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    let ca = dir.join("ca.pem");
+    if !(non_empty(&cert) && non_empty(&key) && non_empty(&ca)) {
+        return Ok(None);
+    }
+    Ok(Some(Pki {
+        cert_pem: std::fs::read_to_string(&cert)?,
+        key_pem: std::fs::read_to_string(&key)?,
+        ca_pem: std::fs::read_to_string(&ca)?,
+    }))
+}
+
+fn save_agent_pki(dir: &std::path::Path, pki: &Pki) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("cert.pem"), &pki.cert_pem)?;
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = dir.join("key.pem");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(pki.key_pem.as_bytes())?;
+    }
+    std::fs::write(dir.join("ca.pem"), &pki.ca_pem)?;
+    Ok(())
+}
+
+fn non_empty(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Append [`RPC_PREFIX`] unless the operator already pointed at it.
@@ -332,13 +425,13 @@ impl Agent {
             CommandKind::PlugPort => {
                 let req: PortPlug = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, "anvil: plug port");
-                crate::runtime::libvirt::plug_port(&req).await?;
+                attach_port(&self.runtimes, &req).await?;
                 Ok(serde_json::Value::Null)
             }
             CommandKind::UnplugPort => {
                 let req: PortPlug = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, "anvil: unplug port");
-                crate::runtime::libvirt::unplug_port(&req).await?;
+                detach_port(&self.runtimes, &req).await?;
                 Ok(serde_json::Value::Null)
             }
             CommandKind::SyncOverlay => {
@@ -364,6 +457,30 @@ impl Agent {
                 "publish is handled by the edge host, not this agent",
             )),
         }
+    }
+}
+
+/// Cloud Hypervisor is the VM runtime only when this host selected it.
+/// libvirt keeps port plug on every other host, including the mock.
+fn cloud_vm(runtimes: &Runtimes) -> bool {
+    runtimes
+        .get(MachineKind::Vm)
+        .is_some_and(|rt| rt.name() == "cloud-hypervisor")
+}
+
+async fn attach_port(runtimes: &Runtimes, req: &PortPlug) -> Result<(), ApiError> {
+    if cloud_vm(runtimes) {
+        crate::runtime::cloud::plug_port(req).await
+    } else {
+        crate::runtime::libvirt::plug_port(req).await
+    }
+}
+
+async fn detach_port(runtimes: &Runtimes, req: &PortPlug) -> Result<(), ApiError> {
+    if cloud_vm(runtimes) {
+        crate::runtime::cloud::unplug_port(req).await
+    } else {
+        crate::runtime::libvirt::unplug_port(req).await
     }
 }
 
@@ -724,6 +841,22 @@ pub fn report(m: RunningMachine) -> MachineReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plug_uses_cloud_only_when_that_runtime_owns_vms() {
+        let cloud: crate::runtime::SharedRuntime = Arc::new(crate::runtime::CloudRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Vm, cloud);
+        assert!(cloud_vm(&rts));
+
+        let lib: crate::runtime::SharedRuntime = Arc::new(crate::runtime::LibvirtRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Vm, lib);
+        assert!(!cloud_vm(&rts));
+
+        let mock: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::default());
+        assert!(!cloud_vm(&Runtimes::all(mock)));
+    }
 
     #[test]
     fn join_url_adds_rpc_prefix_once() {

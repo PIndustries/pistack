@@ -1269,6 +1269,18 @@ fn nic_endpoint(nic: &NicAttachment) -> ApiResult<NicEndpoint> {
     Ok(NicEndpoint::Network(guest_network(nic)?))
 }
 
+/// Bridge a guest port attaches to.
+///
+/// An overlay port (`segment_id` set) uses the `po` bridge. Any other port
+/// uses the host NAT bridge: `pistack0` on the shared subnet, otherwise
+/// `pi` plus 12 hex digits of the network id.
+pub(crate) fn port_bridge(nic: &NicAttachment) -> ApiResult<String> {
+    match nic_endpoint(nic)? {
+        NicEndpoint::Bridge(name) => Ok(name),
+        NicEndpoint::Network(net) => Ok(bridge_of(&net)),
+    }
+}
+
 fn endpoint_matches(ep: &NicEndpoint, row: &IfaceRow) -> bool {
     match ep {
         NicEndpoint::Bridge(bridge) => {

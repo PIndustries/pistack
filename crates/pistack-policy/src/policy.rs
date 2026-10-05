@@ -421,6 +421,8 @@ impl Policy {
             // loom
             "pod",
             "deployment",
+            "statefulset",
+            "daemonset",
             "replicaset",
             "service",
             "ingress",

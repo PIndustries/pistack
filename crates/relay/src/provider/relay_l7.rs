@@ -7,14 +7,16 @@
 //! `ensure_balancer` binds `127.0.0.1:0` unless `spec.vip_address` is
 //! loopback or private. Unspecified, public, multicast, broadcast,
 //! link-local, and 100.64/10 addresses are refused. An `Http` listener
-//! rewrites the request onto the next member and copies the response back.
+//! picks a route by host and path (falling back to the default pool, and
+//! answering 404 when neither applies), rewrites the request onto that
+//! pool's next member and copies the response back.
 //! `Tcp` and `Https` are byte copies. `Terminated` presents the certificate
 //! `keep` already stored for that listener and stays unavailable when it
 //! has none. This proxy does not generate a certificate. UDP copies
 //! datagrams to an up member and is not ready when that list is empty.
 
 use super::{LbProvider, ListenerView, Realized};
-use crate::types::{Balancer, ListenerProtocol, Provider};
+use crate::types::{Balancer, ListenerProtocol, Member, PathMatch, Provider};
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::HashMap;
@@ -37,7 +39,7 @@ struct Slot {
     listener: Option<TcpListener>,
     task: Option<JoinHandle<()>>,
     cancel: tokio_util::sync::CancellationToken,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    members: Arc<parking_lot::Mutex<Table>>,
     cursor: Arc<AtomicUsize>,
     limit: Arc<AtomicUsize>,
     inflight: Arc<AtomicUsize>,
@@ -98,7 +100,7 @@ impl RelayL7Provider {
             }
             slot.bound.ip()
         };
-        let udp = crate::udp::UdpForward::bind(ip, targets).await?;
+        let udp = crate::udp::UdpForward::bind(SocketAddr::new(ip, 0), targets).await?;
         let bound = udp.bound().to_string();
         let mut slots = self.slots.lock();
         let slot = slots
@@ -140,7 +142,7 @@ fn bind_target(lb: &Balancer) -> ApiResult<SocketAddr> {
             )));
         }
     };
-    Ok(SocketAddr::new(ip, 0))
+    Ok(SocketAddr::new(ip, lb.spec.vip_port.unwrap_or(0)))
 }
 
 fn realized(bound: SocketAddr) -> Realized {
@@ -150,13 +152,7 @@ fn realized(bound: SocketAddr) -> Realized {
     }
 }
 
-fn member_addrs(view: &ListenerView) -> Vec<SocketAddr> {
-    if !view.listener.spec.admin_up {
-        return Vec::new();
-    }
-    let Some((_, members)) = &view.pool else {
-        return Vec::new();
-    };
+fn live_addrs(members: &[Member]) -> Vec<SocketAddr> {
     let primary: Vec<SocketAddr> = members
         .iter()
         .filter(|m| !m.spec.backup)
@@ -166,6 +162,165 @@ fn member_addrs(view: &ListenerView) -> Vec<SocketAddr> {
         return primary;
     }
     members.iter().map(|m| m.addr()).collect()
+}
+
+fn table_for(view: &ListenerView) -> Table {
+    if !view.listener.spec.admin_up {
+        return Table::default();
+    }
+    let default = match &view.pool {
+        Some((_, members)) => live_addrs(members),
+        None => Vec::new(),
+    };
+    let routes = view
+        .routes
+        .iter()
+        .map(|r| RouteTarget {
+            host: r.route.host.as_deref().map(normalize_host),
+            path: r.route.path.clone(),
+            exact: r.route.path_match == PathMatch::Exact,
+            members: if r.pool.spec.admin_up {
+                live_addrs(&r.members)
+            } else {
+                Vec::new()
+            },
+        })
+        .collect();
+    Table { default, routes }
+}
+
+/// Where requests on one listener go: routes first, then the default pool.
+#[derive(Default)]
+struct Table {
+    default: Vec<SocketAddr>,
+    routes: Vec<RouteTarget>,
+}
+
+struct RouteTarget {
+    host: Option<String>,
+    path: String,
+    exact: bool,
+    members: Vec<SocketAddr>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Choice {
+    Member(SocketAddr),
+    /// A route or the default pool applies but has no member up.
+    Unavailable,
+    /// Routes exist, none matches, and there is no default member.
+    NotFound,
+}
+
+impl Table {
+    fn choose(&self, host: Option<&str>, path: &str, cursor: &AtomicUsize) -> Choice {
+        let take = |members: &[SocketAddr]| match pick(members, cursor) {
+            Some(addr) => Choice::Member(addr),
+            None => Choice::Unavailable,
+        };
+        let mut best: Option<((u8, usize, bool), &RouteTarget)> = None;
+        for route in &self.routes {
+            let Some(host_rank) = host_rank(route.host.as_deref(), host) else {
+                continue;
+            };
+            let Some(len) = path_len(&route.path, route.exact, path) else {
+                continue;
+            };
+            let rank = (host_rank, len, route.exact);
+            if best.as_ref().is_none_or(|(have, _)| rank > *have) {
+                best = Some((rank, route));
+            }
+        }
+        match best {
+            Some((_, route)) => take(&route.members),
+            None if self.routes.is_empty() || !self.default.is_empty() => take(&self.default),
+            None => Choice::NotFound,
+        }
+    }
+}
+
+/// 2 for an exact host, 1 for a wildcard, 0 for a route with no host.
+fn host_rank(route: Option<&str>, request: Option<&str>) -> Option<u8> {
+    let Some(want) = route else {
+        return Some(0);
+    };
+    let have = request?;
+    if let Some(suffix) = want.strip_prefix('*') {
+        let label = have.strip_suffix(suffix)?;
+        return (!label.is_empty() && !label.contains('.')).then_some(1);
+    }
+    (want == have).then_some(2)
+}
+
+/// Length of the matched route path, or `None` when it does not match.
+fn path_len(route: &str, exact: bool, request: &str) -> Option<usize> {
+    if exact {
+        return (route == request).then_some(route.len());
+    }
+    let base = route.trim_end_matches('/');
+    if base.is_empty() {
+        return Some(0);
+    }
+    let matched = request == base
+        || request
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'));
+    matched.then_some(base.len())
+}
+
+/// Lower-case, without a port or a trailing dot.
+fn normalize_host(raw: &str) -> String {
+    let raw = raw.trim();
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        raw.rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map_or(raw, |(host, _)| host)
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The request's host and path. The host comes from an absolute request
+/// target when there is one, otherwise from the `Host` header. The path
+/// drops any query or fragment.
+fn route_key(head: &[u8]) -> (Option<String>, String) {
+    let Ok(text) = std::str::from_utf8(head) else {
+        return (None, "/".into());
+    };
+    let mut lines = text.split("\r\n");
+    let target = lines
+        .next()
+        .and_then(|start| start.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let mut host = None;
+    let mut path = target;
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = target.strip_prefix(scheme) {
+            let (authority, tail) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, "/"),
+            };
+            host = Some(normalize_host(authority));
+            path = tail;
+        }
+    }
+    if host.is_none() {
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("host") {
+                    host = Some(normalize_host(value));
+                    break;
+                }
+            }
+        }
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let path = if path.is_empty() { "/" } else { path };
+    (host.filter(|h| !h.is_empty()), path.to_owned())
 }
 
 fn pick(members: &[SocketAddr], cursor: &AtomicUsize) -> Option<SocketAddr> {
@@ -178,7 +333,7 @@ fn pick(members: &[SocketAddr], cursor: &AtomicUsize) -> Option<SocketAddr> {
 
 async fn accept_loop(
     listener: TcpListener,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    members: Arc<parking_lot::Mutex<Table>>,
     cursor: Arc<AtomicUsize>,
     limit: Arc<AtomicUsize>,
     inflight: Arc<AtomicUsize>,
@@ -250,14 +405,27 @@ where
     let _ = stream.write_all(body).await;
 }
 
+async fn not_found<S>(mut stream: S)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let body = b"no route";
+    let msg = format!(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(msg.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+}
+
 async fn splice(
     mut inbound: TcpStream,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    members: Arc<parking_lot::Mutex<Table>>,
     cursor: Arc<AtomicUsize>,
 ) {
     let dest = {
         let guard = members.lock();
-        pick(&guard, &cursor)
+        pick(&guard.default, &cursor)
     };
     let Some(dest) = dest else {
         return;
@@ -275,7 +443,7 @@ async fn splice(
 async fn proxy_http<S>(
     mut inbound: S,
     peer: SocketAddr,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    members: Arc<parking_lot::Mutex<Table>>,
     cursor: Arc<AtomicUsize>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -284,15 +452,22 @@ async fn proxy_http<S>(
     let Some((head, rest)) = read else {
         return;
     };
-    if header_has(&head, "transfer-encoding") {
-        let dest = {
-            let guard = members.lock();
-            pick(&guard, &cursor)
-        };
-        let Some(dest) = dest else {
+    let choice = {
+        let (host, path) = route_key(&head);
+        members.lock().choose(host.as_deref(), &path, &cursor)
+    };
+    let dest = match choice {
+        Choice::Member(dest) => dest,
+        Choice::Unavailable => {
             let _ = refuse(inbound).await;
             return;
-        };
+        }
+        Choice::NotFound => {
+            let _ = not_found(inbound).await;
+            return;
+        }
+    };
+    if header_has(&head, "transfer-encoding") {
         let mut outbound = match TcpStream::connect(dest).await {
             Ok(stream) => stream,
             Err(_) => {
@@ -306,14 +481,6 @@ async fn proxy_http<S>(
         return;
     }
     let Some(rewritten) = rewrite_request(&head, peer) else {
-        return;
-    };
-    let dest = {
-        let guard = members.lock();
-        pick(&guard, &cursor)
-    };
-    let Some(dest) = dest else {
-        let _ = refuse(inbound).await;
         return;
     };
     let mut outbound =
@@ -497,7 +664,7 @@ impl LbProvider for RelayL7Provider {
                 listener: Some(listener),
                 task: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
-                members: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                members: Arc::new(parking_lot::Mutex::new(Table::default())),
                 cursor: Arc::new(AtomicUsize::new(0)),
                 limit: Arc::new(AtomicUsize::new(0)),
                 inflight: Arc::new(AtomicUsize::new(0)),
@@ -529,14 +696,14 @@ impl LbProvider for RelayL7Provider {
             ListenerProtocol::Http => Serve::Http,
             ListenerProtocol::Tcp | ListenerProtocol::Https => Serve::Stream,
         };
-        let addrs = member_addrs(view);
+        let table = table_for(view);
         let limit = view.listener.spec.connection_limit as usize;
         let id = view.balancer.meta.id.clone();
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(&id)
             .ok_or_else(|| ApiError::bad_request("http balancer is not bound"))?;
-        *slot.members.lock() = addrs;
+        *slot.members.lock() = table;
         slot.limit.store(limit, Ordering::Relaxed);
         *slot.mode.lock() = serve;
         if slot.task.is_none() {
@@ -577,6 +744,7 @@ mod tests {
             spec: BalancerSpec {
                 vip_network: "net".into(),
                 vip_address: vip,
+                vip_port: None,
                 floating_ip: None,
                 provider: Provider::Relay,
                 admin_up: true,
@@ -626,11 +794,13 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
                 status: ListenerStatus::default(),
             },
             pool: Some((pool, member_rows)),
             tls: None,
+            routes: Vec::new(),
         }
     }
 
@@ -731,5 +901,81 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    fn target(host: Option<&str>, path: &str, exact: bool, port: u16) -> RouteTarget {
+        RouteTarget {
+            host: host.map(str::to_owned),
+            path: path.into(),
+            exact,
+            members: vec![SocketAddr::from(([127, 0, 0, 1], port))],
+        }
+    }
+
+    fn port_of(choice: Choice) -> u16 {
+        match choice {
+            Choice::Member(addr) => addr.port(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_prefers_specific_host_then_longest_path() {
+        let cursor = AtomicUsize::new(0);
+        let table = Table {
+            default: Vec::new(),
+            routes: vec![
+                target(None, "/", false, 1),
+                target(Some("*.example.com"), "/", false, 2),
+                target(Some("app.example.com"), "/", false, 3),
+                target(Some("app.example.com"), "/api/", false, 4),
+                target(Some("app.example.com"), "/api", true, 5),
+            ],
+        };
+        let at = |host: Option<&str>, path: &str| port_of(table.choose(host, path, &cursor));
+        assert_eq!(at(Some("app.example.com"), "/"), 3);
+        assert_eq!(at(Some("app.example.com"), "/api/v1"), 4);
+        assert_eq!(at(Some("app.example.com"), "/api"), 5);
+        assert_eq!(at(Some("app.example.com"), "/apix"), 3);
+        assert_eq!(at(Some("www.example.com"), "/api"), 2);
+        assert_eq!(at(Some("a.b.example.com"), "/"), 1);
+        assert_eq!(at(None, "/"), 1);
+    }
+
+    #[test]
+    fn table_falls_back_then_404s() {
+        let cursor = AtomicUsize::new(0);
+        let mut table = Table {
+            default: Vec::new(),
+            routes: vec![target(Some("app"), "/x", false, 1)],
+        };
+        assert_eq!(table.choose(Some("app"), "/y", &cursor), Choice::NotFound);
+        table.default = vec![SocketAddr::from(([127, 0, 0, 1], 9))];
+        assert_eq!(port_of(table.choose(Some("app"), "/y", &cursor)), 9);
+        table.routes[0].members.clear();
+        assert_eq!(
+            table.choose(Some("app"), "/x/1", &cursor),
+            Choice::Unavailable
+        );
+        let empty = Table::default();
+        assert_eq!(empty.choose(None, "/", &cursor), Choice::Unavailable);
+    }
+
+    #[test]
+    fn route_key_reads_host_and_path() {
+        let key = |raw: &str| route_key(raw.as_bytes());
+        assert_eq!(
+            key("GET /a/b?q=1 HTTP/1.1\r\nHost: App.Example.com:8080\r\n\r\n"),
+            (Some("app.example.com".into()), "/a/b".into())
+        );
+        assert_eq!(
+            key("GET http://Edge.Local./x#f HTTP/1.1\r\nHost: other\r\n\r\n"),
+            (Some("edge.local".into()), "/x".into())
+        );
+        assert_eq!(
+            key("GET ?q HTTP/1.1\r\nhost: [::1]:80\r\n\r\n"),
+            (Some("::1".into()), "/".into())
+        );
+        assert_eq!(key("GET / HTTP/1.0\r\n\r\n"), (None, "/".into()));
     }
 }

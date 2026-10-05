@@ -210,12 +210,15 @@ async fn cluster_ip_and_load_balancer_forward_and_remove_is_idempotent() {
     let bound = lb.status.provider_ref.clone().unwrap();
     assert!(bound.starts_with("127.0.0.1:"), "{bound}");
     assert_eq!(ping(&bound).await, b"one!");
-    cluster.spec.ports[0].protocol = Protocol::Udp;
+    cluster.spec.ports[0].protocol = Protocol::Sctp;
     let err = relay
         .realize(&cluster, &[endpoint(one_addr)])
         .await
         .unwrap_err();
-    assert!(err.message.contains("service forward is tcp only"), "{err}");
+    assert!(
+        err.message.contains("service forward is tcp and udp only"),
+        "{err}"
+    );
     closed(&bound).await;
     assert!(store
         .collection::<relay::Balancer>()
@@ -384,4 +387,281 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
     assert!(!ready.status);
     assert!(ready.message.contains("ingress relay is not configured"));
     assert!(stored.status.load_balancer.is_empty());
+}
+
+async fn http_req(addr: &str, host: &str, path: &str) -> String {
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.set_nodelay(true).unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf))
+        .await
+        .expect("timed out")
+        .unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn rule_path(path: &str, path_type: loom::PathType, svc: &str) -> IngressPath {
+    IngressPath {
+        path: path.into(),
+        path_type,
+        backend: IngressBackend {
+            service: svc.into(),
+            port: IntOrName::Int(80),
+        },
+    }
+}
+
+#[tokio::test]
+async fn ingress_routes_by_host_and_path() {
+    let (store, relay) = realizer();
+    let mut backends = Vec::new();
+    for (name, body) in [
+        ("web", &b"from-web"[..]),
+        ("api", &b"from-api"[..]),
+        ("docs", &b"from-docs"[..]),
+    ] {
+        let backend = listen().await;
+        let addr = backend.local_addr().unwrap();
+        spawn_http(backend, body);
+        let svc = service(
+            name,
+            ServiceKind::ClusterIp,
+            80,
+            addr.port(),
+            Protocol::Tcp,
+            vec![endpoint(addr)],
+        );
+        store.collection::<Service>().create(svc).unwrap();
+        backends.push(addr);
+    }
+    let mut edge = Ingress {
+        meta: Meta::new(loom::kinds::INGRESS, "routed", None),
+        spec: IngressSpec {
+            rules: vec![
+                IngressRule {
+                    host: Some("App.Example.com".into()),
+                    paths: vec![
+                        rule_path("/", loom::PathType::Prefix, "web"),
+                        rule_path("/api", loom::PathType::Prefix, "api"),
+                    ],
+                },
+                IngressRule {
+                    host: Some("*.docs.example.com".into()),
+                    paths: vec![rule_path("/guide", loom::PathType::Exact, "docs")],
+                },
+            ],
+            ..IngressSpec::default()
+        },
+        status: loom::IngressStatus::default(),
+    };
+    store.collection::<Ingress>().create(edge.clone()).unwrap();
+    let addr = relay.ensure_ingress(&edge).await.unwrap().remove(0);
+
+    let cases = [
+        ("app.example.com", "/", "from-web"),
+        ("app.example.com:80", "/apis", "from-web"),
+        ("app.example.com", "/api", "from-api"),
+        ("app.example.com", "/api/v1/things?x=1", "from-api"),
+        ("eu.docs.example.com", "/guide", "from-docs"),
+        ("eu.docs.example.com", "/guide/more", "404 Not Found"),
+        ("a.b.docs.example.com", "/guide", "404 Not Found"),
+        ("other.example.com", "/api", "404 Not Found"),
+    ];
+    for (host, path, want) in cases {
+        let got = http_req(&addr, host, path).await;
+        assert!(got.contains(want), "{host}{path}: {got}");
+    }
+
+    // A default backend catches what no rule matches.
+    edge.spec.default_backend = Some(IngressBackend {
+        service: "docs".into(),
+        port: IntOrName::Int(80),
+    });
+    edge.spec.rules.truncate(1);
+    store
+        .collection::<Ingress>()
+        .update(edge.clone(), None)
+        .unwrap();
+    let again = relay.ensure_ingress(&edge).await.unwrap().remove(0);
+    assert_eq!(again, addr);
+    let got = http_req(&addr, "other.example.com", "/api").await;
+    assert!(got.contains("from-docs"), "{got}");
+    let got = http_req(&addr, "app.example.com", "/api/x").await;
+    assert!(got.contains("from-api"), "{got}");
+
+    // Dropping a rule removes its pool.
+    let pools = store.collection::<relay::Pool>().list(None).unwrap();
+    let names: Vec<_> = pools.iter().map(|p| p.meta.name.clone()).collect();
+    assert_eq!(pools.len(), 3, "{names:?}");
+    assert!(!names.iter().any(|n| n.ends_with("-route-2")), "{names:?}");
+}
+
+/// A free port in the node-port range on loopback.
+fn free_node_port() -> u16 {
+    (30000..=32767)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .expect("a free node port")
+}
+
+#[tokio::test]
+async fn node_port_listens_on_the_node_address_and_moves() {
+    let store = Store::in_memory().unwrap();
+    let relay =
+        std::sync::Arc::new(RelayRealizer::new().with_node_address("127.0.0.1".parse().unwrap()));
+    relay.bind_store(store.clone());
+    let backend = listen().await;
+    let backend_addr = backend.local_addr().unwrap();
+    spawn_tcp(backend, b"node");
+
+    let mut svc = service(
+        "np",
+        ServiceKind::NodePort,
+        80,
+        backend_addr.port(),
+        Protocol::Tcp,
+        vec![endpoint(backend_addr)],
+    );
+    let first = free_node_port();
+    svc.status.node_ports.insert(80, first);
+    let published = relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    assert!(published.is_empty());
+    let at = format!("127.0.0.1:{first}");
+    assert_eq!(ping(&at).await, b"node");
+
+    // Same pass again keeps the same listener.
+    relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    assert_eq!(ping(&at).await, b"node");
+
+    // A new node port replaces the old listener.
+    let second = (first + 1..=32767)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap();
+    svc.status.node_ports.insert(80, second);
+    relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    let moved = format!("127.0.0.1:{second}");
+    assert_eq!(ping(&moved).await, b"node");
+    closed(&at).await;
+
+    // Back to ClusterIp drops the node listener.
+    svc.spec.kind = ServiceKind::ClusterIp;
+    svc.status.node_ports.clear();
+    relay
+        .realize(&svc, &[endpoint(backend_addr)])
+        .await
+        .unwrap();
+    closed(&moved).await;
+
+    relay.remove(&svc).await.unwrap();
+    assert!(store
+        .collection::<relay::Balancer>()
+        .list(None)
+        .unwrap()
+        .iter()
+        .all(|lb| lb.meta.labels.get("loom.pistack.io/service") != Some(&svc.meta.id.to_string())));
+}
+
+fn spawn_udp(socket: tokio::net::UdpSocket, body: &'static [u8]) {
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        while let Ok((_, peer)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(body, peer).await;
+        }
+    });
+}
+
+async fn udp_ping(addr: &str) -> Vec<u8> {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0u8; 64];
+    for _ in 0..10 {
+        sock.send_to(b"ping", addr).await.unwrap();
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(300), sock.recv(&mut buf)).await
+        {
+            return buf[..n].to_vec();
+        }
+    }
+    panic!("{addr} gave no udp answer");
+}
+
+/// A port in the node-port range free for both tcp and udp on loopback.
+fn free_node_port_both(after: u16) -> u16 {
+    (after..=32767)
+        .find(|p| {
+            std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()
+                && std::net::UdpSocket::bind(("127.0.0.1", *p)).is_ok()
+        })
+        .expect("a free node port")
+}
+
+#[tokio::test]
+async fn udp_and_tcp_on_one_port_share_a_node_port() {
+    let store = Store::in_memory().unwrap();
+    let relay =
+        std::sync::Arc::new(RelayRealizer::new().with_node_address("127.0.0.1".parse().unwrap()));
+    relay.bind_store(store.clone());
+
+    // One backend port number answering on both tcp and udp.
+    let (tcp, udp) = loop {
+        let tcp = listen().await;
+        let port = tcp.local_addr().unwrap().port();
+        if let Ok(udp) = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await {
+            break (tcp, udp);
+        }
+    };
+    let backend = tcp.local_addr().unwrap();
+    spawn_tcp(tcp, b"tcp!");
+    spawn_udp(udp, b"udp!");
+
+    let mut svc = service(
+        "dns",
+        ServiceKind::NodePort,
+        53,
+        backend.port(),
+        Protocol::Tcp,
+        vec![endpoint(backend)],
+    );
+    let mut udp_port = svc.spec.ports[0].clone();
+    udp_port.name = "dns-udp".into();
+    udp_port.protocol = Protocol::Udp;
+    svc.spec.ports.push(udp_port);
+    let node_port = free_node_port_both(31500);
+    svc.status.node_ports.insert(53, node_port);
+
+    relay.realize(&svc, &[endpoint(backend)]).await.unwrap();
+    let at = format!("127.0.0.1:{node_port}");
+    assert_eq!(ping(&at).await, b"tcp!");
+    assert_eq!(udp_ping(&at).await, b"udp!");
+
+    // The cluster-side udp listener answers too.
+    let lbs = store.collection::<relay::Balancer>().list(None).unwrap();
+    let cluster_udp = lbs
+        .iter()
+        .find(|lb| lb.meta.name == format!("svc-{}-53-udp", svc.meta.id))
+        .unwrap();
+    let bound = cluster_udp.status.provider_ref.clone().unwrap();
+    assert_eq!(udp_ping(&bound).await, b"udp!");
+
+    // Again is a no-op.
+    relay.realize(&svc, &[endpoint(backend)]).await.unwrap();
+    assert_eq!(udp_ping(&at).await, b"udp!");
+
+    relay.remove(&svc).await.unwrap();
+    closed(&at).await;
+    assert!(store
+        .collection::<relay::Balancer>()
+        .list(None)
+        .unwrap()
+        .iter()
+        .all(|lb| lb.meta.labels.get("loom.pistack.io/service") != Some(&svc.meta.id.to_string())));
 }

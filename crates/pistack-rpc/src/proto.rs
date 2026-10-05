@@ -7,6 +7,7 @@
 //!
 //! | Method | Path                       | Body            | Reply            |
 //! | ------ | -------------------------- | --------------- | ---------------- |
+//! | POST   | `/agents/enroll`           | [`EnrollRequest`] | [`EnrollResponse`] |
 //! | POST   | `/agents/hello`            | [`AgentHello`]  | [`HelloAck`]     |
 //! | POST   | `/agents/heartbeat`        | [`Heartbeat`]   | [`HeartbeatAck`] |
 //! | GET    | `/agents/{node}/commands`  | `?wait=&max=`   | `Vec<Command>`   |
@@ -29,6 +30,22 @@ pub const DEFAULT_POLL_BATCH: usize = 16;
 /// no token. Not an `Authorization` bearer: the gateway treats those as gate
 /// session tokens.
 pub const JOIN_HEADER: &str = "x-pistack-join";
+
+/// Spend a join token once and receive a CA-signed client certificate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrollRequest {
+    /// Becomes the certificate common name and the agent node name.
+    pub node_name: String,
+}
+
+/// Material returned by `/agents/enroll`. Persist and present on TLS.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrollResponse {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub ca_pem: String,
+    pub grant: keep::JoinGrant,
+}
 
 /// First message an agent sends after it starts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

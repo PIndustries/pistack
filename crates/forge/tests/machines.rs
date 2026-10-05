@@ -39,10 +39,25 @@ async fn harness() -> Harness {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "testbox".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let forge = Forge::default();
     let app = forge.router(ctx.clone());
     forge.start(ctx).await.unwrap();
+    // Seed and local host run under leadership asynchronously.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (st, sizes) = call::<Page<Size>>(&app, "GET", "/sizes", None).await;
+        assert_eq!(st, StatusCode::OK);
+        if sizes.total >= 4 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leader never seeded sizes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     Harness { app, shutdown }
 }
 

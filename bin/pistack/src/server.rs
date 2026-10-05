@@ -8,7 +8,7 @@ use crate::gateway;
 use anyhow::Context;
 use pistack_rpc::{CommandQueue, QueueConfig};
 use pistack_store::Store;
-use pistack_types::{Module, ModuleContext};
+use pistack_types::{Leadership, Module, ModuleContext};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -134,12 +134,16 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     };
 
     let shutdown = CancellationToken::new();
+    // Leadership starts false until establish_local / adopt decides; modules
+    // that subscribe will stay idle until set below.
+    let leadership = Leadership::new(false);
     let ctx = ModuleContext {
         store: Arc::new(store.clone()),
         events: events.clone(),
         shutdown: shutdown.clone(),
         public_url: public_url.clone(),
         node_name: hostname(),
+        leadership: leadership.clone(),
     };
 
     if store.get_meta::<String>("cluster_id")?.is_none() {
@@ -188,6 +192,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         members = established.members.len(),
         "control plane membership"
     );
+    leadership.set(established.leader);
     let cluster = std::sync::Arc::new(crate::cluster::handle_from(
         node_id,
         public_url.clone(),
@@ -196,6 +201,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         store_path.clone(),
         &established,
         crate::cluster::advertise_ip(&opts.listen),
+        leadership.clone(),
     ));
     crate::cluster::spawn_background(
         cluster.clone(),
@@ -272,7 +278,32 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
 }
 
 fn hostname() -> String {
+    if let Ok(name) = std::env::var("PISTACK_NODE_NAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_owned();
+        }
+    }
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
         .unwrap_or_else(|_| "localhost".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hostname;
+
+    #[test]
+    fn hostname_prefers_env() {
+        // Serialise env mutation across tests in this process.
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("PISTACK_NODE_NAME", "lab-sim3");
+        assert_eq!(hostname(), "lab-sim3");
+        std::env::set_var("PISTACK_NODE_NAME", "  ");
+        let fallback = hostname();
+        assert!(!fallback.is_empty());
+        std::env::remove_var("PISTACK_NODE_NAME");
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

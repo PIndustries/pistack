@@ -105,14 +105,17 @@ impl Client {
         Ok(v)
     }
 
-    /// Listeners whose default pool is `pool`.
+    /// Listeners whose default pool or one of whose routes is `pool`.
     pub fn listeners_using_pool(&self, pool: &Id) -> ApiResult<Vec<Listener>> {
         Ok(self
             .listeners()
             .list(None)
             .map_err(store_err)?
             .into_iter()
-            .filter(|l| l.spec.default_pool.as_ref() == Some(pool))
+            .filter(|l| {
+                l.spec.default_pool.as_ref() == Some(pool)
+                    || l.spec.routes.iter().any(|r| &r.pool == pool)
+            })
             .collect())
     }
 
@@ -281,6 +284,24 @@ impl Client {
                 ));
             }
         }
+        if !spec.routes.is_empty() && !spec.protocol.is_l7() {
+            return Err(ApiError::bad_request(
+                "routes need an http or terminated listener",
+            ));
+        }
+        for route in &spec.routes {
+            validate_route(route)?;
+            let pool = self.pools().get(&route.pool).map_err(store_err)?;
+            if pool.spec.balancer != lb.meta.id {
+                return Err(ApiError::bad_request(format!(
+                    "pool {} belongs to another balancer",
+                    route.pool
+                )));
+            }
+            if pool.spec.protocol == PoolProtocol::Udp {
+                return Err(ApiError::bad_request("a route pool cannot be udp"));
+            }
+        }
         Ok(())
     }
 
@@ -329,7 +350,7 @@ impl Client {
         let users = self.listeners_using_pool(id)?;
         if let Some(l) = users.first() {
             return Err(ApiError::conflict(format!(
-                "pool {id} is the default pool of listener {}",
+                "pool {id} is used by listener {}",
                 l.meta.id
             )));
         }
@@ -501,6 +522,7 @@ impl Client {
                         connection_limit: 0,
                         admin_up: true,
                         door: None,
+                        routes: Vec::new(),
                     },
                 )?;
             }
@@ -538,6 +560,34 @@ impl Client {
 
 /// A member starts `NoMonitor` when its pool has no health monitor and
 /// `Offline` otherwise, until the checker has seen it rise.
+/// A route path starts with `/`. A host is lower-case letters, digits,
+/// dots and dashes, optionally behind one leading `*.`, with no port.
+fn validate_route(route: &Route) -> ApiResult<()> {
+    if !route.path.starts_with('/') || route.path.contains(char::is_whitespace) {
+        return Err(ApiError::bad_request(format!(
+            "route path {:?} must start with /",
+            route.path
+        )));
+    }
+    if let Some(host) = &route.host {
+        let name = host.strip_prefix("*.").unwrap_or(host);
+        let ok = !name.is_empty()
+            && name.len() <= 253
+            && !name.starts_with('.')
+            && !name.ends_with('.')
+            && !name.contains("..")
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
+        if !ok {
+            return Err(ApiError::bad_request(format!(
+                "route host {host:?} must be a lower-case name, optionally starting with *."
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn initial_status(pool: &Pool, spec: &MemberSpec) -> OperatingStatus {
     if !spec.admin_up {
         OperatingStatus::Draining
@@ -551,6 +601,9 @@ pub fn initial_status(pool: &Pool, spec: &MemberSpec) -> OperatingStatus {
 fn validate_balancer(spec: &BalancerSpec) -> ApiResult<()> {
     if spec.vip_network.trim().is_empty() {
         return Err(ApiError::bad_request("balancer needs a vip_network"));
+    }
+    if spec.vip_port == Some(0) {
+        return Err(ApiError::bad_request("vip_port must be 1-65535"));
     }
     if let Some(IpAddr::V4(a)) = spec.vip_address {
         if a.is_unspecified() || a.is_broadcast() || a.is_multicast() {

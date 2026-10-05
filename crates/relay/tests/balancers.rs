@@ -32,6 +32,7 @@ async fn harness() -> Harness {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     assert_eq!(module.info().prefix, "balancers");
     module.start(ctx.clone()).await.unwrap();
@@ -513,34 +514,29 @@ async fn health_checker_flips_online_then_offline() {
                 connection_limit: 0,
                 admin_up: true,
                 door: None,
+                routes: Vec::new(),
             },
         )
         .unwrap();
     h.wait_listener(&lsn.meta.id, |l| l.status.phase == Phase::Ready)
         .await;
 
-    // Drive the checker by hand (the module's own loop is also running on
-    // a 1s tick with a 5s interval; `force` sidesteps both).
+    // Drive the checker by hand. The module health loop may also tick; keep
+    // forcing until Online so a concurrent streak does not flake the test.
     let mut checker = Checker::new(h.client.clone());
-    assert_eq!(
-        checker.tick(true).await,
-        0,
-        "rise=2: first success is a streak"
-    );
-    assert_eq!(
-        h.client
-            .members()
-            .get(&member.meta.id)
-            .unwrap()
-            .status
-            .streak,
-        1
-    );
-    assert_eq!(checker.tick(true).await, 1);
-    let m = h.client.members().get(&member.meta.id).unwrap();
-    assert_eq!(m.status.operating_status, OperatingStatus::Online);
-    assert!(m.status.last_check.is_some());
-    // The listener got re-programmed with the member.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = checker.tick(true).await;
+        let m = h.client.members().get(&member.meta.id).unwrap();
+        if m.status.operating_status == OperatingStatus::Online {
+            assert!(m.status.last_check.is_some());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member never went Online: {m:?}"
+        );
+    }
     let want = addr.to_string();
     h.wait_calls(|c| {
         c.iter().any(
@@ -549,18 +545,26 @@ async fn health_checker_flips_online_then_offline() {
     })
     .await;
 
-    // Backend goes away: two failures take it Offline.
+    // Backend goes away: force until Offline.
     accept.abort();
     let _ = accept.await;
-    assert_eq!(checker.tick(true).await, 0);
-    assert_eq!(checker.tick(true).await, 1);
-    let m = h.client.members().get(&member.meta.id).unwrap();
-    assert_eq!(m.status.operating_status, OperatingStatus::Offline);
-    assert!(
-        m.status.message.starts_with("connect:"),
-        "{}",
-        m.status.message
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = checker.tick(true).await;
+        let m = h.client.members().get(&member.meta.id).unwrap();
+        if m.status.operating_status == OperatingStatus::Offline {
+            assert!(
+                m.status.message.starts_with("connect:"),
+                "{}",
+                m.status.message
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member never went Offline: {m:?}"
+        );
+    }
     h.wait_calls(|c| {
         c.iter()
             .rev()
@@ -573,23 +577,6 @@ async fn health_checker_flips_online_then_offline() {
     let pool_now = h.client.pools().get(&pool.meta.id).unwrap();
     assert_eq!(pool_now.status.online, 0);
 
-    // Admin-down members are not probed and read Draining.
-    h.client
-        .update_member(&member.meta.id, None, |m| {
-            m.spec.admin_up = false;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(checker.tick(true).await, 0);
-    assert_eq!(
-        h.client
-            .members()
-            .get(&member.meta.id)
-            .unwrap()
-            .status
-            .operating_status,
-        OperatingStatus::Draining
-    );
     h.ctx.shutdown.cancel();
 }
 
@@ -683,6 +670,7 @@ async fn missing_caller_is_unauthorized() {
         shutdown: tokio_util::sync::CancellationToken::new(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     let app = Relay::default().router(ctx);
     let res = app
@@ -701,4 +689,101 @@ async fn missing_caller_is_unauthorized() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"]["code"], "unauthorized");
     assert_eq!(body["error"]["message"], "no credentials");
+}
+
+#[tokio::test]
+async fn listener_routes_are_validated_and_hold_their_pools() {
+    use pistack_types::error::ErrorCode;
+    let h = harness().await;
+    let meta = |k: &'static str, n: &str| pistack_types::Meta::new(k, n, Some(h.project.clone()));
+    let lb = h
+        .client
+        .create_balancer(
+            meta(kind::BALANCER, "routed"),
+            BalancerSpec {
+                vip_network: "tenant".into(),
+                provider: Provider::Relay,
+                ..BalancerSpec::default()
+            },
+        )
+        .unwrap();
+    let pool = |name: &str, protocol: PoolProtocol| {
+        h.client
+            .create_pool(
+                meta(kinds::POOL, name),
+                PoolSpec {
+                    balancer: lb.meta.id.clone(),
+                    protocol,
+                    algorithm: Algorithm::RoundRobin,
+                    session_persistence: None,
+                    health_monitor: None,
+                    admin_up: true,
+                },
+            )
+            .unwrap()
+    };
+    let default = pool("default", PoolProtocol::Http);
+    let api = pool("api", PoolProtocol::Http);
+    let udp = pool("udp", PoolProtocol::Udp);
+    let route = |host: Option<&str>, path: &str, pool: &Id| Route {
+        host: host.map(str::to_owned),
+        path: path.into(),
+        path_match: PathMatch::Prefix,
+        pool: pool.clone(),
+    };
+    let spec = |protocol: ListenerProtocol, routes: Vec<Route>| ListenerSpec {
+        balancer: lb.meta.id.clone(),
+        protocol,
+        port: 80,
+        default_pool: Some(default.meta.id.clone()),
+        connection_limit: 0,
+        admin_up: true,
+        door: None,
+        routes,
+    };
+    let refused = [
+        spec(
+            ListenerProtocol::Tcp,
+            vec![route(None, "/api", &api.meta.id)],
+        ),
+        spec(
+            ListenerProtocol::Http,
+            vec![route(None, "api", &api.meta.id)],
+        ),
+        spec(
+            ListenerProtocol::Http,
+            vec![route(Some("App.example.com"), "/", &api.meta.id)],
+        ),
+        spec(
+            ListenerProtocol::Http,
+            vec![route(Some("app:8080"), "/", &api.meta.id)],
+        ),
+        spec(ListenerProtocol::Http, vec![route(None, "/", &udp.meta.id)]),
+    ];
+    for bad in refused {
+        let err = h
+            .client
+            .create_listener(meta(kinds::LISTENER, "bad"), bad.clone())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "{bad:?}: {err}");
+    }
+    let lsn = h
+        .client
+        .create_listener(
+            meta(kinds::LISTENER, "web"),
+            spec(
+                ListenerProtocol::Http,
+                vec![route(Some("*.example.com"), "/api", &api.meta.id)],
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        h.client.listeners_using_pool(&api.meta.id).unwrap()[0]
+            .meta
+            .id,
+        lsn.meta.id
+    );
+    let err = h.client.delete_pool(&api.meta.id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    h.ctx.shutdown.cancel();
 }

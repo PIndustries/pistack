@@ -3,9 +3,10 @@
 
 //! Container orchestration: pods, deployments, services, controllers.
 //!
-//! * [`types`] — `Pod`, `ReplicaSet`, `Deployment`, `Service`, `ConfigMap`,
-//!   `Job`, `CronJob`, `Ingress`; all `Resource<Spec, Status>` in the
-//!   Kubernetes shape (metadata + spec + status, labels, selectors).
+//! * [`types`] — `Pod`, `ReplicaSet`, `Deployment`, `StatefulSet`,
+//!   `DaemonSet`, `Service`, `ConfigMap`, `Job`, `CronJob`, `Ingress`, `Autoscaler`;
+//!   all `Resource<Spec, Status>` (metadata + spec + status, labels,
+//!   selectors).
 //! * [`controllers`] — one reconcile loop per kind. Pods become forge
 //!   `Machine`s of kind `Container`; see [`controllers::pod`] for the
 //!   machine → anvil contract (`PodSandbox` in `user_data`).
@@ -13,7 +14,8 @@
 //! * [`cron`] — the five-field cron parser CronJobs use.
 //! * [`realizer`] — `ServiceRealizer`, the seam to fabric/relay.
 //! * [`http`] — the `loom` API: `/pods`, `/replicasets`, `/deployments`,
-//!   `/services`, `/configmaps`, `/jobs`, `/cronjobs`, `/ingresses`.
+//!   `/statefulsets`, `/daemonsets`, `/services`, `/configmaps`, `/jobs`,
+//!   `/cronjobs`, `/ingresses`, `/autoscalers`.
 //!
 //! `Loom` is dev mode: unauthenticated requests are admin, services are
 //! realised by [`NoopRealizer`], cluster IPs come from `10.96.0.0/12`.
@@ -36,13 +38,16 @@ pub use types::*;
 use async_trait::async_trait;
 use axum::Router;
 use controllers::{
+    autoscaler::AutoscalerController,
     cronjob::CronJobController,
+    daemonset::DaemonSetController,
     deployment::DeploymentController,
     ingress::IngressController,
     job::JobController,
     pod::PodController,
     replicaset::ReplicaSetController,
     service::{ServiceController, DEFAULT_SERVICE_CIDR},
+    statefulset::StatefulSetController,
 };
 use ipnet::IpNet;
 use pistack_rpc::CommandQueue;
@@ -169,6 +174,14 @@ async fn start(config: &LoomConfig, ctx: ModuleContext) -> anyhow::Result<()> {
         ctx.clone(),
     ));
     tokio::spawn(controllers::run(
+        StatefulSetController::new(store.clone()),
+        ctx.clone(),
+    ));
+    tokio::spawn(controllers::run(
+        DaemonSetController::new(store.clone()),
+        ctx.clone(),
+    ));
+    tokio::spawn(controllers::run(
         ServiceController::new(store.clone(), config.service_cidr, config.realizer.clone()),
         ctx.clone(),
     ));
@@ -178,6 +191,10 @@ async fn start(config: &LoomConfig, ctx: ModuleContext) -> anyhow::Result<()> {
     ));
     tokio::spawn(controllers::run(
         JobController::new(store.clone()),
+        ctx.clone(),
+    ));
+    tokio::spawn(controllers::run(
+        AutoscalerController::new(store.clone()),
         ctx.clone(),
     ));
     tokio::spawn(controllers::run(CronJobController::new(store), ctx));

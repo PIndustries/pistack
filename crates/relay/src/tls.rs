@@ -213,6 +213,7 @@ mod tests {
                 BalancerSpec {
                     vip_network: "net".into(),
                     vip_address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    vip_port: None,
                     floating_ip: None,
                     provider: Provider::Relay,
                     admin_up: true,
@@ -259,6 +260,7 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
             )
             .unwrap();
@@ -281,6 +283,7 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
             )
             .unwrap();

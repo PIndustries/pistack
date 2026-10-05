@@ -45,11 +45,24 @@ async fn harness() -> Harness {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "testbox".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     forge::Forge::default().start(ctx.clone()).await.unwrap();
-    // The dev host advertises this box's cores; give the tests room.
+    // The dev host is registered asynchronously under leadership.
     let hosts = store.collection::<forge::Host>();
-    let local = hosts.get_by_name(None, forge::LOCAL_HOST_NAME).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let local = loop {
+        match hosts.get_by_name(None, forge::LOCAL_HOST_NAME) {
+            Ok(h) => break h,
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "leader never registered the local host"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
     hosts
         .modify(&local.meta.id, |h| {
             h.spec.capacity = pistack_types::Resources {

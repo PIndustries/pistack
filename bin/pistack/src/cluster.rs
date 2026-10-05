@@ -29,7 +29,7 @@ use pistack_cluster::{
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
-use pistack_types::ApiError;
+use pistack_types::{ApiError, Leadership};
 use serde::Deserialize;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -81,6 +81,8 @@ pub struct ClusterHandle {
     pub leader_api: Mutex<String>,
     pub term: AtomicU64,
     pub announce: watch::Sender<Announce>,
+    /// Shared with ModuleContext so controllers idle on followers.
+    pub leadership: Leadership,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -345,6 +347,7 @@ pub async fn adopt(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_from(
     node_id: String,
     self_api: String,
@@ -353,6 +356,7 @@ pub fn handle_from(
     db_path: PathBuf,
     established: &Established,
     advertise: Option<IpAddr>,
+    leadership: Leadership,
 ) -> ClusterHandle {
     let raft = advertise
         .map(|ip| format!("{ip}:18446"))
@@ -364,6 +368,7 @@ pub fn handle_from(
         raft: raft.clone(),
     };
     let (tx, _rx) = watch::channel(announce);
+    leadership.set(established.leader);
     ClusterHandle {
         node_id,
         self_api,
@@ -376,6 +381,7 @@ pub fn handle_from(
         leader_api: Mutex::new(established.leader_api.clone()),
         term: AtomicU64::new(established.term),
         announce: tx,
+        leadership,
     }
 }
 
@@ -518,6 +524,7 @@ async fn vote(
     handle.term.store(ballot.current_term, Ordering::Relaxed);
     if response.term > before && handle.leader.load(Ordering::Relaxed) {
         handle.leader.store(false, Ordering::Relaxed);
+        handle.leadership.set(false);
         handle.store.set_record_log(false);
         if response.granted {
             *guard(&handle.leader_api) = String::new();
@@ -650,6 +657,7 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
 fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     handle.term.store(term, Ordering::Relaxed);
     handle.leader.store(true, Ordering::Relaxed);
+    handle.leadership.set(true);
     *guard(&handle.leader_api) = handle.self_api.clone();
     *guard(&handle.role) = Role::Voter;
     handle.store.set_log_term(term);
@@ -997,6 +1005,7 @@ mod tests {
             path.clone(),
             &ready,
             None,
+            Leadership::always(),
         ));
         let app = router(handle.clone())
             .route("/mutate", axum::routing::post(|| async { "ok" }))

@@ -6,15 +6,22 @@
 //! Cluster IPs come from a CIDR (default `10.96.0.0/12`) through a counter
 //! kept in the store's meta table, so they survive restarts and never
 //! repeat while the counter lasts. Endpoints are the `Running` pods in the
-//! service's project whose labels match `spec.selector`. Every change is
-//! handed to the [`ServiceRealizer`].
+//! service's project whose labels match `spec.selector`. `NodePort` and
+//! `LoadBalancer` services also hold one node port per service port, the
+//! one `spec` asks for or the lowest free one in 30000-32767, and two
+//! services never share one. Every change is handed to the
+//! [`ServiceRealizer`].
 
 use super::{delete_quietly, patch_status, Controller};
 use crate::realizer::ServiceRealizer;
 use crate::selector::labels_match;
-use crate::types::{delete_requested, set_condition, Endpoint, Pod, PodPhase, Service};
+use crate::types::{
+    delete_requested, set_condition, Endpoint, Pod, PodPhase, Service, ServiceKind, NODE_PORT_RANGE,
+};
 use ipnet::IpNet;
 use pistack_store::{Collection, Store, StoreError};
+use pistack_types::Id;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -36,6 +43,52 @@ fn cidr_range(cidr: &IpNet) -> (u128, u128) {
         b if b >= 127 => (network + 1, u128::MAX - 2),
         b => (network + 1, (1u128 << b) - 2),
     }
+}
+
+/// Node ports `svc` should hold, keyed by service port. `taken` maps each
+/// node port another service holds to that service.
+fn node_ports_for(svc: &Service, taken: &BTreeMap<u16, Id>) -> Result<BTreeMap<u16, u16>, String> {
+    let mut out = BTreeMap::new();
+    if svc.spec.kind == ServiceKind::ClusterIp {
+        return Ok(out);
+    }
+    let mut used: BTreeSet<u16> = taken
+        .iter()
+        .filter(|(_, owner)| **owner != svc.meta.id)
+        .map(|(port, _)| *port)
+        .collect();
+    for p in &svc.spec.ports {
+        if let Some(want) = p.node_port {
+            if let Some(owner) = taken.get(&want).filter(|o| **o != svc.meta.id) {
+                return Err(format!(
+                    "node port {want} is already held by service {owner}"
+                ));
+            }
+            out.insert(p.port, want);
+            used.insert(want);
+        }
+    }
+    for p in &svc.spec.ports {
+        if out.contains_key(&p.port) {
+            continue;
+        }
+        if let Some(&had) = svc.status.node_ports.get(&p.port) {
+            if NODE_PORT_RANGE.contains(&had) && used.insert(had) {
+                out.insert(p.port, had);
+            }
+        }
+    }
+    for p in &svc.spec.ports {
+        if out.contains_key(&p.port) {
+            continue;
+        }
+        let Some(free) = NODE_PORT_RANGE.clone().find(|n| !used.contains(n)) else {
+            return Err("no node port is free".into());
+        };
+        used.insert(free);
+        out.insert(p.port, free);
+    }
+    Ok(out)
 }
 
 pub struct ServiceController {
@@ -96,7 +149,13 @@ impl ServiceController {
         Ok(())
     }
 
-    async fn converge(&self, svc: &Service, pods: &[Pod], taken: &[IpAddr]) -> anyhow::Result<()> {
+    async fn converge(
+        &self,
+        svc: &Service,
+        pods: &[Pod],
+        taken: &[IpAddr],
+        taken_ports: &BTreeMap<u16, Id>,
+    ) -> anyhow::Result<()> {
         let cluster_ip = match &svc.status.cluster_ip {
             Some(ip) => ip.clone(),
             None => match &svc.spec.cluster_ip {
@@ -121,14 +180,20 @@ impl ServiceController {
             .collect();
         endpoints.sort_by(|a, b| a.pod.cmp(&b.pod));
 
+        let (node_ports, port_err) = match node_ports_for(svc, taken_ports) {
+            Ok(ports) => (ports, None),
+            Err(why) => (BTreeMap::new(), Some(why)),
+        };
         let changed = svc.status.cluster_ip.as_deref() != Some(cluster_ip.as_str())
-            || svc.status.endpoints != endpoints;
+            || svc.status.endpoints != endpoints
+            || svc.status.node_ports != node_ports;
         let mut lb = svc.status.load_balancer.clone();
         let mut realized = true;
         let mut why = String::new();
         if changed {
             let mut with_ip = svc.clone();
             with_ip.status.cluster_ip = Some(cluster_ip.clone());
+            with_ip.status.node_ports = node_ports.clone();
             match self.realizer.realize(&with_ip, &endpoints).await {
                 Ok(addrs) => lb = addrs,
                 Err(e) => {
@@ -138,10 +203,16 @@ impl ServiceController {
                 }
             }
         }
+        if let Some(e) = port_err {
+            tracing::warn!(svc = %svc.meta.id, error = %e, "loom: service node port refused");
+            realized = false;
+            why = e;
+        }
         let summary = format!("{} endpoints", endpoints.len());
         patch_status(&self.services(), &svc.meta.id, |s| {
             s.cluster_ip = Some(cluster_ip.clone());
             s.endpoints = endpoints.clone();
+            s.node_ports = node_ports.clone();
             s.load_balancer = lb.clone();
             set_condition(
                 &mut s.conditions,
@@ -180,16 +251,25 @@ impl Controller for ServiceController {
             })
             .filter_map(|ip| ip.parse().ok())
             .collect();
+        let mut taken_ports: BTreeMap<u16, Id> = BTreeMap::new();
+        for svc in &services {
+            for node_port in svc.status.node_ports.values() {
+                taken_ports.insert(*node_port, svc.meta.id.clone());
+            }
+        }
         for svc in &services {
             let res = if delete_requested(svc) {
                 self.teardown(svc).await
             } else {
-                let r = self.converge(svc, &pods, &taken).await;
-                if let Ok(Some(ip)) = self
-                    .services()
-                    .try_get(&svc.meta.id)
-                    .map(|s| s.and_then(|s| s.status.cluster_ip))
-                {
+                let r = self.converge(svc, &pods, &taken, &taken_ports).await;
+                let now = self.services().try_get(&svc.meta.id).ok().flatten();
+                if let Some(now) = &now {
+                    taken_ports.retain(|_, owner| *owner != svc.meta.id);
+                    for node_port in now.status.node_ports.values() {
+                        taken_ports.insert(*node_port, svc.meta.id.clone());
+                    }
+                }
+                if let Some(ip) = now.and_then(|s| s.status.cluster_ip) {
                     if let Ok(ip) = ip.parse() {
                         if !taken.contains(&ip) {
                             taken.push(ip);
@@ -203,5 +283,79 @@ impl Controller for ServiceController {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod node_port_tests {
+    use super::*;
+    use crate::types::{ServicePort, ServiceSpec, ServiceStatus};
+    use pistack_types::Meta;
+
+    fn svc(kind: ServiceKind, ports: &[(u16, Option<u16>)]) -> Service {
+        Service {
+            meta: Meta::new(crate::kinds::SERVICE, "web", None),
+            spec: ServiceSpec {
+                ports: ports
+                    .iter()
+                    .map(|(port, node_port)| ServicePort {
+                        port: *port,
+                        node_port: *node_port,
+                        ..ServicePort::default()
+                    })
+                    .collect(),
+                kind,
+                ..ServiceSpec::default()
+            },
+            status: ServiceStatus::default(),
+        }
+    }
+
+    #[test]
+    fn cluster_ip_holds_none() {
+        let s = svc(ServiceKind::ClusterIp, &[(80, None)]);
+        assert!(node_ports_for(&s, &BTreeMap::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lowest_free_and_explicit() {
+        let other = Id::new(crate::kinds::SERVICE);
+        let taken = BTreeMap::from([(30000, other.clone()), (30002, other)]);
+        let s = svc(
+            ServiceKind::NodePort,
+            &[(80, None), (443, Some(30001)), (8080, None)],
+        );
+        let got = node_ports_for(&s, &taken).unwrap();
+        assert_eq!(
+            got,
+            BTreeMap::from([(80, 30003), (443, 30001), (8080, 30004)])
+        );
+    }
+
+    #[test]
+    fn explicit_conflict_is_an_error() {
+        let other = Id::new(crate::kinds::SERVICE);
+        let taken = BTreeMap::from([(31000, other)]);
+        let s = svc(ServiceKind::LoadBalancer, &[(80, Some(31000))]);
+        let err = node_ports_for(&s, &taken).unwrap_err();
+        assert!(err.contains("31000"), "{err}");
+    }
+
+    #[test]
+    fn keeps_its_port_across_passes() {
+        let mut s = svc(ServiceKind::NodePort, &[(80, None)]);
+        s.status.node_ports.insert(80, 32000);
+        let taken = BTreeMap::from([(32000, s.meta.id.clone())]);
+        let got = node_ports_for(&s, &taken).unwrap();
+        assert_eq!(got, BTreeMap::from([(80, 32000)]));
+    }
+
+    #[test]
+    fn gives_up_a_kept_port_another_service_now_holds() {
+        let mut s = svc(ServiceKind::NodePort, &[(80, None)]);
+        s.status.node_ports.insert(80, 30000);
+        let taken = BTreeMap::from([(30000, Id::new(crate::kinds::SERVICE))]);
+        let got = node_ports_for(&s, &taken).unwrap();
+        assert_eq!(got, BTreeMap::from([(80, 30001)]));
     }
 }

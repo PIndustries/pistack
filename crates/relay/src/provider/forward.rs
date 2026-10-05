@@ -95,7 +95,7 @@ fn bind_target(lb: &Balancer) -> ApiResult<SocketAddr> {
             )));
         }
     };
-    Ok(SocketAddr::new(ip, 0))
+    Ok(SocketAddr::new(ip, lb.spec.vip_port.unwrap_or(0)))
 }
 
 fn realized(bound: SocketAddr) -> Realized {
@@ -171,12 +171,19 @@ impl LbProvider for ForwardProvider {
             return Ok(realized(bound));
         }
         let target = bind_target(lb)?;
-        let listener = TcpListener::bind(target)
-            .await
-            .map_err(|e| ApiError::unavailable(format!("forward bind {target}: {e}")))?;
-        let bound = listener
-            .local_addr()
-            .map_err(|e| ApiError::unavailable(format!("forward local address: {e}")))?;
+        // A fixed port is bound by the listener that uses it, so a udp
+        // listener never holds the tcp port (or the other way round).
+        let (listener, bound) = if target.port() != 0 {
+            (None, target)
+        } else {
+            let listener = TcpListener::bind(target)
+                .await
+                .map_err(|e| ApiError::unavailable(format!("forward bind {target}: {e}")))?;
+            let bound = listener
+                .local_addr()
+                .map_err(|e| ApiError::unavailable(format!("forward local address: {e}")))?;
+            (Some(listener), bound)
+        };
         let mut slots = self.slots.lock();
         if let Some(existing) = slots.get(&lb.meta.id) {
             return Ok(realized(existing.bound));
@@ -185,7 +192,7 @@ impl LbProvider for ForwardProvider {
             lb.meta.id.clone(),
             Slot {
                 bound,
-                listener: Some(listener),
+                listener,
                 task: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 members: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -206,11 +213,29 @@ impl LbProvider for ForwardProvider {
         }
         let addrs = member_addrs(view);
         let id = view.balancer.meta.id.clone();
+        let unbound = {
+            let slots = self.slots.lock();
+            let slot = slots
+                .get(&id)
+                .ok_or_else(|| ApiError::bad_request("forward balancer is not bound"))?;
+            (slot.task.is_none() && slot.listener.is_none()).then_some(slot.bound)
+        };
+        let fresh = match unbound {
+            Some(at) => Some(
+                TcpListener::bind(at)
+                    .await
+                    .map_err(|e| ApiError::unavailable(format!("forward bind {at}: {e}")))?,
+            ),
+            None => None,
+        };
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(&id)
             .ok_or_else(|| ApiError::bad_request("forward balancer is not bound"))?;
         *slot.members.lock() = addrs;
+        if slot.task.is_none() && slot.listener.is_none() {
+            slot.listener = fresh;
+        }
         if slot.task.is_none() {
             let listener = slot
                 .listener
@@ -243,7 +268,7 @@ impl ForwardProvider {
             }
             return Err(ApiError::unavailable("udp pool has no up member"));
         }
-        let ip = {
+        let at = {
             let slots = self.slots.lock();
             let slot = slots
                 .get(&id)
@@ -252,9 +277,10 @@ impl ForwardProvider {
                 udp.set_members(targets);
                 return Ok(udp.bound().to_string());
             }
-            slot.bound.ip()
+            slot.bound
         };
-        let udp = crate::udp::UdpForward::bind(ip, targets).await?;
+        // Same address and port the balancer reports.
+        let udp = crate::udp::UdpForward::bind(at, targets).await?;
         let bound = udp.bound().to_string();
         let mut slots = self.slots.lock();
         let slot = slots
@@ -266,6 +292,11 @@ impl ForwardProvider {
             return Ok(existing.bound().to_string());
         }
         slot.udp = Some(udp);
+        if slot.task.is_none() {
+            // Free the tcp port held for an ephemeral balancer; a tcp
+            // listener added later binds it again.
+            slot.listener = None;
+        }
         Ok(bound)
     }
 }
@@ -287,6 +318,7 @@ mod tests {
             spec: BalancerSpec {
                 vip_network: "net".into(),
                 vip_address: vip,
+                vip_port: None,
                 floating_ip: None,
                 provider: Provider::Forward,
                 admin_up: true,
@@ -336,11 +368,13 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
                 status: ListenerStatus::default(),
             },
             pool: Some((pool, member_rows)),
             tls: None,
+            routes: Vec::new(),
         }
     }
 
