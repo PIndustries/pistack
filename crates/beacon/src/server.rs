@@ -7,10 +7,8 @@
 //! Zones are compiled into an in-memory [`Catalog`] on first use and thrown
 //! away whenever a `zone` or `rec` event arrives, so an answer is never
 //! staler than the last store write. SOA and apex NS records are synthesised
-//! from the zone spec and its reconciled serial. UDP and TCP share one port,
-//! `PISTACK_DNS_LISTEN` (default `127.0.0.1:5353` so an unset variable does
-//! not expose DNS on every interface; set `0.0.0.0:53` in production, where
-//! the binary needs `CAP_NET_BIND_SERVICE`).
+//! from the zone spec and its reconciled serial. UDP and TCP share one port
+//! per listen address from [`listen_addrs`].
 //!
 //! Queries and AXFR (TCP only) are served for primary zones and for secondary
 //! zones that have completed an AXFR pull. Updates, notifies and IXFR get
@@ -31,16 +29,23 @@ use parking_lot::RwLock;
 use pistack_types::module::CancellationToken;
 use pistack_types::Event;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-/// Environment variable naming the listen address.
+/// Environment variable naming the listen address(es).
+///
+/// A single `host:port`, or a comma-separated list for multi-bind
+/// (for example `10.66.66.1:5353,127.0.0.1:5353`). When set, the value is
+/// honored exactly — including `0.0.0.0:53` for production (needs
+/// `CAP_NET_BIND_SERVICE`). When unset, see [`listen_addrs`].
 pub const LISTEN_ENV: &str = "PISTACK_DNS_LISTEN";
-/// Unprivileged loopback default when `PISTACK_DNS_LISTEN` is unset.
-/// Production should set an explicit address such as `0.0.0.0:53`.
+/// DNS port used when deriving a default from a cluster/private address.
+pub const DEFAULT_PORT: u16 = 5353;
+/// Unprivileged loopback fallback when `PISTACK_DNS_LISTEN` is unset and no
+/// private cluster address is known. Never the all-interfaces surprise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:5353";
 /// How long an idle TCP client may hold a connection.
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -528,33 +533,125 @@ impl Handler {
     }
 }
 
-/// The listen address from the environment, or the development default.
-pub fn listen_addr() -> anyhow::Result<SocketAddr> {
-    let s = std::env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.into());
-    SocketAddr::from_str(&s).map_err(|e| anyhow::anyhow!("{LISTEN_ENV}={s}: {e}"))
+/// Resolve DNS listen addresses.
+///
+/// * When `PISTACK_DNS_LISTEN` is set (non-empty after trim), parse it as a
+///   comma-separated list of `host:port` and honor it exactly.
+/// * When unset, prefer a private unicast IPv4 taken from `hint` (the
+///   server `--listen` address or `public_url` host — the same private
+///   address cluster advertise uses) on port [`DEFAULT_PORT`].
+/// * When no private address is known, fall back to [`DEFAULT_LISTEN`].
+///   Defaults never use `0.0.0.0` / `::`.
+pub fn listen_addrs(hint: Option<&str>) -> anyhow::Result<Vec<SocketAddr>> {
+    let env = std::env::var(LISTEN_ENV).ok();
+    resolve_listen_addrs(env.as_deref(), hint)
 }
 
-/// Bind UDP and TCP on `listen` and serve until `shutdown` fires. Returns the
-/// bound address (useful when `listen` has port 0). The handler is
-/// invalidated on every zone/record event from `events`.
+/// Pure resolver used by [`listen_addrs`] and unit tests.
+pub fn resolve_listen_addrs(
+    env_value: Option<&str>,
+    hint: Option<&str>,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    if let Some(raw) = env_value.map(str::trim).filter(|s| !s.is_empty()) {
+        return parse_listen_list(raw);
+    }
+    if let Some(ip) = private_ip_from_hint(hint.unwrap_or("")) {
+        return Ok(vec![SocketAddr::new(IpAddr::V4(ip), DEFAULT_PORT)]);
+    }
+    Ok(vec![SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        DEFAULT_PORT,
+    )])
+}
+
+/// Split a comma-separated `host:port` list. Empty segments are skipped.
+fn parse_listen_list(raw: &str) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let addr = SocketAddr::from_str(part)
+            .map_err(|e| anyhow::anyhow!("{LISTEN_ENV} entry {part:?}: {e}"))?;
+        out.push(addr);
+    }
+    if out.is_empty() {
+        anyhow::bail!("{LISTEN_ENV} is empty after parsing");
+    }
+    Ok(out)
+}
+
+/// Private unicast IPv4 from a `host:port` or URL host. Matches cluster
+/// advertise: RFC 1918 only; loopback, unspecified, public, and names are
+/// refused so defaults never bind every interface or a public address.
+fn private_ip_from_hint(hint: &str) -> Option<Ipv4Addr> {
+    let host = host_from_hint(hint)?;
+    let ip: IpAddr = host.parse().ok()?;
+    let IpAddr::V4(v4) = ip else {
+        return None;
+    };
+    if v4.is_private() && !v4.is_unspecified() && !v4.is_broadcast() && !v4.is_multicast() {
+        Some(v4)
+    } else {
+        None
+    }
+}
+
+/// Host of `10.0.0.1:8443`, `http://10.0.0.1:8443/path`, or `[fd00::1]:53`.
+fn host_from_hint(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let rest = match raw.split_once("://") {
+        Some((_, rest)) => rest,
+        None => raw,
+    };
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if hostport.is_empty() {
+        return None;
+    }
+    if let Some(v6) = hostport.strip_prefix('[') {
+        return v6.split(']').next().filter(|s| !s.is_empty());
+    }
+    // host:port — take everything before the last colon when it looks like
+    // an IPv4 or name with a port. A bare IPv4 has no colon.
+    if let Some((host, port)) = hostport.rsplit_once(':') {
+        if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return Some(host);
+        }
+    }
+    Some(hostport)
+}
+
+/// Bind UDP and TCP on each address in `listens` and serve until `shutdown`
+/// fires. Returns the bound addresses (useful when an entry has port 0).
+/// The handler is invalidated on every zone/record event from `events`.
 pub async fn serve(
     client: Client,
-    listen: SocketAddr,
+    listens: &[SocketAddr],
     events: broadcast::Sender<Event>,
     shutdown: CancellationToken,
     secondaries: SecondaryCache,
-) -> anyhow::Result<SocketAddr> {
-    let udp = tokio::net::UdpSocket::bind(listen).await?;
-    let bound = udp.local_addr()?;
-    let tcp = tokio::net::TcpListener::bind(bound).await?;
-
+) -> anyhow::Result<Vec<SocketAddr>> {
+    if listens.is_empty() {
+        anyhow::bail!("beacon: no DNS listen addresses");
+    }
     let handler = Handler::new(client, secondaries);
     handler.watch(events.subscribe(), shutdown.clone());
 
     let mut server = Server::new(handler);
-    server.register_socket(udp);
-    server.register_listener(tcp, TCP_TIMEOUT, 4096);
-    tracing::info!(addr = %bound, "beacon: authoritative dns listening (udp+tcp)");
+    let mut bounds = Vec::with_capacity(listens.len());
+    for listen in listens {
+        let udp = tokio::net::UdpSocket::bind(listen).await?;
+        let bound = udp.local_addr()?;
+        let tcp = tokio::net::TcpListener::bind(bound).await?;
+        server.register_socket(udp);
+        server.register_listener(tcp, TCP_TIMEOUT, 4096);
+        tracing::info!(addr = %bound, "beacon: authoritative dns listening (udp+tcp)");
+        bounds.push(bound);
+    }
 
     tokio::spawn(async move {
         shutdown.cancelled().await;
@@ -563,7 +660,7 @@ pub async fn serve(
         }
         tracing::debug!("beacon dns server stopped");
     });
-    Ok(bound)
+    Ok(bounds)
 }
 
 #[cfg(test)]
@@ -692,5 +789,84 @@ mod tests {
         assert_eq!(xfr.answers.last().unwrap().record_type(), RecordType::SOA);
         assert!(xfr.answers.len() >= 4); // SOA + NS + A(s) + SOA
         assert!(h.resolve_axfr(&n("other.tld.")).unwrap().is_none());
+    }
+
+    #[test]
+    fn env_set_is_honored_exactly() {
+        let one = resolve_listen_addrs(Some("10.0.0.5:5353"), Some("192.168.1.1:8443")).unwrap();
+        assert_eq!(one, vec![SocketAddr::from_str("10.0.0.5:5353").unwrap()]);
+
+        let multi =
+            resolve_listen_addrs(Some("10.0.0.5:5353, 127.0.0.1:5353"), Some("ignored")).unwrap();
+        assert_eq!(
+            multi,
+            vec![
+                SocketAddr::from_str("10.0.0.5:5353").unwrap(),
+                SocketAddr::from_str("127.0.0.1:5353").unwrap(),
+            ]
+        );
+
+        // Explicit all-interfaces is allowed when the operator sets the env.
+        let all = resolve_listen_addrs(Some("0.0.0.0:53"), None).unwrap();
+        assert_eq!(all, vec![SocketAddr::from_str("0.0.0.0:53").unwrap()]);
+    }
+
+    #[test]
+    fn unset_with_private_hint_binds_cluster_address() {
+        for hint in [
+            "10.66.66.1:8443",
+            "https://10.66.66.1:8443",
+            "http://192.168.1.9:18443/v1",
+            "172.16.0.4:1",
+        ] {
+            let addrs = resolve_listen_addrs(None, Some(hint)).unwrap();
+            let ip = private_ip_from_hint(hint).unwrap();
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::new(IpAddr::V4(ip), DEFAULT_PORT)],
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_without_private_falls_back_to_loopback() {
+        for hint in [
+            None,
+            Some(""),
+            Some("0.0.0.0:8443"),
+            Some("127.0.0.1:8443"),
+            Some("8.8.8.8:443"),
+            Some("https://api.example.com:8443"),
+            Some("::"),
+            Some("[::]:8443"),
+        ] {
+            let addrs = resolve_listen_addrs(None, hint).unwrap();
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from_str(DEFAULT_LISTEN).unwrap()],
+                "{hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_env_counts_as_unset() {
+        let addrs = resolve_listen_addrs(Some("  "), Some("10.1.2.3:9")).unwrap();
+        assert_eq!(addrs, vec![SocketAddr::from_str("10.1.2.3:5353").unwrap()]);
+    }
+
+    #[test]
+    fn bad_env_entry_is_refused() {
+        let err = resolve_listen_addrs(Some("not-an-addr"), None).unwrap_err();
+        assert!(err.to_string().contains(LISTEN_ENV), "{err}");
+        let err = resolve_listen_addrs(Some("10.0.0.1:5353,bogus"), None).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn defaults_never_use_unspecified() {
+        let addrs = resolve_listen_addrs(None, Some("0.0.0.0:8443")).unwrap();
+        assert!(!addrs.iter().any(|a| a.ip().is_unspecified()));
     }
 }

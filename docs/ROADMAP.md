@@ -33,6 +33,7 @@ Each phase ends at a gate an outside tool decides.
 - [x] Gateway TLS: `pistack server --tls-listen ADDR` (env `PISTACK_TLS_LISTEN`) serves the same app with rustls beside plain HTTP. Certs are `data_dir/tls/cert.pem`, `key.pem`, and `ca.pem`, reused when present and otherwise issued by keep. The address must be specific (not `0.0.0.0` or `::`). `--insecure-http` still only silences the plain-HTTP warning when TLS is not configured.
 - [x] mTLS on `/rpc`: the TLS listener verifies client certificates against the cloud CA; verified peer identity reaches `/rpc`. Agents enroll with a spend-once join token (`POST /rpc/agents/enroll`) and present the issued certificate on hello/heartbeat/commands. Strict by default; set `PISTACK_RPC_INSECURE=1` only for local HTTP / tests. Optional `PISTACK_REQUIRE_JOIN=1` still authorizes `x-pistack-join` on every call.
 - [x] Stable node identity: `<data_dir>/node.name` holds the one node name the agent, its client certificate, the forge host record, loom's `pistack.io/hostname`, and `ModuleContext::node_name` share. It survives restarts, host renames, and re-enrolls; `PISTACK_NODE_NAME` overrides and persists. `/rpc` binds the client certificate's common name to the node in each call.
+- [x] Beacon DNS listen defaults: honor `PISTACK_DNS_LISTEN` (comma-separated multi-bind) when set; otherwise bind the server's private/cluster advertise address on `:5353`; fall back to `127.0.0.1:5353` when none is known. Defaults never use `0.0.0.0`.
 
 ## Phase 1 — Bootable cloud
 
