@@ -15,6 +15,7 @@
 pub mod agent;
 pub mod facts;
 mod overlay;
+mod probe;
 pub mod runtime;
 
 pub use agent::{run_agent, run_agent_with, run_agent_with_facts, AgentOpts};

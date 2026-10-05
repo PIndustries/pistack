@@ -62,6 +62,14 @@ pub trait MachineRuntime: Send + Sync + 'static {
             self.name()
         )))
     }
+
+    /// Probe definitions for a pod this runtime holds. Empty when `id` is
+    /// not a sandbox or this runtime does not remember probes. Used after
+    /// the agent restarts so checks resume without a new start command.
+    async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
+        let _ = id;
+        Vec::new()
+    }
 }
 
 pub type SharedRuntime = Arc<dyn MachineRuntime>;
@@ -202,6 +210,17 @@ impl Runtimes {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Probe definitions remembered by whichever runtime holds `id`.
+    pub async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
+        for rt in self.distinct() {
+            let found = rt.container_probes(id).await;
+            if !found.is_empty() {
+                return found;
+            }
+        }
+        Vec::new()
     }
 
     /// Everything every runtime holds. A runtime that cannot list (a stub)

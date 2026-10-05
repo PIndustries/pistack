@@ -8,7 +8,7 @@
 //! * [`Registrar`] listens to the queue's agent events: a hello creates or
 //!   refreshes the `Host` resource for that node and registers an
 //!   `RpcDriver` for it; a heartbeat bumps `last_seen` and folds the agent's
-//!   machine reports (addresses, power) into machine status.
+//!   machine reports (addresses, power, probe streaks) into machine status.
 //!
 //! Wire shapes are `pistack_rpc::proto::{MachineRequest, MachineRef,
 //! RunningMachine}`, shared with `anvil`.
@@ -570,6 +570,7 @@ impl Registrar {
                             x.status.power = p;
                         }
                     }
+                    x.status.probes = r.probes.clone();
                     Ok(())
                 }) {
                     Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
@@ -585,7 +586,8 @@ impl Registrar {
             let addrs_differ = !r.addresses.is_empty() && r.addresses != m.status.addresses;
             let power_differs =
                 power.is_some_and(|p| p != PowerState::Unknown && p != m.status.power);
-            if !addrs_differ && !power_differs {
+            let probes_differ = r.probes != m.status.probes;
+            if !addrs_differ && !power_differs && !probes_differ {
                 return Ok(());
             }
             match col.modify(&m.meta.id, |x| {
@@ -594,6 +596,9 @@ impl Registrar {
                 }
                 if let (true, Some(p)) = (power_differs, power) {
                     x.status.power = p;
+                }
+                if probes_differ {
+                    x.status.probes = r.probes.clone();
                 }
                 Ok(())
             }) {
@@ -608,7 +613,7 @@ impl Registrar {
 mod tests {
     use super::*;
     use crate::types::{new_machine, MachineSpec};
-    use pistack_rpc::proto::CommandResult;
+    use pistack_rpc::proto::{CommandResult, ProbeReport};
     use pistack_rpc::QueueConfig;
     use pistack_types::{Kind, Meta};
     use std::time::Duration;
@@ -747,6 +752,7 @@ mod tests {
                 resources: None,
                 addresses: vec!["10.0.0.7".into()],
                 power: Some(pistack_rpc::proto::PowerState::Off),
+                probes: Vec::new(),
             }],
             at: Utc::now(),
         })
@@ -788,6 +794,49 @@ mod tests {
             !text.lines().any(|l| l.contains("node=\"ghost\"")),
             "{text}"
         );
+    }
+
+    #[test]
+    fn heartbeat_copies_probe_streaks_onto_machine_status() {
+        let store = Store::in_memory().unwrap();
+        let drivers = Arc::new(DriverRegistry::new());
+        let queue = CommandQueue::default();
+        let reg = Registrar::new(store.clone(), drivers, queue);
+        let host = reg.on_hello(&hello("h1")).unwrap();
+
+        let mut m = machine("web");
+        m.status.host = Some(host.meta.id.clone());
+        m.status.phase = Phase::Ready;
+        m.status.power = PowerState::On;
+        m.status.addresses = vec!["10.0.0.7".into()];
+        let m = store.collection::<Machine>().create(m).unwrap();
+        let report = ProbeReport {
+            container: "web".into(),
+            kind: pistack_rpc::PROBE_READINESS.into(),
+            success: false,
+            successes: 0,
+            failures: 2,
+            message: "http status 500".into(),
+        };
+        reg.on_heartbeat(&Heartbeat {
+            node_name: "h1".into(),
+            resources_free: Resources::default(),
+            machines: vec![MachineReport {
+                id: m.meta.id.clone(),
+                phase: Phase::Ready,
+                message: String::new(),
+                resources: None,
+                addresses: vec!["10.0.0.7".into()],
+                power: Some(pistack_rpc::proto::PowerState::On),
+                probes: vec![report.clone()],
+            }],
+            at: Utc::now(),
+        })
+        .unwrap();
+        let stored = store.collection::<Machine>().get(&m.meta.id).unwrap();
+        assert_eq!(stored.status.addresses, vec!["10.0.0.7"]);
+        assert_eq!(stored.status.power, PowerState::On);
+        assert_eq!(stored.status.probes, vec![report]);
     }
 
     #[tokio::test]

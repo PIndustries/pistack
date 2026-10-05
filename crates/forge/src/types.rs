@@ -285,6 +285,10 @@ pub struct MachineStatus {
     /// Restarts the reconciler has performed; compare with `spec.restarts`.
     #[serde(default)]
     pub restarts: u64,
+    /// Probe streaks last reported by the host agent. Empty when the
+    /// machine has no liveness or readiness probes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<pistack_rpc::proto::ProbeReport>,
 }
 
 impl MachineStatus {

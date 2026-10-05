@@ -71,6 +71,9 @@ struct Saved {
     /// machine that is not a pod sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     containers: Vec<String>,
+    /// Probe definitions only. The sandbox document itself is not stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    probes: Vec<crate::probe::ContainerProbes>,
 }
 
 #[async_trait]
@@ -85,10 +88,17 @@ impl MachineRuntime for YoukiRuntime {
         let id = req.id.clone();
         let bundle = bundle_dir(&id)?;
         let prior = read_state(&bundle).await?;
+        let probes = crate::probe::probes_in_user_data(req.user_data.as_deref());
         if let Some(saved) = prior.as_ref() {
             if saved.power == PowerState::On && parse_id(&saved.id)? == id {
                 // Already running: do not exec youki again. Addresses come
-                // from this request, not from whatever was stored.
+                // from this request, not from whatever was stored. Refresh
+                // the probe list so a restarted agent can keep checking.
+                if saved.probes != probes {
+                    let mut updated = saved.clone();
+                    updated.probes = probes;
+                    write_state(&bundle, &updated).await?;
+                }
                 return Ok(RunningMachine {
                     id,
                     addresses: nic_addresses(req),
@@ -134,6 +144,7 @@ impl MachineRuntime for YoukiRuntime {
                 addresses: addresses.clone(),
                 power: PowerState::On,
                 containers: Vec::new(),
+                probes: Vec::new(),
             },
         )
         .await?;
@@ -286,6 +297,17 @@ impl MachineRuntime for YoukiRuntime {
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
+        let Ok(bundle) = bundle_dir(id) else {
+            return Vec::new();
+        };
+        let _guard = lock().lock().await;
+        match read_state(&bundle).await {
+            Ok(Some(saved)) => saved.probes,
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -2703,6 +2725,7 @@ async fn start_pod(
             addresses: addresses.clone(),
             power: PowerState::On,
             containers: started,
+            probes: crate::probe::probes_in_user_data(req.user_data.as_deref()),
         },
     )
     .await?;

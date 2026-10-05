@@ -234,6 +234,8 @@ mod tests {
                             resources: Default::default(),
                             volume_mounts: vec![],
                             working_dir: String::new(),
+                            liveness_probe: None,
+                            readiness_probe: None,
                         }],
                         volumes: vec![],
                         restart_policy: Default::default(),

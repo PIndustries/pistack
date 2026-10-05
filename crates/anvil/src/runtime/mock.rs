@@ -18,6 +18,7 @@ pub struct MockRuntime {
 #[derive(Default)]
 struct State {
     machines: BTreeMap<Id, RunningMachine>,
+    probes: BTreeMap<Id, Vec<crate::probe::ContainerProbes>>,
     next_addr: u32,
 }
 
@@ -41,6 +42,10 @@ impl MachineRuntime for MockRuntime {
 
     async fn start(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
         let mut st = self.lock()?;
+        st.probes.insert(
+            req.id.clone(),
+            crate::probe::probes_in_user_data(req.user_data.as_deref()),
+        );
         if let Some(rt) = st.machines.get_mut(&req.id) {
             rt.power = PowerState::On;
             return Ok(rt.clone());
@@ -75,8 +80,16 @@ impl MachineRuntime for MockRuntime {
     }
 
     async fn delete(&self, id: &Id) -> ApiResult<()> {
-        self.lock()?.machines.remove(id);
+        let mut st = self.lock()?;
+        st.machines.remove(id);
+        st.probes.remove(id);
         Ok(())
+    }
+
+    async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
+        self.lock()
+            .map(|st| st.probes.get(id).cloned().unwrap_or_default())
+            .unwrap_or_default()
     }
 
     async fn list(&self) -> ApiResult<Vec<RunningMachine>> {
