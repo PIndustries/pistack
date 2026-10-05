@@ -128,7 +128,7 @@ impl Client {
     ) -> ApiResult<String>
     where
         S: Stream<Item = Result<Bytes, E>> + Send,
-        E: std::fmt::Display,
+        E: crate::client::IntoBodyReadErr + Send + 'static,
     {
         if !(1..=MAX_PART_NUMBER).contains(&part_number) {
             return Err(s3_err(
@@ -155,7 +155,7 @@ impl Client {
         let part_path = dir.join(format!("part-{part_number}"));
         let written = write_part_atomic(
             &part_path,
-            body,
+            crate::client::map_stream_err(body),
             self.max_object_bytes(),
             content_length,
             expected_sha256,
@@ -579,7 +579,10 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         | "InvalidRequest"
         | "MalformedXML"
         | "AuthorizationHeaderMalformed"
-        | "XAmzContentSHA256Mismatch" => ApiError::bad_request(message),
+        | "IncompleteBody"
+        | "BadDigest"
+        | "XAmzContentSHA256Mismatch"
+        | "XAmzContentChecksumMismatch" => ApiError::bad_request(message),
         "InvalidAccessKeyId"
         | "SignatureDoesNotMatch"
         | "AccessDenied"
@@ -625,7 +628,7 @@ struct PartWritten {
     md5: String,
 }
 
-async fn write_part_atomic<S, E>(
+async fn write_part_atomic<S>(
     dest: &Path,
     body: S,
     max: usize,
@@ -633,8 +636,7 @@ async fn write_part_atomic<S, E>(
     expected_sha256: Option<&str>,
 ) -> ApiResult<PartWritten>
 where
-    S: Stream<Item = Result<Bytes, E>> + Send,
-    E: std::fmt::Display,
+    S: Stream<Item = Result<Bytes, ApiError>> + Send,
 {
     use futures::StreamExt;
 
@@ -642,6 +644,7 @@ where
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
+    let _tmp_guard = crate::client::TmpGuard(tmp.clone());
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut md5 = Md5::new();
@@ -649,7 +652,7 @@ where
         let mut size: u64 = 0;
         let mut body = std::pin::pin!(body);
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+            let chunk = chunk?;
             let next = size.saturating_add(chunk.len() as u64);
             if next > max as u64 {
                 return Err(s3_err("EntityTooLarge", object_too_large_message(max)));
