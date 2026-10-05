@@ -914,3 +914,58 @@ async fn streaming_rejected_with_presigned_url() {
         "InvalidRequest"
     );
 }
+
+#[tokio::test]
+async fn streaming_rejected_on_delete() {
+    let w = world().await;
+    let date = amz_now();
+    let path = format!("/{}/del.txt", w.bucket);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "DELETE",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "silo.test",
+        &[("x-amz-decoded-content-length", "0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rejected_on_complete_multipart() {
+    let w = world().await;
+    let date = amz_now();
+    let path = format!("/{}/cmp.txt", w.bucket);
+    // CompleteMultipartUpload is POST ?uploadId=…
+    let (status, body, _) = signed_call(
+        &w.app,
+        "POST",
+        &path,
+        "uploadId=fake-upload-id",
+        b"<CompleteMultipartUpload></CompleteMultipartUpload>",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "silo.test",
+        &[("x-amz-decoded-content-length", "0")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRequest"
+    );
+}
