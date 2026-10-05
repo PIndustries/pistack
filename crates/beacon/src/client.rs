@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 /// Status message for secondary zones until AXFR pull lands.
 pub const SECONDARY_PENDING_MSG: &str =
-    "secondary zone transfer (AXFR) is not implemented; zone is not served";
+    "waiting for AXFR from primaries; zone is not served until transfer succeeds";
 
 #[derive(Clone)]
 pub struct Client {
@@ -279,28 +279,23 @@ impl Client {
             Some(z) => z,
             None => return Ok(None),
         };
-        // Secondaries are accepted on the wire model but not transferred yet.
-        // Keep them Pending with an honest message; never Ready, never served.
+        // Secondaries are owned by the AXFR transfer task. Seed Pending once;
+        // never clobber Ready/Error that transfer already wrote.
         if matches!(zone.spec.kind, ZoneKind::Secondary { .. }) {
             if zone.status.phase == Phase::Pending
-                && zone.status.message == SECONDARY_PENDING_MSG
+                && zone.status.message.is_empty()
                 && zone.status.serial == 0
-                && zone.status.records == 0
             {
-                return Ok(Some(zone));
+                let updated = self
+                    .zones()
+                    .modify(id, |z| {
+                        z.status.message = SECONDARY_PENDING_MSG.into();
+                        Ok(())
+                    })
+                    .map_err(store_err)?;
+                return Ok(Some(updated));
             }
-            let updated = self
-                .zones()
-                .modify(id, |z| {
-                    z.status.phase = Phase::Pending;
-                    z.status.serial = 0;
-                    z.status.records = 0;
-                    z.status.digest.clear();
-                    z.status.message = SECONDARY_PENDING_MSG.into();
-                    Ok(())
-                })
-                .map_err(store_err)?;
-            return Ok(Some(updated));
+            return Ok(Some(zone));
         }
         let sets = self.recordsets_in_zone(id)?;
         let digest = content_digest(&zone, &sets);
@@ -329,6 +324,54 @@ impl Client {
             }
         }
         Ok(Some(updated))
+    }
+
+    /// Secondary zones known to the store.
+    pub fn secondary_zones(&self) -> ApiResult<Vec<Zone>> {
+        Ok(self
+            .zones()
+            .list(None)
+            .map_err(store_err)?
+            .into_iter()
+            .filter(|z| matches!(z.spec.kind, ZoneKind::Secondary { .. }))
+            .collect())
+    }
+
+    /// Mark a secondary Ready after a successful AXFR.
+    pub fn secondary_ready(
+        &self,
+        id: &Id,
+        serial: u32,
+        records: u32,
+        digest: String,
+        from: &str,
+    ) -> ApiResult<Zone> {
+        self.zones()
+            .modify(id, |z| {
+                z.status.phase = Phase::Ready;
+                z.status.serial = serial;
+                z.status.records = records;
+                z.status.digest = digest.clone();
+                z.status.message = format!("transferred from {from}");
+                Ok(())
+            })
+            .map_err(store_err)
+    }
+
+    /// Mark a secondary Error after every primary failed.
+    pub fn secondary_failed(&self, id: &Id, err: &str) -> ApiResult<Zone> {
+        self.zones()
+            .modify(id, |z| {
+                // Keep last good serial/records if we had a prior transfer.
+                z.status.phase = if z.status.serial > 0 {
+                    Phase::Ready
+                } else {
+                    Phase::Error
+                };
+                z.status.message = format!("AXFR failed: {err}");
+                Ok(())
+            })
+            .map_err(store_err)
     }
 
     pub fn reconcile_all(&self) -> ApiResult<()> {
@@ -564,10 +607,22 @@ mod tests {
                 },
             )
             .is_err());
-        // Idempotent reconcile.
+        // Idempotent reconcile — does not clobber.
         let again = c.reconcile_zone(&z.meta.id).unwrap().unwrap();
         assert_eq!(again.status.phase, Phase::Pending);
+        assert_eq!(again.status.message, SECONDARY_PENDING_MSG);
         assert_eq!(again.meta.revision, out.meta.revision);
+        // Transfer success marks Ready.
+        let ready = c
+            .secondary_ready(&z.meta.id, 7, 3, "abc".into(), "10.0.0.1:53")
+            .unwrap();
+        assert_eq!(ready.status.phase, Phase::Ready);
+        assert_eq!(ready.status.serial, 7);
+        assert!(ready.status.message.contains("10.0.0.1:53"));
+        // Reconcile must not wipe Ready.
+        let kept = c.reconcile_zone(&z.meta.id).unwrap().unwrap();
+        assert_eq!(kept.status.phase, Phase::Ready);
+        assert_eq!(kept.status.serial, 7);
     }
 
     #[test]

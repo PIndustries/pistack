@@ -12,8 +12,9 @@
 //! not expose DNS on every interface; set `0.0.0.0:53` in production, where
 //! the binary needs `CAP_NET_BIND_SERVICE`).
 //!
-//! Queries and primary-zone AXFR (TCP only) are served. Updates, notifies and
-//! IXFR get NOTIMP. Secondary zones are never compiled into the catalog.
+//! Queries and AXFR (TCP only) are served for primary zones and for secondary
+//! zones that have completed an AXFR pull. Updates, notifies and IXFR get
+//! NOTIMP. Secondaries live in a side cache filled by [`crate::xfer`].
 
 use crate::client::Client;
 use crate::types::{in_zone, RecordType as Rt, Zone, KINDS};
@@ -47,10 +48,90 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CNAME_DEPTH: usize = 8;
 
 /// One compiled zone: every owner name to its records, SOA and NS included.
-struct ZoneData {
-    apex: Name,
+#[derive(Clone)]
+pub(crate) struct ZoneData {
+    pub(crate) apex: Name,
     soa: Record,
     records: HashMap<Name, Vec<Record>>,
+}
+
+impl ZoneData {
+    /// Build from an AXFR answer (SOA … records … SOA). The trailing SOA is
+    /// dropped; the leading one becomes the zone SOA.
+    pub(crate) fn from_axfr(apex: Name, records: Vec<Record>) -> anyhow::Result<Self> {
+        if records.len() < 2 {
+            anyhow::bail!("AXFR needs at least two SOA records");
+        }
+        let soa = records[0].clone();
+        if soa.record_type() != RecordType::SOA {
+            anyhow::bail!("AXFR must start with SOA");
+        }
+        let mut map: HashMap<Name, Vec<Record>> = HashMap::new();
+        // Skip the closing SOA; keep the opening one and everything else.
+        for r in &records[..records.len() - 1] {
+            map.entry(r.name.clone()).or_default().push(r.clone());
+        }
+        if !map.contains_key(&apex) {
+            // Ensure apex key exists even if names differ in FQDN flag.
+            map.entry(apex.clone()).or_default().push(soa.clone());
+        }
+        Ok(Self {
+            apex,
+            soa,
+            records: map,
+        })
+    }
+
+    pub(crate) fn record_count(&self) -> u32 {
+        self.records
+            .values()
+            .map(|v| {
+                v.iter()
+                    .filter(|r| r.record_type() != RecordType::SOA)
+                    .count() as u32
+            })
+            .sum()
+    }
+}
+
+/// In-memory secondary zones filled by AXFR pull. Shared by the transfer task
+/// and the authoritative handler.
+#[derive(Clone, Default)]
+pub struct SecondaryCache {
+    inner: Arc<RwLock<HashMap<String, ZoneData>>>,
+}
+
+impl SecondaryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(&self, data: ZoneData) {
+        let key = data.apex.to_ascii();
+        self.inner.write().insert(key, data);
+    }
+
+    pub fn remove(&self, apex: &str) {
+        self.inner.write().remove(apex);
+    }
+
+    pub fn retain_apices(&self, keep: &std::collections::HashSet<String>) {
+        self.inner.write().retain(|k, _| keep.contains(k));
+    }
+
+    fn find(&self, name: &Name) -> Option<ZoneData> {
+        let n = name.to_ascii();
+        self.inner
+            .read()
+            .values()
+            .filter(|z| in_zone(&z.apex.to_ascii(), &n))
+            .max_by_key(|z| z.apex.num_labels())
+            .cloned()
+    }
+
+    fn find_apex(&self, name: &Name) -> Option<ZoneData> {
+        self.inner.read().get(&name.to_ascii()).cloned()
+    }
 }
 
 /// Every primary zone, compiled.
@@ -280,13 +361,15 @@ fn synth_owner(mut r: Record, owner: &Name) -> Record {
 pub struct Handler {
     client: Client,
     cache: Arc<RwLock<Option<Arc<Catalog>>>>,
+    secondaries: SecondaryCache,
 }
 
 impl Handler {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, secondaries: SecondaryCache) -> Self {
         Self {
             client,
             cache: Arc::new(RwLock::new(None)),
+            secondaries,
         }
     }
 
@@ -326,13 +409,32 @@ impl Handler {
     /// without a socket.
     pub fn resolve(&self, name: &Name, qtype: RecordType) -> anyhow::Result<Option<Answer>> {
         let catalog = self.catalog()?;
-        Ok(catalog.find(name).map(|z| z.lookup(name, qtype)))
+        let primary = catalog.find(name);
+        let secondary = self.secondaries.find(name);
+        let zone = match (primary, secondary) {
+            (Some(p), Some(s)) => {
+                if s.apex.num_labels() > p.apex.num_labels() {
+                    Some(s)
+                } else {
+                    // Prefer the borrowed primary by looking up again via clone path:
+                    Some(p.clone())
+                }
+            }
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        };
+        Ok(zone.map(|z| z.lookup(name, qtype)))
     }
 
     /// AXFR answer for an exact zone apex, or `None` when we do not own it.
     pub fn resolve_axfr(&self, apex: &Name) -> anyhow::Result<Option<Answer>> {
         let catalog = self.catalog()?;
-        Ok(catalog.find_apex(apex).map(|z| Answer {
+        let zone = catalog
+            .find_apex(apex)
+            .cloned()
+            .or_else(|| self.secondaries.find_apex(apex));
+        Ok(zone.map(|z| Answer {
             code: ResponseCode::NoError,
             answers: z.axfr(),
             authorities: Vec::new(),
@@ -440,12 +542,13 @@ pub async fn serve(
     listen: SocketAddr,
     events: broadcast::Sender<Event>,
     shutdown: CancellationToken,
+    secondaries: SecondaryCache,
 ) -> anyhow::Result<SocketAddr> {
     let udp = tokio::net::UdpSocket::bind(listen).await?;
     let bound = udp.local_addr()?;
     let tcp = tokio::net::TcpListener::bind(bound).await?;
 
-    let handler = Handler::new(client);
+    let handler = Handler::new(client, secondaries);
     handler.watch(events.subscribe(), shutdown.clone());
 
     let mut server = Server::new(handler);
@@ -508,7 +611,7 @@ mod tests {
         up("www", Rt::Cname, &["web.example.cloud."]);
         up("*.apps", Rt::A, &["10.0.0.9"]);
         up("@", Rt::Mx, &["10 mail.example.cloud."]);
-        let h = Handler::new(client.clone());
+        let h = Handler::new(client.clone(), SecondaryCache::new());
 
         let a = h
             .resolve(&n("web.example.cloud."), RecordType::A)

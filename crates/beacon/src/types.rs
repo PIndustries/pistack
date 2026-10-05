@@ -60,9 +60,9 @@ pub const MANAGED_LABEL: &str = "pistack.io/managed-by";
 // ---- Zone -------------------------------------------------------------------
 
 /// Primary zones are edited here and served by beacon (including AXFR over
-/// TCP). Secondary zones accept a `primaries` list so the model is complete,
-/// but transfer is not implemented yet: they stay Pending, are never marked
-/// Ready, and are never served.
+/// TCP). Secondary zones list `primaries` and are filled by AXFR pull: they
+/// stay Pending until a transfer succeeds, then Ready and served from the
+/// secondary cache (record sets are still primary-only).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ZoneKind {
