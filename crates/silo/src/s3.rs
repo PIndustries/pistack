@@ -6,7 +6,7 @@
 //! ```text
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}
 //! GET                       /{bucket}?list-type=2&prefix=&continuation-token=&max-keys=
-//! GET                       /{bucket}?uploads&prefix=&key-marker=&upload-id-marker=&max-uploads=
+//! GET                       /{bucket}?uploads&prefix=&delimiter=&key-marker=&upload-id-marker=&max-uploads=
 //!                                     ListMultipartUploads
 //!
 //! Multipart (query on the object path):
@@ -36,8 +36,9 @@
 //!
 //! Staging dirs under `.uploads/` are removed on abort and complete, and
 //! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
-//! ListMultipartUploads does not support `delimiter` (no CommonPrefixes)
-//! and does not report Initiator/Owner.
+//! ListMultipartUploads supports `delimiter` / `CommonPrefixes` (any
+//! non-empty delimiter). `encoding-type` is not supported (same as
+//! ListObjectsV2). Initiator/Owner are not reported.
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
@@ -782,12 +783,6 @@ async fn list_uploads_inner(
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket_name)?;
-    if q.delimiter.as_deref().is_some_and(|d| !d.is_empty()) {
-        return Err(multipart::s3_err(
-            "InvalidArgument",
-            "delimiter is not supported for ListMultipartUploads",
-        ));
-    }
     let max_uploads = parse_limit(q.max_uploads.as_deref(), "max-uploads", S3_MAX_UPLOADS)?;
     let prefix = q.prefix.as_deref().unwrap_or("");
     let key_marker = q.key_marker.as_deref().unwrap_or("");
@@ -797,13 +792,15 @@ async fn list_uploads_inner(
     } else {
         q.upload_id_marker.as_deref().unwrap_or("")
     };
-    let (uploads, truncated) = c
+    let delimiter = q.delimiter.as_deref().filter(|d| !d.is_empty());
+    let (entries, truncated) = c
         .list_multipart_uploads(
             &bucket.meta.id,
             Some(prefix),
             Some(key_marker),
             Some(upload_id_marker),
             max_uploads,
+            delimiter,
         )
         .await?;
     let xml = list_uploads_xml(&ListUploadsPage {
@@ -811,8 +808,9 @@ async fn list_uploads_inner(
         prefix,
         key_marker,
         upload_id_marker,
+        delimiter: delimiter.unwrap_or(""),
         max_uploads,
-        uploads: &uploads,
+        entries: &entries,
         truncated,
     });
     Ok((
@@ -828,8 +826,9 @@ struct ListUploadsPage<'a> {
     prefix: &'a str,
     key_marker: &'a str,
     upload_id_marker: &'a str,
+    delimiter: &'a str,
     max_uploads: usize,
-    uploads: &'a [multipart::UploadSummary],
+    entries: &'a [multipart::ListUploadEntry],
     truncated: bool,
 }
 
@@ -847,36 +846,62 @@ fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
         xml_escape(page.upload_id_marker)
     ));
     if page.truncated {
-        if let Some(last) = page.uploads.last() {
-            body.push_str(&format!(
-                "<NextKeyMarker>{}</NextKeyMarker>",
-                xml_escape(&last.key)
-            ));
-            body.push_str(&format!(
-                "<NextUploadIdMarker>{}</NextUploadIdMarker>",
-                xml_escape(&last.upload_id)
-            ));
+        if let Some(last) = page.entries.last() {
+            match last {
+                multipart::ListUploadEntry::Upload(u) => {
+                    body.push_str(&format!(
+                        "<NextKeyMarker>{}</NextKeyMarker>",
+                        xml_escape(&u.key)
+                    ));
+                    body.push_str(&format!(
+                        "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+                        xml_escape(&u.upload_id)
+                    ));
+                }
+                multipart::ListUploadEntry::CommonPrefix(cp) => {
+                    body.push_str(&format!(
+                        "<NextKeyMarker>{}</NextKeyMarker>",
+                        xml_escape(cp)
+                    ));
+                    body.push_str("<NextUploadIdMarker></NextUploadIdMarker>");
+                }
+            }
         }
     }
     body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(page.prefix)));
+    if !page.delimiter.is_empty() {
+        body.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            xml_escape(page.delimiter)
+        ));
+    }
     body.push_str(&format!("<MaxUploads>{}</MaxUploads>", page.max_uploads));
     body.push_str(&format!(
         "<IsTruncated>{}</IsTruncated>",
         if page.truncated { "true" } else { "false" }
     ));
-    for u in page.uploads {
-        body.push_str("<Upload>");
-        body.push_str(&format!("<Key>{}</Key>", xml_escape(&u.key)));
-        body.push_str(&format!(
-            "<UploadId>{}</UploadId>",
-            xml_escape(&u.upload_id)
-        ));
-        body.push_str("<StorageClass>STANDARD</StorageClass>");
-        body.push_str(&format!(
-            "<Initiated>{}</Initiated>",
-            u.initiated.format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        ));
-        body.push_str("</Upload>");
+    for e in page.entries {
+        match e {
+            multipart::ListUploadEntry::Upload(u) => {
+                body.push_str("<Upload>");
+                body.push_str(&format!("<Key>{}</Key>", xml_escape(&u.key)));
+                body.push_str(&format!(
+                    "<UploadId>{}</UploadId>",
+                    xml_escape(&u.upload_id)
+                ));
+                body.push_str("<StorageClass>STANDARD</StorageClass>");
+                body.push_str(&format!(
+                    "<Initiated>{}</Initiated>",
+                    u.initiated.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                ));
+                body.push_str("</Upload>");
+            }
+            multipart::ListUploadEntry::CommonPrefix(cp) => {
+                body.push_str("<CommonPrefixes><Prefix>");
+                body.push_str(&xml_escape(cp));
+                body.push_str("</Prefix></CommonPrefixes>");
+            }
+        }
     }
     body.push_str("</ListMultipartUploadsResult>");
     body

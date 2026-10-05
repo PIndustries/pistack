@@ -1270,7 +1270,7 @@ async fn list_multipart_uploads_auth_and_bad_args() {
         "NoSuchBucket"
     );
 
-    for query in ["max-uploads=abc", "max-uploads=-1", "delimiter=/"] {
+    for query in ["max-uploads=abc", "max-uploads=-1"] {
         let (status, body, _) = call(
             &app,
             "GET",
@@ -1398,11 +1398,17 @@ async fn sweep_removes_expired_uploads_and_keeps_fresh() {
     assert!(staging_dir(&client, &bucket, &almost).exists());
 
     let (listed, truncated) = client
-        .list_multipart_uploads(&bucket, None, None, None, 1000)
+        .list_multipart_uploads(&bucket, None, None, None, 1000, None)
         .await
         .unwrap();
     assert!(!truncated);
-    let mut ids: Vec<String> = listed.into_iter().map(|u| u.upload_id).collect();
+    let mut ids: Vec<String> = listed
+        .into_iter()
+        .filter_map(|e| match e {
+            silo::multipart::ListUploadEntry::Upload(u) => Some(u.upload_id),
+            silo::multipart::ListUploadEntry::CommonPrefix(_) => None,
+        })
+        .collect();
     ids.sort();
     let mut want = [fresh.clone(), almost.clone()];
     want.sort();
@@ -1442,7 +1448,7 @@ async fn sweep_removes_expired_uploads_and_keeps_fresh() {
     assert_eq!(report.removed, 1);
     assert!(!staging_dir(&client, &bucket, &almost).exists());
     let (listed, _) = client
-        .list_multipart_uploads(&bucket, None, None, None, 1000)
+        .list_multipart_uploads(&bucket, None, None, None, 1000, None)
         .await
         .unwrap();
     assert!(listed.is_empty());
@@ -2357,4 +2363,123 @@ fn walkdir_tmp(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+fn listed_common_prefixes(xml: &str) -> Vec<String> {
+    xml.split("<CommonPrefixes>")
+        .skip(1)
+        .filter_map(|block| {
+            let block = block.split("</CommonPrefixes>").next()?;
+            xml_tag(block, "Prefix")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn list_multipart_uploads_delimiter_grouping() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "delim").await;
+
+    let a1 = create_upload(&app, &who, &bucket, "logs/a.bin").await;
+    let a2 = create_upload(&app, &who, &bucket, "logs/a.bin").await;
+    let _nested1 = create_upload(&app, &who, &bucket, "logs/2024/x.bin").await;
+    let _nested2 = create_upload(&app, &who, &bucket, "logs/2024/y.bin").await;
+    let flat = create_upload(&app, &who, &bucket, "readme.txt").await;
+    let _other = create_upload(&app, &who, &bucket, "other/z.bin").await;
+    let mut a_ids = [a1, a2];
+    a_ids.sort();
+
+    // delimiter=/ with no prefix: common prefixes + flat upload.
+    let xml = list_uploads(&app, &who, &format!("/{bucket}?uploads&delimiter=/")).await;
+    assert_eq!(xml_tag(&xml, "Delimiter").as_deref(), Some("/"));
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
+    assert_eq!(
+        listed_common_prefixes(&xml),
+        vec!["logs/".to_owned(), "other/".to_owned()]
+    );
+    assert_eq!(
+        listed_uploads(&xml),
+        vec![("readme.txt".to_owned(), flat.clone())]
+    );
+
+    // prefix=logs/ + delimiter=/: uploads under logs/ without further '/', plus nested CP.
+    let xml = list_uploads(
+        &app,
+        &who,
+        &format!("/{bucket}?uploads&prefix=logs/&delimiter=/"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "Prefix").as_deref(), Some("logs/"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["logs/2024/".to_owned()]);
+    assert_eq!(
+        listed_uploads(&xml),
+        vec![
+            ("logs/a.bin".to_owned(), a_ids[0].clone()),
+            ("logs/a.bin".to_owned(), a_ids[1].clone()),
+        ]
+    );
+
+    // Empty delimiter = no grouping (same as omitted).
+    let xml = list_uploads(&app, &who, &format!("/{bucket}?uploads&delimiter=")).await;
+    assert!(xml_tag(&xml, "Delimiter").is_none());
+    assert!(listed_common_prefixes(&xml).is_empty());
+    assert!(listed_uploads(&xml).len() >= 6);
+
+    // Non-'/' delimiter (keys must not look like Windows drive paths to validate_key).
+    let bucket2 = ensure_bucket(&app, &who, "delim2").await;
+    create_upload(&app, &who, &bucket2, "foo::bar::c").await;
+    create_upload(&app, &who, &bucket2, "foo::bar::d").await;
+    create_upload(&app, &who, &bucket2, "plain").await;
+    let xml = list_uploads(&app, &who, &format!("/{bucket2}?uploads&delimiter=::")).await;
+    assert_eq!(xml_tag(&xml, "Delimiter").as_deref(), Some("::"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["foo::".to_owned()]);
+    assert_eq!(listed_uploads(&xml).len(), 1);
+    assert_eq!(listed_uploads(&xml)[0].0, "plain");
+}
+
+#[tokio::test]
+async fn list_multipart_uploads_delimiter_pagination() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+    let bucket = ensure_bucket(&app, &who, "delim-page").await;
+    create_upload(&app, &who, &bucket, "a/1").await;
+    create_upload(&app, &who, &bucket, "a/2").await;
+    let b = create_upload(&app, &who, &bucket, "b.bin").await;
+    create_upload(&app, &who, &bucket, "c/x").await;
+
+    // max-uploads=1: first entry is CommonPrefix a/
+    let xml = list_uploads(
+        &app,
+        &who,
+        &format!("/{bucket}?uploads&delimiter=/&max-uploads=1"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
+    assert!(listed_uploads(&xml).is_empty());
+    assert_eq!(xml_tag(&xml, "NextKeyMarker").as_deref(), Some("a/"));
+    assert_eq!(xml_tag(&xml, "NextUploadIdMarker").as_deref(), Some(""));
+
+    // Continue after common prefix.
+    let xml = list_uploads(
+        &app,
+        &who,
+        &format!("/{bucket}?uploads&delimiter=/&max-uploads=1&key-marker=a/"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
+    assert_eq!(listed_uploads(&xml), vec![("b.bin".to_owned(), b.clone())]);
+    assert!(listed_common_prefixes(&xml).is_empty());
+
+    // max-uploads=2 from start: a/ then b.bin
+    let xml = list_uploads(
+        &app,
+        &who,
+        &format!("/{bucket}?uploads&delimiter=/&max-uploads=2"),
+    )
+    .await;
+    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("true"));
+    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
+    assert_eq!(listed_uploads(&xml).len(), 1);
+    assert_eq!(listed_uploads(&xml)[0].0, "b.bin");
+    assert_eq!(xml_tag(&xml, "NextKeyMarker").as_deref(), Some("b.bin"));
 }
