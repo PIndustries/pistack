@@ -11,11 +11,12 @@
 //! creates `network`, `subnet`, `machine`, `router`, `pod`, `listener`, and
 //! record set rows in the same store. A row an earlier apply of the same
 //! stack created (`status.managed`) is updated to the document's spec
-//! through its module's own update rules. Any other name that already
-//! exists in the project is left in place. Unknown kinds are skipped.
-//! `status.phase` is `applying` while rows are written, then `ready` or
-//! `failed`. `status.created` and `status.updated` list what that apply
-//! changed.
+//! through its module's own update rules. Managed rows the document no
+//! longer names are deleted in dependency order (or marked for async
+//! deletion). Any other name that already exists in the project is left in
+//! place. Unknown kinds are skipped. `status.phase` is `applying` while
+//! rows are written, then `ready` or `failed`. `status.created` and
+//! `status.updated` list what that apply changed.
 //!
 //! [`Client::update_stack`] stores a new spec. Each successful apply of a
 //! new spec is kept in `status.history` (the newest

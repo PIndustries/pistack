@@ -104,7 +104,9 @@ pub const SANDBOX_KIND: &str = "PodSandbox";
 pub const EXITED_CONDITION: &str = "ContainerExited";
 /// Pod condition set from liveness probes. Absent when the pod has none.
 const LIVENESS_CONDITION: &str = "Liveness";
-/// Network attached when the pod names none.
+/// Network attached when the pod names none and the project has a network
+/// by this name. Otherwise the project's only non-external network is used
+/// (see [`pick_networks`]).
 pub const DEFAULT_NETWORK: &str = "default";
 
 impl PodSandbox {
@@ -274,6 +276,46 @@ fn project_secret(bytes: &[u8]) -> ProjectedFiles {
     }
 }
 
+/// Networks a new pod machine joins. The pod's own `networks` when it names
+/// any; else `default` when the project can see a network by that name;
+/// else the project's only non-external network. None or several is an
+/// error that says which networks the pod could name.
+pub fn pick_networks(store: &Store, pod: &Pod) -> Result<Vec<String>, String> {
+    if !pod.spec.networks.is_empty() {
+        return Ok(pod.spec.networks.clone());
+    }
+    let nets = store
+        .collection::<fabric::Network>()
+        .list(None)
+        .map_err(|e| format!("networks are not available: {e}"))?;
+    let visible: Vec<&fabric::Network> = nets
+        .iter()
+        .filter(|n| n.meta.project.is_none() || n.meta.project == pod.meta.project)
+        .collect();
+    if visible.iter().any(|n| n.meta.name == DEFAULT_NETWORK) {
+        return Ok(vec![DEFAULT_NETWORK.into()]);
+    }
+    let mut usable: Vec<String> = visible
+        .iter()
+        .filter(|n| !n.spec.external)
+        .map(|n| n.meta.name.clone())
+        .collect();
+    usable.sort();
+    usable.dedup();
+    match usable.len() {
+        1 => Ok(usable),
+        0 => Err(
+            "pod names no network and its project has no network that is not external; \
+             create one or name one in spec.networks"
+                .into(),
+        ),
+        _ => Err(format!(
+            "pod names no network and its project has several ({}); name one in spec.networks",
+            usable.join(", ")
+        )),
+    }
+}
+
 fn networks_of(pod: &Pod) -> Vec<String> {
     if pod.spec.networks.is_empty() {
         vec![DEFAULT_NETWORK.into()]
@@ -341,7 +383,7 @@ impl PodController {
             })
     }
 
-    fn create_machine(&self, pod: &Pod) -> Result<Machine, StoreError> {
+    fn create_machine(&self, pod: &Pod, networks: Vec<String>) -> Result<Machine, StoreError> {
         let want = pod.spec.resources();
         let size = self.size_for(&want)?;
         let image = pod
@@ -351,6 +393,7 @@ impl PodController {
             .map(|c| c.image.clone())
             .unwrap_or_default();
         let mut sandbox = PodSandbox::from_pod(pod);
+        sandbox.networks = networks.clone();
         fill_projections(&self.store, &mut sandbox);
         let user_data = serde_json::to_string(&sandbox)?;
         let volumes = pod
@@ -366,7 +409,7 @@ impl PodController {
             kind: MachineKind::Container,
             size,
             image,
-            networks: networks_of(pod),
+            networks,
             volumes,
             user_data: Some(user_data),
             host_selector: pod.spec.node_selector.clone(),
@@ -632,7 +675,27 @@ impl PodController {
         if !recreate {
             return Ok(());
         }
-        let m = self.create_machine(pod)?;
+        let networks = match pick_networks(&self.store, pod) {
+            Ok(networks) => networks,
+            Err(message) => {
+                if pod.status.message != message {
+                    patch_status(&self.pods(), &pod.meta.id, |s| {
+                        s.phase = PodPhase::Pending;
+                        s.message = message.clone();
+                        set_condition(
+                            &mut s.conditions,
+                            "PodScheduled",
+                            false,
+                            "NoNetwork",
+                            &message,
+                        );
+                    })?;
+                    tracing::warn!(pod = %pod.meta.id, %message, "loom: pod has no network");
+                }
+                return Ok(());
+            }
+        };
+        let m = self.create_machine(pod, networks)?;
         let mid = m.meta.id.clone();
         let names: Vec<(String, String)> = pod
             .spec
@@ -1465,5 +1528,79 @@ mod tests {
         let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
         assert_eq!(machine.spec.restarts, 1);
         assert_eq!(machine.status.restarts, 0);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::{pick_networks, DEFAULT_NETWORK};
+    use crate::types::{Pod, PodSpec};
+    use pistack_store::Store;
+    use pistack_types::{kind, Id, Meta};
+    use std::sync::Arc;
+
+    fn net(store: &Store, name: &str, project: Option<Id>, external: bool) {
+        fabric::Client::new(store.clone(), Arc::new(fabric::MockBackend::new()))
+            .create_network(
+                Meta::new(kind::NETWORK, name, project),
+                fabric::NetworkSpec {
+                    external,
+                    ..fabric::NetworkSpec::default()
+                },
+            )
+            .unwrap();
+    }
+
+    fn pod(project: &Id, networks: &[&str]) -> Pod {
+        Pod::new(
+            "web",
+            Some(project.clone()),
+            PodSpec {
+                networks: networks.iter().map(|n| n.to_string()).collect(),
+                ..PodSpec::default()
+            },
+        )
+    }
+
+    #[test]
+    fn named_networks_win() {
+        let store = Store::in_memory().unwrap();
+        let p = Id::new(kind::PROJECT);
+        assert_eq!(
+            pick_networks(&store, &pod(&p, &["labnet"])).unwrap(),
+            vec!["labnet"]
+        );
+    }
+
+    #[test]
+    fn default_by_name_then_the_only_internal_one() {
+        let store = Store::in_memory().unwrap();
+        let p = Id::new(kind::PROJECT);
+        net(&store, "labext", Some(p.clone()), true);
+        net(&store, "labnet", Some(p.clone()), false);
+        net(&store, "theirs", Some(Id::new(kind::PROJECT)), false);
+        assert_eq!(
+            pick_networks(&store, &pod(&p, &[])).unwrap(),
+            vec!["labnet"]
+        );
+        net(&store, DEFAULT_NETWORK, None, false);
+        assert_eq!(
+            pick_networks(&store, &pod(&p, &[])).unwrap(),
+            vec![DEFAULT_NETWORK]
+        );
+    }
+
+    #[test]
+    fn none_or_several_fail_clearly() {
+        let store = Store::in_memory().unwrap();
+        let p = Id::new(kind::PROJECT);
+        net(&store, "labext", Some(p.clone()), true);
+        let none = pick_networks(&store, &pod(&p, &[])).unwrap_err();
+        assert!(none.contains("no network that is not external"), "{none}");
+        net(&store, "labnet", Some(p.clone()), false);
+        net(&store, "app", Some(p.clone()), false);
+        let several = pick_networks(&store, &pod(&p, &[])).unwrap_err();
+        assert!(several.contains("(app, labnet)"), "{several}");
+        assert!(several.contains("spec.networks"), "{several}");
     }
 }

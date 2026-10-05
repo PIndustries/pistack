@@ -349,7 +349,8 @@ pub struct PodSpec {
     pub node_selector: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service_account: String,
-    /// fabric networks to attach. Empty means `["default"]`.
+    /// fabric networks to attach. Empty means `default` if the project has one,
+    /// else the project's only non-external network.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<String>,
 }
