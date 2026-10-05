@@ -33,7 +33,12 @@
 //! Count limits (`quota.rs`): `secrets`, `certificates` and `access_keys`
 //! per project through gate's project quotas, with `[modules.keep]` defaults when a
 //! project names none; cloud-wide caps on live join tokens and on a
-//! multi-use token's redemptions.
+//! multi-use token's redemptions. Exact in steady state because only the
+//! leader writes; `quota.rs` gives the over-shoot bound during a
+//! leadership split.
+//!
+//! Background work (`sweep.rs`): the leader deletes join tokens that have
+//! been expired or used up for `join_token_grace_secs` (default 7 days).
 //!
 //! HTTP lives under the `secrets` prefix; see `api.rs`.
 
@@ -46,6 +51,7 @@ pub mod crypto;
 pub mod error;
 pub mod join;
 pub mod quota;
+pub mod sweep;
 pub mod tls;
 pub mod types;
 pub mod vault;
@@ -126,8 +132,21 @@ impl Module for Keep {
         }
     }
 
+    /// Dead join tokens are swept while this node is leader: once on
+    /// promotion (startup on a sole server) and then periodically.
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
-        self.init(&ctx)?;
+        let client = self.init(&ctx)?;
+        let store = (*ctx.store::<Store>()).clone();
+        let grace = client.limits().join_token_grace();
+        let leadership = ctx.leadership.clone();
+        let shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move {
+            leadership
+                .run_while_leader(shutdown, move |active| {
+                    sweep::run(store.clone(), grace, active)
+                })
+                .await;
+        });
         Ok(())
     }
 }

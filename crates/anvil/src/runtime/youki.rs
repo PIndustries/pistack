@@ -17,7 +17,9 @@
 //! argv. A missing youki binary, an image that cannot be unpacked, or an
 //! empty rootfs is unavailable and is not recorded as running. `exec` runs
 //! `youki exec` in one container of a pod sandbox and returns that command's
-//! exit code, stdout, and stderr.
+//! exit code, stdout, and stderr. Command probes call that same helper, with
+//! the probe timeout and a small output cap, and they do not pass an
+//! environment.
 //!
 //! `youki create` and `youki start` do not inherit the agent's pipes. With
 //! `process.terminal` false, the container init keeps youki's stdout and
@@ -354,6 +356,29 @@ impl MachineRuntime for YoukiRuntime {
             Ok(Some(saved)) => saved.probes,
             _ => Vec::new(),
         }
+    }
+
+    /// Command probe. `env` is empty and `cwd` is unset, so the container
+    /// keeps its own environment and working directory. Those values are
+    /// not read and not logged. Privilege follows `exec`: `sudo -n` when
+    /// `PISTACK_YOUKI_SUDO` is set, and the rootless fallback otherwise.
+    async fn command_probe(
+        &self,
+        id: &Id,
+        container: &str,
+        argv: &[String],
+        timeout: Duration,
+    ) -> ApiResult<ExecOutput> {
+        self.exec(
+            id,
+            container,
+            argv,
+            &[],
+            None,
+            timeout,
+            crate::probe::PROBE_EXEC_OUTPUT_CAP,
+        )
+        .await
     }
 }
 

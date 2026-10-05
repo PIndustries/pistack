@@ -817,6 +817,7 @@ mod tests {
             successes: 0,
             failures: 2,
             message: "http status 500".into(),
+            unsupported: false,
         };
         reg.on_heartbeat(&Heartbeat {
             node_name: "h1".into(),

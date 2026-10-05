@@ -167,12 +167,13 @@ pub struct Container {
     pub working_dir: String,
     /// Checked on the host that runs the pod. Failure past
     /// `failure_threshold` restarts the container when the restart policy
-    /// allows it. An `exec` handler is stored and reported unsupported.
+    /// allows it. An `exec` command runs inside the container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness_probe: Option<Probe>,
     /// While this probe has not passed, the container is not ready and the
     /// pod's Ready condition stays false. Absent means the container is
-    /// ready once it is running.
+    /// ready once it is running. `exec`, `http_get`, and `tcp_socket` use
+    /// the same success streak.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<Probe>,
 }
@@ -262,9 +263,8 @@ impl Probe {
     }
 }
 
-/// Which action a [`Probe`] will run. `Exec` is accepted on the spec and
-/// reported unsupported until a later change can run a command in the
-/// container.
+/// Which action a [`Probe`] will run. `Exec` runs its command inside the
+/// container on youki. Other runtimes report that probe unsupported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeHandlerKind {
     Http,

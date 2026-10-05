@@ -106,6 +106,9 @@ format = "text"
 # # redemptions a multi-use token may allow (also its default).
 # max_live_join_tokens = 100
 # max_join_token_uses = 100
+# # Expired or used-up join tokens are deleted by the leader this long
+# # after they stop working (default 7 days).
+# join_token_grace_secs = 604800
 "#;
 
 /// Why configuration could not be loaded.

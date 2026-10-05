@@ -36,8 +36,9 @@
 //! the pod's Ready condition false until its success streak reaches
 //! `success_threshold`. A liveness streak that reaches `failure_threshold`
 //! restarts that container the same way, without the exit backoff, and
-//! bumps only that container's restart count. An exec probe is reported
-//! unsupported and does not restart the container.
+//! bumps only that container's restart count. `http_get`, `tcp_socket`, and
+//! `exec` all use those thresholds. An exec probe the runtime cannot run is
+//! reported unsupported and does not restart the container.
 
 use super::{delete_quietly, patch_status, request_delete, Controller};
 use crate::types::{
@@ -731,7 +732,7 @@ impl PodController {
     /// The whole sandbox restarts, because that is the machine restart
     /// knob, and only the containers that failed have their restart count
     /// bumped. `Never` records the failure and leaves the pod running.
-    /// Exec probes are unsupported and do not count as failures.
+    /// A probe the runtime reports unsupported does not count as a failure.
     async fn apply_liveness(
         &self,
         pod: &Pod,
@@ -740,27 +741,31 @@ impl PodController {
     ) -> anyhow::Result<()> {
         let mut failed = Vec::new();
         let mut saw_check = false;
-        let mut exec_unsupported = false;
+        let mut unsupported_message: Option<String> = None;
         let mut missing = false;
         for container in &pod.spec.containers {
             let Some(probe) = &container.liveness_probe else {
                 continue;
             };
             match probe.handler() {
-                ProbeHandlerKind::Http | ProbeHandlerKind::Tcp => {
+                ProbeHandlerKind::Http | ProbeHandlerKind::Tcp | ProbeHandlerKind::Exec => {
+                    let report = probe_report(reports, &container.name, PROBE_LIVENESS);
+                    if report.is_some_and(|r| r.unsupported) {
+                        if unsupported_message.is_none() {
+                            unsupported_message = Some(unsupported_text(report));
+                        }
+                        continue;
+                    }
                     saw_check = true;
-                    let failures = probe_report(reports, &container.name, PROBE_LIVENESS)
-                        .map(|r| r.failures)
-                        .unwrap_or(0);
+                    let failures = report.map(|r| r.failures).unwrap_or(0);
                     if failures >= probe.failures_required() {
                         failed.push(container.name.clone());
                     }
                 }
-                ProbeHandlerKind::Exec => exec_unsupported = true,
                 ProbeHandlerKind::Missing => missing = true,
             }
         }
-        if failed.is_empty() && !saw_check && !exec_unsupported && !missing {
+        if failed.is_empty() && !saw_check && unsupported_message.is_none() && !missing {
             return Ok(());
         }
         if !failed.is_empty() {
@@ -818,22 +823,26 @@ impl PodController {
             })?;
             return Ok(());
         }
-        let message = if exec_unsupported {
-            "exec probes are not supported"
-        } else {
-            "probe has no handler"
-        };
+        let message = unsupported_message.unwrap_or_else(|| "probe has no handler".to_owned());
         patch_status(&self.pods(), &pod.meta.id, |s| {
             set_condition(
                 &mut s.conditions,
                 LIVENESS_CONDITION,
                 false,
                 "Unsupported",
-                message,
+                &message,
             );
         })?;
         Ok(())
     }
+}
+
+fn unsupported_text(report: Option<&ProbeReport>) -> String {
+    report
+        .map(|r| r.message.trim())
+        .filter(|message| !message.is_empty())
+        .unwrap_or("probe is not supported")
+        .to_owned()
 }
 
 fn probe_report<'a>(
@@ -877,8 +886,13 @@ fn apply_readiness(pod: &Pod, reports: &[ProbeReport], status: &mut PodStatus) {
             continue;
         };
         match probe.handler() {
-            ProbeHandlerKind::Http | ProbeHandlerKind::Tcp => {
+            ProbeHandlerKind::Http | ProbeHandlerKind::Tcp | ProbeHandlerKind::Exec => {
                 let report = probe_report(reports, &cs.name, PROBE_READINESS);
+                if report.is_some_and(|r| r.unsupported) {
+                    let message = unsupported_text(report);
+                    hold_not_ready(cs, &message, &mut waiting);
+                    continue;
+                }
                 let successes = report.map(|r| r.successes).unwrap_or(0);
                 if successes >= probe.successes_required() {
                     cs.ready = true;
@@ -890,9 +904,6 @@ fn apply_readiness(pod: &Pod, reports: &[ProbeReport], status: &mut PodStatus) {
                         .unwrap_or("readiness probe has not passed");
                     hold_not_ready(cs, message, &mut waiting);
                 }
-            }
-            ProbeHandlerKind::Exec => {
-                hold_not_ready(cs, "exec probes are not supported", &mut waiting);
             }
             ProbeHandlerKind::Missing => {
                 hold_not_ready(cs, "probe has no handler", &mut waiting);
@@ -1153,10 +1164,16 @@ mod tests {
     }
 
     fn exec_probe() -> Probe {
+        exec_probe_with(1, 3)
+    }
+
+    fn exec_probe_with(success: u32, failure: u32) -> Probe {
         Probe {
             exec: Some(ExecProbe {
                 command: vec!["/bin/true".into()],
             }),
+            success_threshold: success,
+            failure_threshold: failure,
             ..Probe::default()
         }
     }
@@ -1185,6 +1202,19 @@ mod tests {
             successes,
             failures,
             message: message.into(),
+            unsupported: false,
+        }
+    }
+
+    fn unsupported_report(container: &str, kind: &str) -> ProbeReport {
+        ProbeReport {
+            container: container.into(),
+            kind: kind.into(),
+            success: false,
+            successes: 0,
+            failures: 0,
+            message: "exec probes are not supported".into(),
+            unsupported: true,
         }
     }
 
@@ -1362,11 +1392,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_readiness_stays_not_ready() {
+    async fn exec_readiness_follows_the_success_threshold() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", None, Some(exec_probe_with(2, 3)))],
+            vec![streak("web", PROBE_READINESS, 1, 0, "")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(!pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "ContainersNotReady");
+        assert!(!pod.status.container_statuses[0].ready);
+
+        fx.store
+            .collection::<Machine>()
+            .modify(&fx.machine, |m| {
+                m.status.probes = vec![streak("web", PROBE_READINESS, 2, 0, "")];
+                Ok(())
+            })
+            .unwrap();
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert!(pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "Running");
+        assert!(pod.status.container_statuses[0].ready);
+    }
+
+    #[tokio::test]
+    async fn exec_readiness_stays_not_ready_when_unsupported() {
         let fx = running_pod(
             RestartPolicy::Always,
             vec![ctr("web", None, Some(exec_probe()))],
-            vec![],
+            vec![unsupported_report("web", PROBE_READINESS)],
             0,
             0,
             &[],
@@ -1383,7 +1444,7 @@ mod tests {
             .find(|c| c.kind == POD_READY)
             .unwrap()
             .message;
-        assert!(message.contains("not supported"));
+        assert!(message.contains("not supported"), "{message}");
         assert!(!pod.status.container_statuses[0].ready);
     }
 
@@ -1486,11 +1547,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_liveness_failure_restarts_at_the_threshold() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", Some(exec_probe_with(1, 3)), None)],
+            vec![streak("web", PROBE_LIVENESS, 0, 3, "exit 1")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Pending);
+        assert_eq!(pod.status.container_statuses[0].restart_count, 1);
+        assert_eq!(reason(&pod, LIVENESS_CONDITION), "ProbeFailed");
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn exec_liveness_below_threshold_does_not_restart() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", Some(exec_probe_with(1, 3)), None)],
+            vec![streak("web", PROBE_LIVENESS, 0, 2, "timed out")],
+            0,
+            0,
+            &[],
+        );
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert_eq!(pod.status.container_statuses[0].restart_count, 0);
+        assert_eq!(reason(&pod, LIVENESS_CONDITION), "Ok");
+        let machine = fx.store.collection::<Machine>().get(&fx.machine).unwrap();
+        assert_eq!(machine.spec.restarts, 0);
+    }
+
+    #[tokio::test]
     async fn exec_liveness_is_unsupported_and_does_not_restart() {
+        let mut report = unsupported_report("web", PROBE_LIVENESS);
+        report.failures = 9;
         let fx = running_pod(
             RestartPolicy::Always,
             vec![ctr("web", Some(exec_probe()), None)],
-            vec![],
+            vec![report],
             0,
             0,
             &[],
