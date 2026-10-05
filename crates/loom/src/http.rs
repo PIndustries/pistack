@@ -49,6 +49,8 @@ pub fn router(state: AppState) -> Router {
     let r = crud::<DeploymentSpec>(r)
         .route("/deployments/{id}/scale", post(scale_deployment))
         .route("/deployments/{id}/rollback", post(rollback_deployment));
+    let r = crud::<StatefulSetSpec>(r).route("/statefulsets/{id}/scale", post(scale_statefulset));
+    let r = crud::<DaemonSetSpec>(r);
     let r = crud::<ServiceSpec>(r);
     let r = crud::<ConfigMapSpec>(r);
     let r = crud::<JobSpec>(r);
@@ -211,6 +213,73 @@ impl Api for DeploymentSpec {
                         )));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Api for StatefulSetSpec {
+    type Status = StatefulSetStatus;
+    const NOUN: &'static str = "statefulsets";
+    const DELETE: DeleteMode = DeleteMode::Annotate;
+    fn validate(&mut self, current: Option<&StatefulSet>) -> ApiResult<()> {
+        validate_pod_spec(&self.template.spec)?;
+        if self.template.labels.contains_key(POD_TEMPLATE_HASH) {
+            return Err(ApiError::bad_request(format!(
+                "spec.template.labels may not set '{POD_TEMPLATE_HASH}'"
+            )));
+        }
+        validate_selector(&mut self.selector, &self.template)?;
+        let mut claims = BTreeSet::new();
+        for c in &self.volume_claim_templates {
+            validate_name(&c.name)
+                .map_err(|e| ApiError::bad_request(format!("volume claim name: {}", e.message)))?;
+            if c.size_gib == 0 {
+                return Err(ApiError::bad_request(format!(
+                    "volume claim '{}' size_gib must be at least 1",
+                    c.name
+                )));
+            }
+            if !claims.insert(c.name.as_str()) {
+                return Err(ApiError::bad_request(format!(
+                    "volume claim name '{}' is used twice",
+                    c.name
+                )));
+            }
+        }
+        if let Some(cur) = current {
+            if self.selector != cur.spec.selector {
+                return Err(ApiError::unprocessable("spec.selector is immutable"));
+            }
+            if self.service_name != cur.spec.service_name {
+                return Err(ApiError::unprocessable("spec.service_name is immutable"));
+            }
+            if self.volume_claim_templates != cur.spec.volume_claim_templates {
+                return Err(ApiError::unprocessable(
+                    "spec.volume_claim_templates is immutable",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Api for DaemonSetSpec {
+    type Status = DaemonSetStatus;
+    const NOUN: &'static str = "daemonsets";
+    const DELETE: DeleteMode = DeleteMode::Annotate;
+    fn validate(&mut self, current: Option<&DaemonSet>) -> ApiResult<()> {
+        validate_pod_spec(&self.template.spec)?;
+        if self.template.labels.contains_key(POD_TEMPLATE_HASH) {
+            return Err(ApiError::bad_request(format!(
+                "spec.template.labels may not set '{POD_TEMPLATE_HASH}'"
+            )));
+        }
+        validate_selector(&mut self.selector, &self.template)?;
+        if let Some(cur) = current {
+            if self.selector != cur.spec.selector {
+                return Err(ApiError::unprocessable("spec.selector is immutable"));
             }
         }
         Ok(())
@@ -545,8 +614,9 @@ async fn index() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "module": "loom",
         "resources": [
-            PodSpec::NOUN, ReplicaSetSpec::NOUN, DeploymentSpec::NOUN, ServiceSpec::NOUN,
-            ConfigMapSpec::NOUN, JobSpec::NOUN, CronJobSpec::NOUN, IngressSpec::NOUN,
+            PodSpec::NOUN, ReplicaSetSpec::NOUN, DeploymentSpec::NOUN, StatefulSetSpec::NOUN,
+            DaemonSetSpec::NOUN, ServiceSpec::NOUN, ConfigMapSpec::NOUN, JobSpec::NOUN,
+            CronJobSpec::NOUN, IngressSpec::NOUN,
         ],
     }))
 }
@@ -717,6 +787,23 @@ async fn scale_deployment(
         Ok(())
     })?;
     Ok(Json(d))
+}
+
+async fn scale_statefulset(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<ScaleBody>,
+) -> ApiResult<Json<StatefulSet>> {
+    let sts = load::<StatefulSetSpec>(&s, &scope, &id)?;
+    if delete_requested(&sts) {
+        return Err(ApiError::conflict("statefulset is being deleted"));
+    }
+    let sts = col::<StatefulSetSpec>(&s).modify(&sts.meta.id, |x| {
+        x.spec.replicas = body.replicas;
+        Ok(())
+    })?;
+    Ok(Json(sts))
 }
 
 #[derive(Debug, Deserialize, Default)]

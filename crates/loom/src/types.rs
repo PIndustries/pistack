@@ -25,6 +25,8 @@ pub mod kinds {
     pub const POD: &str = pistack_types::kind::POD;
     pub const REPLICA_SET: &str = "rs";
     pub const DEPLOYMENT: &str = "deploy";
+    pub const STATEFUL_SET: &str = "sts";
+    pub const DAEMON_SET: &str = "ds";
     pub const SERVICE: &str = "svc";
     pub const CONFIG_MAP: &str = "cm";
     pub const JOB: &str = "job";
@@ -53,6 +55,19 @@ pub const MACHINE_POD_LABEL: &str = "loom.pistack.io/pod";
 /// Annotation the Deployment controller keeps on each ReplicaSet with its
 /// monotonically increasing rollout revision (`1`, `2`, ...).
 pub const REVISION_ANNOTATION: &str = "loom.pistack.io/revision";
+
+/// Stable pod name for a StatefulSet ordinal (`web-0`).
+pub const POD_NAME_LABEL: &str = "loom.pistack.io/pod-name";
+
+/// Ordinal index of a StatefulSet pod (`0`, `1`, ...).
+pub const POD_ORDINAL_LABEL: &str = "loom.pistack.io/pod-ordinal";
+
+/// Host `node_name` stamped on forge hosts so a DaemonSet can pin one pod
+/// per host through `pod.spec.node_selector`.
+pub const HOSTNAME_LABEL: &str = "pistack.io/hostname";
+
+/// Annotation on a DaemonSet pod naming the forge host id it belongs to.
+pub const TARGET_HOST_ANNOTATION: &str = "loom.pistack.io/target-host";
 
 // ---- selectors -----------------------------------------------------------------
 
@@ -628,6 +643,114 @@ pub struct CronJobStatus {
 }
 
 pub type CronJob = Resource<CronJobSpec, CronJobStatus>;
+
+// ---- StatefulSet ----------------------------------------------------------------
+
+/// How a StatefulSet creates and deletes pods.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+#[serde(rename_all = "PascalCase")]
+pub enum PodManagementPolicy {
+    /// Create/delete one ordinal at a time, waiting for Ready.
+    #[default]
+    OrderedReady,
+    /// Create/delete every ordinal in one pass.
+    Parallel,
+}
+
+/// How a StatefulSet rolls a new pod template.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+#[serde(rename_all = "PascalCase")]
+pub enum StatefulSetUpdateStrategy {
+    /// Replace pods that do not match the current template, highest ordinal first.
+    #[default]
+    RollingUpdate,
+    /// Leave existing pods alone until they are deleted by hand or scaled away.
+    OnDelete,
+}
+
+/// A per-ordinal block volume to create in `slab` and attach to the pod.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeClaimTemplate {
+    pub name: String,
+    pub size_gib: u64,
+    #[serde(default = "default_volume_type")]
+    pub volume_type: String,
+}
+
+fn default_volume_type() -> String {
+    "standard".into()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatefulSetSpec {
+    #[serde(default = "one")]
+    pub replicas: u32,
+    /// Defaults to the template labels when empty.
+    #[serde(default)]
+    pub selector: Selector,
+    pub template: PodTemplate,
+    /// Name of the Service that gives pods a stable network identity.
+    /// Empty when unused; loom does not invent DNS records here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub service_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_claim_templates: Vec<VolumeClaimTemplate>,
+    #[serde(default)]
+    pub pod_management_policy: PodManagementPolicy,
+    #[serde(default)]
+    pub update_strategy: StatefulSetUpdateStrategy,
+}
+
+impl Spec for StatefulSetSpec {
+    const KIND: &'static str = kinds::STATEFUL_SET;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StatefulSetStatus {
+    #[serde(default)]
+    pub replicas: u32,
+    #[serde(default)]
+    pub ready: u32,
+    /// Pods whose template hash matches the current spec.
+    #[serde(default)]
+    pub current: u32,
+    #[serde(default)]
+    pub updated: u32,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+}
+
+pub type StatefulSet = Resource<StatefulSetSpec, StatefulSetStatus>;
+
+// ---- DaemonSet -------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonSetSpec {
+    /// Defaults to the template labels when empty.
+    #[serde(default)]
+    pub selector: Selector,
+    pub template: PodTemplate,
+}
+
+impl Spec for DaemonSetSpec {
+    const KIND: &'static str = kinds::DAEMON_SET;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DaemonSetStatus {
+    /// Eligible hosts the controller wants a pod on.
+    #[serde(default)]
+    pub desired: u32,
+    /// Owned pods that are not being deleted.
+    #[serde(default)]
+    pub current: u32,
+    #[serde(default)]
+    pub ready: u32,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+}
+
+pub type DaemonSet = Resource<DaemonSetSpec, DaemonSetStatus>;
 
 // ---- Ingress ---------------------------------------------------------------------
 
