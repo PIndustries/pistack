@@ -16,9 +16,8 @@
 //! ([`sigv4`]): header auth, presigned GET/PUT, and aws-chunked streaming
 //! PutObject/UploadPart (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
 //! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
-//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`). **UploadPartCopy**
-//! (`x-amz-copy-source` on `PUT …?partNumber=&uploadId=`) is supported;
-//! CopyObject is not implemented yet. Region comes from
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`). **UploadPartCopy** and
+//! **CopyObject** (`x-amz-copy-source`) are supported. Region comes from
 //! `[modules.silo] region` (default `pistack`).
 //!
 //! Multipart staging lives under `{data}/silo/{bucket}/.uploads/{uploadId}/`.

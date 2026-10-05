@@ -1408,47 +1408,69 @@ async fn copy_source_presigned_unsigned_header_access_denied() {
 }
 
 #[tokio::test]
-async fn copy_source_presigned_fully_signed_ok() {
+async fn copy_object_unsigned_copy_source_access_denied() {
     let w = world().await;
-    let src = b"presign-ok!";
-    let upload_id = put_source_and_start_mpu(&w, "psrc2.bin", "pdst2.bin", src).await;
-    let path = format!("/{}/pdst2.bin", w.bucket);
-    let host = "silo.test";
-    let amz_date = amz_now();
-    let copy_src = format!("/{}/psrc2.bin", w.bucket);
-    let q = sigv4::presign_query_with_headers(
+    let src = b"copy-object-src";
+    let src_path = format!("/{}/co-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
         "PUT",
-        &path,
-        host,
+        &src_path,
+        "",
+        src,
         &w.access_key_id,
         &w.secret,
         &w.region,
-        &amz_date,
-        3600,
-        &format!("partNumber=1&uploadId={upload_id}"),
-        &[("x-amz-copy-source".into(), copy_src.clone())],
-    );
-    let resp = w
-        .app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("{path}?{q}"))
-                .header("host", host)
-                .header("content-length", "0")
-                .header("x-amz-copy-source", &copy_src)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    assert!(
-        String::from_utf8_lossy(&body).contains("CopyPartResult"),
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/co-dst.bin", w.bucket);
+    let copy_src = format!("/{}/co-src.bin", w.bucket);
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[("x-amz-copy-source", &copy_src)],
+        &[], // omit from SignedHeaders
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
         "{}",
         String::from_utf8_lossy(&body)
     );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Helpers for S3 UploadPartCopy (`x-amz-copy-source` / range / conditionals).
-//!
-//! CopyObject (PUT with `x-amz-copy-source` and no `partNumber`) is **not**
-//! implemented here; callers should return `NotImplemented` for that shape.
+//! Helpers for S3 UploadPartCopy / CopyObject (`x-amz-copy-source`, range,
+//! conditionals). Range parsing is for UploadPartCopy only; CopyObject
+//! rejects `x-amz-copy-source-range`.
 
 use crate::multipart::s3_err;
 use crate::types::Object;
