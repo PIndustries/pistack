@@ -29,6 +29,10 @@ pub enum KeepError {
     /// The request clashes with state `keep` manages itself.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Refused by a quota or count limit, or a disabled project. Carries
+    /// the HTTP error as gate builds it (403 `quota_exceeded` / forbidden).
+    #[error("{}", .0.message)]
+    Denied(ApiError),
     /// The root-key backend is misconfigured, unreachable or refused.
     #[error("key backend: {0}")]
     Backend(String),
@@ -47,6 +51,7 @@ impl From<KeepError> for ApiError {
             KeepError::Invalid(m) => ApiError::bad_request(m),
             KeepError::Unauthorized(m) => ApiError::unauthorized(m),
             KeepError::Conflict(m) => ApiError::conflict(m),
+            KeepError::Denied(e) => e,
             KeepError::Backend(m) => ApiError::unavailable(format!("key backend: {m}")),
         }
     }

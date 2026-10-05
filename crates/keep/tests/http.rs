@@ -625,3 +625,94 @@ fn base64_decode(s: &str) -> Vec<u8> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
 }
+
+#[tokio::test]
+async fn limits_over_http() {
+    let (app, store) = boot().await;
+    // A gate project whose quota allows one secret and one certificate.
+    let mut spec = gate::ProjectSpec::default();
+    spec.quotas.insert("secrets".into(), 1);
+    spec.quotas.insert("certificates".into(), 1);
+    let proj = store
+        .collection::<gate::Project>()
+        .create(gate::Project {
+            meta: pistack_types::Meta::new(kind::PROJECT, "tight", None),
+            spec,
+            status: Default::default(),
+        })
+        .unwrap()
+        .meta
+        .id
+        .to_string();
+    let member = format!("member:{proj}");
+
+    let secret = |name: &str| json!({"name": name, "payload": "x"});
+    let (st, _) = call(&app, "POST", "/secrets", Some(&member), Some(secret("a"))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, e) = call(&app, "POST", "/secrets", Some(&member), Some(secret("b"))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"]["code"], "quota_exceeded", "{e}");
+    assert_eq!(e["error"]["details"]["resource"], "secrets", "{e}");
+    assert_eq!(e["error"]["details"]["limit"], 1, "{e}");
+
+    let cert = |name: &str| json!({"name": name, "common_name": name});
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/certificates",
+        Some(&member),
+        Some(cert("w1")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/certificates",
+        Some(&member),
+        Some(cert("w2")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"]["details"]["resource"], "certificates", "{e}");
+    // Usage is visible on the project.
+    let p = store
+        .collection::<gate::Project>()
+        .get(&serde_json::from_value(Value::String(proj.clone())).unwrap())
+        .unwrap();
+    assert_eq!(p.status.usage.get("secrets"), Some(&1));
+    assert_eq!(p.status.usage.get("certificates"), Some(&1));
+
+    // Certificate metadata has the secret limits.
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/certificates",
+        Some("admin"),
+        Some(json!({"name": "big", "common_name": "big", "description": "d".repeat(4097)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+
+    // A multi-use join token above the cap is refused; at the cap it is not.
+    let cap = keep::KeepConfig::configured().max_join_token_uses;
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/join-tokens",
+        Some("admin"),
+        Some(json!({"name": "over", "multi_use": true, "max_uses": cap + 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, t) = call(
+        &app,
+        "POST",
+        "/join-tokens",
+        Some("admin"),
+        Some(json!({"name": "at-cap", "multi_use": true, "max_uses": cap})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(t["join_token"]["spec"]["max_uses"], cap);
+}

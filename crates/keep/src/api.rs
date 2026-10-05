@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ca::PEM_CONTENT_TYPE,
-    join::{create_join_token, redeem_join_token},
+    join::{create_join_token_with, redeem_join_token, NewJoinToken},
     paginate,
     types::*,
     Client,
@@ -492,19 +492,13 @@ async fn create_certificate(
         ttl_days: req.ttl_days.unwrap_or_else(default_ttl_days),
         issuer: req.issuer,
     };
-    let mut cert = c.issue_certificate(project, &req.name, spec)?;
-    if req.description.is_some() || !req.labels.is_empty() {
-        let desc = req.description.unwrap_or_default();
-        let labels = req.labels;
-        cert = c
-            .store()
-            .collection::<Certificate>()
-            .modify(&cert.meta.id, |x| {
-                x.meta.description = desc.clone();
-                x.meta.labels = labels.clone();
-                Ok(())
-            })?;
-    }
+    let cert = c.issue_certificate_with(
+        project,
+        &req.name,
+        spec,
+        req.description.unwrap_or_default(),
+        req.labels,
+    )?;
     Ok(created(cert))
 }
 
@@ -652,6 +646,10 @@ pub struct CreateJoinToken {
     pub name: String,
     #[serde(default)]
     pub multi_use: bool,
+    /// Redemptions a multi-use token allows; default and maximum
+    /// `[modules.keep] max_join_token_uses`.
+    #[serde(default)]
+    pub max_uses: Option<u64>,
     /// Lifetime in seconds; default and maximum 24h.
     #[serde(default)]
     pub ttl_secs: Option<i64>,
@@ -693,12 +691,16 @@ async fn create_join_token_h(
         Some(s) => Some(Duration::seconds(s)),
         None => None,
     };
-    let (join_token, token) = create_join_token(
+    let (join_token, token) = create_join_token_with(
         c.store(),
-        &req.name,
-        &scope.caller().principal_name,
-        req.multi_use,
-        ttl,
+        &NewJoinToken {
+            name: &req.name,
+            created_by: &scope.caller().principal_name,
+            multi_use: req.multi_use,
+            max_uses: req.max_uses,
+            ttl,
+        },
+        c.limits(),
     )?;
     Ok(created(JoinTokenResponse { token, join_token }))
 }

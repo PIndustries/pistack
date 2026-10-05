@@ -25,6 +25,11 @@
 //! Every path that needs the key, including [`read_payload`], goes through
 //! the configured backend; there is no fallback between backends.
 //!
+//! Count limits (`quota.rs`): `secrets` and `certificates` per project
+//! through gate's project quotas, with `[modules.keep]` defaults when a
+//! project names none; cloud-wide caps on live join tokens and on a
+//! multi-use token's redemptions.
+//!
 //! HTTP lives under the `secrets` prefix; see `api.rs`.
 
 pub mod api;
@@ -34,6 +39,7 @@ pub mod client;
 pub mod crypto;
 pub mod error;
 pub mod join;
+pub mod quota;
 pub mod tls;
 pub mod types;
 pub mod vault;
@@ -49,7 +55,11 @@ pub use ca::{Ca, Issued};
 pub use client::Client;
 pub use crypto::{RootKey, Sealed};
 pub use error::{KeepError, Result};
-pub use join::{authorize_join_token, create_join_token, redeem_join_token};
+pub use join::{
+    authorize_join_token, create_join_token, create_join_token_with, redeem_join_token,
+    NewJoinToken,
+};
+pub use quota::KeepConfig;
 pub use tls::{PeerIdentity, Pki};
 pub use types::*;
 

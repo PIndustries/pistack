@@ -94,6 +94,15 @@ format = "text"
 # [modules.silo]
 # # Largest single PUT in bytes (default 5 GiB).
 # max_object_bytes = 5368709120
+# [modules.keep]
+# # Defaults for projects whose gate quotas do not name `secrets` or
+# # `certificates`; a project quota always wins.
+# max_secrets_per_project = 1000
+# max_certificates_per_project = 500
+# # Cloud-wide: unexpired, unspent join tokens at once, and the most
+# # redemptions a multi-use token may allow (also its default).
+# max_live_join_tokens = 100
+# max_join_token_uses = 100
 "#;
 
 /// Why configuration could not be loaded.
