@@ -171,7 +171,7 @@ impl Client {
     ) -> ApiResult<Object>
     where
         S: Stream<Item = Result<Bytes, E>> + Send,
-        E: std::fmt::Display,
+        E: IntoBodyReadErr + Send + 'static,
     {
         self.put_object_stream_sha(bucket_id, key, body, content_length, content_type, None)
             .await
@@ -189,7 +189,7 @@ impl Client {
     ) -> ApiResult<Object>
     where
         S: Stream<Item = Result<Bytes, E>> + Send,
-        E: std::fmt::Display,
+        E: IntoBodyReadErr + Send + 'static,
     {
         if let Some(len) = content_length {
             if len > self.max_object_bytes as u64 {
@@ -223,7 +223,7 @@ impl Client {
 
         let written = write_stream_atomic(
             &path,
-            body,
+            map_stream_err(body),
             self.max_object_bytes,
             content_length,
             expected_sha256,
@@ -528,7 +528,75 @@ struct Written {
     size: u64,
 }
 
-async fn write_stream_atomic<S, E>(
+/// Preserve [`ApiError`] stream errors (including `details.s3_code`); wrap others.
+pub(crate) fn map_stream_err<S, E>(body: S) -> impl Stream<Item = Result<Bytes, ApiError>> + Send
+where
+    S: Stream<Item = Result<Bytes, E>> + Send,
+    E: IntoBodyReadErr + Send,
+{
+    use futures::StreamExt;
+    body.map(|item| item.map_err(IntoBodyReadErr::into_body_read_err))
+}
+
+pub trait IntoBodyReadErr {
+    fn into_body_read_err(self) -> ApiError;
+}
+
+impl IntoBodyReadErr for ApiError {
+    fn into_body_read_err(self) -> ApiError {
+        self
+    }
+}
+
+impl IntoBodyReadErr for std::io::Error {
+    fn into_body_read_err(self) -> ApiError {
+        ApiError::bad_request(format!("reading body: {self}"))
+    }
+}
+
+impl IntoBodyReadErr for String {
+    fn into_body_read_err(self) -> ApiError {
+        ApiError::bad_request(format!("reading body: {self}"))
+    }
+}
+
+impl IntoBodyReadErr for &str {
+    fn into_body_read_err(self) -> ApiError {
+        ApiError::bad_request(format!("reading body: {self}"))
+    }
+}
+
+impl IntoBodyReadErr for axum::Error {
+    fn into_body_read_err(self) -> ApiError {
+        ApiError::bad_request(format!("reading body: {self}"))
+    }
+}
+
+/// Best-effort cleanup of a staging path if the future is cancelled or errors
+/// before rename. Call [`TmpGuard::disarm`] after a successful rename so Drop
+/// does not attempt another delete of the (now gone) temp path.
+pub(crate) struct TmpGuard(Option<std::path::PathBuf>);
+
+impl TmpGuard {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    /// Stop Drop from deleting the path (use after a successful rename).
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn write_stream_atomic<S>(
     dest: &Path,
     body: S,
     max: usize,
@@ -536,8 +604,7 @@ async fn write_stream_atomic<S, E>(
     expected_sha256: Option<&str>,
 ) -> ApiResult<Written>
 where
-    S: Stream<Item = Result<Bytes, E>> + Send,
-    E: std::fmt::Display,
+    S: Stream<Item = Result<Bytes, ApiError>> + Send,
 {
     use futures::StreamExt;
 
@@ -545,6 +612,7 @@ where
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
+    let mut tmp_guard = TmpGuard::new(tmp.clone());
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut sha = Sha256::new();
@@ -552,7 +620,7 @@ where
         let mut size: u64 = 0;
         let mut body = std::pin::pin!(body);
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+            let chunk = chunk?;
             let next = size.saturating_add(chunk.len() as u64);
             if next > max as u64 {
                 return Err(ApiError::bad_request(object_too_large_message(max)));
@@ -597,8 +665,35 @@ where
         })
     }
     .await;
-    if result.is_err() {
+    if result.is_ok() {
+        tmp_guard.disarm();
+    } else {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     result
+}
+
+#[cfg(test)]
+mod tmp_guard_tests {
+    use super::TmpGuard;
+
+    #[test]
+    fn disarm_skips_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep-me");
+        std::fs::write(&path, b"hi").unwrap();
+        let mut g = TmpGuard::new(path.clone());
+        g.disarm();
+        drop(g);
+        assert!(path.exists(), "disarmed guard must not delete the path");
+    }
+
+    #[test]
+    fn drop_deletes_when_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove-me");
+        std::fs::write(&path, b"hi").unwrap();
+        drop(TmpGuard::new(path.clone()));
+        assert!(!path.exists(), "armed guard must delete on drop");
+    }
 }

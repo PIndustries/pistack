@@ -18,6 +18,10 @@
 //! | restore         | `lvcreate --snapshot --name {new_vol_id} {vg}/{snap_id}` then `lvchange -ay -K {vg}/{new_vol_id}` |
 //! | extend          | `lvextend --size {new_size_gib}G {vg}/{vol_id}` |
 //! | attach_info     | same host: `Local { path: /dev/{vg}/{vol_id} }` |
+//! | image           | `qemu-img convert -O raw -f <fmt> -n <src> /dev/{vg}/{vol_id}` |
+//!
+//! Image bytes are written onto the logical volume after `lvcreate`.
+//! `-n` tells `qemu-img` the device already exists.
 //!
 //! Parameters come from `VolumeTypeSpec::params`: `vg` (required),
 //! `pool` (thin pool, default `pistack-thin`).
@@ -32,6 +36,7 @@ use async_trait::async_trait;
 use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use super::{AttachInfo, AttachTarget, BackendRef, BlockBackend};
@@ -117,6 +122,17 @@ impl LvmBackend {
         ident("pool", pool)?;
         Ok(pool)
     }
+
+    /// `qemu-img convert -O raw -f <format> -n <src> /dev/{vg}/{id}`.
+    fn image_convert_args(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<Vec<String>> {
+        let vg = self.vg()?;
+        let id = vol_id(vol)?;
+        Ok(super::qemu_img_convert_argv(
+            format,
+            src,
+            &format!("/dev/{vg}/{id}"),
+        ))
+    }
 }
 
 #[async_trait]
@@ -145,6 +161,11 @@ impl BlockBackend for LvmBackend {
         )
         .await?;
         Ok(BackendRef::new(format!("/dev/{vg}/{id}")))
+    }
+
+    async fn write_image(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<()> {
+        let args = self.image_convert_args(vol, src, format)?;
+        super::run_qemu_img(src, &args).await
     }
 
     async fn delete(&self, vol: &Volume) -> ApiResult<()> {
@@ -451,5 +472,56 @@ mod tests {
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.contains("--thin"), "{logged}");
         assert!(!logged.contains("--virtualsize"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn image_convert_command_targets_the_device() {
+        let _guard = LOCK.lock().await;
+        let _qemu = super::super::QEMU_IMG_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("qemu-img");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{quoted}'\nexit 0\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(super::super::ENV_QEMU_IMG, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(super::super::ENV_QEMU_IMG);
+            }
+        }
+        let _reset = Reset;
+
+        let backend = LvmBackend::new("vg0", "pistack-thin");
+        let vol = volume(4);
+        let src = dir.path().join("seed.raw");
+        std::fs::write(&src, b"seed").unwrap();
+        let id = vol.meta.id.to_string();
+        let args = backend.image_convert_args(&vol, &src, "raw").unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "convert".to_owned(),
+                "-O".to_owned(),
+                "raw".to_owned(),
+                "-f".to_owned(),
+                "raw".to_owned(),
+                "-n".to_owned(),
+                src.display().to_string(),
+                format!("/dev/vg0/{id}"),
+            ]
+        );
+        backend.write_image(&vol, &src, "raw").await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            logged,
+            args.iter().map(|a| format!("{a}\n")).collect::<String>()
+        );
     }
 }

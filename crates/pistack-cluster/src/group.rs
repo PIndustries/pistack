@@ -287,6 +287,7 @@ mod tests {
         let mut c = Node::voter("c");
         catch_up(&a, &mut b);
         catch_up(&a, &mut c);
+        // `a` is not asked: the leader process is gone, not stepping down.
         campaign(&mut b, std::slice::from_mut(&mut c)).unwrap();
         assert!(b.leader);
         assert!(!c.leader);

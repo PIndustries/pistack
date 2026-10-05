@@ -38,7 +38,10 @@
 //! after youki exits. The wait is only on youki's exit status. A create that
 //! times out or fails runs `youki delete --force` and removes the bundle.
 //! Before create, a container `youki state` still knows about, and that this
-//! agent does not have recorded as running, is removed the same way.
+//! agent does not have recorded as running, is removed the same way. Delete
+//! uses `youki delete --force` and then removes the bundle. In sudo mode a
+//! bundle or rootfs the agent cannot unlink is removed through the cleanup
+//! helper below.
 //!
 //! Privilege. A root agent keeps this root OCI config and runs `youki`
 //! directly. `PISTACK_YOUKI_SUDO` does not change that.
@@ -46,15 +49,36 @@
 //! When the agent is not root and `PISTACK_YOUKI_SUDO` is `1`, `true`, or
 //! `yes`, every youki invocation (`create`, `start`, `kill`, `delete`,
 //! `state`, `exec`) is `sudo -n <youki> ...` and the OCI config stays the root
-//! config. Allow only that binary. `sudo -n` fails closed without the rule:
+//! config. Files this agent writes (the bundle, the unpacked rootfs, volume
+//! files, and logs) stay owned by the agent. youki runs as root and may leave
+//! root-owned files under the bundle. Removing those, and replacing a rootfs
+//! the agent can no longer unlink, is `sudo -n <helper> delete --path <path>`.
+//! The helper is `scripts/pistack-youki-cleanup`, installed as
+//! `/usr/local/sbin/pistack-youki-cleanup` (`PISTACK_YOUKI_CLEANUP` overrides
+//! the path). The agent checks that the path is inside the youki state
+//! directory and contains no `..` before it calls sudo. The helper checks
+//! again, unlinks symlinks without following them, and refuses anything else.
+//! As root it only removes paths under `/var/lib/pistack/youki`, the default
+//! state directory. sudo resets the environment, so a custom
+//! `PISTACK_YOUKI_STATE` cannot widen that directory. `sudo -n` fails closed
+//! without a rule. Allow only the youki binary and that helper:
 //!
 //! ```text
 //! # /etc/sudoers.d/pistack-youki
-//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki
+//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup
 //! ```
 //!
-//! Replace `ubuntu` and `/usr/bin/youki` with the agent user and the youki
-//! path on the host.
+//! Replace `ubuntu` and the paths with the agent user and the binaries on
+//! the host. Leave sudo's environment reset.
+//!
+//! In sudo mode the bundle directory is `0700`, so other host users cannot
+//! traverse it. ConfigMap and Secret volume directories are `0755` and their
+//! files are `0644`. Secret files are `0644` rather than `0640`: the
+//! container user is uid 0 and gid 0, not the agent, and is not in the
+//! agent's group, so group-read would still leave the file unreadable when
+//! the container has no `CAP_DAC_OVERRIDE`. The private bundle directory is
+//! what hides those files from other accounts on the host. Root and rootless
+//! keep Secret files at `0400` and the Secret directory at `0700`.
 //!
 //! An RBD volume on a pod is mapped with `rbd device map`. The device path
 //! (`/dev/rbd/<pool>/<image>` when that link exists, otherwise `/dev/rbdN`)
@@ -168,7 +192,7 @@ impl MachineRuntime for YoukiRuntime {
         }
         if let Err(e) = write_bundle(&bundle, req, &mode).await {
             if prior.is_none() {
-                let _ = remove_bundle(&bundle).await;
+                let _ = remove_bundle(&bundle, &mode.privilege).await;
             }
             return Err(e);
         }
@@ -185,6 +209,9 @@ impl MachineRuntime for YoukiRuntime {
         } else {
             exec_detach(&bin, &mode, &["start", &id_str], None, &io).await?;
         }
+        // youki may have loosened the bundle directory. The agent still owns
+        // it unless youki changed the owner, in which case this is a no-op.
+        let _ = privatize_bundle(&bundle, &mode.privilege);
         let addresses = nic_addresses(req);
         write_state(
             &bundle,
@@ -246,7 +273,7 @@ impl MachineRuntime for YoukiRuntime {
             .collect();
         order.push(id.to_string());
         for cid in &order {
-            if let Err(e) = exec_youki(&bin, &mode, &["delete", cid], None).await {
+            if let Err(e) = exec_youki(&bin, &mode, &["delete", "--force", cid], None).await {
                 // A bundle with no state was never created in youki. A container
                 // youki has already forgotten is gone too. Anything else stays on
                 // disk so a later delete can retry.
@@ -256,7 +283,7 @@ impl MachineRuntime for YoukiRuntime {
             }
         }
         unmap_recorded(&bundle).await?;
-        remove_bundle(&bundle).await
+        remove_bundle(&bundle, &mode.privilege).await
     }
 
     async fn attach_volume(&self, req: &super::VolumeAttach) -> ApiResult<String> {
@@ -604,10 +631,13 @@ impl RunMode {
 
 const SUDO_ENV: &str = "PISTACK_YOUKI_SUDO";
 const SUDO_BIN_ENV: &str = "PISTACK_YOUKI_SUDO_BIN";
+const CLEANUP_ENV: &str = "PISTACK_YOUKI_CLEANUP";
+const DEFAULT_CLEANUP: &str = "/usr/local/sbin/pistack-youki-cleanup";
 const NETNS_ENV: &str = "PISTACK_YOUKI_NETNS";
 
-/// Sample sudoers rule. Operators replace the user and the youki path.
-const SUDOERS_SAMPLE: &str = "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki";
+/// Sample sudoers rule. Operators replace the user and the two paths.
+const SUDOERS_SAMPLE: &str =
+    "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup";
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -636,7 +666,7 @@ fn resolve_privilege() -> ApiResult<Privilege> {
         return match sudo_bin() {
             Some(sudo) => Ok(Privilege::Sudo { sudo }),
             None if unprivileged_userns_available() => Err(ApiError::unavailable(format!(
-                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
+                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary and the cleanup helper (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
             ))),
             None => Err(privilege_unavailable()),
         };
@@ -649,7 +679,7 @@ fn resolve_privilege() -> ApiResult<Privilege> {
 
 fn privilege_unavailable() -> ApiError {
     ApiError::unavailable(format!(
-        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
+        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary and the cleanup helper (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
     ))
 }
 
@@ -1385,9 +1415,10 @@ fn install_bundle(
     std::fs::create_dir_all(bundle).map_err(|e| {
         ApiError::unavailable(format!("youki runtime: creating {}: {e}", bundle.display()))
     })?;
+    privatize_bundle(bundle, &mode.privilege)?;
     let rootfs = bundle.join("rootfs");
-    reset_dir(&rootfs)?;
-    let cfg = unpack_image(image, &rootfs)?;
+    reset_dir(&rootfs, &mode.privilege)?;
+    let cfg = unpack_image_with(image, &rootfs, &mode.privilege)?;
     if rootfs_empty(&rootfs) {
         return Err(ApiError::unavailable(
             "youki runtime: image rootfs is empty",
@@ -1408,7 +1439,8 @@ fn install_bundle(
     ))
     .map_err(|e| ApiError::internal(format!("youki runtime: encoding config: {e}")))?;
     std::fs::write(bundle.join("config.json"), text)
-        .map_err(|e| ApiError::unavailable(format!("youki runtime: writing config.json: {e}")))
+        .map_err(|e| ApiError::unavailable(format!("youki runtime: writing config.json: {e}")))?;
+    privatize_bundle(bundle, &mode.privilege)
 }
 
 fn rootfs_empty(rootfs: &Path) -> bool {
@@ -1417,24 +1449,21 @@ fn rootfs_empty(rootfs: &Path) -> bool {
         .unwrap_or(true)
 }
 
-fn reset_dir(dir: &Path) -> ApiResult<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(dir) {
-        let ft = meta.file_type();
-        let removed = if ft.is_symlink() || !ft.is_dir() {
-            std::fs::remove_file(dir)
-        } else {
-            std::fs::remove_dir_all(dir)
-        };
-        removed.map_err(|e| {
-            ApiError::unavailable(format!("youki runtime: removing {}: {e}", dir.display()))
-        })?;
-    }
+fn reset_dir(dir: &Path, privilege: &Privilege) -> ApiResult<()> {
+    delete_path(dir, privilege)?;
     std::fs::create_dir_all(dir).map_err(|e| {
         ApiError::unavailable(format!("youki runtime: creating {}: {e}", dir.display()))
     })
 }
 
+/// Test helper. These rootfs trees are created by the test process, so
+/// removal stays unprivileged.
+#[cfg(test)]
 fn unpack_image(src: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
+    unpack_image_with(src, rootfs, &Privilege::Root)
+}
+
+fn unpack_image_with(src: &Path, rootfs: &Path, privilege: &Privilege) -> ApiResult<ImageConfig> {
     let meta = std::fs::symlink_metadata(src).map_err(|_| cannot_unpack())?;
     if meta.file_type().is_symlink() {
         return Err(cannot_unpack());
@@ -1449,10 +1478,10 @@ fn unpack_image(src: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES {
         return Err(cannot_unpack());
     }
-    unpack_archive(src, rootfs)
+    unpack_archive(src, rootfs, privilege)
 }
 
-fn unpack_archive(src: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
+fn unpack_archive(src: &Path, rootfs: &Path, privilege: &Privilege) -> ApiResult<ImageConfig> {
     let owned = decompress_to_tar(src)?;
     let staging = temp_path("stage");
     let _stage = TempPath(staging.clone());
@@ -1463,7 +1492,7 @@ fn unpack_archive(src: &Path, rootfs: &Path) -> ApiResult<ImageConfig> {
     } else if staging.join("oci-layout").is_file() && staging.join("index.json").is_file() {
         apply_oci(&staging, rootfs)
     } else {
-        reset_dir(rootfs)?;
+        reset_dir(rootfs, privilege)?;
         extract_tar(&owned.path, rootfs, true)?;
         Ok(ImageConfig::default())
     }
@@ -2146,6 +2175,34 @@ fn remove_path(path: &Path) -> ApiResult<()> {
     result.map_err(|_| cannot_unpack())
 }
 
+/// Loosen a directory this process can already access so `remove_dir_all`
+/// can unlink its children. Mode 000 is left unchanged: there is no owner
+/// bit to extend, and sudo mode hands that tree to the cleanup helper.
+/// Symlinks are not followed. A chmod that fails (the directory is not
+/// ours) is ignored.
+fn chmod_deletable(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0 && mode & 0o700 != 0o700 {
+            let _ = set_mode_nofollow(path, (mode | 0o700) & 0o7777);
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        chmod_deletable(&ent.path());
+    }
+}
+
 /// Add owner read, write, and execute so a read-only unpacked directory can
 /// still be deleted. Symlinks are not followed.
 fn chmod_writable(path: &Path) {
@@ -2557,27 +2614,185 @@ fn rel_under(name: &str) -> Option<PathBuf> {
     }
 }
 
-async fn remove_bundle(bundle: &Path) -> ApiResult<()> {
+async fn remove_bundle(bundle: &Path, privilege: &Privilege) -> ApiResult<()> {
+    let bundle = bundle.to_path_buf();
+    let privilege = privilege.clone();
+    match tokio::task::spawn_blocking(move || delete_bundle(&bundle, &privilege)).await {
+        Ok(result) => result,
+        Err(_) => Err(ApiError::unavailable(
+            "youki runtime: bundle removal stopped",
+        )),
+    }
+}
+
+/// Unlink a symlink `rootfs` without following it, then remove the bundle.
+fn delete_bundle(bundle: &Path, privilege: &Privilege) -> ApiResult<()> {
     let rootfs = bundle.join("rootfs");
-    if let Ok(meta) = tokio::fs::symlink_metadata(&rootfs).await {
+    if let Ok(meta) = std::fs::symlink_metadata(&rootfs) {
         if meta.file_type().is_symlink() {
-            tokio::fs::remove_file(&rootfs).await.map_err(|e| {
-                ApiError::unavailable(format!(
-                    "youki runtime: unlinking {}: {e}",
-                    rootfs.display()
-                ))
-            })?;
+            delete_path(&rootfs, privilege)?;
         }
     }
-    chmod_writable(bundle);
-    match tokio::fs::remove_dir_all(bundle).await {
+    delete_path(bundle, privilege)
+}
+
+fn delete_path(path: &Path, privilege: &Privilege) -> ApiResult<()> {
+    match remove_unprivileged(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(ApiError::unavailable(format!(
-            "youki runtime: removing {}: {e}",
-            bundle.display()
-        ))),
+        Err(e) if permission_denied(&e) && matches!(privilege, Privilege::Sudo { .. }) => {
+            privileged_remove(path, privilege, &e)
+        }
+        Err(e) => Err(remove_err(path, &e)),
     }
+}
+
+fn remove_unprivileged(path: &Path) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        std::fs::remove_file(path)
+    } else {
+        // A layer directory such as 0555 is still ours to delete when this
+        // uid can already access it. Mode 000 stays locked, and a directory
+        // we do not own is unchanged when chmod fails. Sudo mode removes
+        // those through the cleanup helper.
+        chmod_deletable(path);
+        std::fs::remove_dir_all(path)
+    }
+}
+
+fn permission_denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+fn remove_err(path: &Path, err: &std::io::Error) -> ApiError {
+    ApiError::unavailable(format!("youki runtime: removing {}: {err}", path.display()))
+}
+
+/// `sudo -n <helper> delete --path <path>`. The path is checked here, and
+/// the helper checks it again.
+fn privileged_remove(path: &Path, privilege: &Privilege, cause: &std::io::Error) -> ApiResult<()> {
+    let Privilege::Sudo { sudo } = privilege else {
+        return Err(remove_err(path, cause));
+    };
+    let path = match checked_removal_path(path) {
+        Ok(path) => path,
+        Err(()) => {
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: removing {}: {cause}. Refusing privileged removal of a path outside the youki state directory or containing '..'",
+                path.display()
+            )));
+        }
+    };
+    let Some(helper) = cleanup_helper() else {
+        return Err(ApiError::unavailable(format!(
+            "youki runtime: removing {}: {cause}. Install {DEFAULT_CLEANUP} and allow it in sudoers (`{SUDOERS_SAMPLE}`), or set {CLEANUP_ENV}",
+            path.display()
+        )));
+    };
+    let output = std::process::Command::new(sudo)
+        .arg("-n")
+        .arg(&helper)
+        .arg("delete")
+        .arg("--path")
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| {
+            ApiError::unavailable(format!(
+                "youki runtime: cannot run cleanup helper {}: {e}",
+                helper.display()
+            ))
+        })?;
+    if output.status.success() && !path_exists(&path) {
+        return Ok(());
+    }
+    if output.status.success() {
+        return Err(ApiError::unavailable(format!(
+            "youki runtime: cleanup helper left {} in place",
+            path.display()
+        )));
+    }
+    Err(ApiError::unavailable(format!(
+        "youki runtime: removing {} failed: {}",
+        path.display(),
+        stderr_tail(&output.stderr, output.status)
+    )))
+}
+
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Absolute path strictly inside [`state_dir`], with no `..` component.
+/// Lexical only: a symlink is not resolved, so the check cannot be pointed
+/// at another directory by canonicalizing it.
+fn checked_removal_path(path: &Path) -> Result<PathBuf, ()> {
+    if !removal_text_ok(path) || !path.is_absolute() {
+        return Err(());
+    }
+    let state = state_dir();
+    if !removal_text_ok(&state) || !state.is_absolute() {
+        return Err(());
+    }
+    let path = normalize_lexical(path);
+    let state = normalize_lexical(&state);
+    if path == state || !path.starts_with(&state) {
+        return Err(());
+    }
+    Ok(path)
+}
+
+fn removal_text_ok(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.contains('\0') || text.chars().any(|ch| ch.is_control() || ch == '\u{7f}') {
+        return false;
+    }
+    !text.split('/').any(|part| part == "..")
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => out.push(".."),
+            Component::RootDir => out.push("/"),
+            Component::Normal(part) => out.push(part),
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `PISTACK_YOUKI_CLEANUP` replaces the installed helper. An empty value is ignored.
+fn cleanup_helper() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os(CLEANUP_ENV) {
+        if !value.is_empty() {
+            let path = PathBuf::from(value);
+            return is_executable(&path).then_some(path);
+        }
+    }
+    let path = PathBuf::from(DEFAULT_CLEANUP);
+    is_executable(&path).then_some(path)
+}
+
+/// In sudo mode the bundle is `0700` and owned by the agent. Other host
+/// users cannot traverse it. Root and rootless leave the mode alone.
+fn privatize_bundle(bundle: &Path, privilege: &Privilege) -> ApiResult<()> {
+    if matches!(privilege, Privilege::Sudo { .. }) {
+        set_mode(bundle, 0o700)?;
+    }
+    Ok(())
 }
 
 async fn read_state(bundle: &Path) -> ApiResult<Option<Saved>> {
@@ -2819,7 +3034,8 @@ fn prepare_pod(
     mode: &RunMode,
 ) -> ApiResult<Vec<PreparedProcess>> {
     std::fs::create_dir_all(bundle).map_err(|e| volume_io(bundle, e))?;
-    materialize_volumes(bundle, plan)?;
+    privatize_bundle(bundle, &mode.privilege)?;
+    materialize_volumes(bundle, plan, &mode.privilege)?;
     write_mount_plan(bundle, plan)?;
     write_pause_rootfs(bundle, hostname, limits, mode)?;
     let mut processes = Vec::new();
@@ -2829,8 +3045,8 @@ fn prepare_pod(
         let dir = container_dir(bundle, index);
         std::fs::create_dir_all(&dir).map_err(|e| volume_io(&dir, e))?;
         let rootfs = dir.join("rootfs");
-        reset_dir(&rootfs)?;
-        let cfg = unpack_image(&image, &rootfs)?;
+        reset_dir(&rootfs, &mode.privilege)?;
+        let cfg = unpack_image_with(&image, &rootfs, &mode.privilege)?;
         if rootfs_empty(&rootfs) {
             return Err(ApiError::unavailable(
                 "youki runtime: image rootfs is empty",
@@ -2846,6 +3062,7 @@ fn prepare_pod(
         let (args, env, cwd) = process_spec(Some(&launch), &cfg);
         processes.push(PreparedProcess { args, env, cwd });
     }
+    privatize_bundle(bundle, &mode.privilege)?;
     Ok(processes)
 }
 
@@ -2856,7 +3073,7 @@ fn write_pause_rootfs(
     mode: &RunMode,
 ) -> ApiResult<()> {
     let rootfs = bundle.join("rootfs");
-    reset_dir(&rootfs)?;
+    reset_dir(&rootfs, &mode.privilege)?;
     write_mode(&rootfs.join("pause"), PAUSE_ELF, 0o755)?;
     let args = vec!["/pause".to_string()];
     let env = vec![format!("PATH={DEFAULT_PATH}")];
@@ -2881,7 +3098,7 @@ fn write_container_configs(
     mode: &RunMode,
 ) -> ApiResult<()> {
     // Projected dirs are rewritten; EmptyDir and container rootfs are not.
-    materialize_volumes(bundle, plan)?;
+    materialize_volumes(bundle, plan, &mode.privilege)?;
     let rootless = matches!(&mode.privilege, Privilege::Rootless { .. });
     let namespaces = container_namespaces(pid, rootless);
     for (index, process) in processes.iter().enumerate() {
@@ -2925,7 +3142,7 @@ fn write_mount_plan(pod: &Path, plan: &PodPlan) -> ApiResult<()> {
 
 /// ConfigMap and Secret directories are replaced. EmptyDir is created once
 /// and kept. Slab volumes are not files on the pod directory.
-fn materialize_volumes(pod: &Path, plan: &PodPlan) -> ApiResult<()> {
+fn materialize_volumes(pod: &Path, plan: &PodPlan, privilege: &Privilege) -> ApiResult<()> {
     for (index, vol) in plan.volumes.iter().enumerate() {
         match &vol.source {
             VolumeSrc::EmptyDir => {
@@ -2934,18 +3151,25 @@ fn materialize_volumes(pod: &Path, plan: &PodPlan) -> ApiResult<()> {
             }
             VolumeSrc::ConfigMap(name) => {
                 let dir = volume_host_dir(pod, index, &vol.name);
+                let (file_mode, dir_mode) = projected_modes(privilege, false);
                 match plan.config_maps.get(name) {
-                    Some(files) => write_projected(&dir, files, 0o644, 0o755)?,
-                    None => reset_dir(&dir)?,
+                    Some(files) => write_projected(&dir, files, file_mode, dir_mode, privilege)?,
+                    None => {
+                        reset_dir(&dir, privilege)?;
+                        if matches!(privilege, Privilege::Sudo { .. }) {
+                            set_mode(&dir, dir_mode)?;
+                        }
+                    }
                 }
             }
             VolumeSrc::Secret(name) => {
                 let dir = volume_host_dir(pod, index, &vol.name);
+                let (file_mode, dir_mode) = projected_modes(privilege, true);
                 match plan.secrets.get(name) {
-                    Some(files) => write_projected(&dir, files, 0o400, 0o700)?,
+                    Some(files) => write_projected(&dir, files, file_mode, dir_mode, privilege)?,
                     None => {
-                        reset_dir(&dir)?;
-                        set_mode(&dir, 0o700)?;
+                        reset_dir(&dir, privilege)?;
+                        set_mode(&dir, dir_mode)?;
                     }
                 }
             }
@@ -2955,8 +3179,30 @@ fn materialize_volumes(pod: &Path, plan: &PodPlan) -> ApiResult<()> {
     Ok(())
 }
 
-fn write_projected(dir: &Path, files: &Projected, file_mode: u32, dir_mode: u32) -> ApiResult<()> {
-    reset_dir(dir)?;
+/// `(file mode, directory mode)`. Sudo mode opens Secret files to the
+/// container user. Root and rootless keep them private to the owner.
+fn projected_modes(privilege: &Privilege, secret: bool) -> (u32, u32) {
+    if matches!(privilege, Privilege::Sudo { .. }) {
+        // 0644, not 0640. The container user is uid 0 / gid 0, not the
+        // agent's group, and may not have CAP_DAC_OVERRIDE. The bundle
+        // directory is 0700, so other host users cannot traverse here.
+        return (0o644, 0o755);
+    }
+    if secret {
+        (0o400, 0o700)
+    } else {
+        (0o644, 0o755)
+    }
+}
+
+fn write_projected(
+    dir: &Path,
+    files: &Projected,
+    file_mode: u32,
+    dir_mode: u32,
+    privilege: &Privilege,
+) -> ApiResult<()> {
+    reset_dir(dir, privilege)?;
     set_mode(dir, dir_mode)?;
     let mut keys: Vec<&String> = files.data.keys().collect();
     for key in files.binary_data.keys() {
@@ -3269,7 +3515,7 @@ async fn start_pod(
         Ok(processes) => processes,
         Err(e) => {
             if !prior {
-                let _ = remove_bundle(bundle).await;
+                let _ = remove_bundle(bundle, &mode.privilege).await;
             }
             return Err(e);
         }
@@ -3349,6 +3595,7 @@ async fn start_pod(
         }
         started.push(cid);
     }
+    let _ = privatize_bundle(bundle, &mode.privilege);
     write_state(
         bundle,
         &Saved {
@@ -3379,7 +3626,7 @@ async fn abort_new_pod(
         let _ = exec_youki(bin, mode, &["delete", "--force", cid], None).await;
     }
     let _ = exec_youki(bin, mode, &["delete", "--force", sandbox_id], None).await;
-    let _ = remove_bundle(bundle).await;
+    let _ = remove_bundle(bundle, &mode.privilege).await;
 }
 
 fn validate_exec(argv: &[String], env: &[(String, String)], cwd: Option<&str>) -> ApiResult<()> {
@@ -3715,7 +3962,7 @@ async fn clear_leftover(bin: &Path, mode: &RunMode, id: &str) -> ApiResult<()> {
 async fn forget_failed_create(bin: &Path, mode: &RunMode, id: &str, bundle: Option<&Path>) {
     let _ = exec_youki(bin, mode, &["delete", "--force", id], None).await;
     if let Some(bundle) = bundle {
-        let _ = remove_bundle(bundle).await;
+        let _ = remove_bundle(bundle, &mode.privilege).await;
     }
 }
 
@@ -3730,7 +3977,7 @@ async fn create_container(
 ) -> ApiResult<()> {
     if let Err(e) = clear_leftover(bin, mode, id).await {
         if let Some(root) = drop_bundle {
-            let _ = remove_bundle(root).await;
+            let _ = remove_bundle(root, &mode.privilege).await;
         }
         return Err(e);
     }
@@ -4033,6 +4280,7 @@ mod tests {
                 TIMEOUT_ENV,
                 SUDO_ENV,
                 SUDO_BIN_ENV,
+                CLEANUP_ENV,
                 NETNS_ENV,
                 "PISTACK_YOUKI_TEST_EUID",
                 "PISTACK_YOUKI_TEST_EGID",
@@ -4054,6 +4302,7 @@ mod tests {
                 TIMEOUT_ENV,
                 SUDO_ENV,
                 SUDO_BIN_ENV,
+                CLEANUP_ENV,
                 NETNS_ENV,
                 "PISTACK_YOUKI_TEST_EGID",
                 "PISTACK_YOUKI_TEST_USERNS",
@@ -4826,6 +5075,17 @@ fi
         assert_eq!(cfg.entrypoint, vec!["/bin/httpd".to_string()]);
         assert_layer_modes(&oci_root);
 
+        // A rootless agent owns these directories, including mode 0555, and
+        // must be able to remove them without the cleanup helper.
+        let rootless = Privilege::Rootless {
+            uid: 1000,
+            gid: 1000,
+        };
+        delete_path(&root, &rootless).unwrap();
+        assert!(!root.exists());
+        delete_path(&oci_root, &rootless).unwrap();
+        assert!(!oci_root.exists());
+
         let outside = PathBuf::from(format!(
             "/tmp/yk-out-{}-{}",
             std::process::id(),
@@ -5400,6 +5660,104 @@ fi
         assert_eq!(
             mode_of(&bundle.join("containers").join("0").join("config.json")),
             0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_mode_opens_secret_volumes_and_keeps_the_bundle_private() {
+        let _guard = env_lock().lock().await;
+        let _netns = EnvSlot::clear(NETNS_ENV);
+        let tmp = temp_dir("sudo-vol");
+        let _dir = scopeguard_dir(&tmp);
+        let image = tmp.join("image");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("marker"), "a").unwrap();
+        let user_data = serde_json::json!({
+            "kind": "PodSandbox",
+            "containers": [{
+                "name": "web",
+                "image": image,
+                "command": ["/bin/web"]
+            }],
+            "volumes": [
+                {"name": "cfg", "source": {"config_map": "app"}},
+                {"name": "sec", "source": {"secret": "db"}},
+                {"name": "empty-sec", "source": {"secret": "missing"}}
+            ],
+            "config_maps": {"app": {"data": {"MODE": "prod"}}},
+            "secrets": {"db": {"data": {"password": "s3cret-value"}}}
+        })
+        .to_string();
+        let mut request = req("web", "not-a-path", "10.9.1.1");
+        request.user_data = Some(user_data);
+        let plan = sandbox_plan(&request).unwrap().unwrap();
+        let limits = Limits {
+            vcpus: 1,
+            memory_mib: 64,
+        };
+        let sudo_mode = RunMode {
+            privilege: Privilege::Sudo {
+                sudo: PathBuf::from("/bin/sudo"),
+            },
+            cgroup: CgroupCaps {
+                memory: true,
+                cpu: true,
+            },
+        };
+        let sudo_bundle = tmp.join("sudo");
+        sudo_mode
+            .stage_pod_bundles(&sudo_bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
+        assert_eq!(mode_of(&sudo_bundle), 0o700);
+        let cfg = sudo_bundle.join("volumes").join("0-cfg");
+        let sec = sudo_bundle.join("volumes").join("1-sec");
+        let empty = sudo_bundle.join("volumes").join("2-empty-sec");
+        assert_eq!(mode_of(&cfg), 0o755);
+        assert_eq!(mode_of(&cfg.join("MODE")), 0o644);
+        assert_eq!(std::fs::read_to_string(cfg.join("MODE")).unwrap(), "prod");
+        assert_eq!(mode_of(&sec), 0o755);
+        assert_eq!(mode_of(&sec.join("password")), 0o644);
+        assert_eq!(
+            std::fs::read_to_string(sec.join("password")).unwrap(),
+            "s3cret-value"
+        );
+        assert_eq!(mode_of(&empty), 0o755);
+        assert_eq!(
+            file_uid(&sec.join("password")).unwrap(),
+            file_uid(&image.join("marker")).unwrap()
+        );
+
+        let root_bundle = tmp.join("root");
+        RunMode::privileged()
+            .stage_pod_bundles(&root_bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
+        assert_eq!(mode_of(&root_bundle.join("volumes").join("0-cfg")), 0o755);
+        assert_eq!(
+            mode_of(&root_bundle.join("volumes").join("0-cfg").join("MODE")),
+            0o644
+        );
+        assert_eq!(mode_of(&root_bundle.join("volumes").join("1-sec")), 0o700);
+        assert_eq!(
+            mode_of(&root_bundle.join("volumes").join("1-sec").join("password")),
+            0o400
+        );
+        assert_eq!(
+            mode_of(&root_bundle.join("volumes").join("2-empty-sec")),
+            0o700
+        );
+
+        let less_bundle = tmp.join("rootless");
+        RunMode::rootless(1000, 1000)
+            .stage_pod_bundles(&less_bundle, "web", &limits, &plan, "not-a-path", 4242)
+            .unwrap();
+        assert_eq!(mode_of(&less_bundle.join("volumes").join("1-sec")), 0o700);
+        assert_eq!(
+            mode_of(&less_bundle.join("volumes").join("1-sec").join("password")),
+            0o400
+        );
+        assert_eq!(
+            mode_of(&less_bundle.join("volumes").join("0-cfg").join("MODE")),
+            0o644
         );
     }
 
@@ -6476,6 +6834,196 @@ exit 1
         assert!(direct.iter().all(|line| line != "-n"));
         rt.delete(&plain.id).await.unwrap();
         assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+    }
+
+    #[test]
+    fn youki_cleanup_helper_self_test() {
+        // SAFETY: geteuid does not fail and does not touch Rust memory.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/pistack-youki-cleanup");
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import runpy, sys; runpy.run_path(sys.argv[1])['self_test']()")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper self-test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_mode_removes_a_bundle_the_agent_cannot_unlink() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("sudo-rm");
+        let _dir = scopeguard_dir(&tmp);
+        let youki_log = tmp.join("youki.log");
+        let sudo_log = tmp.join("sudo.log");
+        let youki = tmp.join("youki");
+        let sudo_bin = tmp.join("sudo");
+        write_script(&youki, &youki_log, 0);
+        write_sudo(&sudo_bin, &sudo_log);
+        let helper = install_cleanup_helper(&tmp);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "1000");
+        std::env::set_var("PISTACK_YOUKI_TEST_EGID", "1000");
+        std::env::set_var(SUDO_ENV, "1");
+        std::env::set_var(SUDO_BIN_ENV, &sudo_bin);
+        std::env::set_var(CLEANUP_ENV, &helper);
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+        let privilege = Privilege::Sudo {
+            sudo: sudo_bin.clone(),
+        };
+
+        let outside = tmp.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        let sibling = state.join("sibling-keep");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("file"), b"keep").unwrap();
+
+        let rootfs = state.join("mach-1").join("rootfs");
+        let locked_rootfs = rootfs.join("locked");
+        lock_dir(&locked_rootfs);
+        {
+            let _unlock = Unlock(locked_rootfs.clone());
+            assert!(std::fs::remove_file(locked_rootfs.join("file")).is_err());
+            reset_dir(&rootfs, &privilege).unwrap();
+            assert!(rootfs.is_dir());
+            assert!(!locked_rootfs.exists());
+            assert!(std::fs::read_dir(&rootfs).unwrap().next().is_none());
+        }
+        assert_eq!(std::fs::read(sibling.join("file")).unwrap(), b"keep");
+        let helper_arg = helper.to_string_lossy().into_owned();
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+        assert!(
+            sudo_text.contains(&helper_arg),
+            "rootfs removal did not use the helper: {sudo_text}"
+        );
+        assert!(
+            !sudo_text.contains(".."),
+            "privileged removal saw a dot-dot path: {sudo_text}"
+        );
+
+        let image = tmp.join("image");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("marker"), b"keep").unwrap();
+        let rt = YoukiRuntime;
+        let request = req("web", image.to_str().unwrap(), "10.8.1.1");
+        rt.start(&request).await.unwrap();
+        let bundle = state.join(request.id.to_string());
+        assert_eq!(mode_of(&bundle), 0o700);
+        let locked = bundle.join("rootfs").join("locked");
+        lock_dir(&locked);
+        let _unlock = Unlock(locked.clone());
+        assert!(std::fs::remove_file(locked.join("file")).is_err());
+        rt.stop(&request.id).await.unwrap();
+        rt.delete(&request.id).await.unwrap();
+        assert!(!bundle.exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert_eq!(std::fs::read(sibling.join("file")).unwrap(), b"keep");
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+        let bundle_arg = bundle.to_string_lossy().into_owned();
+        assert!(
+            sudo_text.contains(&bundle_arg),
+            "delete did not remove the bundle through sudo: {sudo_text}"
+        );
+        let lines = arg_lines(&sudo_text);
+        assert!(
+            lines.windows(4).any(|w| {
+                w[0] == "-n" && w[1] == helper_arg && w[2] == "delete" && w[3] == "--path"
+            }),
+            "{lines:?}"
+        );
+        let youki_lines = arg_lines(&std::fs::read_to_string(&youki_log).unwrap());
+        assert!(
+            youki_lines
+                .windows(2)
+                .any(|w| w[0] == "delete" && w[1] == "--force"),
+            "{youki_lines:?}"
+        );
+
+        let _ = std::fs::write(&sudo_log, b"");
+        let plain = req("plain", image.to_str().unwrap(), "10.8.1.2");
+        rt.start(&plain).await.unwrap();
+        rt.delete(&plain.id).await.unwrap();
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+        assert!(
+            !sudo_text.contains(&helper_arg),
+            "agent-owned bundle used the helper: {sudo_text}"
+        );
+        assert!(sudo_text.contains("delete"), "{sudo_text}");
+
+        let cause = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let _ = std::fs::write(&sudo_log, b"");
+        let tricky = state
+            .join("..")
+            .join(tmp.file_name().unwrap())
+            .join("outside");
+        let err = privileged_remove(&tricky, &privilege, &cause).unwrap_err();
+        assert!(err.message.contains("Refusing privileged removal"), "{err}");
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert!(checked_removal_path(&state.join("abc-1")).is_ok());
+        assert!(checked_removal_path(&state).is_err());
+        assert!(checked_removal_path(&outside).is_err());
+        assert!(checked_removal_path(&tricky).is_err());
+
+        std::env::remove_var(SUDO_ENV);
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "1");
+        let rootless = req("less", image.to_str().unwrap(), "10.8.1.3");
+        rt.start(&rootless).await.unwrap();
+        let less_bundle = state.join(rootless.id.to_string());
+        let less_locked = less_bundle.join("rootfs").join("locked");
+        lock_dir(&less_locked);
+        let _less_unlock = Unlock(less_locked);
+        let err = rt.delete(&rootless.id).await.unwrap_err();
+        assert!(err.message.contains("removing"), "{err}");
+        assert!(less_bundle.exists());
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+
+        std::env::set_var(SUDO_ENV, "1");
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "0");
+        let _ = std::fs::write(&sudo_log, b"");
+        let rooted = req("root", image.to_str().unwrap(), "10.8.1.4");
+        rt.start(&rooted).await.unwrap();
+        rt.delete(&rooted.id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+    }
+
+    fn install_cleanup_helper(dir: &Path) -> PathBuf {
+        let src =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/pistack-youki-cleanup");
+        let dest = dir.join("pistack-youki-cleanup");
+        std::fs::copy(&src, &dest).unwrap();
+        let mut perms = std::fs::metadata(&dest).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dest, perms).unwrap();
+        dest
+    }
+
+    fn lock_dir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join("file"), b"x").unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o0);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    struct Unlock(PathBuf);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            if let Ok(mut perms) = std::fs::metadata(&self.0).map(|meta| meta.permissions()) {
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, perms);
+            }
+        }
     }
 
     #[tokio::test]

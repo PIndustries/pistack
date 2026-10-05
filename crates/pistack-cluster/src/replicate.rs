@@ -4,10 +4,18 @@
 //! A fresh node classifies what it heard. A running node admits a join
 //! without duplicating a member that is already present.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::discover::Announce;
 use crate::group::{admit, ClusterError, Member, Role};
+
+/// Shortest wait after the last sign of a leader or candidate before a
+/// follower campaigns.
+pub const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(800);
+/// Extra wait mixed in so two followers do not increment the same term.
+pub const ELECTION_TIMEOUT_SPAN: Duration = Duration::from_millis(1_200);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
@@ -139,6 +147,39 @@ pub fn consider_vote(local: &mut Ballot, req: &VoteRequest) -> VoteResponse {
         term: local.current_term,
         granted,
     }
+}
+
+/// Mix node identity, attempt, and a clock so each election wait differs.
+pub fn election_seed(node_id: &str, attempt: u64, now_nanos: u64) -> u64 {
+    let mut seed = attempt
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(now_nanos);
+    for byte in node_id.as_bytes() {
+        seed = seed.wrapping_mul(16_777_619).wrapping_add(*byte as u64);
+    }
+    seed
+}
+
+/// Wait in `[ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MIN + SPAN)`.
+pub fn election_timeout(seed: u64) -> Duration {
+    let mut x = seed | 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    ELECTION_TIMEOUT_MIN + Duration::from_millis(x % ELECTION_TIMEOUT_SPAN.as_millis() as u64)
+}
+
+/// A follower campaigns when the leader has been silent this long.
+pub fn should_campaign(silent: Duration, timeout: Duration) -> bool {
+    silent >= timeout
+}
+
+/// After granting a vote, follow that candidate instead of the old leader.
+pub fn follow_candidate(members: &[Member], candidate_id: &str) -> Option<String> {
+    members
+        .iter()
+        .find(|member| member.id == candidate_id)
+        .map(|member| member.api.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +357,30 @@ mod tests {
         assert_eq!(local.voted_for.as_deref(), Some("d"));
         assert_eq!(local.last_term, 2);
         assert_eq!(local.last_index, 3);
+    }
+
+    #[test]
+    fn silence_starts_an_election_and_a_grant_follows_the_candidate() {
+        let timeout = Duration::from_millis(800);
+        assert!(!should_campaign(Duration::from_millis(799), timeout));
+        assert!(should_campaign(timeout, timeout));
+        let first = election_timeout(election_seed("sim2", 1, 1));
+        let second = election_timeout(election_seed("sim3", 1, 1));
+        assert_ne!(first, second);
+        assert!(first >= ELECTION_TIMEOUT_MIN);
+        assert!(second >= ELECTION_TIMEOUT_MIN);
+        assert!(first < ELECTION_TIMEOUT_MIN + ELECTION_TIMEOUT_SPAN);
+        assert!(second < ELECTION_TIMEOUT_MIN + ELECTION_TIMEOUT_SPAN);
+        let members = vec![
+            Member::voter("sim", "http://sim"),
+            Member::voter("sim2", "http://sim2"),
+            Member::voter("sim3", "http://sim3"),
+        ];
+        assert_eq!(
+            follow_candidate(&members, "sim3").as_deref(),
+            Some("http://sim3")
+        );
+        assert_eq!(follow_candidate(&members, "gone"), None);
     }
 
     #[test]
