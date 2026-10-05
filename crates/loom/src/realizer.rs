@@ -311,6 +311,7 @@ fn projects_match(a: &Option<Id>, b: &Option<Id>) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_forward(
     client: &Client,
     project: Option<Id>,
