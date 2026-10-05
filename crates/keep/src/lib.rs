@@ -30,7 +30,7 @@ pub mod types;
 use async_trait::async_trait;
 use axum::Router;
 use pistack_store::Store;
-use pistack_types::{ApiError, Kind, ListQuery, Module, ModuleContext, ModuleInfo, Page};
+use pistack_types::{ApiError, Id, Kind, ListQuery, Module, ModuleContext, ModuleInfo, Page};
 use std::sync::OnceLock;
 
 pub use ca::{Ca, Issued};
@@ -40,6 +40,15 @@ pub use error::{KeepError, Result};
 pub use join::{authorize_join_token, create_join_token, redeem_join_token};
 pub use tls::Pki;
 pub use types::*;
+
+/// Decrypt a secret payload. Does not create a root key or a CA. Missing
+/// key material or a missing payload is [`KeepError::NotFound`].
+pub fn read_payload(store: &Store, id: &Id) -> Result<Vec<u8>> {
+    let Some(key) = crypto::RootKey::load_existing(store)? else {
+        return Err(KeepError::NotFound("root key is not initialised".into()));
+    };
+    ca::open_secret(store, &key, id)
+}
 
 #[derive(Default)]
 pub struct Keep {

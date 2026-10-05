@@ -6,7 +6,7 @@
 //! * [`facts`] — what this host is (cpus, memory, disk) and can run (kvm,
 //!   libvirt, youki, ovs).
 //! * [`runtime`] — the `MachineRuntime` trait. The mock is in-process. libvirt
-//!   drives KVM through `virsh`. youki is still a stub.
+//!   drives KVM through `virsh`. youki runs pods as OCI bundles.
 //! * [`Anvil`] — the module mounted at `/host` on a control-plane node,
 //!   serving this node's facts.
 //! * [`agent`] — [`run_agent`], the entry point for `pistack agent`: hello,
