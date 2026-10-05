@@ -137,6 +137,10 @@ fn is_bookkeeping(op: &Op) -> bool {
             ))
 }
 
+fn log_key(index: u64) -> String {
+    format!("cluster_log/{index:020}")
+}
+
 fn log_op_from(op: &Op) -> LogOp {
     match op {
         Op::Put { table, key, value } => LogOp {
@@ -335,7 +339,7 @@ impl Backend for RedbBackend {
                     ops: logged,
                 };
                 let raw = serde_json::to_vec(&entry)?;
-                let key = format!("cluster_log/{index:020}");
+                let key = log_key(index);
                 meta.insert(key.as_str(), raw.as_slice())?;
                 let commit = serde_json::to_vec(&index)?;
                 meta.insert("cluster_commit", commit.as_slice())?;
@@ -473,37 +477,47 @@ impl Store {
         Ok(self.get_meta::<u64>("cluster_commit")?.unwrap_or(0))
     }
 
+    /// Term of the log row at `index`, when this store holds that row.
+    pub fn log_term_at(&self, index: u64) -> Result<Option<u64>> {
+        if index == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .get_meta::<LogEntry>(&log_key(index))?
+            .map(|entry| entry.term))
+    }
+
     /// Apply follower entries. Recording is off for the duration, then restored.
-    /// Each entry's index must be one past the commit index. A gap leaves earlier
-    /// entries applied and returns `StoreError::Conflict`.
+    /// Each entry's index must be one past the commit index. Each entry is
+    /// applied, kept as a log row with its original term, and committed in
+    /// one transaction, so a follower that later leads can serve it and votes
+    /// compare real terms. A gap leaves earlier entries applied and returns
+    /// `StoreError::Conflict`.
     pub fn apply_entries(&self, entries: &[LogEntry]) -> Result<()> {
         let prev = self.backend.record_log();
         self.set_record_log(false);
         let result = (|| {
             let mut have = self.commit_index()?;
-            let mut applied = None;
             for entry in entries {
                 if entry.index != have + 1 {
-                    if let Some(index) = applied {
-                        self.put_meta("cluster_commit", &index)?;
-                    }
                     return Err(StoreError::Conflict(format!(
                         "gap: have {have}, got {}",
                         entry.index
                     )));
                 }
-                let ops = entry.ops.iter().map(op_from_log).collect();
-                if let Err(e) = self.backend.batch(ops) {
-                    if let Some(index) = applied {
-                        self.put_meta("cluster_commit", &index)?;
-                    }
-                    return Err(e);
-                }
+                let mut ops: Vec<Op> = entry.ops.iter().map(op_from_log).collect();
+                ops.push(Op::Put {
+                    table: "meta".into(),
+                    key: log_key(entry.index),
+                    value: serde_json::to_vec(entry)?,
+                });
+                ops.push(Op::Put {
+                    table: "meta".into(),
+                    key: "cluster_commit".into(),
+                    value: serde_json::to_vec(&entry.index)?,
+                });
+                self.backend.batch(ops)?;
                 have = entry.index;
-                applied = Some(have);
-            }
-            if let Some(index) = applied {
-                self.put_meta("cluster_commit", &index)?;
             }
             Ok(())
         })();
@@ -1044,7 +1058,9 @@ mod tests {
             b.get_meta::<String>("cluster_id").unwrap().as_deref(),
             Some("abc")
         );
-        assert!(b.read_log(0, 10).unwrap().is_empty());
+        assert_eq!(b.read_log(0, 10).unwrap(), log);
+        assert_eq!(b.log_term_at(1).unwrap(), Some(log[0].term));
+        assert_eq!(b.log_term_at(2).unwrap(), None);
         assert_eq!(b.commit_index().unwrap(), 1);
     }
 

@@ -105,6 +105,10 @@ pub struct VoteRequest {
     pub candidate_id: String,
     pub last_index: u64,
     pub last_term: u64,
+    /// Pre-vote: "would you vote for me at `term`?" Nothing is stored and no
+    /// term moves. A candidate only raises its term after a majority says yes.
+    #[serde(default)]
+    pub pre: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,19 +137,86 @@ pub fn consider_vote(local: &mut Ballot, req: &VoteRequest) -> VoteResponse {
         local.current_term = req.term;
         local.voted_for = None;
     }
-    let log_ok = req.last_term > local.last_term
-        || (req.last_term == local.last_term && req.last_index >= local.last_index);
     let vote_free = match &local.voted_for {
         None => true,
         Some(choice) => choice == &req.candidate_id,
     };
-    let granted = log_ok && vote_free;
+    let granted = log_is_current(local, req) && vote_free;
     if granted {
         local.voted_for = Some(req.candidate_id.clone());
     }
     VoteResponse {
         term: local.current_term,
         granted,
+    }
+}
+
+/// Pre-vote against the local ballot. Nothing changes. Yes only when the
+/// proposed term is newer than ours and the candidate's log is at least as
+/// current. Response.term is our current term.
+pub fn consider_pre_vote(local: &Ballot, req: &VoteRequest) -> VoteResponse {
+    VoteResponse {
+        term: local.current_term,
+        granted: req.term > local.current_term && log_is_current(local, req),
+    }
+}
+
+fn log_is_current(local: &Ballot, req: &VoteRequest) -> bool {
+    req.last_term > local.last_term
+        || (req.last_term == local.last_term && req.last_index >= local.last_index)
+}
+
+/// True while a live leader was confirmed less than [`ELECTION_TIMEOUT_MIN`]
+/// ago: a pull from it on a follower, a majority answer on the leader. Vote
+/// and pre-vote requests are refused in that window and their term is not
+/// adopted, so a node that lost touch cannot depose a healthy leader.
+pub fn in_leader_lease(since_contact: Option<Duration>) -> bool {
+    since_contact.is_some_and(|elapsed| elapsed < ELECTION_TIMEOUT_MIN)
+}
+
+/// A leader that has not heard from a voter majority for this long steps down.
+pub fn lost_quorum(since_majority: Duration) -> bool {
+    since_majority >= ELECTION_TIMEOUT_MIN + ELECTION_TIMEOUT_SPAN
+}
+
+/// What a peer said about itself on `/cluster`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerView {
+    pub api: String,
+    pub term: u64,
+    pub leader: bool,
+}
+
+/// The peer to follow: one that says it leads, at our term or newer. The
+/// newest term wins. A peer that leads an older term is stale.
+pub fn pick_leader(term: u64, peers: &[PeerView]) -> Option<&PeerView> {
+    peers
+        .iter()
+        .filter(|peer| peer.leader && peer.term >= term && !peer.api.is_empty())
+        .max_by_key(|peer| peer.term)
+}
+
+/// Check a follower's tip before serving it entries after `index`.
+/// `term` is the follower's term at `index` (0 when it has no row there),
+/// `commit` is our commit index, and `ours` our term at `index`. A follower
+/// past our commit, or whose term at `index` differs from ours, holds entries
+/// this log never had. Error text contains "diverged".
+pub fn check_follower_tip(
+    index: u64,
+    term: u64,
+    commit: u64,
+    ours: Option<u64>,
+) -> Result<(), ClusterError> {
+    if index > commit {
+        return Err(ClusterError(format!(
+            "diverged: follower is at index {index}, leader commit is {commit}"
+        )));
+    }
+    match ours {
+        Some(ours) if term != 0 && ours != term => Err(ClusterError(format!(
+            "diverged at index {index}: follower term {term}, leader term {ours}"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -307,6 +378,7 @@ mod tests {
                 candidate_id: "a".into(),
                 last_index: 0,
                 last_term: 0,
+                pre: false,
             },
         );
         assert!(first.granted);
@@ -319,6 +391,7 @@ mod tests {
                 candidate_id: "b".into(),
                 last_index: 0,
                 last_term: 0,
+                pre: false,
             },
         );
         assert!(!second.granted);
@@ -337,6 +410,7 @@ mod tests {
                 candidate_id: "c".into(),
                 last_index: 0,
                 last_term: 0,
+                pre: false,
             },
         );
         assert!(!older.granted);
@@ -350,6 +424,7 @@ mod tests {
                 candidate_id: "d".into(),
                 last_index: 4,
                 last_term: 3,
+                pre: false,
             },
         );
         assert!(newer.granted);
@@ -381,6 +456,78 @@ mod tests {
             Some("http://sim3")
         );
         assert_eq!(follow_candidate(&members, "gone"), None);
+    }
+
+    #[test]
+    fn a_pre_vote_changes_nothing_and_needs_a_newer_term_and_a_current_log() {
+        let local = Ballot {
+            current_term: 7,
+            voted_for: Some("sim3".into()),
+            last_index: 40,
+            last_term: 7,
+        };
+        let ask = |term, last_index, last_term| VoteRequest {
+            term,
+            candidate_id: "sim".into(),
+            last_index,
+            last_term,
+            pre: true,
+        };
+        let yes = consider_pre_vote(&local, &ask(8, 40, 7));
+        assert!(yes.granted);
+        assert_eq!(yes.term, 7);
+        // The old leader came back with a log from term 6.
+        assert!(!consider_pre_vote(&local, &ask(8, 99, 6)).granted);
+        assert!(!consider_pre_vote(&local, &ask(7, 40, 7)).granted);
+        assert!(!consider_pre_vote(&local, &ask(8, 39, 7)).granted);
+        assert_eq!(local.current_term, 7);
+        assert_eq!(local.voted_for.as_deref(), Some("sim3"));
+        let old: VoteRequest = serde_json::from_str(
+            r#"{"term":8,"candidate_id":"sim","last_index":40,"last_term":7}"#,
+        )
+        .unwrap();
+        assert!(!old.pre);
+    }
+
+    #[test]
+    fn a_recent_leader_holds_a_lease_and_a_lost_majority_ends_it() {
+        assert!(!in_leader_lease(None));
+        assert!(in_leader_lease(Some(Duration::from_millis(100))));
+        assert!(!in_leader_lease(Some(ELECTION_TIMEOUT_MIN)));
+        assert!(!lost_quorum(ELECTION_TIMEOUT_MIN));
+        assert!(lost_quorum(ELECTION_TIMEOUT_MIN + ELECTION_TIMEOUT_SPAN));
+    }
+
+    #[test]
+    fn follow_the_newest_leader_and_never_a_stale_one() {
+        let view = |api: &str, term, leader| PeerView {
+            api: api.into(),
+            term,
+            leader,
+        };
+        let peers = vec![
+            view("http://sim", 6, true),
+            view("http://sim2", 7, false),
+            view("http://sim3", 7, true),
+        ];
+        assert_eq!(pick_leader(6, &peers).unwrap().api, "http://sim3");
+        assert_eq!(pick_leader(7, &peers).unwrap().api, "http://sim3");
+        assert!(pick_leader(8, &peers).is_none());
+        assert!(pick_leader(0, &[view("http://sim", 6, true)]).is_some());
+        assert!(pick_leader(7, &[view("http://sim", 6, true)]).is_none());
+    }
+
+    #[test]
+    fn a_follower_tip_must_match_the_leader_log() {
+        assert!(check_follower_tip(0, 0, 0, None).is_ok());
+        assert!(check_follower_tip(5, 6, 9, Some(6)).is_ok());
+        // Rows written before followers kept them cannot be compared.
+        assert!(check_follower_tip(5, 0, 9, Some(6)).is_ok());
+        assert!(check_follower_tip(5, 6, 9, None).is_ok());
+        let ahead = check_follower_tip(10, 6, 9, None).unwrap_err();
+        assert!(ahead.to_string().contains("diverged"), "{ahead}");
+        let forked = check_follower_tip(9, 6, 12, Some(7)).unwrap_err();
+        assert!(forked.to_string().contains("diverged"), "{forked}");
     }
 
     #[test]
