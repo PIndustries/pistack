@@ -5,11 +5,20 @@
 //!
 //! Not a full S3 server. Buckets are store resources; object bytes live on
 //! local disk under `$PISTACK_DATA_DIR/silo/{bucket-id}/{key}`, and
-//! `status.sha256` is the content address of those bytes.
+//! `status.sha256` is the content address of those bytes. Object puts stream
+//! to a temp file then rename; the default size cap is 5 GiB
+//! ([`MAX_OBJECT_BYTES`]), overridable via [`SiloConfig`] /
+//! `[modules.silo] max_object_bytes`.
 //!
-//! * [`types`] — `Bucket`, `Object`.
+//! Path-style S3 routes (`/{bucket}/{key}`, ListObjectsV2) share this
+//! module's HTTP router and the same bearer/`Caller` auth. **AWS Signature
+//! Version 4 is not verified**; clients must present a gate token (or run
+//! under the gateway's `--dev` admin injection).
+//!
+//! * [`types`] — `Bucket`, `Object`, [`SiloConfig`].
 //! * [`Client`] — the library API.
-//! * [`http`] — routes mounted at `/silo`.
+//! * [`http`] — native routes mounted at `/silo`.
+//! * [`s3`] — path-style S3-compatible handlers on the same router.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -19,6 +28,7 @@ use std::path::PathBuf;
 
 pub mod client;
 pub mod http;
+pub mod s3;
 pub mod types;
 
 pub use client::Client;
@@ -26,7 +36,7 @@ pub use types::*;
 
 /// Object storage module. `silo::Silo` is a unit value so the gateway can
 /// keep constructing it that way. The data directory is read when the
-/// router is built.
+/// router is built; size limits come from [`SiloConfig::load`].
 #[derive(Default)]
 pub struct Silo;
 
@@ -40,7 +50,8 @@ impl Silo {
     }
 
     pub fn client(&self, store: Store) -> Client {
-        Client::new(store, Self::data_root())
+        let cfg = SiloConfig::load();
+        Client::new(store, Self::data_root()).with_max_object_bytes(cfg.max_object_bytes)
     }
 }
 
@@ -57,6 +68,10 @@ impl Module for Silo {
 
     fn router(&self, ctx: ModuleContext) -> Router {
         let store = ctx.store::<Store>();
-        http::router(Client::new((*store).clone(), Self::data_root()))
+        let cfg = SiloConfig::load();
+        http::router(
+            Client::new((*store).clone(), Self::data_root())
+                .with_max_object_bytes(cfg.max_object_bytes),
+        )
     }
 }
