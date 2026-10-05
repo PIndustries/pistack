@@ -24,6 +24,8 @@ const TOKEN: &str = "tok-secret-123";
 struct Mock {
     machines: Arc<Mutex<BTreeMap<String, Value>>>,
     polls: Arc<Mutex<u32>>,
+    pods: Arc<Mutex<BTreeMap<String, Value>>>,
+    execs: Arc<Mutex<Vec<Value>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -195,6 +197,54 @@ async fn start(State(m): State<Mock>, Path(id): Path<String>) -> axum::response:
     }
 }
 
+fn find_pod(pods: &BTreeMap<String, Value>, id: &str) -> Option<Value> {
+    pods.get(id).cloned().or_else(|| {
+        pods.values()
+            .find(|v| v["id"] == id || v["name"] == id)
+            .cloned()
+    })
+}
+
+async fn show_pod(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    match find_pod(&m.pods.lock().unwrap(), &id) {
+        Some(v) => Json(v).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("pod '{id}' not found"),
+        ),
+    }
+}
+
+async fn exec_pod(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    m.execs
+        .lock()
+        .unwrap()
+        .push(json!({"pod": id, "body": body}));
+    let failed = body["command"][0] == "false";
+    Json(json!({
+        "exit_code": if failed { 3 } else { 0 },
+        "stdout": if failed { "nope\n" } else { "hi\n" },
+        "stderr": if failed { "bad\n" } else { "" }
+    }))
+    .into_response()
+}
+
 async fn discovery() -> Json<Value> {
     Json(json!({
         "name": "pistack", "version": "0.1.0-test", "public_url": "http://mock", "dev_mode": false,
@@ -214,6 +264,8 @@ async fn serve() -> (String, Mock) {
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
         .route("/compute/machines/{id}/start", post(start))
+        .route("/loom/pods/{id}", get(show_pod))
+        .route("/loom/pods/{id}/exec", post(exec_pod))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -500,4 +552,220 @@ async fn usage_errors_and_completion() {
     let r = pi(&cfg, "", &["completion", "bash"]).await;
     assert_eq!(r.code, 0);
     assert!(r.out.contains("_pi"), "{}", r.out);
+    let r = pi(&cfg, "", &["pod", "exec", "--help"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("-c"), "{}", r.out);
+    assert!(r.out.contains("--timeout"), "{}", r.out);
+}
+
+#[tokio::test]
+async fn pod_exec_prints_output_and_returns_the_exit_code() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    mock.pods.lock().unwrap().insert(
+        "web".into(),
+        json!({
+            "id": "pod-web",
+            "name": "web",
+            "spec": {"containers": [{"name": "app", "image": "img"}]}
+        }),
+    );
+    mock.pods.lock().unwrap().insert(
+        "multi".into(),
+        json!({
+            "id": "pod-multi",
+            "name": "multi",
+            "spec": {"containers": [
+                {"name": "app", "image": "img"},
+                {"name": "side", "image": "img"}
+            ]}
+        }),
+    );
+    mock.pods.lock().unwrap().insert(
+        "bare".into(),
+        json!({"id": "pod-bare", "name": "bare", "spec": {"containers": []}}),
+    );
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "pod",
+            "exec",
+            "multi",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("app"), "{}", r.err);
+    assert!(r.err.contains("side"), "{}", r.err);
+    assert!(mock.execs.lock().unwrap().is_empty(), "usage must not exec");
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "pod",
+            "exec",
+            "multi",
+            "-c",
+            "missing",
+            "--",
+            "/bin/true",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("missing"), "{}", r.err);
+    assert!(mock.execs.lock().unwrap().is_empty());
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "pod",
+            "exec",
+            "bare",
+            "--",
+            "/bin/true",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("pass -c"), "{}", r.err);
+    assert!(mock.execs.lock().unwrap().is_empty());
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "pod",
+            "exec",
+            "web",
+            "--timeout",
+            "12",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out, "hi\n");
+    assert!(r.err.is_empty(), "{}", r.err);
+    let execs = mock.execs.lock().unwrap().clone();
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0]["pod"], "pod-web");
+    assert_eq!(execs[0]["body"]["container"], "app");
+    assert_eq!(execs[0]["body"]["command"], json!(["/bin/echo", "hi"]));
+    assert_eq!(execs[0]["body"]["timeout_secs"], 12);
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "pod",
+            "exec",
+            "web",
+            "--",
+            "/bin/echo",
+            "--hello",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        mock.execs.lock().unwrap().last().unwrap()["body"]["command"],
+        json!(["/bin/echo", "--hello"])
+    );
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "-o",
+            "json",
+            "pod",
+            "exec",
+            "multi",
+            "-c",
+            "side",
+            "--",
+            "/bin/echo",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("\"exit_code\""), "{}", r.out);
+    assert!(r.out.contains("hi"), "{}", r.out);
+    assert_eq!(
+        mock.execs.lock().unwrap().last().unwrap()["body"]["container"],
+        "side"
+    );
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url", &url, "--token", TOKEN, "pod", "exec", "web", "--", "false",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 3, "{r:?}");
+    assert_eq!(r.out, "nope\n");
+    assert_eq!(r.err, "bad\n");
+    assert!(!r.err.contains("error:"), "{}", r.err);
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "--url",
+            &url,
+            "--token",
+            TOKEN,
+            "pod",
+            "exec",
+            "bare",
+            "-c",
+            "app",
+            "--",
+            "/bin/true",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        mock.execs.lock().unwrap().last().unwrap()["body"]["container"],
+        "app"
+    );
 }

@@ -13,10 +13,12 @@
 //! set, otherwise `youki` on `PATH`. `user_data` and ssh keys are not logged
 //! and are not placed on the youki argv. A missing youki binary, an image
 //! that cannot be unpacked, or an empty rootfs is unavailable and is not
-//! recorded as running.
+//! recorded as running. `exec` runs `youki exec` in one container of a pod
+//! sandbox and returns that command's exit code, stdout, and stderr.
 
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
+use pistack_rpc::proto::ExecOutput;
 use pistack_types::{kind, ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -28,6 +30,8 @@ use tokio::process::Command;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STATE: &str = "/var/lib/pistack/youki";
+/// Most bytes of stdout or stderr the agent keeps from one exec.
+pub const EXEC_OUTPUT_CAP: usize = 256 * 1024;
 
 /// Host-side OCI runtime. Stateless apart from the bundles on disk; a process
 /// wide lock keeps start idempotent when two calls race.
@@ -45,6 +49,9 @@ struct Saved {
     /// machine that is not a pod sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     containers: Vec<String>,
+    /// Container names in the same order as `containers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    container_names: Vec<String>,
 }
 
 #[async_trait]
@@ -101,6 +108,7 @@ impl MachineRuntime for YoukiRuntime {
                 addresses: addresses.clone(),
                 power: PowerState::On,
                 containers: Vec::new(),
+                container_names: Vec::new(),
             },
         )
         .await?;
@@ -257,6 +265,61 @@ impl MachineRuntime for YoukiRuntime {
 fn lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Tests that point youki at a fake binary share this lock. `PISTACK_YOUKI_BIN`
+/// and `PISTACK_YOUKI_STATE` are process-wide.
+#[cfg(test)]
+pub(crate) fn youki_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+impl YoukiRuntime {
+    #[allow(clippy::too_many_arguments)]
+    /// Run `argv` with `youki exec` inside `container` of the pod sandbox `id`.
+    ///
+    /// `env` and `cwd` are optional: an empty slice and `None` leave the
+    /// container's own environment and working directory. `timeout` bounds
+    /// the wait. `output_cap` is the most bytes kept of stdout and of stderr,
+    /// separately. The returned exit code is the command's, including
+    /// non-zero. A missing youki binary is unavailable. A container this
+    /// sandbox does not have, or a machine that is not on this host, is not
+    /// found. Stdin is closed. This does not allocate a terminal.
+    pub async fn exec(
+        &self,
+        id: &Id,
+        container: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+        timeout: Duration,
+        output_cap: usize,
+    ) -> ApiResult<ExecOutput> {
+        if timeout.is_zero() {
+            return Err(ApiError::bad_request(
+                "youki runtime: exec timeout must be greater than zero",
+            ));
+        }
+        validate_exec(argv, env, cwd)?;
+        let bin = resolve_youki()?;
+        let container_id = {
+            let _guard = lock().lock().await;
+            let bundle = bundle_dir(id)?;
+            let Some(saved) = read_state(&bundle).await? else {
+                return Err(ApiError::not_found(format!(
+                    "youki runtime: machine {id} is not on this host"
+                )));
+            };
+            if saved.power != PowerState::On {
+                return Err(ApiError::unavailable(
+                    "youki runtime: pod sandbox is not running",
+                ));
+            }
+            resolve_container(&saved, container)?.to_owned()
+        };
+        run_exec(&bin, &container_id, argv, env, cwd, timeout, output_cap).await
+    }
 }
 
 fn state_dir() -> PathBuf {
@@ -2303,6 +2366,7 @@ async fn start_pod(
             addresses: addresses.clone(),
             power: PowerState::On,
             containers: started,
+            container_names: plan.containers.iter().map(|c| c.name.clone()).collect(),
         },
     )
     .await?;
@@ -2319,6 +2383,275 @@ async fn abort_new_pod(bin: &Path, bundle: &Path, sandbox_id: &str, created: &[S
     }
     let _ = exec_youki(bin, &["delete", sandbox_id]).await;
     let _ = remove_bundle(bundle).await;
+}
+
+fn validate_exec(argv: &[String], env: &[(String, String)], cwd: Option<&str>) -> ApiResult<()> {
+    if argv.is_empty() {
+        return Err(ApiError::bad_request(
+            "youki runtime: exec command is empty",
+        ));
+    }
+    if argv.iter().any(|arg| arg.contains('\0')) {
+        return Err(ApiError::bad_request(
+            "youki runtime: exec command contains a NUL byte",
+        ));
+    }
+    for (name, value) in env {
+        if !valid_env_name(name) || value.contains('\0') || value.contains('\n') {
+            return Err(ApiError::bad_request(
+                "youki runtime: exec env must be a NAME=value pair",
+            ));
+        }
+    }
+    if let Some(dir) = cwd {
+        if dir.is_empty() || dir.starts_with('-') || dir.contains('\0') {
+            return Err(ApiError::bad_request(
+                "youki runtime: exec working directory is not a path",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn resolve_container<'a>(saved: &'a Saved, name: &str) -> ApiResult<&'a str> {
+    if name.is_empty() {
+        return Err(ApiError::bad_request(
+            "youki runtime: container name is empty",
+        ));
+    }
+    if let Some(index) = saved.container_names.iter().position(|n| n == name) {
+        if let Some(id) = saved.containers.get(index) {
+            return Ok(id);
+        }
+    }
+    if let Some(id) = saved.containers.iter().find(|id| id.as_str() == name) {
+        return Ok(id);
+    }
+    Err(ApiError::not_found(format!(
+        "youki runtime: container {name} is not in this pod"
+    )))
+}
+
+fn exec_argv(
+    container_id: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(4 + env.len() * 2 + argv.len());
+    args.push("exec".into());
+    if let Some(dir) = cwd {
+        args.push("--cwd".into());
+        args.push(dir.to_owned());
+    }
+    for (name, value) in env {
+        args.push("--env".into());
+        args.push(format!("{name}={value}"));
+    }
+    args.push(container_id.to_owned());
+    args.push("--".into());
+    args.extend(argv.iter().cloned());
+    args
+}
+
+/// Kills the youki process group if a wait is abandoned. Disarm after a
+/// successful wait so a recycled pid is left alone.
+struct GroupKill {
+    pid: Option<u32>,
+}
+
+impl GroupKill {
+    fn arm(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            signal_group(pid);
+        }
+    }
+}
+
+fn signal_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        if pid <= 0 {
+            return;
+        }
+        // SAFETY: `pid` is a positive process-group id created with
+        // `process_group(0)`. A negative pid asks the kernel to signal that
+        // group. A stale id fails the call; the result is ignored.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+fn timeout_label(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+    let millis = timeout.subsec_millis();
+    if millis == 0 {
+        format!("{secs}s")
+    } else if secs == 0 {
+        format!("{millis}ms")
+    } else {
+        format!("{secs}.{millis:03}s")
+    }
+}
+
+async fn run_exec(
+    bin: &Path,
+    container_id: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: Option<&str>,
+    timeout: Duration,
+    output_cap: usize,
+) -> ApiResult<ExecOutput> {
+    let args = exec_argv(container_id, argv, env, cwd);
+    let mut cmd = Command::new(bin);
+    cmd.args(&args)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| {
+        ApiError::unavailable(format!("youki runtime: cannot run {}: {e}", bin.display()))
+    })?;
+    let mut group = GroupKill::arm(child.id());
+    let stdout = spawn_reader(child.stdout.take(), output_cap);
+    let stderr = spawn_reader(child.stderr.take(), output_cap);
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            group.disarm();
+            status
+        }
+        Ok(Err(e)) => {
+            drop(group);
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let _ = drain_text(stdout).await;
+            let _ = drain_text(stderr).await;
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: {}: {e}",
+                bin.display()
+            )));
+        }
+        Err(_) => {
+            drop(group);
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let _ = drain_text(stdout).await;
+            let _ = drain_text(stderr).await;
+            return Err(ApiError::unavailable(format!(
+                "youki runtime: exec timed out after {}",
+                timeout_label(timeout)
+            )));
+        }
+    };
+    Ok(ExecOutput {
+        exit_code: status.code().unwrap_or(1),
+        stdout: drain_text(stdout).await,
+        stderr: drain_text(stderr).await,
+    })
+}
+
+fn spawn_reader<R>(pipe: Option<R>, cap: usize) -> tokio::task::JoinHandle<String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        match pipe {
+            Some(pipe) => bytes_to_text(&read_capped(pipe, cap).await),
+            None => String::new(),
+        }
+    })
+}
+
+async fn read_capped<R>(mut pipe: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                if room == 0 {
+                    continue;
+                }
+                let take = n.min(room);
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+    }
+    buf
+}
+
+async fn drain_text(task: tokio::task::JoinHandle<String>) -> String {
+    match tokio::time::timeout(Duration::from_secs(2), task).await {
+        Ok(Ok(text)) => text,
+        _ => String::new(),
+    }
+}
+
+/// Keep a trailing partial UTF-8 sequence out of the lossy conversion so a
+/// cap that lands mid-character does not invent a replacement character.
+fn bytes_to_text(buf: &[u8]) -> String {
+    let end = utf8_prefix_end(buf);
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+fn utf8_prefix_end(buf: &[u8]) -> usize {
+    if std::str::from_utf8(buf).is_ok() {
+        return buf.len();
+    }
+    let mut end = buf.len();
+    while end > 0 && (buf[end - 1] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    if end > 0 {
+        let lead = buf[end - 1];
+        let width = match lead {
+            0x00..=0x7F => 1,
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        let have = buf.len() - (end - 1);
+        if width == 0 || have < width {
+            end -= 1;
+        }
+    }
+    end
 }
 
 async fn exec_youki(bin: &Path, args: &[&str]) -> ApiResult<()> {
@@ -2392,11 +2725,9 @@ mod tests {
     use pistack_types::{error::ErrorCode, Resources};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::OnceLock;
 
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        super::youki_env_lock()
     }
 
     struct EnvGuard {
@@ -3546,6 +3877,288 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn write_exec_script(path: &Path, log: &Path) {
+        let quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
+        let body = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" >> {quoted}\n\
+             printf '\\n' >> {quoted}\n\
+             if [ \"$1\" = state ]; then\n\
+               printf '%s\\n' '{{\"pid\":4242,\"status\":\"running\"}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = exec ]; then\n\
+               for arg in \"$@\"; do\n\
+                 if [ \"$arg\" = __sleep__ ]; then\n\
+                   sleep 30\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ \"$arg\" = __flood__ ]; then\n\
+                   i=0\n\
+                   while [ \"$i\" -lt 200 ]; do\n\
+                     printf x\n\
+                     i=$((i + 1))\n\
+                   done\n\
+                   i=0\n\
+                   while [ \"$i\" -lt 80 ]; do\n\
+                     printf y >&2\n\
+                     i=$((i + 1))\n\
+                   done\n\
+                   exit 0\n\
+                 fi\n\
+               done\n\
+               printf 'out-line\\n'\n\
+               printf 'err-line\\n' >&2\n\
+               exit 7\n\
+             fi\n\
+             exit 0\n"
+        );
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn has_seq(lines: &[String], seq: &[String]) -> bool {
+        lines.windows(seq.len()).any(|window| window == seq)
+    }
+
+    #[test]
+    fn exec_output_trims_a_split_utf8_sequence() {
+        assert_eq!(bytes_to_text("é".as_bytes()), "é");
+        assert_eq!(bytes_to_text(&[0xc3]), "");
+        assert_eq!(bytes_to_text(&[0xc3, 0xa9, 0xc3]), "é");
+        assert_eq!(bytes_to_text(b"ok"), "ok");
+    }
+
+    #[tokio::test]
+    async fn exec_runs_youki_with_argv_cap_and_timeout() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let log = tmp.join("youki.log");
+        let bin = tmp.join("youki");
+        let state = tmp.join("state");
+        write_exec_script(&bin, &log);
+        let _env = EnvGuard::set(&bin, &state);
+        let rt = YoukiRuntime;
+
+        let external = tmp.join("image");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("marker"), "keep").unwrap();
+        let image = external.to_str().unwrap();
+        let mut request = req("web", "not-a-path", "10.1.0.8");
+        request.user_data = Some(sandbox_doc(image));
+
+        let absent = Id::new(kind::MACHINE);
+        let err = rt
+            .exec(
+                &absent,
+                "web",
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(2),
+                64,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound, "{err}");
+        assert!(err.message.contains("not on this host"), "{err}");
+
+        rt.start(&request).await.unwrap();
+        let out = rt
+            .exec(
+                &request.id,
+                "web",
+                &["/bin/echo".into(), "hello".into()],
+                &[
+                    ("MODE".into(), "prod".into()),
+                    ("EMPTY".into(), String::new()),
+                ],
+                Some("/work"),
+                Duration::from_secs(5),
+                EXEC_OUTPUT_CAP,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 7);
+        assert_eq!(out.stdout, "out-line\n");
+        assert_eq!(out.stderr, "err-line\n");
+        let id0 = format!("{}-0", request.id);
+        let lines = arg_lines(&std::fs::read_to_string(&log).unwrap());
+        assert!(
+            has_seq(
+                &lines,
+                &[
+                    "exec".into(),
+                    "--cwd".into(),
+                    "/work".into(),
+                    "--env".into(),
+                    "MODE=prod".into(),
+                    "--env".into(),
+                    "EMPTY=".into(),
+                    id0.clone(),
+                    "--".into(),
+                    "/bin/echo".into(),
+                    "hello".into(),
+                ],
+            ),
+            "{lines:?}"
+        );
+
+        let side = rt
+            .exec(
+                &request.id,
+                "side",
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(5),
+                64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(side.exit_code, 7);
+        let id1 = format!("{}-1", request.id);
+        let lines = arg_lines(&std::fs::read_to_string(&log).unwrap());
+        assert!(
+            has_seq(
+                &lines,
+                &["exec".into(), id1, "--".into(), "/bin/true".into(),],
+            ),
+            "{lines:?}"
+        );
+
+        let by_id = rt
+            .exec(
+                &request.id,
+                &id0,
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(5),
+                64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_id.exit_code, 7);
+
+        let flooded = rt
+            .exec(
+                &request.id,
+                "web",
+                &["__flood__".into()],
+                &[],
+                None,
+                Duration::from_secs(5),
+                16,
+            )
+            .await
+            .unwrap();
+        assert_eq!(flooded.exit_code, 0);
+        assert_eq!(flooded.stdout, "x".repeat(16));
+        assert_eq!(flooded.stderr, "y".repeat(16));
+
+        let started = std::time::Instant::now();
+        let err = rt
+            .exec(
+                &request.id,
+                "web",
+                &["__sleep__".into()],
+                &[],
+                None,
+                Duration::from_millis(400),
+                64,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "exec timeout took {:?}",
+            started.elapsed()
+        );
+
+        let before = count_arg(&arg_lines(&std::fs::read_to_string(&log).unwrap()), "exec");
+        let err = rt
+            .exec(
+                &request.id,
+                "nope",
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(2),
+                64,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound, "{err}");
+        assert!(err.message.contains("nope"), "{err}");
+        let err = rt
+            .exec(
+                &request.id,
+                "web",
+                &[],
+                &[],
+                None,
+                Duration::from_secs(2),
+                64,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
+        assert!(err.message.contains("empty"), "{err}");
+        let after = count_arg(&arg_lines(&std::fs::read_to_string(&log).unwrap()), "exec");
+        assert_eq!(before, after, "a rejected exec must not call youki");
+
+        rt.stop(&request.id).await.unwrap();
+        let err = rt
+            .exec(
+                &request.id,
+                "web",
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(2),
+                64,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("not running"), "{err}");
+
+        let missing_bin = tmp.join("missing-youki");
+        std::env::set_var("PISTACK_YOUKI_BIN", &missing_bin);
+        let err = rt
+            .exec(
+                &request.id,
+                "web",
+                &["/bin/true".into()],
+                &[],
+                None,
+                Duration::from_secs(2),
+                64,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("not available"), "{err}");
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.contains("do-not-log-user-data"), "{logged}");
+        assert!(!logged.contains("do-not-log-ssh-key"), "{logged}");
     }
 
     struct DirGuard(PathBuf);

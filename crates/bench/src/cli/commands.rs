@@ -19,8 +19,21 @@ use std::time::Duration;
 const POLL: Duration = Duration::from_secs(1);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
-pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()> {
+pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<i32> {
     match cmd {
+        Cmd::Pod { cmd } => pod(ctx, cmd, io).await,
+        other => {
+            dispatch_rest(ctx, other, io).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()> {
+    match cmd {
+        Cmd::Pod { .. } => Err(CliError::usage(
+            "pod exec is handled before the other commands",
+        )),
         Cmd::Login(a) => login(ctx, a, io).await,
         Cmd::Profile { cmd } => profile(ctx, cmd, io),
         Cmd::Whoami => whoami(ctx, io).await,
@@ -1471,6 +1484,76 @@ async fn upload(
     let v = c.put_file(&path, file).await?;
     let size = str_at(&v, "/status/size_bytes");
     report(ctx, io, k, &v, &format!("uploaded ({size} bytes)"))
+}
+
+async fn pod(ctx: &Ctx, cmd: PodCmd, io: &mut Io<'_>) -> CliResult<i32> {
+    match cmd {
+        PodCmd::Exec(args) => pod_exec(ctx, args, io).await,
+    }
+}
+
+async fn pod_exec(ctx: &Ctx, args: PodExecArgs, io: &mut Io<'_>) -> CliResult<i32> {
+    let client = ctx.client()?;
+    let pod = client
+        .get_value(&format!("/loom/pods/{}", args.pod))
+        .await?;
+    let names = container_names(&pod);
+    let container = pick_container(&names, args.container.as_deref())?;
+    let id = pod["id"].as_str().unwrap_or(args.pod.as_str());
+    let body = json!({
+        "container": container,
+        "command": args.command,
+        "timeout_secs": args.timeout,
+    });
+    let v = client.post(&format!("/loom/pods/{id}/exec"), &body).await?;
+    match ctx.fmt.output {
+        Output::Json | Output::Yaml => print_value(io.stdout, ctx.fmt, &v)?,
+        _ => {
+            write!(io.stdout, "{}", v["stdout"].as_str().unwrap_or(""))?;
+            write!(io.stderr, "{}", v["stderr"].as_str().unwrap_or(""))?;
+        }
+    }
+    let code = v
+        .get("exit_code")
+        .and_then(|c| c.as_i64())
+        .ok_or_else(|| CliError::usage("exec result is missing an exit code"))?;
+    Ok(i32::try_from(code).unwrap_or(1))
+}
+
+fn container_names(pod: &Value) -> Vec<String> {
+    pod["spec"]["containers"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|c| c["name"].as_str().map(str::to_owned))
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn pick_container(names: &[String], requested: Option<&str>) -> CliResult<String> {
+    match requested {
+        Some(name) => {
+            if names.is_empty() || names.iter().any(|n| n == name) {
+                Ok(name.to_owned())
+            } else {
+                Err(CliError::usage(format!(
+                    "container '{name}' is not in this pod ({})",
+                    names.join(", ")
+                )))
+            }
+        }
+        None => match names {
+            [only] => Ok(only.clone()),
+            [] => Err(CliError::usage("pass -c to name the container")),
+            many => Err(CliError::usage(format!(
+                "pod has more than one container; pass -c ({})",
+                many.join(", ")
+            ))),
+        },
+    }
 }
 
 #[cfg(test)]

@@ -20,9 +20,9 @@ use std::time::Duration;
 use chrono::Utc;
 use keep::Pki;
 use pistack_rpc::proto::{
-    AgentHello, Command, CommandKind, CommandResult, Heartbeat, LogText, MachineRef, MachineReport,
-    MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached, VolumeDetach,
-    MAX_LONG_POLL_SECS,
+    AgentHello, Command, CommandKind, CommandResult, ExecRequest, Heartbeat, LogText, MachineRef,
+    MachineReport, MachineRequest, MigrateRequest, PortPlug, VolumeAttach, VolumeAttached,
+    VolumeDetach, MAX_LONG_POLL_SECS,
 };
 use pistack_rpc::{AgentClient, RpcError, RPC_INSECURE_ENV};
 use pistack_types::{ApiError, Phase, Resources};
@@ -453,6 +453,25 @@ impl Agent {
                 serde_json::to_value(LogText { text })
                     .map_err(|e| ApiError::internal(e.to_string()))
             }
+            CommandKind::Exec => {
+                let req: ExecRequest = payload(c.payload)?;
+                tracing::info!(machine = %req.id, container = %req.container, "anvil: exec");
+                let timeout = pistack_rpc::proto::exec_timeout(req.timeout_secs)?;
+                let env: Vec<(String, String)> =
+                    req.env.into_iter().map(|e| (e.name, e.value)).collect();
+                let out = crate::runtime::YoukiRuntime
+                    .exec(
+                        &req.id,
+                        &req.container,
+                        &req.command,
+                        &env,
+                        req.cwd.as_deref(),
+                        timeout,
+                        crate::runtime::youki::EXEC_OUTPUT_CAP,
+                    )
+                    .await?;
+                serde_json::to_value(out).map_err(|e| ApiError::internal(e.to_string()))
+            }
             CommandKind::Publish => Err(ApiError::not_implemented(
                 "publish is handled by the edge host, not this agent",
             )),
@@ -817,6 +836,7 @@ pub fn report(m: RunningMachine) -> MachineReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::MachineRuntime;
 
     #[test]
     fn join_url_adds_rpc_prefix_once() {
@@ -1111,5 +1131,181 @@ still here
                 panic!("expected no log for a fresh id, got {n} bytes");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn exec_command_round_trips_through_the_queue() {
+        let _lock = crate::runtime::youki::youki_env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-agent-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("youki.log");
+        let bin = tmp.join("youki");
+        let quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" >> {quoted}\n\
+             printf '\\n' >> {quoted}\n\
+             if [ \"$1\" = state ]; then\n\
+               printf '%s\\n' '{{\"pid\":4242,\"status\":\"running\"}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = exec ]; then\n\
+               printf 'agent-out\\n'\n\
+               printf 'agent-err\\n' >&2\n\
+               exit 9\n\
+             fi\n\
+             exit 0\n"
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let image = tmp.join("image");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("marker"), "keep").unwrap();
+        let state = tmp.join("state");
+        let prev_bin = std::env::var_os("PISTACK_YOUKI_BIN");
+        let prev_state = std::env::var_os("PISTACK_YOUKI_STATE");
+        std::env::set_var("PISTACK_YOUKI_BIN", &bin);
+        std::env::set_var("PISTACK_YOUKI_STATE", &state);
+        struct Restore(
+            Option<std::ffi::OsString>,
+            Option<std::ffi::OsString>,
+            std::path::PathBuf,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("PISTACK_YOUKI_BIN", v),
+                    None => std::env::remove_var("PISTACK_YOUKI_BIN"),
+                }
+                match self.1.take() {
+                    Some(v) => std::env::set_var("PISTACK_YOUKI_STATE", v),
+                    None => std::env::remove_var("PISTACK_YOUKI_STATE"),
+                }
+                let _ = std::fs::remove_dir_all(&self.2);
+            }
+        }
+        let _restore = Restore(prev_bin, prev_state, tmp.clone());
+
+        let image_arg = image.to_str().unwrap();
+        let request = crate::runtime::MachineRequest {
+            id: pistack_types::Id::new(pistack_types::kind::MACHINE),
+            name: "web".into(),
+            kind: crate::runtime::MachineKind::Container,
+            image: "not-a-path".into(),
+            resources: Resources {
+                vcpus: 1,
+                memory_mib: 128,
+                disk_gib: 1,
+                gpus: 0,
+            },
+            networks: vec![],
+            nics: vec![crate::runtime::NicAttachment {
+                address: "10.9.0.2".into(),
+                ..Default::default()
+            }],
+            volumes: vec![],
+            user_data: Some(
+                serde_json::json!({
+                    "kind": "PodSandbox",
+                    "containers": [{
+                        "name": "web",
+                        "image": image_arg,
+                        "command": ["/usr/bin/web"],
+                        "env": [{"name": "SECRET", "value_from": {"secret": "do-not-log-user-data"}}]
+                    }]
+                })
+                .to_string(),
+            ),
+            ssh_keys: vec!["do-not-log-ssh-key".into()],
+            overlay: None,
+            bmc_address: None,
+            bmc_user: None,
+        };
+        crate::runtime::YoukiRuntime.start(&request).await.unwrap();
+
+        let client = AgentClient::new("http://127.0.0.1:1", "n1").unwrap();
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::new());
+        let agent = Agent {
+            client,
+            runtimes: Runtimes::all(rt),
+            facts: facts::gather(),
+        };
+        let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
+            command_timeout: Duration::from_secs(5),
+            capacity: 4,
+            heartbeat_interval: Duration::from_secs(30),
+        });
+
+        let ran = queue_exec(
+            &queue,
+            &agent,
+            serde_json::json!({
+                "id": request.id.to_string(),
+                "container": "web",
+                "command": ["/bin/echo", "hi"],
+                "timeout_secs": 5
+            }),
+        )
+        .await
+        .unwrap();
+        let out: pistack_rpc::ExecOutput = serde_json::from_value(ran).unwrap();
+        assert_eq!(out.exit_code, 9);
+        assert_eq!(out.stdout, "agent-out\n");
+        assert_eq!(out.stderr, "agent-err\n");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.contains("do-not-log-user-data"), "{logged}");
+        assert!(!logged.contains("do-not-log-ssh-key"), "{logged}");
+
+        let bad = queue_exec(&queue, &agent, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, pistack_types::error::ErrorCode::BadRequest);
+
+        let missing = queue_exec(
+            &queue,
+            &agent,
+            serde_json::json!({
+                "id": request.id.to_string(),
+                "container": "missing",
+                "command": ["/bin/true"],
+                "timeout_secs": 5
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code, pistack_types::error::ErrorCode::NotFound);
+        assert!(missing.message.contains("missing"), "{missing}");
+    }
+
+    async fn queue_exec(
+        queue: &pistack_rpc::CommandQueue,
+        agent: &Agent,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        let ticket = queue.enqueue("node-a", CommandKind::Exec, payload).unwrap();
+        let cmd = queue
+            .next("node-a", Duration::from_secs(2), 1)
+            .await
+            .into_iter()
+            .next()
+            .expect("exec command");
+        assert_eq!(cmd.kind, CommandKind::Exec);
+        let id = cmd.id;
+        let result = match agent.execute(cmd).await {
+            Ok(body) => CommandResult::ok(id).with_payload(body),
+            Err(e) => CommandResult::from_api_error(id, &e),
+        };
+        queue.ack("node-a", result).unwrap();
+        ticket.wait().await.unwrap().into_api_result()
     }
 }

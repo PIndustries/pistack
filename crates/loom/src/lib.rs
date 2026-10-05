@@ -21,7 +21,8 @@
 //! realised by [`NoopRealizer`], cluster IPs come from `10.96.0.0/12`.
 //! Production wiring builds a [`LoomConfig`] and mounts
 //! [`Loom::configured`]. [`LoomConfig::production`] programs service and
-//! ingress listeners through relay and reads pod logs from the command queue.
+//! ingress listeners through relay and reads pod logs and runs pod exec
+//! through the command queue.
 
 pub mod controllers;
 pub mod cron;
@@ -65,7 +66,7 @@ pub struct LoomConfig {
     pub realizer: Arc<dyn ServiceRealizer>,
     /// Service and ingress listeners. `None` in dev mode.
     pub relay: Option<Arc<RelayRealizer>>,
-    /// Pod log reads. `None` until the server supplies the command queue.
+    /// Pod log reads and pod exec. `None` until the server supplies the command queue.
     pub queue: Option<CommandQueue>,
 }
 
@@ -85,7 +86,7 @@ impl Default for LoomConfig {
 
 impl LoomConfig {
     /// Relay listeners for services and ingresses, and the command queue
-    /// pod logs are read through. `dev_admin` matches the server flag.
+    /// pod logs and pod exec use. `dev_admin` matches the server flag.
     pub fn production(dev_admin: bool, queue: CommandQueue) -> Self {
         let relay = Arc::new(RelayRealizer::new());
         Self {
