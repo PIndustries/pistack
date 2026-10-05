@@ -202,6 +202,18 @@ impl Client {
         Ok(self.call(Method::PUT, path, Some(body)).await?.1)
     }
 
+    /// PUT with an `If-Match` revision header (blueprint stack update).
+    pub async fn put_if_match(&self, path: &str, body: &Value, revision: &str) -> CliResult<Value> {
+        let resp = self
+            .request(Method::PUT, path)
+            .header(reqwest::header::IF_MATCH, revision)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| CliError::Transport(format!("{} ({})", e, self.url(path))))?;
+        Ok(self.finish(resp).await?.1)
+    }
+
     pub async fn delete(&self, path: &str) -> CliResult<(StatusCode, Value)> {
         self.call(Method::DELETE, path, None).await
     }

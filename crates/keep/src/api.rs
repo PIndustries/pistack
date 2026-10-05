@@ -392,12 +392,7 @@ async fn delete_secret(
 ) -> ApiResult<Response> {
     scope.require_write()?;
     let s = resolve::<Secret>(&c, &scope, &id)?;
-    if s.meta
-        .labels
-        .get("keep.pistack.io/role")
-        .map(String::as_str)
-        == Some("private-key")
-    {
+    if crate::client::is_private_key(&s.meta.labels) {
         return Err(ApiError::conflict(
             "this secret holds a certificate's key; delete the certificate instead",
         ));

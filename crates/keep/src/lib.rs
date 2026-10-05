@@ -12,13 +12,23 @@
 //! * The resource types in [`types`].
 //!
 //! Secret payloads and private keys are encrypted at rest with AES-256-GCM
-//! under a root key stored in store meta `keep/root_key`. That is the
-//! *software* backend (see `crypto.rs`); PKCS#11 and Vault are the planned
-//! replacements and slot in behind [`crypto::RootKey`].
+//! under one root key ([`crypto::RootKey`]). A [`backend::KeyBackend`],
+//! chosen with `PISTACK_KEEP_BACKEND`, keeps that key between restarts:
+//! * `software` (default): base64 in store meta `keep/root_key`.
+//! * `vault`: **partial**. Wrapped by a Vault Transit key over HTTP; only
+//!   the ciphertext is stored (`keep/root_key_wrapped`). Round-trips for
+//!   real and is tested against a mock Transit server; migrating an existing
+//!   software key, re-wrapping after Transit key rotation and a lab run
+//!   against real Vault are not done.
+//! * `pkcs11`: **parked**. Refused with an error; nothing pretends to work.
+//!
+//! Every path that needs the key, including [`read_payload`], goes through
+//! the configured backend; there is no fallback between backends.
 //!
 //! HTTP lives under the `secrets` prefix; see `api.rs`.
 
 pub mod api;
+pub mod backend;
 pub mod ca;
 pub mod client;
 pub mod crypto;
@@ -26,6 +36,7 @@ pub mod error;
 pub mod join;
 pub mod tls;
 pub mod types;
+pub mod vault;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -33,6 +44,7 @@ use pistack_store::Store;
 use pistack_types::{ApiError, Id, Kind, ListQuery, Module, ModuleContext, ModuleInfo, Page};
 use std::sync::OnceLock;
 
+pub use backend::KeyBackend;
 pub use ca::{Ca, Issued};
 pub use client::Client;
 pub use crypto::{RootKey, Sealed};
@@ -42,7 +54,8 @@ pub use tls::{PeerIdentity, Pki};
 pub use types::*;
 
 /// Decrypt a secret payload. Does not create a root key or a CA. Missing
-/// key material or a missing payload is [`KeepError::NotFound`].
+/// key material or a missing payload is [`KeepError::NotFound`]; a backend
+/// that is misconfigured or refuses is [`KeepError::Backend`].
 pub fn read_payload(store: &Store, id: &Id) -> Result<Vec<u8>> {
     let Some(key) = crypto::RootKey::load_existing(store)? else {
         return Err(KeepError::NotFound("root key is not initialised".into()));

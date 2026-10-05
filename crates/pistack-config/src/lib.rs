@@ -91,6 +91,9 @@ format = "text"
 # ovn_nb = "tcp:127.0.0.1:6641"
 # [modules.slab]
 # backends = ["lvm"]
+# [modules.silo]
+# # Largest single PUT in bytes (default 5 GiB).
+# max_object_bytes = 5368709120
 "#;
 
 /// Why configuration could not be loaded.

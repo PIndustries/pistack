@@ -14,8 +14,67 @@ use serde::{Deserialize, Serialize};
 /// Id prefix for objects (`obj-<uuid>`).
 pub const KIND_OBJECT: &str = "obj";
 
-/// Largest object body accepted by `PUT` (1 GiB).
-pub const MAX_OBJECT_BYTES: usize = 1024 * 1024 * 1024;
+/// Default largest object body accepted by a single PUT (5 GiB).
+///
+/// Matches the historical S3 single-PUT ceiling. Override per client with
+/// [`crate::Client::with_max_object_bytes`] or `[modules.silo]
+/// max_object_bytes` (see [`SiloConfig`]).
+pub const MAX_OBJECT_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
+/// Module settings under `[modules.silo]` / `PISTACK__MODULES__SILO__*`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SiloConfig {
+    /// Largest accepted object body, in bytes.
+    pub max_object_bytes: usize,
+}
+
+impl Default for SiloConfig {
+    fn default() -> Self {
+        Self {
+            max_object_bytes: MAX_OBJECT_BYTES,
+        }
+    }
+}
+
+impl SiloConfig {
+    /// Read `[modules.silo]` from a loaded config. Missing section → defaults.
+    pub fn from_config(cfg: &pistack_config::Config) -> Result<Self, pistack_config::ConfigError> {
+        cfg.module("silo")
+    }
+
+    /// Load process config (file + `PISTACK__*`) and take `[modules.silo]`.
+    ///
+    /// On config load failure, returns defaults so the module still starts;
+    /// the error is logged by the caller when wired that way.
+    pub fn load() -> Self {
+        match pistack_config::Config::load(None) {
+            Ok(cfg) => Self::from_config(&cfg).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// Human-readable size for error messages (`5 GiB`, `64 MiB`, …).
+pub fn format_byte_limit(bytes: usize) -> String {
+    const GIB: usize = 1024 * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if bytes > 0 && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes > 0 && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes > 0 && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// `object is larger than …` using [`format_byte_limit`].
+pub fn object_too_large_message(max: usize) -> String {
+    format!("object is larger than {}", format_byte_limit(max))
+}
 
 // ---- Bucket ------------------------------------------------------------------
 
@@ -70,6 +129,10 @@ pub struct ObjectStatus {
     /// Lower-case hex SHA-256 of the bytes at `{bucket}/{key}`.
     #[serde(default)]
     pub sha256: String,
+    /// Lower-case hex MD5 of the bytes (S3 ETag for single-PUT). Empty on
+    /// objects written before this field existed.
+    #[serde(default)]
+    pub md5: String,
     #[serde(default)]
     pub size_bytes: u64,
     /// Generation at this key. Starts at 1; each put increments it.
@@ -84,6 +147,7 @@ impl Default for ObjectStatus {
     fn default() -> Self {
         Self {
             sha256: String::new(),
+            md5: String::new(),
             size_bytes: 0,
             version: default_version(),
             latest: default_latest(),
@@ -136,7 +200,7 @@ pub fn content_type_or_default(value: Option<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_key;
+    use super::*;
 
     #[test]
     fn key_rules() {
@@ -150,5 +214,22 @@ mod tests {
         assert!(validate_key("a//b").is_err());
         assert!(validate_key(".blobs/abcd").is_err());
         assert!(validate_key(r"foo\bar").is_err());
+    }
+
+    #[test]
+    fn format_limits() {
+        assert_eq!(format_byte_limit(MAX_OBJECT_BYTES), "5 GiB");
+        assert_eq!(format_byte_limit(64 * 1024), "64 KiB");
+        assert_eq!(format_byte_limit(3), "3 bytes");
+        assert!(object_too_large_message(1024).contains("1 KiB"));
+    }
+
+    #[test]
+    fn silo_config_defaults() {
+        assert_eq!(SiloConfig::default().max_object_bytes, MAX_OBJECT_BYTES);
+        let cfg = pistack_config::Config::from_toml("[modules.silo]\nmax_object_bytes = 1048576\n")
+            .unwrap();
+        let silo = SiloConfig::from_config(&cfg).unwrap();
+        assert_eq!(silo.max_object_bytes, 1024 * 1024);
     }
 }

@@ -8,7 +8,8 @@ use chrono::Utc;
 use pistack_store::Store;
 use pistack_types::{Id, Phase};
 
-use crate::ca::{open_secret, seal_pem_secret, Ca, Issued};
+use crate::backend::KeyBackend;
+use crate::ca::{open_secret, seal_pem_secret, Ca, Issued, ROLE_LABEL, ROLE_PRIVATE_KEY};
 use crate::crypto::RootKey;
 use crate::error::{KeepError, Result};
 use crate::tls::Pki;
@@ -16,6 +17,14 @@ use crate::types::*;
 
 /// Largest secret payload accepted (1 MiB).
 pub const MAX_PAYLOAD: usize = 1 << 20;
+/// Limits on a secret's clear-text metadata, so labels, description and
+/// content type cannot carry more than the (sealed) payload is allowed to.
+/// Applied the same way on create and update.
+pub const MAX_LABELS: usize = 64;
+pub const MAX_LABEL_KEY: usize = 128;
+pub const MAX_LABEL_VALUE: usize = 1024;
+pub const MAX_DESCRIPTION: usize = 4096;
+pub const MAX_CONTENT_TYPE: usize = 255;
 
 #[derive(Clone)]
 pub struct Client {
@@ -31,10 +40,15 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Open (or on first start, initialise) the software key backend and
-    /// the cloud CA on `store`.
+    /// Open (or on first start, initialise) the root key through the
+    /// process's configured backend, and the cloud CA, on `store`.
     pub fn open(store: &Store) -> Result<Self> {
-        let root_key = RootKey::load_or_create(store)?;
+        Self::open_with(store, crate::backend::configured()?)
+    }
+
+    /// [`open`](Self::open) with an explicit root-key backend.
+    pub fn open_with(store: &Store, backend: &KeyBackend) -> Result<Self> {
+        let root_key = backend.load_or_create(store)?;
         let ca = Ca::load_or_init(store, &root_key)?;
         Ok(Self {
             store: store.clone(),
@@ -110,6 +124,12 @@ impl Client {
     /// Create a secret with its first payload version.
     pub fn create_secret(&self, mut secret: Secret, payload: &[u8]) -> Result<Secret> {
         check_payload(payload)?;
+        check_metadata(&secret)?;
+        if secret.meta.labels.contains_key(ROLE_LABEL) {
+            return Err(KeepError::Invalid(format!(
+                "label {ROLE_LABEL} is reserved for keep"
+            )));
+        }
         secret.status = SecretStatus {
             phase: Phase::Ready,
             version: 1,
@@ -131,9 +151,17 @@ impl Client {
     }
 
     /// Replace spec and metadata (not the payload). Honours `If-Match`.
+    /// The same metadata limits as create apply, and the reserved role
+    /// label cannot be added, changed or removed.
     pub fn update_secret(&self, secret: Secret, expected_revision: Option<u64>) -> Result<Secret> {
+        check_metadata(&secret)?;
         let col = self.store.collection::<StoredSecret>();
         let current = col.get(&secret.meta.id)?;
+        if secret.meta.labels.get(ROLE_LABEL) != current.meta.labels.get(ROLE_LABEL) {
+            return Err(KeepError::Conflict(format!(
+                "label {ROLE_LABEL} is managed by keep and cannot be changed"
+            )));
+        }
         let stored = StoredSecret {
             meta: secret.meta,
             spec: secret.spec,
@@ -155,6 +183,11 @@ impl Client {
         check_payload(payload)?;
         let col = self.store.collection::<StoredSecret>();
         let mut cur = col.get(id)?;
+        if is_private_key(&cur.meta.labels) {
+            return Err(KeepError::Conflict(
+                "this secret holds a certificate's key; it cannot be rotated on its own".into(),
+            ));
+        }
         if let Some(exp) = expected_revision {
             if exp != cur.meta.revision {
                 return Err(pistack_store::StoreError::Revision {
@@ -297,6 +330,41 @@ fn check_payload(payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn check_metadata(secret: &Secret) -> Result<()> {
+    let m = &secret.meta;
+    if m.labels.len() > MAX_LABELS {
+        return Err(KeepError::Invalid(format!(
+            "at most {MAX_LABELS} labels are allowed"
+        )));
+    }
+    if let Some((k, _)) = m
+        .labels
+        .iter()
+        .find(|(k, v)| k.is_empty() || k.len() > MAX_LABEL_KEY || v.len() > MAX_LABEL_VALUE)
+    {
+        return Err(KeepError::Invalid(format!(
+            "label '{}' must have a 1-{MAX_LABEL_KEY} byte key and a value of at most \
+             {MAX_LABEL_VALUE} bytes",
+            k.chars().take(32).collect::<String>()
+        )));
+    }
+    if m.description.len() > MAX_DESCRIPTION {
+        return Err(KeepError::Invalid(format!(
+            "description exceeds {MAX_DESCRIPTION} bytes"
+        )));
+    }
+    if secret.spec.content_type.len() > MAX_CONTENT_TYPE {
+        return Err(KeepError::Invalid(format!(
+            "content_type exceeds {MAX_CONTENT_TYPE} bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_private_key(labels: &std::collections::BTreeMap<String, String>) -> bool {
+    labels.get(ROLE_LABEL).map(String::as_str) == Some(ROLE_PRIVATE_KEY)
+}
+
 /// Turn a CN into something that fits the resource-name rules.
 fn sanitize(cn: &str) -> String {
     let s: String = cn
@@ -383,5 +451,200 @@ mod tests {
         c.delete_certificate(&cert.meta.id).unwrap();
         assert!(c.get_secret(&key).is_err());
         assert_eq!(c.list_cas().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn payload_limit_is_inclusive_on_create_and_rotate() {
+        let c = client();
+        let at = vec![b'a'; MAX_PAYLOAD];
+        let over = vec![b'a'; MAX_PAYLOAD + 1];
+        let s = c
+            .create_secret(Secret::new("big", None, SecretSpec::default()), &at)
+            .unwrap();
+        assert_eq!(c.get_secret_payload(&s.meta.id).unwrap().len(), MAX_PAYLOAD);
+        assert!(matches!(
+            c.create_secret(Secret::new("big2", None, SecretSpec::default()), &over),
+            Err(KeepError::Invalid(_))
+        ));
+        assert!(matches!(
+            c.rotate_secret(&s.meta.id, &over, None),
+            Err(KeepError::Invalid(_))
+        ));
+        assert!(matches!(
+            c.rotate_secret(&s.meta.id, b"", None),
+            Err(KeepError::Invalid(_))
+        ));
+        c.rotate_secret(&s.meta.id, &at, None).unwrap();
+    }
+
+    #[test]
+    fn metadata_limits_apply_on_create_and_update() {
+        let c = client();
+        let mut s = Secret::new("m", None, SecretSpec::default());
+        s.meta.description = "d".repeat(MAX_DESCRIPTION);
+        for i in 0..MAX_LABELS {
+            s.meta
+                .labels
+                .insert(format!("k{i}"), "v".repeat(MAX_LABEL_VALUE));
+        }
+        let s = c.create_secret(s, b"x").unwrap();
+
+        let over = |f: fn(&mut Secret)| {
+            let mut x = Secret::new("n", None, SecretSpec::default());
+            f(&mut x);
+            x
+        };
+        let cases: [fn(&mut Secret); 6] = [
+            |x| x.meta.description = "d".repeat(MAX_DESCRIPTION + 1),
+            |x| x.spec.content_type = "t".repeat(MAX_CONTENT_TYPE + 1),
+            |x| {
+                for i in 0..=MAX_LABELS {
+                    x.meta.labels.insert(format!("k{i}"), "v".into());
+                }
+            },
+            |x| {
+                x.meta
+                    .labels
+                    .insert("k".repeat(MAX_LABEL_KEY + 1), "v".into());
+            },
+            |x| {
+                x.meta
+                    .labels
+                    .insert("k".into(), "v".repeat(MAX_LABEL_VALUE + 1));
+            },
+            |x| {
+                x.meta.labels.insert(String::new(), "v".into());
+            },
+        ];
+        for f in cases {
+            // Create refuses it...
+            assert!(matches!(
+                c.create_secret(over(f), b"x"),
+                Err(KeepError::Invalid(_))
+            ));
+            // ...and so does update, which used to skip every check.
+            let mut cur = c.get_secret(&s.meta.id).unwrap();
+            cur.meta.labels.clear();
+            f(&mut cur);
+            assert!(matches!(
+                c.update_secret(cur, None),
+                Err(KeepError::Invalid(_))
+            ));
+        }
+        assert_eq!(
+            c.get_secret(&s.meta.id).unwrap().meta.revision,
+            s.meta.revision
+        );
+    }
+
+    #[test]
+    fn reserved_role_label_cannot_be_forged_or_stripped() {
+        let c = client();
+        let proj = Id::new(kind::PROJECT);
+        // Callers may not create a secret that claims to be a cert key.
+        let mut forged = Secret::new("fake-key", Some(proj.clone()), SecretSpec::default());
+        forged
+            .meta
+            .labels
+            .insert(ROLE_LABEL.into(), ROLE_PRIVATE_KEY.into());
+        assert!(matches!(
+            c.create_secret(forged, b"x"),
+            Err(KeepError::Invalid(_))
+        ));
+
+        let cert = c
+            .issue_certificate(
+                Some(proj.clone()),
+                "web",
+                CertificateSpec {
+                    common_name: "web".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let key_id = cert.status.key_secret.clone().unwrap();
+        let key_secret = c.get_secret(&key_id).unwrap();
+        // Stripping the label (which would let the key be deleted out from
+        // under its certificate) is refused...
+        let mut stripped = key_secret.clone();
+        stripped.meta.labels.remove(ROLE_LABEL);
+        assert!(matches!(
+            c.update_secret(stripped, None),
+            Err(KeepError::Conflict(_))
+        ));
+        // ...as is adding it to an ordinary secret...
+        let plain = c
+            .create_secret(Secret::new("p", Some(proj), SecretSpec::default()), b"x")
+            .unwrap();
+        let mut tagged = plain.clone();
+        tagged
+            .meta
+            .labels
+            .insert(ROLE_LABEL.into(), ROLE_PRIVATE_KEY.into());
+        assert!(matches!(
+            c.update_secret(tagged, None),
+            Err(KeepError::Conflict(_))
+        ));
+        // ...and rotating the key away from its certificate.
+        assert!(matches!(
+            c.rotate_secret(&key_id, b"not a key", None),
+            Err(KeepError::Conflict(_))
+        ));
+        assert!(c
+            .certificate_key_pem(&cert)
+            .unwrap()
+            .contains("PRIVATE KEY"));
+        // Editing other metadata on the key secret still works.
+        let mut desc = key_secret;
+        desc.meta.description = "web key".into();
+        assert_eq!(
+            c.update_secret(desc, None).unwrap().meta.description,
+            "web key"
+        );
+    }
+
+    #[test]
+    fn client_round_trips_secrets_through_vault_transit() {
+        use crate::backend::{forget_unwrapped, KeyBackend, META_ROOT_KEY_WRAPPED};
+        use crate::crypto::META_ROOT_KEY;
+        use crate::vault::mock::{MockVault, KEY, TOKEN};
+
+        let vault = MockVault::start();
+        let backend = KeyBackend::VaultTransit(vault.config(TOKEN, KEY));
+        let store = Store::in_memory().unwrap();
+        let c = Client::open_with(&store, &backend).unwrap();
+        let s = c
+            .create_secret(Secret::new("db", None, SecretSpec::default()), b"pw-vault")
+            .unwrap();
+        let pki = c
+            .issue_server_cert("gw.local", &["gw.local".into()])
+            .unwrap();
+        assert!(store.get_meta::<String>(META_ROOT_KEY).unwrap().is_none());
+        assert!(store
+            .get_meta::<serde_json::Value>(META_ROOT_KEY_WRAPPED)
+            .unwrap()
+            .is_some());
+
+        // Restart: the key comes back from Vault, CA keys and payloads open.
+        forget_unwrapped();
+        let c2 = Client::open_with(&store, &backend).unwrap();
+        assert_eq!(c2.get_secret_payload(&s.meta.id).unwrap(), b"pw-vault");
+        assert_eq!(c2.ca_bundle_pem(), pki.ca_pem);
+        let cert = c2.list_certificates(None).unwrap().remove(0);
+        assert_eq!(c2.certificate_key_pem(&cert).unwrap(), pki.key_pem);
+
+        // The software backend refuses this store rather than starting over.
+        assert!(matches!(
+            Client::open_with(&store, &KeyBackend::Software),
+            Err(KeepError::Backend(_))
+        ));
+        // A token Vault refuses cannot open it either.
+        assert!(matches!(
+            Client::open_with(
+                &store,
+                &KeyBackend::VaultTransit(vault.config("s.revoked", KEY))
+            ),
+            Err(KeepError::Backend(_))
+        ));
     }
 }

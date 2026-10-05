@@ -7,7 +7,6 @@
 //! does not issue, renew, or generate a certificate. A missing, revoked, or
 //! unreadable certificate is unavailable.
 
-use base64::Engine;
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult, Id};
 use rustls::pki_types::pem::PemObject;
@@ -77,18 +76,16 @@ pub fn load_kept(store: &Store, id: &Id) -> ApiResult<TlsMaterial> {
     })
 }
 
+/// The root key through keep's configured backend; never creates one.
 fn existing_root(store: &Store) -> ApiResult<keep::RootKey> {
-    let Some(b64) = store
-        .get_meta::<String>(keep::crypto::META_ROOT_KEY)
-        .map_err(|_| ApiError::unavailable(NO_CERT))?
-    else {
-        return Err(ApiError::unavailable(NO_CERT));
-    };
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|_| ApiError::unavailable(NO_CERT))?;
-    let bytes: [u8; 32] = raw.try_into().map_err(|_| ApiError::unavailable(NO_CERT))?;
-    Ok(keep::RootKey::from_bytes(bytes))
+    match keep::RootKey::load_existing(store) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => Err(ApiError::unavailable(NO_CERT)),
+        Err(e) => {
+            tracing::warn!(error = %e, "relay: cannot load keep root key");
+            Err(ApiError::unavailable(NO_CERT))
+        }
+    }
 }
 
 /// rustls config that presents `material`. Parsing a bad PEM is unavailable.

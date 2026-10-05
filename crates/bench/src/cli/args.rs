@@ -107,6 +107,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: MachineCmd,
     },
+    /// Run a command in a pod container.
+    Pod {
+        #[command(subcommand)]
+        cmd: PodCmd,
+    },
     /// Sizes (flavors).
     Size {
         #[command(subcommand)]
@@ -166,6 +171,26 @@ pub enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: ImageCmd,
+    },
+    /// StatefulSets (loom).
+    Statefulset {
+        #[command(subcommand)]
+        cmd: StatefulsetCmd,
+    },
+    /// DaemonSets (loom).
+    Daemonset {
+        #[command(subcommand)]
+        cmd: DaemonsetCmd,
+    },
+    /// Autoscalers (loom).
+    Autoscaler {
+        #[command(subcommand)]
+        cmd: AutoscalerCmd,
+    },
+    /// Stacks (blueprint).
+    Stack {
+        #[command(subcommand)]
+        cmd: StackCmd,
     },
 }
 
@@ -444,6 +469,27 @@ crud!(
     /// Reboot.
     Reboot(PowerArgs),
 );
+
+#[derive(Subcommand, Debug)]
+pub enum PodCmd {
+    /// Run a command in one container and print its output.
+    Exec(PodExecArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PodExecArgs {
+    /// Pod name or id.
+    pub pod: String,
+    /// Container name. Required when the pod has more than one.
+    #[arg(short = 'c', long)]
+    pub container: Option<String>,
+    /// Seconds to wait. The server rejects values outside 1..=3600.
+    #[arg(long, default_value_t = 30)]
+    pub timeout: u64,
+    /// Command and arguments. Flags after `--` belong to the command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    pub command: Vec<String>,
+}
 
 #[derive(Args, Debug)]
 pub struct SizeCreate {
@@ -834,4 +880,124 @@ crud!(
     Upload(ImageUpload),
     /// Download image data.
     Download(ImageDownload),
+);
+
+// ---- loom / blueprint --------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct StatefulsetCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Container image.
+    #[arg(long)]
+    pub image: String,
+    /// Container name (default: the StatefulSet name).
+    #[arg(long)]
+    pub container: Option<String>,
+    /// Desired replicas.
+    #[arg(long, default_value_t = 1)]
+    pub replicas: u32,
+    /// Service that gives pods a stable network identity.
+    #[arg(long = "service-name")]
+    pub service_name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ScaleArgs {
+    pub name: String,
+    #[arg(long)]
+    pub replicas: u32,
+}
+
+crud!(
+    StatefulsetCmd,
+    StatefulsetCreate,
+    /// Scale replicas.
+    Scale(ScaleArgs),
+);
+
+#[derive(Args, Debug)]
+pub struct DaemonsetCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Container image.
+    #[arg(long)]
+    pub image: String,
+    /// Container name (default: the DaemonSet name).
+    #[arg(long)]
+    pub container: Option<String>,
+}
+crud!(DaemonsetCmd, DaemonsetCreate);
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ScaleTargetKindArg {
+    Deployment,
+    StatefulSet,
+}
+
+#[derive(Args, Debug)]
+pub struct AutoscalerCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Workload kind to scale.
+    #[arg(long = "target-kind", value_enum)]
+    pub target_kind: ScaleTargetKindArg,
+    /// Target Deployment or StatefulSet (name or id).
+    #[arg(long = "target")]
+    pub target: String,
+    /// Gauge metric name.
+    #[arg(long)]
+    pub metric: String,
+    /// Target metric value.
+    #[arg(long = "target-value")]
+    pub target_value: f64,
+    /// Minimum replicas.
+    #[arg(long = "min", default_value_t = 1)]
+    pub min_replicas: u32,
+    /// Maximum replicas.
+    #[arg(long = "max")]
+    pub max_replicas: u32,
+}
+crud!(AutoscalerCmd, AutoscalerCreate);
+
+#[derive(Args, Debug)]
+pub struct StackCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Stack document (YAML/JSON text); `@file` reads a file, `-` reads stdin.
+    #[arg(long, short = 'd')]
+    pub document: String,
+}
+
+#[derive(Args, Debug)]
+pub struct StackUpdate {
+    /// Name or id.
+    pub name: String,
+    /// Replacement document; `@file` or `-` for stdin.
+    #[arg(long, short = 'd')]
+    pub document: String,
+}
+
+#[derive(Args, Debug)]
+pub struct StackRollback {
+    /// Name or id.
+    pub name: String,
+    /// Revision from status.history (default: previous).
+    #[arg(long)]
+    pub revision: Option<u64>,
+}
+
+crud!(
+    StackCmd,
+    StackCreate,
+    /// Store a new document (honours revision / If-Match).
+    Update(StackUpdate),
+    /// Apply the stored document.
+    Apply(NameArg),
+    /// Re-apply an earlier revision.
+    Rollback(StackRollback),
 );

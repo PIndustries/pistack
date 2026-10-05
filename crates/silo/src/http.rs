@@ -9,16 +9,22 @@
 //! GET|DELETE      /buckets/{id}
 //! GET             /buckets/{id}/objects
 //! PUT|GET|DELETE  /buckets/{id}/objects/{*key}
+//!
+//! S3 path-style (same router, same auth):
+//! PUT|GET|HEAD|DELETE  /{bucket}/{*key}
+//! GET                  /{bucket}?list-type=2&…
 //! ```
 //!
-//! `{id}` is a bucket id or name. Object puts take a raw body, capped at
-//! 1 GiB (axum's default limit is 2 MiB). `{*key}` is the object key and
-//! may contain `/`; `..`, empty, and absolute keys are rejected.
+//! `{id}` is a bucket id or name. Object puts stream the body to disk and
+//! refuse anything larger than the client's configured max (default 5 GiB).
+//! `{*key}` is the object key and may contain `/`; `..`, empty, and absolute
+//! keys are rejected.
 //!
 //! The `Caller` comes from request extensions. Without one, the request
-//! is rejected.
+//! is rejected. AWS SigV4 is not verified; see the crate docs.
 
 use crate::client::Client;
+use crate::s3;
 use crate::types::*;
 use axum::{
     body::Body,
@@ -29,26 +35,36 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use futures::TryStreamExt;
 use pistack_types::{ApiError, ApiResult, Caller, Id, ListQuery, Meta, Page, Spec};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use tokio_util::io::ReaderStream;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
 pub fn router(client: Client) -> Router {
+    // Object puts enforce the size cap while streaming; disable axum's
+    // default 2 MiB buffer limit the same way mold does for image uploads.
+    let object_routes = axum::routing::put(put_object)
+        .get(get_object)
+        .delete(delete_object)
+        .layer(DefaultBodyLimit::disable());
+    let s3_object = axum::routing::put(s3::put_object)
+        .get(s3::get_object)
+        .delete(s3::delete_object)
+        .head(s3::head_object)
+        .layer(DefaultBodyLimit::disable());
+
     Router::new()
         .route("/", get(info))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{id}", get(get_bucket).delete(delete_bucket))
         .route("/buckets/{id}/objects", get(list_objects))
-        .route(
-            "/buckets/{id}/objects/{*key}",
-            axum::routing::put(put_object)
-                .get(get_object)
-                .delete(delete_object)
-                .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES)),
-        )
+        .route("/buckets/{id}/objects/{*key}", object_routes)
+        .route("/{bucket}", get(s3::list_or_bucket))
+        .route("/{bucket}/{*key}", s3_object)
         .fallback(|| async { ApiError::not_found("no such silo endpoint") })
         .layer(middleware::from_fn(require_caller))
         .with_state(client)
@@ -118,7 +134,7 @@ fn visible(caller: &Caller, bucket: Bucket) -> ApiResult<Bucket> {
     }
 }
 
-fn load_bucket(client: &Client, caller: &Caller, name_or_id: &str) -> ApiResult<Bucket> {
+pub(crate) fn load_bucket(client: &Client, caller: &Caller, name_or_id: &str) -> ApiResult<Bucket> {
     if !caller.is_admin() && caller.project.is_none() {
         return Err(ApiError::forbidden("token has no project scope"));
     }
@@ -157,7 +173,7 @@ fn page(mut items: Vec<Bucket>, q: &ListQuery) -> Page<Bucket> {
     Page { items, next, total }
 }
 
-fn content_type_header(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn content_type_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -251,11 +267,25 @@ async fn put_object(
     ext: Option<Extension<Caller>>,
     Path((id, key)): Path<(String, String)>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    req: Request,
 ) -> ApiResult<(StatusCode, Json<Object>)> {
     let bucket = load_bucket(&c, &caller(ext)?, &id)?;
+    let len = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let stream = req
+        .into_body()
+        .into_data_stream()
+        .map_err(std::io::Error::other);
     let obj = c
-        .put_object(&bucket.meta.id, &key, &body, content_type_header(&headers))
+        .put_object_stream(
+            &bucket.meta.id,
+            &key,
+            stream,
+            len,
+            content_type_header(&headers),
+        )
         .await?;
     let status = if obj.meta.revision == 1 {
         StatusCode::CREATED
@@ -271,13 +301,21 @@ async fn get_object(
     Path((id, key)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     let bucket = load_bucket(&c, &caller(ext)?, &id)?;
-    let (obj, bytes) = c.get_object(&bucket.meta.id, &key).await?;
-    let mut resp = Body::from(bytes).into_response();
+    let (obj, file) = c.open_object(&bucket.meta.id, &key).await?;
+    let mut resp = Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
     let headers = resp.headers_mut();
     let ctype = HeaderValue::from_str(&obj.spec.content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     headers.insert(header::CONTENT_TYPE, ctype);
-    if let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", obj.status.sha256)) {
+    if let Ok(len) = HeaderValue::from_str(&obj.status.size_bytes.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, len);
+    }
+    let etag_hex = if !obj.status.md5.is_empty() {
+        obj.status.md5.clone()
+    } else {
+        obj.status.sha256.clone()
+    };
+    if let Ok(etag) = HeaderValue::from_str(&format!("\"{etag_hex}\"")) {
         headers.insert(header::ETAG, etag);
     }
     Ok(resp)

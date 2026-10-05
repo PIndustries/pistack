@@ -24,7 +24,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use pistack_rpc::proto::CommandKind;
+use pistack_rpc::proto::{exec_timeout, CommandKind, ExecEnv, ExecOutput, ExecRequest};
 use pistack_rpc::CommandQueue;
 use pistack_store::{Collection, Store};
 use pistack_types::{ApiError, ApiResult, Caller, Id, Kind, ListQuery, Page, Resource, Spec};
@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
     let r = Router::new().route("/", get(index));
     let r = crud::<PodSpec>(r)
         .route("/pods/{id}/logs", get(pod_logs))
+        .route("/pods/{id}/exec", post(pod_exec))
         .route("/pods/{id}/sandbox", get(pod_sandbox));
     let r = crud::<ReplicaSetSpec>(r);
     let r = crud::<DeploymentSpec>(r)
@@ -872,6 +873,84 @@ async fn pod_logs(
         None => return Err(ApiError::unavailable("pod log text is missing")),
     };
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecBody {
+    container: String,
+    /// Argv. This is not a shell line.
+    command: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    env: Vec<ExecEnv>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Run a command in one container of a pod and return its exit code and
+/// output. A non-zero exit is still HTTP 200. Stdin and a terminal are a
+/// later change; this call does not attach.
+async fn pod_exec(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<ExecBody>,
+) -> ApiResult<Json<ExecOutput>> {
+    let pod = load::<PodSpec>(&s, &scope, &id)?;
+    if body.container.is_empty() {
+        return Err(ApiError::bad_request("container name is empty"));
+    }
+    if body.command.is_empty() {
+        return Err(ApiError::bad_request("command is empty"));
+    }
+    exec_timeout(body.timeout_secs)?;
+    if !pod.spec.containers.iter().any(|c| c.name == body.container) {
+        return Err(ApiError::not_found(format!(
+            "container '{}' is not in this pod",
+            body.container
+        )));
+    }
+    let machine = pod
+        .status
+        .machine
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("pod exec is not available"))?;
+    let host_id = pod
+        .status
+        .host
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("pod exec is not available"))?;
+    let host = match s.store.collection::<forge::Host>().get(&host_id) {
+        Ok(host) => host,
+        Err(e) => {
+            let api = ApiError::from(e);
+            if api.code == pistack_types::error::ErrorCode::NotFound {
+                return Err(api);
+            }
+            return Err(ApiError::unavailable("pod exec is not available"));
+        }
+    };
+    if host.spec.node_name.is_empty() {
+        return Err(ApiError::unavailable("pod exec is not available"));
+    }
+    let queue = s
+        .queue
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("pod exec is not configured"))?;
+    let payload = serde_json::to_value(ExecRequest {
+        id: machine,
+        container: body.container,
+        command: body.command,
+        env: body.env,
+        cwd: body.cwd,
+        timeout_secs: body.timeout_secs,
+    })?;
+    let ticket = queue.enqueue(&host.spec.node_name, CommandKind::Exec, payload)?;
+    let value = ticket.wait().await?.into_api_result()?;
+    let out = serde_json::from_value(value)
+        .map_err(|_| ApiError::unavailable("pod exec result is missing"))?;
+    Ok(Json(out))
 }
 
 /// The document the pod's machine carries to anvil; handy for debugging.

@@ -19,8 +19,21 @@ use std::time::Duration;
 const POLL: Duration = Duration::from_secs(1);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
-pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()> {
+pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<i32> {
     match cmd {
+        Cmd::Pod { cmd } => pod(ctx, cmd, io).await,
+        other => {
+            dispatch_rest(ctx, other, io).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()> {
+    match cmd {
+        Cmd::Pod { .. } => Err(CliError::usage(
+            "pod exec is handled before the other commands",
+        )),
         Cmd::Login(a) => login(ctx, a, io).await,
         Cmd::Profile { cmd } => profile(ctx, cmd, io),
         Cmd::Whoami => whoami(ctx, io).await,
@@ -48,6 +61,10 @@ pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()>
         Cmd::Snapshot { cmd } => snapshot(ctx, cmd, io).await,
         Cmd::Voltype { cmd } => voltype(ctx, cmd, io).await,
         Cmd::Image { cmd } => image(ctx, cmd, io).await,
+        Cmd::Statefulset { cmd } => statefulset(ctx, cmd, io).await,
+        Cmd::Daemonset { cmd } => daemonset(ctx, cmd, io).await,
+        Cmd::Autoscaler { cmd } => autoscaler(ctx, cmd, io).await,
+        Cmd::Stack { cmd } => stack(ctx, cmd, io).await,
     }
 }
 
@@ -1471,6 +1488,240 @@ async fn upload(
     let v = c.put_file(&path, file).await?;
     let size = str_at(&v, "/status/size_bytes");
     report(ctx, io, k, &v, &format!("uploaded ({size} bytes)"))
+}
+
+async fn pod(ctx: &Ctx, cmd: PodCmd, io: &mut Io<'_>) -> CliResult<i32> {
+    match cmd {
+        PodCmd::Exec(args) => pod_exec(ctx, args, io).await,
+    }
+}
+
+async fn pod_exec(ctx: &Ctx, args: PodExecArgs, io: &mut Io<'_>) -> CliResult<i32> {
+    let client = ctx.client()?;
+    let pod = client
+        .get_value(&format!("/loom/pods/{}", args.pod))
+        .await?;
+    let names = container_names(&pod);
+    let container = pick_container(&names, args.container.as_deref())?;
+    let id = pod["id"].as_str().unwrap_or(args.pod.as_str());
+    let body = json!({
+        "container": container,
+        "command": args.command,
+        "timeout_secs": args.timeout,
+    });
+    let v = client.post(&format!("/loom/pods/{id}/exec"), &body).await?;
+    match ctx.fmt.output {
+        Output::Json | Output::Yaml => print_value(io.stdout, ctx.fmt, &v)?,
+        _ => {
+            write!(io.stdout, "{}", v["stdout"].as_str().unwrap_or(""))?;
+            write!(io.stderr, "{}", v["stderr"].as_str().unwrap_or(""))?;
+        }
+    }
+    let code = v
+        .get("exit_code")
+        .and_then(|c| c.as_i64())
+        .ok_or_else(|| CliError::usage("exec result is missing an exit code"))?;
+    Ok(i32::try_from(code).unwrap_or(1))
+}
+
+fn container_names(pod: &Value) -> Vec<String> {
+    pod["spec"]["containers"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|c| c["name"].as_str().map(str::to_owned))
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn pick_container(names: &[String], requested: Option<&str>) -> CliResult<String> {
+    match requested {
+        Some(name) => {
+            if names.is_empty() || names.iter().any(|n| n == name) {
+                Ok(name.to_owned())
+            } else {
+                Err(CliError::usage(format!(
+                    "container '{name}' is not in this pod ({})",
+                    names.join(", ")
+                )))
+            }
+        }
+        None => match names {
+            [only] => Ok(only.clone()),
+            [] => Err(CliError::usage("pass -c to name the container")),
+            many => Err(CliError::usage(format!(
+                "pod has more than one container; pass -c ({})",
+                many.join(", ")
+            ))),
+        },
+    }
+}
+
+async fn statefulset(ctx: &Ctx, cmd: StatefulsetCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("statefulset");
+    match cmd {
+        StatefulsetCmd::List(a) => do_list(ctx, io, k, a).await,
+        StatefulsetCmd::Show(a) => do_show(ctx, io, k, a).await,
+        StatefulsetCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        StatefulsetCmd::Create(a) => {
+            let c = ctx.client()?;
+            let mut spec = json!({
+                "replicas": a.replicas,
+                "template": {
+                    "labels": { "app": a.name },
+                    "spec": {
+                        "containers": [{
+                            "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                            "image": a.image,
+                        }]
+                    }
+                }
+            });
+            if let Some(svc) = a.service_name {
+                spec.as_object_mut()
+                    .unwrap()
+                    .insert("service_name".into(), json!(svc));
+            }
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+        StatefulsetCmd::Scale(a) => {
+            let c = ctx.client()?;
+            let id = resolve(&c, k, &a.name).await?;
+            let v = c
+                .post(
+                    &format!("{}/{}/scale", k.path, id),
+                    &json!({ "replicas": a.replicas }),
+                )
+                .await?;
+            report(ctx, io, k, &v, "scaled")
+        }
+    }
+}
+
+async fn daemonset(ctx: &Ctx, cmd: DaemonsetCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("daemonset");
+    match cmd {
+        DaemonsetCmd::List(a) => do_list(ctx, io, k, a).await,
+        DaemonsetCmd::Show(a) => do_show(ctx, io, k, a).await,
+        DaemonsetCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        DaemonsetCmd::Create(a) => {
+            let c = ctx.client()?;
+            let spec = json!({
+                "template": {
+                    "labels": { "app": a.name },
+                    "spec": {
+                        "containers": [{
+                            "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                            "image": a.image,
+                        }]
+                    }
+                }
+            });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+    }
+}
+
+async fn autoscaler(ctx: &Ctx, cmd: AutoscalerCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("autoscaler");
+    match cmd {
+        AutoscalerCmd::List(a) => do_list(ctx, io, k, a).await,
+        AutoscalerCmd::Show(a) => do_show(ctx, io, k, a).await,
+        AutoscalerCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        AutoscalerCmd::Create(a) => {
+            let c = ctx.client()?;
+            let target_kind = match a.target_kind {
+                ScaleTargetKindArg::Deployment => "Deployment",
+                ScaleTargetKindArg::StatefulSet => "StatefulSet",
+            };
+            let spec = json!({
+                "target_kind": target_kind,
+                "target_name": a.target,
+                "metric": a.metric,
+                "target_value": a.target_value,
+                "min_replicas": a.min_replicas,
+                "max_replicas": a.max_replicas,
+            });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+    }
+}
+
+fn read_document(io: &mut Io<'_>, raw: &str) -> CliResult<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        return read_manifest(io, path);
+    }
+    if raw == "-" {
+        return read_manifest(io, "-");
+    }
+    Ok(raw.to_owned())
+}
+
+async fn stack(ctx: &Ctx, cmd: StackCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("stack");
+    match cmd {
+        StackCmd::List(a) => do_list(ctx, io, k, a).await,
+        StackCmd::Show(a) => do_show(ctx, io, k, a).await,
+        StackCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        StackCmd::Create(a) => {
+            let c = ctx.client()?;
+            let document = read_document(io, &a.document)?;
+            let spec = json!({ "name": a.name, "document": document });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+        StackCmd::Update(a) => {
+            let c = ctx.client()?;
+            let cur = c.get_value(&k.item_path(&a.name)).await?;
+            let id = str_at(&cur, "/id");
+            let rev = str_at(&cur, "/revision");
+            let document = read_document(io, &a.document)?;
+            let mut name = str_at(&cur, "/spec/name");
+            if name.is_empty() {
+                name = str_at(&cur, "/name");
+            }
+            if name.is_empty() {
+                name = a.name.clone();
+            }
+            let body = json!({
+                "spec": { "name": name, "document": document }
+            });
+            let v = if rev.is_empty() {
+                c.put(&k.item_path(&id), &body).await?
+            } else {
+                c.put_if_match(&k.item_path(&id), &body, &rev).await?
+            };
+            report(ctx, io, k, &v, "updated")
+        }
+        StackCmd::Apply(a) => {
+            let c = ctx.client()?;
+            let id = resolve(&c, k, &a.name).await?;
+            let v = c.post_empty(&format!("{}/{}/apply", k.path, id)).await?;
+            report(ctx, io, k, &v, "applied")
+        }
+        StackCmd::Rollback(a) => {
+            let c = ctx.client()?;
+            let id = resolve(&c, k, &a.name).await?;
+            let body = match a.revision {
+                Some(r) => json!({ "revision": r }),
+                None => json!({}),
+            };
+            let v = c
+                .post(&format!("{}/{}/rollback", k.path, id), &body)
+                .await?;
+            report(ctx, io, k, &v, "rolled back")
+        }
+    }
 }
 
 #[cfg(test)]

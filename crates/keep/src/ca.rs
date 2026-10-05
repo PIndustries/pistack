@@ -38,6 +38,10 @@ const ROOT_TTL_DAYS: u32 = 3650;
 const ISSUING_TTL_DAYS: u32 = 1826;
 /// Content type given to private-key secrets.
 pub const PEM_CONTENT_TYPE: &str = "application/x-pem-file";
+/// Label `keep` puts on secrets it manages itself; reserved for keep.
+pub const ROLE_LABEL: &str = "keep.pistack.io/role";
+/// [`ROLE_LABEL`] value on a certificate's or CA's private-key secret.
+pub const ROLE_PRIVATE_KEY: &str = "private-key";
 
 /// A freshly issued certificate and its key. The key PEM exists only here
 /// until the caller seals it.
@@ -452,7 +456,7 @@ pub(crate) fn seal_pem_secret(
     );
     s.meta
         .labels
-        .insert("keep.pistack.io/role".to_owned(), "private-key".to_owned());
+        .insert(ROLE_LABEL.to_owned(), ROLE_PRIVATE_KEY.to_owned());
     let aad = s.meta.id.to_string();
     s.status.sealed = Some(root_key.seal(pem.as_bytes(), aad.as_bytes())?);
     s.status.public = SecretStatus {

@@ -12,6 +12,10 @@ Each phase ends at a gate an outside tool decides.
 - [x] `pistack-rpc`: host command queue (HTTP long-poll) and event bus
 - [x] `gate`: projects, principals, roles, tokens, API keys, quotas; auth layer on the gateway; `--dev` mode
 - [x] `keep`: cloud CA (root + issuing), encrypted secrets, certificates, join tokens, rustls server/client configs (gateway TLS wiring pending)
+- `keep` root-key backends, chosen with `PISTACK_KEEP_BACKEND` (an unknown or parked value refuses to start; there is no fallback between backends):
+  - [x] `software` (default): the AES-256-GCM root key is base64 in store meta `keep/root_key`.
+  - [ ] Partial: `vault`. The root key is wrapped and unwrapped with a Vault Transit key over HTTP (`PISTACK_KEEP_VAULT_ADDR`, `_TOKEN` or `_TOKEN_FILE`, `_KEY`, optional `_MOUNT`, `_NAMESPACE`, `_CACERT`); only the ciphertext is stored, in `keep/root_key_wrapped`. Tested against a mock Transit server. Not done: moving an existing software key into Vault (refused with an error), re-wrapping after a Transit key rotation, a lab run against real Vault.
+  - [ ] Parked: `pkcs11`. Refused with an error; not implemented.
 - [x] `forge`: Host/Size/Machine, scheduler, reconciler, mock driver, RpcDriver + agent registrar
 - [x] `anvil`: host facts, runtime trait with mock, real `pistack agent --join` loop
 - [x] `loom`: Pod/ReplicaSet/Deployment/Service/ConfigMap/Job/CronJob/Ingress with six controllers on top of forge
@@ -22,7 +26,7 @@ Each phase ends at a gate an outside tool decides.
 - [x] `bench`: `pi` CLI covering 18 nouns, login/profiles, apply, completions. `/console` serves the web portal (login, machines, hosts, networks, volumes, images, buckets).
 - [x] Gate reached 2026-10-02: `pistack server --init` + `pistack agent --join` in separate processes; `pi machine create --wait` reaches Ready on the agent's mock runtime; volumes attach; secrets and certs issue; a Deployment produces Running pods. 233 tests in CI.
 - [x] Decisions for the next phase are recorded in [DECISIONS.md](DECISIONS.md): libvirt/KVM first, PiStack YAML stacks, the PiStack API only in v1, loom on the same records as every other module, youki directly under anvil
-- [x] `silo`, `shelf`, `gauge`, `blueprint` are store-backed HTTP APIs. silo writes object bytes under the data dir (32 MiB cap). gauge keeps an in-memory sample ring and Prometheus text. shelf shares stay Pending. blueprint apply accepts a document and does not create machines.
+- [x] `silo`, `shelf`, `gauge`, `blueprint` are store-backed HTTP APIs. silo writes object bytes under the data dir (streaming PUT, default 5 GiB cap). gauge keeps an in-memory sample ring and Prometheus text. shelf shares stay Pending. blueprint apply accepts a document and does not create machines.
 - [x] A request with no Caller is unauthorized (`no credentials`) on fabric, beacon, relay, blueprint, gauge, slab, mold, silo, and shelf. `--dev` still injects an admin only at the gateway. `/`, `/healthz`, `POST /identity/tokens`, and `/rpc` do not require a token.
 - [x] Gateway TLS: `pistack server --tls-listen ADDR` (env `PISTACK_TLS_LISTEN`) serves the same app with rustls beside plain HTTP. Certs are `data_dir/tls/cert.pem`, `key.pem`, and `ca.pem`, reused when present and otherwise issued by keep. The address must be specific (not `0.0.0.0` or `::`). `--insecure-http` still only silences the plain-HTTP warning when TLS is not configured.
 - [x] mTLS on `/rpc`: the TLS listener verifies client certificates against the cloud CA; verified peer identity reaches `/rpc`. Agents enroll with a spend-once join token (`POST /rpc/agents/enroll`) and present the issued certificate on hello/heartbeat/commands. Strict by default; set `PISTACK_RPC_INSECURE=1` only for local HTTP / tests. Optional `PISTACK_REQUIRE_JOIN=1` still authorizes `x-pistack-join` on every call.
