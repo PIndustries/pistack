@@ -50,6 +50,22 @@ pub struct UploadSummary {
     pub initiated: DateTime<Utc>,
 }
 
+/// One row in a ListMultipartUploads page (upload or rolled-up prefix).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListUploadEntry {
+    Upload(UploadSummary),
+    CommonPrefix(String),
+}
+
+impl ListUploadEntry {
+    pub fn sort_key(&self) -> &str {
+        match self {
+            Self::Upload(u) => u.key.as_str(),
+            Self::CommonPrefix(p) => p.as_str(),
+        }
+    }
+}
+
 /// A staging directory found on disk. `meta` is `None` when `meta.json` is
 /// missing or unreadable (for example a create that crashed half way).
 #[derive(Clone, Debug)]
@@ -369,7 +385,10 @@ impl Client {
     /// `key_marker` skips keys up to and including it; with
     /// `upload_id_marker` as well, uploads for `key_marker` itself with a
     /// larger upload id are kept. `upload_id_marker` without `key_marker`
-    /// is ignored, as in S3. Returns `(page, truncated)`.
+    /// is ignored, as in S3.
+    ///
+    /// Non-empty `delimiter` rolls keys into [`ListUploadEntry::CommonPrefix`]
+    /// (each counts once toward `max_uploads`). Returns `(page, truncated)`.
     pub async fn list_multipart_uploads(
         &self,
         bucket_id: &Id,
@@ -377,12 +396,24 @@ impl Client {
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
         max_uploads: usize,
-    ) -> ApiResult<(Vec<UploadSummary>, bool)> {
+        delimiter: Option<&str>,
+    ) -> ApiResult<(Vec<ListUploadEntry>, bool)> {
         let _bucket = self.store().collection::<Bucket>().get(bucket_id)?;
         let bucket = bucket_id.to_string();
-        let prefix = prefix.filter(|p| !p.is_empty());
+        let prefix = prefix.unwrap_or("").to_owned();
+        let prefix_filter = if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix.as_str())
+        };
         let key_marker = key_marker.filter(|m| !m.is_empty());
-        let upload_id_marker = upload_id_marker.filter(|m| !m.is_empty());
+        // S3 ignores upload-id-marker unless key-marker is set.
+        let upload_id_marker = if key_marker.is_some() {
+            upload_id_marker.filter(|m| !m.is_empty())
+        } else {
+            None
+        };
+        let delimiter = delimiter.filter(|d| !d.is_empty());
 
         let mut uploads: Vec<UploadSummary> = scan_staged(&self.uploads_root(bucket_id))
             .await?
@@ -398,19 +429,21 @@ impl Client {
                     initiated: st.initiated?,
                 })
             })
-            .filter(|u| prefix.is_none_or(|p| u.key.starts_with(p)))
-            .filter(|u| match (key_marker, upload_id_marker) {
-                (None, _) => true,
-                (Some(km), None) => u.key.as_str() > km,
-                (Some(km), Some(um)) => {
-                    u.key.as_str() > km || (u.key == km && u.upload_id.as_str() > um)
-                }
-            })
+            .filter(|u| prefix_filter.is_none_or(|p| u.key.starts_with(p)))
             .collect();
         uploads.sort_by(|a, b| a.key.cmp(&b.key).then(a.upload_id.cmp(&b.upload_id)));
-        let truncated = uploads.len() > max_uploads;
-        uploads.truncate(max_uploads);
-        Ok((uploads, truncated))
+
+        let entries = match delimiter {
+            Some(d) => collapse_uploads_with_delimiter(&uploads, &prefix, d),
+            None => uploads.into_iter().map(ListUploadEntry::Upload).collect(),
+        };
+        let filtered: Vec<ListUploadEntry> = entries
+            .into_iter()
+            .filter(|e| entry_after_marker(e, key_marker, upload_id_marker))
+            .collect();
+        let truncated = filtered.len() > max_uploads;
+        let page = filtered.into_iter().take(max_uploads).collect();
+        Ok((page, truncated))
     }
 
     async fn load_upload_meta(&self, bucket_id: &Id, upload_id: &str) -> ApiResult<UploadMeta> {
@@ -444,6 +477,61 @@ impl Client {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io_err(e)),
         }
+    }
+}
+
+/// After `prefix`, if `delimiter` appears, the rolled-up common prefix
+/// (including the delimiter). `None` means the key is listed as an upload.
+pub(crate) fn common_prefix_after(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    let rest = &key[prefix.len()..];
+    rest.find(delimiter).map(|i| {
+        let end = i + delimiter.len();
+        format!("{}{}", prefix, &rest[..end])
+    })
+}
+
+/// Collapse sorted uploads into Upload / CommonPrefix entries (S3 delimiter).
+pub(crate) fn collapse_uploads_with_delimiter(
+    uploads: &[UploadSummary],
+    prefix: &str,
+    delimiter: &str,
+) -> Vec<ListUploadEntry> {
+    let mut out = Vec::new();
+    let mut last_cp: Option<String> = None;
+    for u in uploads {
+        match common_prefix_after(&u.key, prefix, delimiter) {
+            Some(cp) => {
+                if last_cp.as_ref() != Some(&cp) {
+                    out.push(ListUploadEntry::CommonPrefix(cp.clone()));
+                    last_cp = Some(cp);
+                }
+            }
+            None => {
+                last_cp = None;
+                out.push(ListUploadEntry::Upload(u.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn entry_after_marker(
+    entry: &ListUploadEntry,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> bool {
+    let Some(km) = key_marker else {
+        return true;
+    };
+    match entry {
+        ListUploadEntry::CommonPrefix(cp) => cp.as_str() > km,
+        ListUploadEntry::Upload(u) => match upload_id_marker {
+            None => u.key.as_str() > km,
+            Some(um) => u.key.as_str() > km || (u.key == km && u.upload_id.as_str() > um),
+        },
     }
 }
 
@@ -767,5 +855,48 @@ mod tests {
         assert_eq!(parts[0].part_number, 1);
         assert_eq!(normalize_etag(&parts[0].etag), "aabb");
         assert_eq!(parts[1].part_number, 2);
+    }
+
+    #[test]
+    fn common_prefix_and_collapse() {
+        assert_eq!(
+            common_prefix_after("logs/a/b", "logs/", "/"),
+            Some("logs/a/".into())
+        );
+        assert_eq!(common_prefix_after("logs/a.bin", "logs/", "/"), None);
+        assert_eq!(common_prefix_after("a::b::c", "", "::"), Some("a::".into()));
+
+        let now = Utc::now();
+        let uploads = vec![
+            UploadSummary {
+                key: "a/1".into(),
+                upload_id: "u1".into(),
+                initiated: now,
+            },
+            UploadSummary {
+                key: "a/2".into(),
+                upload_id: "u2".into(),
+                initiated: now,
+            },
+            UploadSummary {
+                key: "b".into(),
+                upload_id: "u3".into(),
+                initiated: now,
+            },
+            UploadSummary {
+                key: "c/x".into(),
+                upload_id: "u4".into(),
+                initiated: now,
+            },
+        ];
+        let entries = collapse_uploads_with_delimiter(&uploads, "", "/");
+        assert_eq!(
+            entries,
+            vec![
+                ListUploadEntry::CommonPrefix("a/".into()),
+                ListUploadEntry::Upload(uploads[2].clone()),
+                ListUploadEntry::CommonPrefix("c/".into()),
+            ]
+        );
     }
 }
