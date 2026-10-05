@@ -37,7 +37,9 @@ pub struct Assembly {
 }
 
 /// Every module in the binary, in mount order. Adding a module = one line.
-pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig) -> Assembly {
+/// `listen` is the server `--listen` address; beacon uses it as the cluster
+/// hint when `PISTACK_DNS_LISTEN` is unset.
+pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly {
     let gate_m = Arc::new(gate::Gate::default());
     let registry = Arc::new(forge::DriverRegistry::new());
     let queue = CommandQueue::new(QueueConfig::default());
@@ -61,7 +63,7 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig) -> Assembly {
         Arc::new(mold::Mold::default()),
         Arc::new(silo::Silo::configured(silo_cfg)),
         Arc::new(shelf::Shelf),
-        Arc::new(beacon::Beacon::default()),
+        Arc::new(beacon::Beacon::with_cluster_hint(listen)),
         Arc::new(relay_module().with_queue(queue.clone())),
         Arc::new(keep::Keep::default()),
         Arc::new(blueprint::Blueprint),
@@ -234,7 +236,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         max_object_bytes = silo_cfg.max_object_bytes,
         "silo: max object size"
     );
-    let asm = assemble(opts.dev, silo_cfg);
+    let asm = assemble(opts.dev, silo_cfg, &opts.listen);
 
     // Start modules first so gate has generated its signing key before the
     // gateway asks for the verifier.

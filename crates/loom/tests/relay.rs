@@ -6,9 +6,9 @@
 use loom::controllers::ingress::IngressController;
 use loom::controllers::Controller;
 use loom::{
-    Endpoint, Ingress, IngressBackend, IngressPath, IngressRule, IngressSpec, IntOrName, Protocol,
-    RelayRealizer, Service, ServiceKind, ServicePort, ServiceRealizer, ServiceSpec,
-    DELETE_ANNOTATION,
+    Endpoint, Ingress, IngressBackend, IngressPath, IngressRule, IngressSpec, IngressTls,
+    IntOrName, Protocol, RelayRealizer, Service, ServiceKind, ServicePort, ServiceRealizer,
+    ServiceSpec, DELETE_ANNOTATION,
 };
 use pistack_store::Store;
 use pistack_types::{kind, Id, Meta};
@@ -499,6 +499,125 @@ async fn ingress_routes_by_host_and_path() {
 }
 
 /// A free port in the node-port range on loopback.
+async fn https_req(keep: &keep::Client, addr: &str, host: &str, path: &str) -> String {
+    let bound: SocketAddr = addr.parse().unwrap();
+    let cfg = keep::tls::client_config(&keep.ca().bundle_pem(), None).unwrap();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+    let tcp = tokio::net::TcpStream::connect(bound).await.unwrap();
+    let name = rustls::pki_types::ServerName::IpAddress(bound.ip().into());
+    let mut tls = connector.connect(name, tcp).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf))
+        .await
+        .expect("timed out")
+        .unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn ingress_tls_serves_https_with_the_named_certificate() {
+    let (store, relay) = realizer();
+    for (name, body) in [("web", &b"from-web"[..]), ("api", &b"from-api"[..])] {
+        let backend = listen().await;
+        let addr = backend.local_addr().unwrap();
+        spawn_http(backend, body);
+        let svc = service(
+            name,
+            ServiceKind::ClusterIp,
+            80,
+            addr.port(),
+            Protocol::Tcp,
+            vec![endpoint(addr)],
+        );
+        store.collection::<Service>().create(svc).unwrap();
+    }
+    let keep = keep::Client::open(&store).unwrap();
+    let spec = keep::CertificateSpec {
+        common_name: "app.example.com".into(),
+        sans: vec!["app.example.com".into(), "127.0.0.1".into()],
+        ..keep::CertificateSpec::default()
+    };
+    keep.issue_certificate(None, "app-cert", spec.clone())
+        .unwrap();
+    keep.issue_certificate(Some(Id::new(kind::PROJECT)), "elsewhere", spec)
+        .unwrap();
+
+    let tls_for = |name: &str| IngressTls {
+        hosts: vec!["app.example.com".into()],
+        secret_name: name.into(),
+    };
+    let mut edge = Ingress {
+        meta: Meta::new(loom::kinds::INGRESS, "secure", None),
+        spec: IngressSpec {
+            rules: vec![IngressRule {
+                host: Some("app.example.com".into()),
+                paths: vec![
+                    rule_path("/", loom::PathType::Prefix, "web"),
+                    rule_path("/api", loom::PathType::Prefix, "api"),
+                ],
+            }],
+            tls: vec![tls_for("app-cert")],
+            ..IngressSpec::default()
+        },
+        status: loom::IngressStatus::default(),
+    };
+    store.collection::<Ingress>().create(edge.clone()).unwrap();
+    let addrs = relay.ensure_ingress(&edge).await.unwrap();
+    assert_eq!(addrs.len(), 2, "{addrs:?}");
+    let (http, https) = (addrs[0].clone(), addrs[1].clone());
+
+    // Plain HTTP keeps working; HTTPS routes the same way with the cert.
+    let got = http_req(&http, "app.example.com", "/").await;
+    assert!(got.contains("from-web"), "{got}");
+    let got = https_req(&keep, &https, "app.example.com", "/").await;
+    assert!(got.contains("from-web"), "{got}");
+    let got = https_req(&keep, &https, "app.example.com", "/api/v1").await;
+    assert!(got.contains("from-api"), "{got}");
+
+    // Reconciling again keeps the same sockets.
+    let again = relay.ensure_ingress(&edge).await.unwrap();
+    assert_eq!(again, addrs);
+
+    // Two different certificates on one ingress are refused, HTTPS goes away.
+    edge.spec.tls = vec![tls_for("app-cert"), tls_for("other-cert")];
+    let err = relay.ensure_ingress(&edge).await.unwrap_err();
+    assert!(err.message.contains("one certificate per ingress"), "{err}");
+    closed(&https).await;
+    let got = http_req(&http, "app.example.com", "/").await;
+    assert!(got.contains("from-web"), "{got}");
+
+    // A missing name, or one from another project, is a clear error.
+    for name in ["no-such-cert", "elsewhere"] {
+        edge.spec.tls = vec![tls_for(name)];
+        let err = relay.ensure_ingress(&edge).await.unwrap_err();
+        assert!(
+            err.message
+                .contains(&format!("ingress certificate '{name}' not found")),
+            "{err}"
+        );
+    }
+
+    // Dropping tls leaves one HTTP listener.
+    edge.spec.tls = vec![tls_for("app-cert")];
+    let https = relay.ensure_ingress(&edge).await.unwrap().remove(1);
+    edge.spec.tls.clear();
+    let addrs = relay.ensure_ingress(&edge).await.unwrap();
+    assert_eq!(addrs, vec![http.clone()]);
+    closed(&https).await;
+    let lbs = store.collection::<relay::Balancer>().list(None).unwrap();
+    assert_eq!(
+        lbs.len(),
+        1,
+        "{:?}",
+        lbs.iter().map(|l| &l.meta.name).collect::<Vec<_>>()
+    );
+
+    relay.remove_ingress(&edge).await.unwrap();
+    closed(&http).await;
+}
+
 fn free_node_port() -> u16 {
     (30000..=32767)
         .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())

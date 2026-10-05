@@ -28,6 +28,8 @@ ipnet.workspace = true
 fabric.workspace = true
 
 [dev-dependencies]
+rustls.workspace = true
+tokio-rustls.workspace = true
 tower.workspace = true
 http-body-util = "0.1"
 tokio-util.workspace = true

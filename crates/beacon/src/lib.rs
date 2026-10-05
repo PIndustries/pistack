@@ -38,11 +38,16 @@ use std::time::Duration;
 /// Timer for a full serial-reconcile pass, in case an event was missed.
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The module. `Default` reads the listen address from `PISTACK_DNS_LISTEN`
-/// (default `127.0.0.1:5353`); tests use [`Beacon::with_listen`] and port 0.
+/// The module. `Default` resolves listen addresses via [`server::listen_addrs`]
+/// (see that function for the env / private-hint / loopback rules). Tests use
+/// [`Beacon::with_listen`] and port 0. The binary passes the server `--listen`
+/// through [`Beacon::with_cluster_hint`] so an unset env binds the cluster
+/// private address when one is known.
 #[derive(Default)]
 pub struct Beacon {
     listen: Option<SocketAddr>,
+    /// Server `--listen` (or similar) used when `PISTACK_DNS_LISTEN` is unset.
+    cluster_hint: Option<String>,
     bound: Arc<OnceLock<SocketAddr>>,
 }
 
@@ -50,6 +55,16 @@ impl Beacon {
     pub fn with_listen(addr: SocketAddr) -> Self {
         Self {
             listen: Some(addr),
+            cluster_hint: None,
+            bound: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Prefer the private address in `server_listen` when the env is unset.
+    pub fn with_cluster_hint(server_listen: impl Into<String>) -> Self {
+        Self {
+            listen: None,
+            cluster_hint: Some(server_listen.into()),
             bound: Arc::new(OnceLock::new()),
         }
     }
@@ -60,7 +75,7 @@ impl Beacon {
         Client::new((*store).clone())
     }
 
-    /// Address the DNS server bound to, once `start` has run.
+    /// First address the DNS server bound to, once `start` has run.
     pub fn bound_addr(&self) -> Option<SocketAddr> {
         self.bound.get().copied()
     }
@@ -85,19 +100,27 @@ impl Module for Beacon {
         let client = self.client(&ctx);
         let secondaries = server::SecondaryCache::new();
 
-        let listen = match self.listen {
-            Some(a) => a,
-            None => server::listen_addr()?,
+        let listens = match self.listen {
+            Some(a) => vec![a],
+            None => {
+                let hint = self
+                    .cluster_hint
+                    .as_deref()
+                    .or(Some(ctx.public_url.as_str()));
+                server::listen_addrs(hint)?
+            }
         };
-        let bound = server::serve(
+        let bounds = server::serve(
             client.clone(),
-            listen,
+            &listens,
             ctx.events.clone(),
             ctx.shutdown.clone(),
             secondaries.clone(),
         )
         .await?;
-        let _ = self.bound.set(bound);
+        if let Some(first) = bounds.first().copied() {
+            let _ = self.bound.set(first);
+        }
 
         // Secondary AXFR pull runs on every node that serves DNS so the local
         // secondary cache stays warm even when this node is not the leader.
