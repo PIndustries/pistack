@@ -644,7 +644,7 @@ where
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
-    let _tmp_guard = crate::client::TmpGuard(tmp.clone());
+    let mut tmp_guard = crate::client::TmpGuard::new(tmp.clone());
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut md5 = Md5::new();
@@ -695,7 +695,9 @@ where
         })
     }
     .await;
-    if result.is_err() {
+    if result.is_ok() {
+        tmp_guard.disarm();
+    } else {
         // Discard the temp file only. A prior successful part at `dest`
         // stays until a later UploadPart renames over it.
         let _ = tokio::fs::remove_file(&tmp).await;

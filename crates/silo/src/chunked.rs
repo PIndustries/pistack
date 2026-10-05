@@ -598,8 +598,20 @@ fn finish_trailer(this: &mut DecodedStream) -> ApiResult<bool> {
         let (k, v) = split_header_line(line)?;
         let k = k.to_ascii_lowercase();
         if k == want_name {
+            if got_value.is_some() {
+                return Err(s3_err(
+                    "InvalidRequest",
+                    format!("duplicate trailing checksum header {want_name}"),
+                ));
+            }
             got_value = Some(v.to_owned());
         } else if k == "x-amz-trailer-signature" {
+            if trailer_sig.is_some() {
+                return Err(s3_err(
+                    "InvalidRequest",
+                    "duplicate x-amz-trailer-signature trailing header",
+                ));
+            }
             trailer_sig = Some(v.to_ascii_lowercase());
         } else {
             return Err(s3_err(
@@ -1241,5 +1253,79 @@ mod tests {
             e.details.get("s3_code").and_then(|v| v.as_str()),
             Some("IncompleteBody")
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_checksum_trailer_rejected() {
+        let payload = b"dup";
+        let mut framed = frame_unsigned_trailer(payload, 8, TrailerChecksum::Crc32);
+        // Inject a second checksum line before the blank terminator.
+        // framed ends with: 0\r\nname:b64\r\n\r\n
+        assert!(framed.ends_with(b"\r\n\r\n"));
+        framed.truncate(framed.len() - 2); // drop final \r\n of terminator
+        let name = TrailerChecksum::Crc32.header_name();
+        framed.extend_from_slice(format!("{name}:AAAAAA==\r\n\r\n").as_bytes());
+        let auth = StreamingAuth {
+            kind: StreamingKind::UnsignedTrailer {
+                checksum: TrailerChecksum::Crc32,
+            },
+            seed_signature: String::new(),
+            signing_key: Vec::new(),
+            amz_date: "20130524T000000Z".into(),
+            scope: "20130524/us-east-1/s3/aws4_request".into(),
+            decoded_content_length: payload.len() as u64,
+        };
+        let stream = futures::stream::once(async move { Ok::<_, String>(Bytes::from(framed)) });
+        let mut decoded = decode_stream(stream, auth);
+        let mut err = None;
+        while let Some(item) = decoded.next().await {
+            if let Err(e) = item {
+                err = Some(e);
+                break;
+            }
+        }
+        let e = err.expect("must error");
+        assert_eq!(
+            e.details.get("s3_code").and_then(|v| v.as_str()),
+            Some("InvalidRequest")
+        );
+        assert!(e.message.contains("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn signed_trailer_split_across_reads_ok() {
+        let secret = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let key = derive_signing_key(secret, "20130524", "us-east-1", "s3");
+        let seed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let amz_date = "20130524T000000Z";
+        let scope = "20130524/us-east-1/s3/aws4_request";
+        let payload = b"signed-split-trailer";
+        let framed = frame_signed_trailer(
+            payload,
+            5,
+            &key,
+            amz_date,
+            scope,
+            seed,
+            TrailerChecksum::Sha256,
+        );
+        let pieces: Vec<Result<Bytes, String>> =
+            framed.iter().map(|&b| Ok(Bytes::from(vec![b]))).collect();
+        let auth = StreamingAuth {
+            kind: StreamingKind::SignedTrailer {
+                checksum: TrailerChecksum::Sha256,
+            },
+            seed_signature: seed.into(),
+            signing_key: key,
+            amz_date: amz_date.into(),
+            scope: scope.into(),
+            decoded_content_length: payload.len() as u64,
+        };
+        let mut decoded = decode_stream(futures::stream::iter(pieces), auth);
+        let mut got = Vec::new();
+        while let Some(item) = decoded.next().await {
+            got.extend_from_slice(&item.expect("ok"));
+        }
+        assert_eq!(&got[..], payload);
     }
 }

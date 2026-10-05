@@ -960,13 +960,19 @@ async fn truncated_chunked_body_http() {
     let signing_key = derive_signing_key(&w.secret, date_stamp, &w.region, "s3");
     let scope = scope(&amz_date, &w.region);
     let host = "silo.test";
-    let data = b"hello";
-    let decoded = data.len().to_string();
+    // Two logical chunks; we send only the first (complete) and omit the rest + zero chunk.
+    let c1 = b"good-chunk-only!!";
+    let c2 = b"never-sent";
+    let decoded = (c1.len() + c2.len()).to_string();
 
-    // Content-Length matches the truncated wire body (header only).
     let seed0 = "0".repeat(64);
-    let sig = chunk_signature(&signing_key, &amz_date, &scope, &seed0, data);
-    let trial = format!("{:x};chunk-signature={sig}\r\n", data.len()).into_bytes();
+    let sig1 = chunk_signature(&signing_key, &amz_date, &scope, &seed0, c1);
+    let mut trial = Vec::new();
+    trial.extend_from_slice(format!("{:x};chunk-signature={sig1}\r\n", c1.len()).as_bytes());
+    trial.extend_from_slice(c1);
+    trial.extend_from_slice(b"\r\n");
+    // truncated: stop here (no second chunk, no final zero chunk)
+
     let mut headers = vec![
         ("content-encoding".into(), "aws-chunked".into()),
         ("content-length".into(), trial.len().to_string()),
@@ -987,8 +993,11 @@ async fn truncated_chunked_body_http() {
         &w.region,
         &amz_date,
     );
-    let sig = chunk_signature(&signing_key, &amz_date, &scope, &seed, data);
-    let truncated = format!("{:x};chunk-signature={sig}\r\n", data.len()).into_bytes();
+    let sig1 = chunk_signature(&signing_key, &amz_date, &scope, &seed, c1);
+    let mut truncated = Vec::new();
+    truncated.extend_from_slice(format!("{:x};chunk-signature={sig1}\r\n", c1.len()).as_bytes());
+    truncated.extend_from_slice(c1);
+    truncated.extend_from_slice(b"\r\n");
     assert_eq!(truncated.len(), trial.len());
 
     let (status, body) = signed_put(
@@ -1010,4 +1019,24 @@ async fn truncated_chunked_body_http() {
         extract_error_code(&String::from_utf8_lossy(&body)),
         "IncompleteBody"
     );
+
+    let (get_status, _) = signed_get(&w.app, &path, &w.access_key_id, &w.secret, &w.region).await;
+    assert_eq!(
+        get_status,
+        StatusCode::NOT_FOUND,
+        "no object after truncate"
+    );
+
+    let mut found_tmp = false;
+    let mut found_object = false;
+    for entry in walkdir_files(&w.silo_root) {
+        if entry.contains(".tmp-") {
+            found_tmp = true;
+        }
+        if entry.contains("trunc.txt") && !entry.contains(".tmp-") {
+            found_object = true;
+        }
+    }
+    assert!(!found_object, "truncated upload must not leave an object");
+    assert!(!found_tmp, "truncated upload must not leave .tmp-* files");
 }

@@ -573,12 +573,26 @@ impl IntoBodyReadErr for axum::Error {
 }
 
 /// Best-effort cleanup of a staging path if the future is cancelled or errors
-/// before rename. After a successful rename the path is gone and Drop is a no-op.
-pub(crate) struct TmpGuard(pub(crate) std::path::PathBuf);
+/// before rename. Call [`TmpGuard::disarm`] after a successful rename so Drop
+/// does not attempt another delete of the (now gone) temp path.
+pub(crate) struct TmpGuard(Option<std::path::PathBuf>);
+
+impl TmpGuard {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    /// Stop Drop from deleting the path (use after a successful rename).
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for TmpGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -598,8 +612,7 @@ where
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
-    // Drop removes the temp path on cancel/error (rename success → path gone → no-op).
-    let _tmp_guard = TmpGuard(tmp.clone());
+    let mut tmp_guard = TmpGuard::new(tmp.clone());
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
         let mut sha = Sha256::new();
@@ -652,8 +665,35 @@ where
         })
     }
     .await;
-    if result.is_err() {
+    if result.is_ok() {
+        tmp_guard.disarm();
+    } else {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     result
+}
+
+#[cfg(test)]
+mod tmp_guard_tests {
+    use super::TmpGuard;
+
+    #[test]
+    fn disarm_skips_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep-me");
+        std::fs::write(&path, b"hi").unwrap();
+        let mut g = TmpGuard::new(path.clone());
+        g.disarm();
+        drop(g);
+        assert!(path.exists(), "disarmed guard must not delete the path");
+    }
+
+    #[test]
+    fn drop_deletes_when_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove-me");
+        std::fs::write(&path, b"hi").unwrap();
+        drop(TmpGuard::new(path.clone()));
+        assert!(!path.exists(), "armed guard must delete on drop");
+    }
 }
