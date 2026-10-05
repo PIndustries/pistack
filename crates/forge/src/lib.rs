@@ -36,6 +36,9 @@ pub use driver::{
     ChannelDriver, DriverCommand, DriverRegistry, DriverReply, DriverRequest, HostDriver,
     MachineRuntime, MockDriver,
 };
+pub use overlay::{
+    ServiceEndpointView, ServicePortView, ServiceRecord, ServiceStatusView, ServiceView,
+};
 pub use reconcile::Reconciler;
 pub use scheduler::{place, place_on_segment, Allocations, Strategy};
 pub use types::*;

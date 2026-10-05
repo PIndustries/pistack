@@ -16,15 +16,16 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use fabric::overlay::{
     is_private_ula, plan, DhcpLease, DhcpRoute, DnatRule, OverlayPlan, PlanFloat, PlanHost,
-    PlanNetwork, PlanPort, PlanProvider, PlanRouter, PortAddress, SegmentPlan, SgRule,
-    PLAN_VERSION,
+    PlanNetwork, PlanPort, PlanProvider, PlanRouter, PortAddress, SegmentPlan, ServiceBackend,
+    ServiceRule, SgRule, PLAN_VERSION,
 };
 use fabric::{
     Direction, EtherType, FloatingIp, Network, NetworkKind, Port, Protocol, Remote, Router,
     SecurityGroup, Subnet,
 };
 use pistack_store::Store;
-use pistack_types::{kind, ApiError, ApiResult, Id};
+use pistack_types::{kind, ApiError, ApiResult, Id, Resource, Spec};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::types::{usable_underlay, Host, Machine};
@@ -56,6 +57,46 @@ pub fn segment_for_nic(net: &Network, address: &str) -> ApiResult<Option<u32>> {
     }
 }
 
+/// The parts of a workload service record the project router needs. The
+/// workload controller owns the record; this view only reads it and must
+/// never be written back, since it drops every other field.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServiceView {
+    #[serde(default)]
+    pub ports: Vec<ServicePortView>,
+}
+
+impl Spec for ServiceView {
+    const KIND: &'static str = "svc";
+}
+
+/// One port of a service. `protocol` is `TCP`, `UDP`, or `SCTP`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServicePortView {
+    #[serde(default)]
+    pub protocol: String,
+    pub port: u16,
+    #[serde(default)]
+    pub target_port: Option<u16>,
+}
+
+/// The allocated cluster address and the ready workload addresses.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServiceStatusView {
+    #[serde(default)]
+    pub cluster_ip: Option<String>,
+    #[serde(default)]
+    pub endpoints: Vec<ServiceEndpointView>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServiceEndpointView {
+    pub ip: String,
+}
+
+/// Read-only service record. See [`ServiceView`].
+pub type ServiceRecord = Resource<ServiceView, ServiceStatusView>;
+
 /// Plans for every host that holds a guest, a project router, or a floating
 /// binding on an overlay segment or a provider network.
 pub fn all_plans(store: &Store) -> ApiResult<Vec<(String, Value)>> {
@@ -77,6 +118,10 @@ pub fn all_plans(store: &Store) -> ApiResult<Vec<(String, Value)>> {
         .map_err(store_err)?;
     let fips = store
         .collection::<FloatingIp>()
+        .list(None)
+        .map_err(store_err)?;
+    let services = store
+        .collection::<ServiceRecord>()
         .list(None)
         .map_err(store_err)?;
     let guests = placed_guests(&ports, &machines, &hosts)?;
@@ -115,6 +160,7 @@ pub fn all_plans(store: &Store) -> ApiResult<Vec<(String, Value)>> {
                 &routers,
                 &ports,
                 &fips,
+                &services,
                 &on_net,
             )?,
             None => Vec::new(),
@@ -655,6 +701,7 @@ fn member_cidrs(group: &Id, v6: bool, ports: &[Port]) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn routers_on(
     network: &Id,
     networks: &[Network],
@@ -662,6 +709,7 @@ fn routers_on(
     routers: &[Router],
     ports: &[Port],
     fips: &[FloatingIp],
+    services: &[ServiceRecord],
     bound: &[&Guest],
 ) -> ApiResult<Vec<PlanRouter>> {
     let on_net: Vec<&Subnet> = subnets
@@ -756,9 +804,70 @@ fn routers_on(
             dnat,
             metadata: true,
             dhcp: dhcp_leases(subnet, bound),
+            services: service_rules(router, subnet, services),
         });
     }
     Ok(out)
+}
+
+/// Cluster addresses the router answers for services in its project. Each
+/// leg lists only the ready workloads on its own subnet; the helper joins
+/// the legs of one namespace. A service with none here is still listed, so
+/// the router refuses it instead of letting it hang. IPv4 and TCP or UDP
+/// only.
+fn service_rules(router: &Router, subnet: &Subnet, services: &[ServiceRecord]) -> Vec<ServiceRule> {
+    let mut out: Vec<ServiceRule> = Vec::new();
+    for svc in services {
+        if svc.meta.project != router.meta.project {
+            continue;
+        }
+        let Some(address) = svc
+            .status
+            .cluster_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        let local: Vec<Ipv4Addr> = svc
+            .status
+            .endpoints
+            .iter()
+            .filter_map(|e| e.ip.parse::<Ipv4Addr>().ok())
+            .filter(|ip| subnet.spec.cidr.contains(&IpAddr::V4(*ip)))
+            .collect();
+        for port in &svc.spec.ports {
+            let protocol = match port.protocol.to_ascii_lowercase().as_str() {
+                "" | "tcp" => "tcp",
+                "udp" => "udp",
+                _ => continue,
+            };
+            if port.port == 0 {
+                continue;
+            }
+            let target = port.target_port.filter(|p| *p != 0).unwrap_or(port.port);
+            let rule = ServiceRule {
+                id: svc.meta.id.to_string(),
+                address: address.to_string(),
+                protocol: protocol.into(),
+                port: port.port,
+                backends: local
+                    .iter()
+                    .map(|ip| ServiceBackend {
+                        address: ip.to_string(),
+                        port: target,
+                    })
+                    .collect(),
+            };
+            if out.iter().any(|r| {
+                r.address == rule.address && r.protocol == rule.protocol && r.port == rule.port
+            }) {
+                continue;
+            }
+            out.push(rule);
+        }
+    }
+    out
 }
 
 /// Leases for the designated router host. Other hosts send no router, so
@@ -1203,6 +1312,116 @@ mod tests {
             })
             .unwrap();
         (net.meta.id.to_string(), port.meta.id.to_string())
+    }
+
+    fn service(
+        project: &Id,
+        ip: &str,
+        endpoints: &[&str],
+        ports: &[(&str, u16, Option<u16>)],
+    ) -> ServiceRecord {
+        ServiceRecord {
+            meta: Meta::new(
+                "svc",
+                format!("web-{}", ip.replace('.', "-")),
+                Some(project.clone()),
+            ),
+            spec: ServiceView {
+                ports: ports
+                    .iter()
+                    .map(|(protocol, port, target_port)| ServicePortView {
+                        protocol: (*protocol).into(),
+                        port: *port,
+                        target_port: *target_port,
+                    })
+                    .collect(),
+            },
+            status: ServiceStatusView {
+                cluster_ip: Some(ip.into()),
+                endpoints: endpoints
+                    .iter()
+                    .map(|ip| ServiceEndpointView { ip: (*ip).into() })
+                    .collect(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn the_project_router_answers_service_addresses_with_ready_backends() {
+        let store = Store::in_memory().unwrap();
+        let client = Client::new(store.clone(), Arc::new(MockBackend::new()));
+        let a = host("a", "10.1.0.1");
+        store.collection::<Host>().create(a.clone()).unwrap();
+        let project = Id::new(kind::PROJECT);
+        let other = Id::new(kind::PROJECT);
+        let (net, port) = tenant(
+            &client,
+            &store,
+            "app",
+            &project,
+            &a,
+            "10.90.0.0/24",
+            7,
+            "10.66.66.84",
+            "10.66.66.85",
+        )
+        .await;
+        let before = plan_for(&all_plans(&store).unwrap(), "a");
+        let fixed = before
+            .networks
+            .iter()
+            .flat_map(|n| &n.ports)
+            .find(|p| p.id == port)
+            .unwrap()
+            .address
+            .clone();
+        let services = store.collection::<ServiceRecord>();
+        // One backend on the leg's subnet, one elsewhere.
+        services
+            .create(service(
+                &project,
+                "10.96.0.10",
+                &[&fixed, "10.77.0.9"],
+                &[
+                    ("TCP", 80, Some(8080)),
+                    ("UDP", 53, None),
+                    ("SCTP", 9, None),
+                ],
+            ))
+            .unwrap();
+        services
+            .create(service(&project, "10.96.0.11", &[], &[("TCP", 443, None)]))
+            .unwrap();
+        services
+            .create(service(
+                &other,
+                "10.96.0.12",
+                &[&fixed],
+                &[("TCP", 80, None)],
+            ))
+            .unwrap();
+
+        let plans = all_plans(&store).unwrap();
+        let plan = plan_for(&plans, "a");
+        let seg = plan.networks.iter().find(|n| n.id == net).unwrap();
+        let rules = &seg.routers[0].services;
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        let web = rules.iter().find(|r| r.port == 80).unwrap();
+        assert_eq!(web.address, "10.96.0.10");
+        assert_eq!(web.protocol, "tcp");
+        assert_eq!(
+            web.backends,
+            vec![ServiceBackend {
+                address: fixed.clone(),
+                port: 8080
+            }]
+        );
+        let dns = rules.iter().find(|r| r.port == 53).unwrap();
+        assert_eq!(dns.protocol, "udp");
+        assert_eq!(dns.backends[0].port, 53);
+        let idle = rules.iter().find(|r| r.port == 443).unwrap();
+        assert!(idle.backends.is_empty(), "no ready backend is still listed");
+        assert!(rules.iter().all(|r| r.address != "10.96.0.12"));
     }
 
     fn placed(name: &str, project: &Id, network: &str, host: &Host) -> Machine {

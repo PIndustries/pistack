@@ -352,6 +352,34 @@ mod node_port_tests {
         }
     }
 
+    /// The router plan reads services through a narrow view in forge. Keep
+    /// the two shapes in step.
+    #[test]
+    fn the_router_plan_reads_the_service_record() {
+        use pistack_types::{Kind, Spec};
+        assert_eq!(<forge::ServiceView as Spec>::KIND, <Service as Kind>::KIND);
+        let mut s = svc(ServiceKind::ClusterIp, &[(80, None)]);
+        s.spec.ports[0].target_port = Some(8080);
+        s.spec.ports.push(ServicePort {
+            protocol: crate::types::Protocol::Udp,
+            port: 53,
+            ..ServicePort::default()
+        });
+        s.status.cluster_ip = Some("10.96.0.10".into());
+        s.status.endpoints = vec![Endpoint {
+            ip: "10.90.0.5".into(),
+            pod: Id::new(crate::kinds::POD),
+            host: None,
+        }];
+        let view: forge::ServiceRecord =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(view.status.cluster_ip.as_deref(), Some("10.96.0.10"));
+        assert_eq!(view.status.endpoints[0].ip, "10.90.0.5");
+        assert_eq!(view.spec.ports[0].protocol, "TCP");
+        assert_eq!(view.spec.ports[0].target_port, Some(8080));
+        assert_eq!(view.spec.ports[1].protocol, "UDP");
+    }
+
     #[test]
     fn cluster_ip_holds_none() {
         let s = svc(ServiceKind::ClusterIp, &[(80, None)]);

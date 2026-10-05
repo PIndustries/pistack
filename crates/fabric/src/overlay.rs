@@ -132,6 +132,9 @@ pub struct RouterNamespace {
     pub snat: bool,
     pub dnat: Vec<DnatRule>,
     pub metadata: bool,
+    /// Service addresses answered in this namespace. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceRule>,
 }
 
 /// A router leg on one tenant network.
@@ -156,6 +159,27 @@ pub struct DnatRule {
     pub id: String,
     pub floating: String,
     pub fixed: String,
+}
+
+/// A service address answered inside the router namespace. New connections to
+/// `address:port` are spread across `backends`. With no backends the router
+/// refuses them instead of letting them hang. IPv4 only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceRule {
+    pub id: String,
+    pub address: String,
+    /// `tcp` or `udp`.
+    pub protocol: String,
+    pub port: u16,
+    #[serde(default)]
+    pub backends: Vec<ServiceBackend>,
+}
+
+/// One ready workload address a service sends to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceBackend {
+    pub address: String,
+    pub port: u16,
 }
 
 /// One DHCP route handed to a guest with its lease.
@@ -264,6 +288,8 @@ pub struct PlanRouter {
     pub metadata: bool,
     /// Input only. Copied onto this leg's [`RouterInterface`]. Not serialized.
     pub dhcp: Vec<DhcpLease>,
+    /// Service addresses for this router. Legs of one router are merged.
+    pub services: Vec<ServiceRule>,
 }
 
 /// Why [`plan`] refused a document.
@@ -538,6 +564,7 @@ fn attach_router(
     let dhcp = canonical_dhcp(&router.dhcp, &cidr)?;
     let external_ip = canonical_external_ip(&router.external_ip)?;
     let dnat = canonical_dnat(&router.dnat)?;
+    let services = canonical_services(&router.services)?;
     debug_assert_eq!(net_hex.len(), 12);
     debug_assert_eq!(rhex.len(), 12);
     let veth_key = format!("{}{}", &net_hex[..6], &rhex[..6]);
@@ -552,7 +579,7 @@ fn attach_router(
     };
 
     if let Some(existing) = pending.iter_mut().find(|p| p.ns.id == router.id) {
-        merge_router(&mut existing.ns, router, external_ip, dnat)?;
+        merge_router(&mut existing.ns, router, external_ip, dnat, services)?;
         existing.ns.interfaces.push(iface);
         return Ok(());
     }
@@ -571,6 +598,7 @@ fn attach_router(
             snat,
             dnat,
             metadata: router.metadata,
+            services,
         },
     });
     Ok(())
@@ -581,6 +609,7 @@ fn merge_router(
     router: &PlanRouter,
     external_ip: Option<String>,
     dnat: Vec<DnatRule>,
+    services: Vec<ServiceRule>,
 ) -> Result<(), PlanError> {
     if let Some(ip) = external_ip {
         if let Some(have) = &ns.external_ip {
@@ -625,6 +654,19 @@ fn merge_router(
             )));
         }
         ns.dnat.push(rule);
+    }
+    // Each leg lists the backends on its own subnet. One namespace answers
+    // for every leg, so it sends to all of them.
+    for rule in services {
+        if let Some(prev) = ns.services.iter_mut().find(|r| same_service(r, &rule)) {
+            for b in rule.backends {
+                if !prev.backends.contains(&b) {
+                    prev.backends.push(b);
+                }
+            }
+            continue;
+        }
+        ns.services.push(rule);
     }
     ns.snat = ns.external_ip.is_some();
     Ok(())
@@ -952,6 +994,74 @@ fn canonical_external_ip(raw: &Option<String>) -> Result<Option<String>, PlanErr
     }
 }
 
+fn same_service(a: &ServiceRule, b: &ServiceRule) -> bool {
+    a.address == b.address && a.protocol == b.protocol && a.port == b.port
+}
+
+fn canonical_services(rules: &[ServiceRule]) -> Result<Vec<ServiceRule>, PlanError> {
+    let mut out: Vec<ServiceRule> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        if rule.id.is_empty() {
+            return Err(PlanError::Invalid("service rule has an empty id".into()));
+        }
+        let address = match canonical_ip("service", &rule.address)? {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(_) => {
+                return Err(PlanError::Invalid(format!(
+                    "service {} address {} is not ipv4",
+                    rule.id, rule.address
+                )))
+            }
+        };
+        if rule.protocol != "tcp" && rule.protocol != "udp" {
+            return Err(PlanError::Invalid(format!(
+                "service {} protocol {} is not tcp or udp",
+                rule.id, rule.protocol
+            )));
+        }
+        if rule.port == 0 {
+            return Err(PlanError::Invalid(format!("service {} port is 0", rule.id)));
+        }
+        let mut backends = Vec::with_capacity(rule.backends.len());
+        for b in &rule.backends {
+            let IpAddr::V4(ip) = canonical_ip("service backend", &b.address)? else {
+                return Err(PlanError::Invalid(format!(
+                    "service {} backend {} is not ipv4",
+                    rule.id, b.address
+                )));
+            };
+            if b.port == 0 {
+                return Err(PlanError::Invalid(format!(
+                    "service {} backend port is 0",
+                    rule.id
+                )));
+            }
+            let backend = ServiceBackend {
+                address: ip.to_string(),
+                port: b.port,
+            };
+            if !backends.contains(&backend) {
+                backends.push(backend);
+            }
+        }
+        let rule = ServiceRule {
+            id: rule.id.clone(),
+            address,
+            protocol: rule.protocol.clone(),
+            port: rule.port,
+            backends,
+        };
+        if out.iter().any(|r| same_service(r, &rule)) {
+            return Err(PlanError::Invalid(format!(
+                "service {}:{}/{} is listed twice",
+                rule.address, rule.port, rule.protocol
+            )));
+        }
+        out.push(rule);
+    }
+    Ok(out)
+}
+
 fn canonical_dnat(rules: &[DnatRule]) -> Result<Vec<DnatRule>, PlanError> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
@@ -1066,7 +1176,97 @@ mod tests {
             dnat: Vec::new(),
             metadata: false,
             dhcp: vec![],
+            services: vec![],
         }
+    }
+
+    fn svc(id: &str, address: &str, port: u16, backends: &[(&str, u16)]) -> ServiceRule {
+        ServiceRule {
+            id: id.into(),
+            address: address.into(),
+            protocol: "tcp".into(),
+            port,
+            backends: backends
+                .iter()
+                .map(|(a, p)| ServiceBackend {
+                    address: (*a).into(),
+                    port: *p,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn router_legs_merge_their_service_rules() {
+        let mut leg_a = router(RTR_A, "10.90.0.1", "10.90.0.0/24");
+        leg_a.services = vec![svc("svc-web", "10.96.0.10", 80, &[("10.90.0.5", 8080)])];
+        let mut leg_b = router(RTR_A, "10.91.0.1", "10.91.0.0/24");
+        leg_b.services = vec![
+            svc("svc-web", "10.96.0.10", 80, &[("10.91.0.6", 8080)]),
+            svc("svc-idle", "10.96.0.11", 53, &[]),
+        ];
+        let shared = svc(
+            "svc-web",
+            "10.96.0.10",
+            80,
+            &[("10.90.0.5", 8080), ("10.91.0.6", 8080)],
+        );
+        let nets = [
+            network(NET_A, 3, vec![leg_a], vec![]),
+            network(NET_B, 4, vec![leg_b], vec![]),
+        ];
+        let plan = plan(&host("10.0.0.1"), &nets, &[]).unwrap();
+        let ns = plan
+            .networks
+            .iter()
+            .flat_map(|s| &s.routers)
+            .next()
+            .unwrap();
+        assert_eq!(ns.services.len(), 2);
+        assert_eq!(ns.services[0], shared);
+        assert!(ns.services[1].backends.is_empty());
+        let json = serde_json::to_value(ns).unwrap();
+        assert_eq!(json["services"][0]["backends"][1]["address"], "10.91.0.6");
+    }
+
+    #[test]
+    fn router_without_services_leaves_the_field_out() {
+        let nets = [network(
+            NET_A,
+            3,
+            vec![router(RTR_A, "10.90.0.1", "10.90.0.0/24")],
+            vec![],
+        )];
+        let plan = plan(&host("10.0.0.1"), &nets, &[]).unwrap();
+        let json = serde_json::to_value(&plan.networks[0].routers[0]).unwrap();
+        assert!(json.get("services").is_none());
+    }
+
+    #[test]
+    fn service_rules_are_checked() {
+        let bad = [
+            svc("", "10.96.0.10", 80, &[]),
+            svc("svc-a", "fd00::10", 80, &[]),
+            svc("svc-a", "10.96.0.10", 0, &[]),
+            svc("svc-a", "10.96.0.10", 80, &[("10.90.0.5", 0)]),
+            ServiceRule {
+                protocol: "sctp".into(),
+                ..svc("svc-a", "10.96.0.10", 80, &[])
+            },
+        ];
+        for rule in bad {
+            let mut leg = router(RTR_A, "10.90.0.1", "10.90.0.0/24");
+            leg.services = vec![rule.clone()];
+            let nets = [network(NET_A, 3, vec![leg], vec![])];
+            assert!(plan(&host("10.0.0.1"), &nets, &[]).is_err(), "{rule:?}");
+        }
+        let mut leg = router(RTR_A, "10.90.0.1", "10.90.0.0/24");
+        leg.services = vec![
+            svc("svc-a", "10.96.0.10", 80, &[]),
+            svc("svc-b", "10.96.0.10", 80, &[]),
+        ];
+        let nets = [network(NET_A, 3, vec![leg], vec![])];
+        assert!(plan(&host("10.0.0.1"), &nets, &[]).is_err());
     }
 
     fn port(id: &str, mac: &str, underlay: &str, address: &str) -> PlanPort {
