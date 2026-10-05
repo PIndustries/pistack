@@ -8,7 +8,9 @@
 //! request-id, tracing, CORS, and authentication. `gate::attach_caller`
 //! turns a bearer token into a `Caller` in request extensions (401 on a bad
 //! token, pass-through when absent). In dev mode a missing caller is
-//! replaced by a synthetic admin so a laptop works with no login.
+//! replaced by a synthetic admin so a laptop works with no login, except
+//! `/silo` SigV4 (header or presigned), which must reach silo without a
+//! bearer `Caller`.
 
 use crate::server::Assembly;
 use axum::{
@@ -158,8 +160,13 @@ async fn audit_mutation(
 }
 
 /// Dev mode only: requests with no caller become the admin.
+///
+/// Skip `/silo` SigV4 (AWS4 header or presigned query): attaching a
+/// synthetic caller would make silo reject the request as bearer+SigV4.
 async fn dev_admin(mut req: Request, next: Next) -> Response {
-    if req.extensions().get::<Caller>().is_none() {
+    if req.extensions().get::<Caller>().is_none()
+        && !gate::silo_sigv4_skips_bearer(req.uri().path(), req.headers(), req.uri().query())
+    {
         req.extensions_mut().insert(Caller {
             principal: Id::new(pistack_types::kind::PRINCIPAL),
             principal_name: "dev-admin".into(),
@@ -169,4 +176,117 @@ async fn dev_admin(mut req: Request, next: Next) -> Response {
         });
     }
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_admin;
+    use axum::{
+        body::{to_bytes, Body},
+        extract::Request,
+        http::{header, StatusCode},
+        middleware,
+        routing::get,
+        Extension, Router,
+    };
+    use gate::{Keys, Verifier};
+    use pistack_store::Store;
+    use pistack_types::Caller;
+    use tower::ServiceExt;
+
+    async fn who(ext: Option<Extension<Caller>>) -> &'static str {
+        if let Some(Extension(c)) = ext {
+            if c.principal_name == "dev-admin" {
+                "dev-admin"
+            } else {
+                "other-caller"
+            }
+        } else {
+            "no-caller"
+        }
+    }
+
+    fn app(dev: bool, verifier: Verifier) -> Router {
+        let mut app = Router::new()
+            .route("/silo/{*rest}", get(who))
+            .route("/healthz", get(who));
+        if dev {
+            app = app.layer(middleware::from_fn(dev_admin));
+        }
+        app.layer(middleware::from_fn_with_state(
+            verifier,
+            gate::attach_caller,
+        ))
+    }
+
+    async fn body(resp: axum::response::Response) -> String {
+        String::from_utf8(to_bytes(resp.into_body(), 1024).await.unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dev_admin_skips_silo_sigv4_header_and_presign() {
+        let store = Store::in_memory().unwrap();
+        let keys = Keys::load_or_create(&store).unwrap();
+        let app = app(true, keys.verifier());
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/silo/bucket/key")
+                    .header(
+                        header::AUTHORIZATION,
+                        "AWS4-HMAC-SHA256 Credential=x/20200101/pistack/s3/aws4_request, Signature=ab",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "no-caller");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/silo/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "no-caller");
+
+        // Non-silo still gets the synthetic admin.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "dev-admin");
+    }
+
+    #[tokio::test]
+    async fn without_dev_non_silo_stays_unauthenticated() {
+        let store = Store::in_memory().unwrap();
+        let keys = Keys::load_or_create(&store).unwrap();
+        let app = app(false, keys.verifier());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body(res).await, "no-caller");
+    }
 }

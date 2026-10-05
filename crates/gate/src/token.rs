@@ -11,7 +11,7 @@
 
 use axum::{
     extract::{FromRef, FromRequestParts, Request, State},
-    http::{header, request::Parts},
+    http::{header, request::Parts, HeaderMap},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -287,8 +287,45 @@ pub fn is_aws4_authorization(value: &str) -> bool {
     v.len() >= PREFIX.len() && v[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
 }
 
-fn path_under_silo(path: &str) -> bool {
+/// True for `/silo` and `/silo/…` (not `/siloevil`).
+pub fn path_under_silo(path: &str) -> bool {
     path == "/silo" || path.starts_with("/silo/")
+}
+
+/// True when a `/silo` request carries SigV4 material that must not get a
+/// synthetic bearer [`Caller`]: a well-formed `AWS4-HMAC-SHA256 ` header, or
+/// a presigned query (`X-Amz-Algorithm=AWS4-HMAC-SHA256` / `X-Amz-Signature`).
+///
+/// Used by gateway `dev_admin` so `--dev` does not inject an admin over
+/// SigV4 (which silo would then reject as bearer+SigV4). `attach_caller`
+/// already leaves header SigV4 alone under `/silo`; presigned requests have
+/// no `Authorization` so they always reach `dev_admin`.
+pub fn silo_sigv4_skips_bearer(path: &str, headers: &HeaderMap, query: Option<&str>) -> bool {
+    if !path_under_silo(path) {
+        return false;
+    }
+    let auths: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
+    if auths.len() == 1 {
+        if let Ok(s) = auths[0].to_str() {
+            if is_aws4_authorization(s) {
+                return true;
+            }
+        }
+    }
+    let Some(q) = query.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    for pair in q.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        // Clients send the algorithm unescaped; accept the literal form.
+        if k.eq_ignore_ascii_case("X-Amz-Algorithm") && v.eq_ignore_ascii_case("AWS4-HMAC-SHA256") {
+            return true;
+        }
+        if k.eq_ignore_ascii_case("X-Amz-Signature") && !v.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -319,6 +356,41 @@ mod tests {
         assert!(path_under_silo("/silo/bucket/key"));
         assert!(!path_under_silo("/identity/tokens"));
         assert!(!path_under_silo("/siloevil"));
+    }
+
+    #[test]
+    fn silo_sigv4_skips_bearer_header_and_presign() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=x/20200101/pistack/s3/aws4_request, Signature=ab"
+                .parse()
+                .unwrap(),
+        );
+        assert!(silo_sigv4_skips_bearer("/silo/b/k", &headers, None));
+        assert!(!silo_sigv4_skips_bearer("/identity/tokens", &headers, None));
+
+        let empty = HeaderMap::new();
+        assert!(silo_sigv4_skips_bearer(
+            "/silo/b/k",
+            &empty,
+            Some("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"),
+        ));
+        assert!(silo_sigv4_skips_bearer(
+            "/silo/b/k",
+            &empty,
+            Some("X-Amz-Signature=abc"),
+        ));
+        assert!(!silo_sigv4_skips_bearer(
+            "/silo/b/k",
+            &empty,
+            Some("list-type=2")
+        ));
+        assert!(!silo_sigv4_skips_bearer(
+            "/other",
+            &empty,
+            Some("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"),
+        ));
     }
 
     #[test]
