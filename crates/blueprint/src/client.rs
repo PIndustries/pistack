@@ -3,8 +3,9 @@
 
 //! The one writer of stacks, kits, and workflows. HTTP handlers call this.
 //! Apply inserts network, subnet, machine, router, pod, listener, and
-//! record set rows into the same store, and updates the rows an earlier
-//! apply of the same stack or kit inserted.
+//! record set rows into the same store, updates the rows an earlier apply
+//! of the same stack or kit inserted, and deletes managed rows the
+//! document no longer names (dependents first).
 
 use crate::types::{
     validate_document, validate_kit, validate_spec, validate_workflow, Kit, KitSpec, Stack,
@@ -12,6 +13,7 @@ use crate::types::{
     WorkflowStatus, APPLYING_MESSAGE, KIT_KIND, REVISION_HISTORY_LIMIT, WORKFLOW_KIND,
 };
 use pistack_store::{Collection, Store, StoreError};
+use pistack_types::error::ErrorCode;
 use pistack_types::{kind, ApiError, ApiResult, Id, Kind, Meta, Phase, Resource, Spec};
 use serde::Deserialize;
 use serde_json::Value;
@@ -119,8 +121,10 @@ impl Client {
     /// `machine`, `router`, `pod`, `listener`, and DNS record set items is
     /// written into this store. A missing name is created. A name an
     /// earlier apply of this stack created is updated to the document's
-    /// spec. Any other existing name is left as it is. Unknown kinds are
-    /// reported and do not fail the apply.
+    /// spec. Any other existing name is left as it is. Managed ids the
+    /// document no longer names are deleted in dependency order (or marked
+    /// for deletion when the owning module deletes asynchronously).
+    /// Unknown kinds are reported and do not fail the apply.
     ///
     /// The phase is `Applying` while rows are written, then `Ready`. On an
     /// error the phase is `Failed`, the message says why, and the error is
@@ -370,7 +374,11 @@ struct Applied {
     updated: Vec<String>,
     present: Vec<String>,
     ignored: Vec<String>,
-    /// Managed ids the document no longer names. They are not deleted.
+    /// Managed ids deleted (or marked for async deletion) because the
+    /// document no longer names them.
+    deleted: Vec<String>,
+    /// Managed ids the document no longer names that could not be deleted
+    /// (unknown kind). Successfully deleted ids are not listed here.
     left: Vec<String>,
 }
 
@@ -404,9 +412,12 @@ impl Applied {
         if !self.ignored.is_empty() {
             parts.push(format!("ignored {}", self.ignored.join(", ")));
         }
+        if !self.deleted.is_empty() {
+            parts.push(format!("deleted {}", self.deleted.join(", ")));
+        }
         if !self.left.is_empty() {
             parts.push(format!(
-                "left {} (no longer in the document)",
+                "left {} (no longer in the document; could not delete)",
                 self.left.join(", ")
             ));
         }
@@ -436,6 +447,7 @@ fn finish(status: &mut StackStatus, managed: &[String], out: &Applied, err: Opti
             all.push(id.clone());
         }
     }
+    all.retain(|id| !out.deleted.iter().any(|d| d == id));
     status.managed = all;
     status.created = out.created.clone();
     status.updated = out.updated.clone();
@@ -1220,6 +1232,135 @@ fn update_record(
     Ok(true)
 }
 
+/// Rank for deleting managed orphans. Lower goes first so dependents leave
+/// before the rows they hold (record sets and listeners, then pods and
+/// machines, then routers, subnets, and networks).
+fn delete_rank(id: &str) -> u8 {
+    if Id::parse(kind::RECORD, id).is_some() {
+        0
+    } else if Id::parse(relay::kinds::LISTENER, id).is_some() {
+        1
+    } else if Id::parse(kind::POD, id).is_some() {
+        2
+    } else if Id::parse(kind::MACHINE, id).is_some() {
+        3
+    } else if Id::parse(kind::ROUTER, id).is_some() {
+        4
+    } else if Id::parse(kind::SUBNET, id).is_some() {
+        5
+    } else if Id::parse(kind::NETWORK, id).is_some() {
+        6
+    } else {
+        7
+    }
+}
+
+/// Run an async delete from the sync realize path.
+fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(fut),
+    }
+}
+
+fn already_gone(err: ApiError) -> ApiResult<()> {
+    if err.code == ErrorCode::NotFound {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// Mark a machine for deletion the same way forge's DELETE does.
+fn request_machine_delete(store: &Store, id: &Id) -> ApiResult<()> {
+    match store.collection::<forge::Machine>().modify(id, |m| {
+        m.meta
+            .annotations
+            .entry(forge::DELETE_ANNOTATION.into())
+            .or_insert_with(|| chrono::Utc::now().to_rfc3339());
+        Ok(())
+    }) {
+        Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Delete one managed id through its owning module. `Ok(true)` when the
+/// row was deleted or marked for async deletion; `Ok(false)` when the kind
+/// is unknown to apply.
+fn delete_owned(
+    store: &Store,
+    fabric: &fabric::Client,
+    relay: &relay::Client,
+    beacon: &beacon::Client,
+    id_str: &str,
+) -> ApiResult<bool> {
+    if let Some(id) = Id::parse(kind::RECORD, id_str) {
+        match beacon.delete_recordset(&id) {
+            Ok(_) => return Ok(true),
+            Err(e) => return already_gone(e).map(|()| true),
+        }
+    }
+    if let Some(id) = Id::parse(relay::kinds::LISTENER, id_str) {
+        match block_on_async(relay.delete_listener(&id)) {
+            Ok(_) => return Ok(true),
+            Err(e) => return already_gone(e).map(|()| true),
+        }
+    }
+    if let Some(id) = Id::parse(kind::POD, id_str) {
+        loom::controllers::request_delete(&store.collection::<loom::Pod>(), &id)
+            .map_err(ApiError::from)?;
+        return Ok(true);
+    }
+    if let Some(id) = Id::parse(kind::MACHINE, id_str) {
+        request_machine_delete(store, &id)?;
+        return Ok(true);
+    }
+    if let Some(id) = Id::parse(kind::ROUTER, id_str) {
+        match fabric.delete_router(&id) {
+            Ok(_) => return Ok(true),
+            Err(e) => return already_gone(e).map(|()| true),
+        }
+    }
+    if let Some(id) = Id::parse(kind::SUBNET, id_str) {
+        match fabric.delete_subnet(&id) {
+            Ok(_) => return Ok(true),
+            Err(e) => return already_gone(e).map(|()| true),
+        }
+    }
+    if let Some(id) = Id::parse(kind::NETWORK, id_str) {
+        match fabric.delete_network(&id) {
+            Ok(_) => return Ok(true),
+            Err(e) => return already_gone(e).map(|()| true),
+        }
+    }
+    Ok(false)
+}
+
+/// Delete managed ids the document no longer names, dependents first.
+fn delete_orphans(
+    store: &Store,
+    fabric: &fabric::Client,
+    relay: &relay::Client,
+    beacon: &beacon::Client,
+    orphans: &[String],
+    out: &mut Applied,
+) -> ApiResult<()> {
+    let mut ordered = orphans.to_vec();
+    ordered.sort_by_key(|id| (delete_rank(id), id.clone()));
+    for id in ordered {
+        match delete_owned(store, fabric, relay, beacon, &id)? {
+            true => out.deleted.push(id),
+            false => out.left.push(id),
+        }
+    }
+    Ok(())
+}
+
 /// Realize the resources named in `document`.
 ///
 /// `network`, `subnet`, `machine`, `router`, `pod`, `listener`, and a DNS
@@ -1231,8 +1372,11 @@ fn update_record(
 /// balancer is created when it is missing. A record set is stored through
 /// beacon, which needs a zone: the named zone is created when it is
 /// missing. Unknown kinds are reported and do not fail the apply. Managed
-/// ids the document no longer names are reported as `left` and are not
-/// deleted.
+/// ids the document no longer names are deleted in dependency order
+/// (record sets and listeners before pods and machines, then routers,
+/// subnets, and networks). Machines and pods are marked for deletion;
+/// their controllers finish the work. Resources the stack never created
+/// stay untouched.
 ///
 /// `out` holds what was written even when an item fails part way.
 fn realize(
@@ -1377,11 +1521,12 @@ fn realize(
         .chain(&out.updated)
         .chain(&out.present)
         .collect();
-    out.left = managed
+    let orphans: Vec<String> = managed
         .iter()
         .filter(|id| !touched.contains(id))
         .cloned()
         .collect();
+    delete_orphans(store, &fabric, &relay, &beacon, &orphans, out)?;
     Ok(())
 }
 
@@ -2122,9 +2267,16 @@ spec:
         assert_eq!(back.status.history.len(), 3);
         assert_eq!(back.status.history[2].restored_from, Some(1));
         assert_eq!(back.status.history[2].spec, back.status.history[0].spec);
-        assert_eq!(back.status.left, vec![extra.meta.id.to_string()]);
-        assert!(back.status.message.contains("left"), "{back:?}");
-        assert!(back.status.message.contains("no longer in the document"));
+        assert!(back.status.left.is_empty(), "{back:?}");
+        assert!(back.status.message.contains("deleted"), "{back:?}");
+        assert!(
+            back.status.message.contains(&extra.meta.id.to_string()),
+            "{back:?}"
+        );
+        assert!(
+            !back.status.managed.contains(&extra.meta.id.to_string()),
+            "deleted managed ids leave ownership"
+        );
 
         let net: fabric::Network = named(&store, &project, "app");
         let pod: loom::Pod = named(&store, &project, "web");
@@ -2138,8 +2290,8 @@ spec:
             store
                 .collection::<fabric::Network>()
                 .get(&extra.meta.id)
-                .is_ok(),
-            "rows dropped from the document are not deleted"
+                .is_err(),
+            "rows dropped from the document are deleted"
         );
 
         let forward = client.rollback_stack(&stack.meta.id, Some(2)).unwrap();
@@ -2148,6 +2300,12 @@ spec:
         let listener: relay::Listener = named(&store, &project, "web-http");
         assert_eq!(listener.spec.port, 8080);
         assert!(forward.status.left.is_empty());
+        // Rolling forward recreates the extra network.
+        let extra_again: fabric::Network = named(&store, &project, "extra");
+        assert!(forward
+            .status
+            .managed
+            .contains(&extra_again.meta.id.to_string()));
 
         let err = client.rollback_stack(&stack.meta.id, Some(99)).unwrap_err();
         assert!(err.message.contains("revision 99 not found"), "{err}");
@@ -2225,6 +2383,107 @@ spec:
         assert_eq!(failed.status.phase, StackPhase::Failed);
         let machine: forge::Machine = named(&store, &project, "db");
         assert_eq!(machine.spec.image, "postgres");
+    }
+
+    #[test]
+    fn drop_on_update_deletes_managed_rows_in_dependency_order() {
+        let store = Store::in_memory().unwrap();
+        let client = Client::new(store.clone());
+        let project = Id::new(kind::PROJECT);
+        let full = App {
+            extra: true,
+            ..App::default()
+        };
+        let stack = stack(&client, &project, "app", &full.doc());
+        let first = client.apply_stack(&stack.meta.id).unwrap();
+        assert_eq!(first.status.phase, StackPhase::Ready);
+        let extra: fabric::Network = named(&store, &project, "extra");
+        let record: beacon::RecordSet = named(&store, &project, "web.app.test");
+        let listener: relay::Listener = named(&store, &project, "web-http");
+        let pod: loom::Pod = named(&store, &project, "web");
+        let machine: forge::Machine = named(&store, &project, "db");
+        let router: fabric::Router = named(&store, &project, "edge");
+        let sub: fabric::Subnet = named(&store, &project, "app-net");
+        let net: fabric::Network = named(&store, &project, "app");
+
+        // Keep only the base network: every other managed row is an orphan.
+        set_document(
+            &client,
+            &stack.meta.id,
+            "kind: network\nname: app\nspec:\n  mtu: 1500\n".into(),
+        );
+        let dropped = client.apply_stack(&stack.meta.id).unwrap();
+        assert_eq!(dropped.status.phase, StackPhase::Ready, "{dropped:?}");
+        assert!(dropped.status.left.is_empty(), "{dropped:?}");
+        assert!(dropped.status.message.contains("deleted"), "{dropped:?}");
+        assert_eq!(dropped.status.managed, vec![net.meta.id.to_string()]);
+        // Sync deletes remove the row; async kinds are annotated instead.
+        assert!(store
+            .collection::<beacon::RecordSet>()
+            .get(&record.meta.id)
+            .is_err());
+        assert!(store
+            .collection::<relay::Listener>()
+            .get(&listener.meta.id)
+            .is_err());
+        assert!(store
+            .collection::<fabric::Router>()
+            .get(&router.meta.id)
+            .is_err());
+        assert!(store
+            .collection::<fabric::Subnet>()
+            .get(&sub.meta.id)
+            .is_err());
+        assert!(store
+            .collection::<fabric::Network>()
+            .get(&extra.meta.id)
+            .is_err());
+        let pod_after = store.collection::<loom::Pod>().get(&pod.meta.id).unwrap();
+        assert!(loom::delete_requested(&pod_after), "pod marked for delete");
+        let machine_after = store
+            .collection::<forge::Machine>()
+            .get(&machine.meta.id)
+            .unwrap();
+        assert!(
+            forge::delete_requested(&machine_after),
+            "machine marked for delete"
+        );
+        let kept: fabric::Network = named(&store, &project, "app");
+        assert_eq!(kept.meta.id, net.meta.id);
+    }
+
+    #[test]
+    fn drop_on_rollback_deletes_the_extra_managed_network() {
+        let store = Store::in_memory().unwrap();
+        let client = Client::new(store.clone());
+        let project = Id::new(kind::PROJECT);
+        let v1 = App::default();
+        let v2 = App {
+            extra: true,
+            ..App::default()
+        };
+        let stack = stack(&client, &project, "app", &v1.doc());
+        client.apply_stack(&stack.meta.id).unwrap();
+        set_document(&client, &stack.meta.id, v2.doc());
+        client.apply_stack(&stack.meta.id).unwrap();
+        let extra: fabric::Network = named(&store, &project, "extra");
+        assert!(store
+            .collection::<fabric::Network>()
+            .get(&extra.meta.id)
+            .is_ok());
+
+        let back = client.rollback_stack(&stack.meta.id, None).unwrap();
+        assert_eq!(back.status.phase, StackPhase::Ready, "{back:?}");
+        assert!(back.status.left.is_empty(), "{back:?}");
+        assert!(back.status.message.contains("deleted"), "{back:?}");
+        assert!(!back.status.managed.contains(&extra.meta.id.to_string()));
+        assert!(
+            store
+                .collection::<fabric::Network>()
+                .get(&extra.meta.id)
+                .is_err(),
+            "extra network removed on rollback"
+        );
     }
 
     #[test]
