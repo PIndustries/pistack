@@ -973,7 +973,9 @@ pub struct IngressRule {
 pub struct IngressTls {
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// A `keep` certificate/secret name.
+    /// A `keep` certificate name (or id) in the ingress's project. When set,
+    /// the ingress also serves HTTPS with that certificate; every entry on
+    /// one ingress must name the same certificate.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub secret_name: String,
 }
