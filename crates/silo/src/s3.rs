@@ -18,17 +18,20 @@
 //! ```
 //!
 //! Auth: gate bearer `Caller` (request extensions) or AWS Signature
-//! Version 4 ([`crate::sigv4`]) via keep access keys. Header SigV4 and
-//! presigned GET/PUT URLs are supported; `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
-//! (aws-chunked) returns `NotImplemented`. Single-PUT ETag is the content
-//! MD5 hex (quoted); completed multipart ETag is `{md5-of-part-md5s}-{n}`
-//! (quoted).
+//! Version 4 ([`crate::sigv4`]) via keep access keys. Header SigV4,
+//! presigned GET/PUT, and aws-chunked streaming PutObject/UploadPart
+//! (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+//! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) are supported. Single-PUT
+//! ETag is the content MD5 hex (quoted); completed multipart ETag is
+//! `{md5-of-part-md5s}-{n}` (quoted).
 //!
 //! Staging dirs under `.uploads/` are removed on abort and complete, and
 //! by the [`crate::gc`] sweep once older than `multipart_ttl_secs`.
 //! ListMultipartUploads does not support `delimiter` (no CommonPrefixes)
 //! and does not report Initiator/Owner.
 
+use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
 use crate::http::{content_type_header, load_bucket};
 use crate::multipart::{self, s3_code_of};
@@ -44,6 +47,9 @@ use axum::{
 use pistack_types::{ApiError, ApiResult, Caller};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
+
+type DecodedBodyStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, ApiError>> + Send>>;
 
 const S3_MAX_KEYS: usize = 1000;
 const S3_MAX_UPLOADS: usize = 1000;
@@ -105,16 +111,32 @@ async fn put_object_inner(
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
-    let len = content_length(&headers)?;
+    let wire_len = content_length(&headers)?;
     let expected_sha = req
         .extensions()
         .get::<ExpectedPayloadSha256>()
         .map(|e| e.0.clone());
+    let streaming = req.extensions().get::<StreamingAuth>().cloned();
+    if let Some(ref s) = streaming {
+        if s.decoded_content_length > c.max_object_bytes() as u64 {
+            return Err(multipart::s3_err(
+                "EntityTooLarge",
+                format!(
+                    "object exceeds configured max_object_bytes ({})",
+                    c.max_object_bytes()
+                ),
+            ));
+        }
+    }
+    let object_len = streaming
+        .as_ref()
+        .map(|s| Some(s.decoded_content_length))
+        .unwrap_or(wire_len);
     if let (Some(upload_id), Some(part_raw)) = (q.upload_id.as_deref(), q.part_number.as_deref()) {
         let part_number: u32 = part_raw
             .parse()
             .map_err(|_| multipart::s3_err("InvalidArgument", "partNumber must be a number"))?;
-        let stream = req.into_body().into_data_stream();
+        let stream = maybe_decode_chunked(req.into_body().into_data_stream(), streaming)?;
         let etag = c
             .upload_part(
                 &bucket.meta.id,
@@ -122,7 +144,7 @@ async fn put_object_inner(
                 upload_id,
                 part_number,
                 stream,
-                len,
+                object_len,
                 expected_sha.as_deref(),
             )
             .await?;
@@ -135,13 +157,13 @@ async fn put_object_inner(
         return Ok(resp);
     }
     let ctype = content_type_header(&headers);
-    let stream = req.into_body().into_data_stream();
+    let stream = maybe_decode_chunked(req.into_body().into_data_stream(), streaming)?;
     let obj = c
         .put_object_stream_sha(
             &bucket.meta.id,
             &key,
             stream,
-            len,
+            object_len,
             ctype,
             expected_sha.as_deref(),
         )
@@ -590,6 +612,27 @@ fn etag_value(obj: &Object) -> Option<HeaderValue> {
         return None;
     };
     HeaderValue::from_str(&format!("\"{hex}\"")).ok()
+}
+
+/// If SigV4 middleware attached [`StreamingAuth`], decode aws-chunked framing
+/// into a plain object/part byte stream (verify-before-write happens inside).
+fn maybe_decode_chunked<S, E>(
+    body: S,
+    streaming: Option<StreamingAuth>,
+) -> ApiResult<DecodedBodyStream>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    use futures::StreamExt;
+    Ok(match streaming {
+        Some(auth) => chunked::decode_stream(body, auth).boxed(),
+        None => body
+            .map(|item| {
+                item.map_err(|e| multipart::s3_err("IncompleteBody", format!("reading body: {e}")))
+            })
+            .boxed(),
+    })
 }
 
 fn content_length(headers: &HeaderMap) -> ApiResult<Option<u64>> {

@@ -458,7 +458,7 @@ async fn presigned_get() {
 }
 
 #[tokio::test]
-async fn streaming_payload_not_implemented() {
+async fn streaming_ecdsa_still_not_implemented() {
     let w = world().await;
     let date = amz_now();
     let path = format!("/{}/chunked.txt", w.bucket);
@@ -472,9 +472,9 @@ async fn streaming_payload_not_implemented() {
         &w.secret,
         &w.region,
         &date,
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
         "silo.test",
-        &[],
+        &[("x-amz-decoded-content-length", "0")],
     )
     .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
