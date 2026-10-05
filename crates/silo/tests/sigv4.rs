@@ -1406,3 +1406,71 @@ async fn copy_source_presigned_unsigned_header_access_denied() {
         "AccessDenied"
     );
 }
+
+#[tokio::test]
+async fn copy_object_unsigned_copy_source_access_denied() {
+    let w = world().await;
+    let src = b"copy-object-src";
+    let src_path = format!("/{}/co-src.bin", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &src_path,
+        "",
+        src,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(src),
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dst_path = format!("/{}/co-dst.bin", w.bucket);
+    let copy_src = format!("/{}/co-src.bin", w.bucket);
+    let (status, body, _) = signed_call_partial(
+        &w.app,
+        "PUT",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[("x-amz-copy-source", &copy_src)],
+        &[], // omit from SignedHeaders
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &dst_path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

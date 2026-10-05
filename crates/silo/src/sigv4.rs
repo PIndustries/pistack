@@ -15,8 +15,7 @@
 //!
 //! ECDSA / SigV4A streaming variants return `NotImplemented`.
 //!
-//! When `x-amz-copy-source` is present (UploadPartCopy today; CopyObject
-//! later), it and any present `x-amz-copy-source-*` condition/range headers
+//! When `x-amz-copy-source` is present (UploadPartCopy / CopyObject), it and any present `x-amz-copy-source-*` condition/range headers
 //! must appear in SignedHeaders (header auth and presigned), matching the
 //! streaming `x-amz-decoded-content-length` rule — otherwise `AccessDenied`.
 //!
@@ -321,7 +320,7 @@ fn check_streaming_signed_headers(parsed: &ParsedAuth, kind: &StreamingKind) -> 
 }
 
 /// Headers that must be signed when present alongside `x-amz-copy-source`.
-/// Shared by UploadPartCopy and a future CopyObject.
+/// Shared by UploadPartCopy and CopyObject.
 const COPY_SOURCE_DEPENDENT_HEADERS: &[&str] = &[
     "x-amz-copy-source-range",
     "x-amz-copy-source-if-match",
