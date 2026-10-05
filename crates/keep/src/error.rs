@@ -26,6 +26,12 @@ pub enum KeepError {
     /// A join token or certificate that is unknown, used up, revoked or expired.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    /// The request clashes with state `keep` manages itself.
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// The root-key backend is misconfigured, unreachable or refused.
+    #[error("key backend: {0}")]
+    Backend(String),
 }
 
 pub type Result<T> = std::result::Result<T, KeepError>;
@@ -40,6 +46,8 @@ impl From<KeepError> for ApiError {
             KeepError::NotFound(m) => ApiError::not_found(m),
             KeepError::Invalid(m) => ApiError::bad_request(m),
             KeepError::Unauthorized(m) => ApiError::unauthorized(m),
+            KeepError::Conflict(m) => ApiError::conflict(m),
+            KeepError::Backend(m) => ApiError::unavailable(format!("key backend: {m}")),
         }
     }
 }

@@ -53,7 +53,7 @@ pub trait Module {
 | shelf | Share, ShareAccess | CephFS / NFS |
 | beacon | Zone, RecordSet | its own authoritative server (hickory) |
 | relay | Balancer, Listener, Pool, Member, HealthMonitor | OVN LB (L4), Pingora (L7) |
-| keep | Secret, Certificate, CertificateAuthority | software store, PKCS#11, Vault |
+| keep | Secret, Certificate, CertificateAuthority | root key: software store (default), Vault Transit (partial), PKCS#11 (parked) |
 | blueprint | Stack, Workflow, Kit | every other module |
 | gauge | Metric (Prometheus), Alarm, UsageRecord | anvil reports, events |
 | bench | none | all APIs (CLI + console) |

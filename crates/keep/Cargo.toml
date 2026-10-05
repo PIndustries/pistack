@@ -28,6 +28,7 @@ x509-parser = { workspace = true, features = ["verify-aws"] }
 pem.workspace = true
 aes-gcm.workspace = true
 tokio-rustls.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

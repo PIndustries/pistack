@@ -215,6 +215,10 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
 
     relay::RelayBackend::from_env().map_err(anyhow::Error::msg)?;
+    // PISTACK_KEEP_BACKEND: refuse a bad or parked root-key backend before
+    // any module opens keep.
+    let key_backend = keep::backend::configured().context("keep root-key backend")?;
+    tracing::info!(backend = key_backend.name(), "keep: root-key backend");
     let asm = assemble(opts.dev);
 
     // Start modules first so gate has generated its signing key before the
