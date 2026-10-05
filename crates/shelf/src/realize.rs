@@ -20,23 +20,30 @@
 //! `PISTACK_EXPORTFS` overrides the `exportfs` binary.
 //!
 //! Any other user runs both steps through one helper named by
-//! `PISTACK_SHELF_HELPER`. The call matches fabric's host helper: one
-//! program, `sudo -n`, arguments, and a stdin payload. No shelf daemon and
-//! no second API.
+//! `PISTACK_SHELF_HELPER`. The program in this repo is
+//! `scripts/pistack-shelf-helper`. Install it as
+//! `/usr/local/sbin/pistack-shelf-helper` and point the variable at that
+//! path. The call matches fabric's host helper: one program, `sudo -n`,
+//! arguments, and a stdin payload. No shelf daemon and no second API.
 //!
 //! ```text
 //! sudo -n "$PISTACK_SHELF_HELPER" apply --file <exports-path>
 //! ```
 //!
-//! Stdin is the full file body. The helper must be allowed to:
+//! Stdin is the full file body. The helper creates the parent of
+//! `<exports-path>` when it is missing (normally `/etc/exports.d`), replaces
+//! that one file with exactly those bytes, mode `0644`, and runs
+//! `exportfs -ra`. It exits 0 only when the write and `exportfs -ra` both
+//! succeed. It refuses any path that is not one file directly under
+//! `/etc/exports.d` ending in `.exports`. A sudoers rule for the server user
+//! names only that command, with `NOPASSWD`:
 //!
-//! * create the parent of `<exports-path>` (normally `/etc/exports.d`)
-//! * replace `<exports-path>` with exactly those bytes, mode `0644`
-//! * run `exportfs -ra`
+//! ```text
+//! pistack ALL=(root) NOPASSWD: /usr/local/sbin/pistack-shelf-helper
+//! ```
 //!
-//! It must not edit any other exports file. A sudoers rule should name only
-//! that command, with `NOPASSWD`. `PISTACK_SHELF_EUID`, when set, overrides
-//! the process euid so tests can take either path. Leave it unset on a server.
+//! `PISTACK_SHELF_EUID`, when set, overrides the process euid so tests can
+//! take either path. Leave it unset on a server.
 //!
 //! A failed export is [`Phase::Error`] with the helper or `exportfs` text in
 //! `status.message`. The reconcile loop retries it with exponential backoff.

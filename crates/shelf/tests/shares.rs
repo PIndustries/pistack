@@ -750,6 +750,7 @@ async fn failed_export_is_retried_after_backoff() {
         shutdown: shutdown.clone(),
         public_url: "http://test".into(),
         node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
     };
     Shelf.start(ctx).await.expect("start shelf");
     let app = router(store);
