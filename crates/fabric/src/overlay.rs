@@ -109,6 +109,9 @@ pub struct RouterNamespace {
     /// (`/32` or `/128`) in the namespace. IPv6 is unique-local (`fc00::/7`).
     pub external_ip: Option<String>,
     /// Recorded only. The agent must not move, enslave, or address this device.
+    /// Empty, and left out of the document, when the router has no external
+    /// address: that router gets no external veth.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub external_dev: String,
     /// True only when [`Self::external_ip`] is set.
     pub snat: bool,
@@ -395,7 +398,11 @@ pub fn plan(
             seg.peers.clone_from(&peer_list);
         }
     }
-    for router in pending {
+    for mut router in pending {
+        if router.ns.external_ip.is_none() {
+            // No external address means no external veth, so no underlay to record.
+            router.ns.external_dev.clear();
+        }
         segments[router.at].routers.push(router.ns);
     }
     for seg in &segments {
@@ -1571,6 +1578,23 @@ mod tests {
         let nets = [network(NET_A, 14, vec![mixed], vec![])];
         let err = plan(&host("10.0.0.1"), &nets, &[]).unwrap_err();
         assert!(matches!(err, PlanError::Invalid(ref msg) if msg.contains("snat family")));
+    }
+
+    #[test]
+    fn router_without_external_ip_sends_no_external_dev() {
+        let mut leg = router(RTR_A, "10.90.0.1", "10.90.0.0/24");
+        leg.external_dev = "external".into();
+        let nets = [network(NET_A, 3, vec![leg], vec![])];
+        let plan = plan(&host("10.0.0.1"), &nets, &[]).unwrap();
+        let ns = &plan.networks[0].routers[0];
+        assert!(ns.external_ip.is_none());
+        assert!(!ns.snat);
+        assert!(ns.external_dev.is_empty());
+        let value = serde_json::to_value(&plan).unwrap();
+        let doc = &value["networks"][0]["routers"][0];
+        assert!(doc.get("external_dev").is_none(), "{doc}");
+        let back: OverlayPlan = serde_json::from_value(value).unwrap();
+        assert!(back.networks[0].routers[0].external_dev.is_empty());
     }
 
     #[test]
