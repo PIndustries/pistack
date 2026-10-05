@@ -68,9 +68,28 @@ impl RelayBackend {
         }
     }
 
-    /// Read `PISTACK_RELAY_BACKEND`.
+    /// The backend for an explicit `PISTACK_RELAY_BACKEND` value and the
+    /// `PISTACK_FABRIC_BACKEND` value. An explicit value always wins. When
+    /// it is unset or empty, a server on a real datapath (`hostnat` or
+    /// `overlay`) gets `Forward`, so its balancers move traffic; anything
+    /// else keeps `Mock`.
+    pub fn choose(value: Option<&str>, fabric: Option<&str>) -> Result<Self, String> {
+        let explicit = value.map(str::trim).is_some_and(|v| !v.is_empty());
+        if explicit {
+            return Self::parse(value);
+        }
+        match fabric.map(str::trim) {
+            Some("hostnat") | Some("overlay") => Ok(Self::Forward),
+            _ => Ok(Self::Mock),
+        }
+    }
+
+    /// Read `PISTACK_RELAY_BACKEND`, defaulting from `PISTACK_FABRIC_BACKEND`.
     pub fn from_env() -> Result<Self, String> {
-        Self::parse(std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref())
+        Self::choose(
+            std::env::var("PISTACK_RELAY_BACKEND").ok().as_deref(),
+            std::env::var("PISTACK_FABRIC_BACKEND").ok().as_deref(),
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -86,7 +105,8 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The module. `Default` uses the mock provider so a single-node server is
 /// functional end to end. [`Relay::forward`] is the in-process L4 forwarder
-/// and the HTTP reverse proxy (`PISTACK_RELAY_BACKEND=forward`).
+/// and the HTTP reverse proxy (`PISTACK_RELAY_BACKEND=forward`, or the
+/// default when the fabric backend is `hostnat` or `overlay`).
 pub struct Relay {
     providers: Providers,
     queue: Option<CommandQueue>,
@@ -222,6 +242,26 @@ mod backend_tests {
         );
         assert!(RelayBackend::parse(Some("fwd")).is_err());
         assert!(RelayBackend::parse(Some("ovn")).is_err());
+    }
+
+    #[test]
+    fn a_real_fabric_defaults_to_forward() {
+        use RelayBackend::{Forward, Mock};
+        assert_eq!(RelayBackend::choose(None, None), Ok(Mock));
+        assert_eq!(RelayBackend::choose(None, Some("mock")), Ok(Mock));
+        assert_eq!(RelayBackend::choose(None, Some("hostnat")), Ok(Forward));
+        assert_eq!(RelayBackend::choose(Some(""), Some("overlay")), Ok(Forward));
+        assert_eq!(
+            RelayBackend::choose(Some(" "), Some("overlay")),
+            Ok(Forward)
+        );
+        // An explicit value always wins, including a typo.
+        assert_eq!(
+            RelayBackend::choose(Some("mock"), Some("hostnat")),
+            Ok(Mock)
+        );
+        assert_eq!(RelayBackend::choose(Some("forward"), None), Ok(Forward));
+        assert!(RelayBackend::choose(Some("fwd"), Some("hostnat")).is_err());
     }
 
     #[test]
