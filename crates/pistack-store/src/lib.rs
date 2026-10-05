@@ -431,6 +431,32 @@ impl Store {
         self.backend.put("meta", key, &serde_json::to_vec(value)?)
     }
 
+    /// Put `put_key` and delete `delete_key` in one transaction: after a
+    /// crash the store holds either both old values or both new ones.
+    pub fn put_and_delete_meta<T: Serialize>(
+        &self,
+        put_key: &str,
+        value: &T,
+        delete_key: &str,
+    ) -> Result<()> {
+        self.backend.batch(vec![
+            Op::Put {
+                table: "meta".into(),
+                key: put_key.into(),
+                value: serde_json::to_vec(value)?,
+            },
+            Op::Delete {
+                table: "meta".into(),
+                key: delete_key.into(),
+            },
+        ])
+    }
+
+    /// Delete one meta key.
+    pub fn delete_meta(&self, key: &str) -> Result<bool> {
+        self.backend.delete("meta", key)
+    }
+
     pub fn set_record_log(&self, on: bool) {
         self.backend.set_record_log(on);
     }
@@ -862,6 +888,39 @@ mod tests {
             spec: WidgetSpec { size: 1 },
             status: WidgetStatus::default(),
         }
+    }
+
+    #[test]
+    fn put_and_delete_meta_is_one_transaction() {
+        let store = Store::in_memory().unwrap();
+        store.put_meta("old", &"a").unwrap();
+        store.set_record_log(true);
+        store.put_and_delete_meta("new", &"b", "old").unwrap();
+        assert_eq!(
+            store.get_meta::<String>("new").unwrap().as_deref(),
+            Some("b")
+        );
+        assert!(store.get_meta::<String>("old").unwrap().is_none());
+        // Replicated as one log entry carrying both changes.
+        let log = store.read_log(0, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].ops.len(), 2);
+        assert!(store.delete_meta("new").unwrap());
+        assert!(!store.delete_meta("new").unwrap());
+    }
+
+    #[test]
+    fn a_store_file_opens_once() {
+        let dir = std::env::temp_dir().join(format!("pistack-open-once-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.redb");
+        let (events, _) = broadcast::channel(8);
+        let first = Store::open(&path, events.clone()).unwrap();
+        // What keeps `pistack keep …` off a store a running server holds.
+        assert!(Store::open(&path, events.clone()).is_err());
+        drop(first);
+        assert!(Store::open(&path, events).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
