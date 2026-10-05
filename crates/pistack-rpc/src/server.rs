@@ -6,62 +6,139 @@
 //! Mount it wherever the gateway serves agents; the paths are relative:
 //!
 //! ```text
+//! POST /agents/enroll
 //! POST /agents/hello
 //! POST /agents/heartbeat
 //! GET  /agents/{node}/commands?wait=30&max=16
 //! POST /agents/{node}/results
 //! ```
 //!
-//! Join-token enforcement is off unless the router was built with a store
-//! and `PISTACK_REQUIRE_JOIN=1`. Unset, `/rpc` is the open router. The check
-//! asks keep whether `x-pistack-join` matches an unexpired token that is not
-//! spent. It does not redeem, so a long-poll does not burn a one-time token.
+//! # Auth
+//!
+//! Strict by default: every `/rpc` request except enroll must present a
+//! client certificate that the TLS listener verified against the cloud CA
+//! ([`keep::PeerIdentity`]). Enroll spends a join token once and returns a
+//! CA-signed client certificate for steady-state calls.
+//!
+//! Escape hatch for local HTTP and unit tests: set `PISTACK_RPC_INSECURE=1`
+//! to skip the client-certificate check. Join-token enforcement on every
+//! call stays opt-in via `PISTACK_REQUIRE_JOIN=1` (authorize only; it does
+//! not redeem).
 
 use std::time::Duration;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use keep::PeerIdentity;
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult};
 use serde::Deserialize;
 
 use crate::proto::{
-    AgentHello, Command, CommandResult, Heartbeat, HeartbeatAck, HelloAck, ReportAck,
-    DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
+    AgentHello, Command, CommandResult, EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck,
+    HelloAck, ReportAck, DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
 };
 use crate::queue::CommandQueue;
 
-/// Set to `1` to make [`router_with_store`] require a join token.
-/// Any other value, including unset, leaves the router open.
+/// Set to `1` to make [`router_with_store`] require a join token on every
+/// call. Any other value, including unset, leaves join optional.
 pub const REQUIRE_JOIN_ENV: &str = "PISTACK_REQUIRE_JOIN";
 
-/// Build the agent-facing router over `queue`. Does not require a join token.
+/// Set to `1` to skip the client-certificate requirement on `/rpc`.
+/// Intended only for local development and tests over plain HTTP.
+pub const RPC_INSECURE_ENV: &str = "PISTACK_RPC_INSECURE";
+
+/// Auth knobs for the agent router.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RpcAuth {
+    /// Require `x-pistack-join` matching an unexpired, unspent token.
+    pub require_join: bool,
+    /// Require a verified client certificate common name on the connection.
+    pub require_client_cert: bool,
+}
+
+impl RpcAuth {
+    /// Production defaults from the process environment.
+    pub fn from_env() -> Self {
+        Self {
+            require_join: join_required(),
+            require_client_cert: client_cert_required(),
+        }
+    }
+
+    /// No join token and no client certificate (unit tests / open lab).
+    pub fn open() -> Self {
+        Self {
+            require_join: false,
+            require_client_cert: false,
+        }
+    }
+
+    /// Join token only (existing test helper behaviour).
+    pub fn join_only() -> Self {
+        Self {
+            require_join: true,
+            require_client_cert: false,
+        }
+    }
+
+    /// Client certificate only.
+    pub fn mtls_only() -> Self {
+        Self {
+            require_join: false,
+            require_client_cert: true,
+        }
+    }
+}
+
+/// Build the agent-facing router over `queue`. Does not require join or mTLS.
 pub fn router(queue: CommandQueue) -> Router {
     routes(queue)
 }
 
-/// Same routes as [`router`]. When [`REQUIRE_JOIN_ENV`] is exactly `1`, every
-/// request must carry [`JOIN_HEADER`] matching an unexpired stored join token
-/// that is not a spent one-time token. The token is not redeemed. Any other
-/// env value, including unset, returns the open router and ignores `store`.
+/// Same routes as [`router`], with auth from [`RpcAuth::from_env`].
+///
+/// When [`RPC_INSECURE_ENV`] is not exactly `1`, every request except enroll
+/// must carry a verified client certificate (see [`keep::PeerIdentity`]).
+/// When [`REQUIRE_JOIN_ENV`] is exactly `1`, every request must also carry
+/// [`JOIN_HEADER`] matching an unexpired stored join token that is not a
+/// spent one-time token. The token is not redeemed on those paths.
 pub fn router_with_store(queue: CommandQueue, store: Store) -> Router {
-    if join_required() {
-        tracing::info!("/rpc requires a join token");
-        router_guarded(queue, store)
-    } else {
-        routes(queue)
+    let auth = RpcAuth::from_env();
+    if auth.require_client_cert {
+        tracing::info!("/rpc requires a client certificate (set {RPC_INSECURE_ENV}=1 to disable)");
     }
+    if auth.require_join {
+        tracing::info!("/rpc requires a join token");
+    }
+    router_with_auth(queue, store, auth)
 }
 
-/// Routes that always require a join token. Tests use this so they do not
-/// touch the process environment. The live server goes through
-/// [`router_with_store`].
+/// Routes with an explicit [`RpcAuth`]. Tests use this so they do not touch
+/// the process environment.
+pub fn router_with_auth(queue: CommandQueue, store: Store, auth: RpcAuth) -> Router {
+    let enroll = Router::new()
+        .route("/agents/enroll", post(enroll))
+        .with_state(store.clone());
+    let app = enroll.merge(routes(queue));
+    if !auth.require_join && !auth.require_client_cert {
+        return app;
+    }
+    app.layer(middleware::from_fn_with_state(
+        AuthState { store, auth },
+        require_rpc_auth,
+    ))
+}
+
+/// Routes that always require a join token and never a client certificate.
+/// Tests use this so they do not touch the process environment.
+#[cfg(test)]
 pub(crate) fn router_guarded(queue: CommandQueue, store: Store) -> Router {
-    routes(queue).layer(middleware::from_fn_with_state(store, require_join))
+    router_with_auth(queue, store, RpcAuth::join_only())
 }
 
 fn routes(queue: CommandQueue) -> Router {
@@ -81,9 +158,36 @@ fn join_required_value(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "1")
 }
 
-async fn require_join(State(store): State<Store>, req: Request, next: Next) -> Response {
-    if let Err(err) = check_join(&store, req.headers()) {
-        return err.into_response();
+fn client_cert_required() -> bool {
+    client_cert_required_value(std::env::var(RPC_INSECURE_ENV).ok().as_deref())
+}
+
+fn client_cert_required_value(insecure: Option<&str>) -> bool {
+    insecure.is_none_or(|v| v.trim() != "1")
+}
+
+#[derive(Clone)]
+struct AuthState {
+    store: Store,
+    auth: RpcAuth,
+}
+
+fn is_enroll(req: &Request) -> bool {
+    req.uri().path() == "/agents/enroll" || req.uri().path().ends_with("/agents/enroll")
+}
+
+async fn require_rpc_auth(State(state): State<AuthState>, req: Request, next: Next) -> Response {
+    let enroll = is_enroll(&req);
+    if state.auth.require_join || enroll {
+        // Enroll always needs a join token, even when REQUIRE_JOIN is off.
+        if let Err(err) = check_join(&state.store, req.headers()) {
+            return err.into_response();
+        }
+    }
+    if state.auth.require_client_cert && !enroll {
+        if let Err(err) = check_client_cert(req.extensions()) {
+            return err.into_response();
+        }
     }
     next.run(req).await
 }
@@ -113,6 +217,17 @@ fn accept_join_token(store: &Store, token: &str) -> Result<(), ApiError> {
         .map_err(ApiError::from)
 }
 
+fn check_client_cert(ext: &axum::http::Extensions) -> Result<(), ApiError> {
+    let peer = ext
+        .get::<ConnectInfo<PeerIdentity>>()
+        .map(|c| &c.0)
+        .or_else(|| ext.get::<PeerIdentity>());
+    match peer.and_then(|p| p.common_name.as_deref()) {
+        Some(cn) if !cn.is_empty() => Ok(()),
+        _ => Err(ApiError::unauthorized("missing client certificate")),
+    }
+}
+
 fn check_node_name(name: &str) -> ApiResult<()> {
     if name.is_empty() || name.len() > 253 {
         return Err(ApiError::bad_request(
@@ -128,6 +243,28 @@ fn check_node_name(name: &str) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+async fn enroll(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Json(req): Json<EnrollRequest>,
+) -> ApiResult<Json<EnrollResponse>> {
+    check_node_name(&req.node_name)?;
+    let token = presented_token(&headers)?;
+    // Spend-once exchange: redeem before issuing so a raced second enroll
+    // cannot mint another certificate with the same one-time token.
+    let grant = keep::redeem_join_token(&store, token).map_err(ApiError::from)?;
+    let client = keep::Client::open(&store).map_err(ApiError::from)?;
+    let pki = client
+        .issue_client_cert(&req.node_name)
+        .map_err(ApiError::from)?;
+    Ok(Json(EnrollResponse {
+        cert_pem: pki.cert_pem,
+        key_pem: pki.key_pem,
+        ca_pem: pki.ca_pem,
+        grant,
+    }))
 }
 
 async fn hello(
@@ -188,8 +325,9 @@ async fn results(
 mod tests {
     use std::time::{Duration, Instant};
 
+    use axum::Extension;
     use chrono::{Duration as ChronoDuration, Utc};
-    use keep::{create_join_token, redeem_join_token, JoinToken};
+    use keep::{create_join_token, redeem_join_token, JoinToken, PeerIdentity};
     use pistack_store::Store;
     use pistack_types::Resources;
 
@@ -226,6 +364,16 @@ mod tests {
         assert!(join_required_value(Some(" 1 ")));
     }
 
+    #[test]
+    fn client_cert_required_unless_insecure() {
+        assert!(client_cert_required_value(None));
+        assert!(client_cert_required_value(Some("")));
+        assert!(client_cert_required_value(Some("0")));
+        assert!(client_cert_required_value(Some("true")));
+        assert!(!client_cert_required_value(Some("1")));
+        assert!(!client_cert_required_value(Some(" 1 ")));
+    }
+
     fn hello(name: &str) -> AgentHello {
         AgentHello {
             node_name: name.into(),
@@ -241,6 +389,25 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router_guarded(CommandQueue::default(), store);
+        let h = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), h)
+    }
+
+    async fn serve_auth(
+        store: Store,
+        auth: RpcAuth,
+        peer: Option<PeerIdentity>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut app = router_with_auth(CommandQueue::default(), store, auth);
+        if let Some(p) = peer {
+            // Production inserts ConnectInfo<PeerIdentity> from the TLS
+            // listener; tests inject the same peer type as an Extension.
+            app = app.layer(Extension(p));
+        }
         let h = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -429,18 +596,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unset_require_join_leaves_the_router_open() {
-        if join_required() {
-            return;
-        }
+    async fn open_auth_leaves_the_router_open() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router_with_store(CommandQueue::default(), Store::in_memory().unwrap());
+        let app = router_with_auth(
+            CommandQueue::default(),
+            Store::in_memory().unwrap(),
+            RpcAuth::open(),
+        );
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         let client = AgentClient::new(format!("http://{addr}"), "n1").unwrap();
         client.hello(&hello("n1")).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mtls_router_rejects_missing_cert_and_accepts_peer() {
+        let store = Store::in_memory().unwrap();
+        let (base, server) = serve_auth(store.clone(), RpcAuth::mtls_only(), None).await;
+        let (status, body) = call(&base, "POST", "/agents/hello", None).await;
+        assert_eq!(status, 401, "{body}");
+        message_is(&body, "missing client certificate");
+        server.abort();
+
+        let peer = PeerIdentity {
+            addr: None,
+            common_name: Some("agent-n1".into()),
+        };
+        let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
+        let http = reqwest::Client::new();
+        let resp = http
+            .post(format!("{base}/agents/hello"))
+            .json(&hello("n1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn enroll_spends_join_token_and_returns_client_cert() {
+        let store = Store::in_memory().unwrap();
+        keep::Client::open(&store).unwrap();
+        let (_tok, clear) = create_join_token(&store, "rack", "admin", false, None).unwrap();
+
+        let (base, server) = serve_auth(store.clone(), RpcAuth::mtls_only(), None).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/agents/enroll"))
+            .json(&EnrollRequest {
+                node_name: "n1".into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        message_is(&resp.text().await.unwrap(), "missing join token");
+
+        let resp = http
+            .post(format!("{base}/agents/enroll"))
+            .header(JOIN_HEADER, "pij_nope")
+            .json(&EnrollRequest {
+                node_name: "n1".into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let body = resp.text().await.unwrap();
+        message_is(&body, "unknown join token");
+        assert!(!body.contains("pij_nope"));
+
+        let resp = http
+            .post(format!("{base}/agents/enroll"))
+            .header(JOIN_HEADER, &clear)
+            .json(&EnrollRequest {
+                node_name: "n1".into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let enrolled: EnrollResponse = resp.json().await.unwrap();
+        assert!(enrolled.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(enrolled.key_pem.contains("BEGIN"));
+        assert!(enrolled.ca_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(enrolled.grant.token_name, "rack");
+
+        let der = keep::ca::pem_to_der(&enrolled.cert_pem).unwrap();
+        let keep_client = keep::Client::open(&store).unwrap();
+        assert_eq!(keep_client.verify_client_cert(&der).unwrap(), "n1");
+
+        let resp = http
+            .post(format!("{base}/agents/enroll"))
+            .header(JOIN_HEADER, &clear)
+            .json(&EnrollRequest {
+                node_name: "n1".into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let body = resp.text().await.unwrap();
+        message_is(&body, "join token already used");
+        assert!(!body.contains(&clear));
+
+        let (status, body) = call(&base, "POST", "/agents/hello", None).await;
+        assert_eq!(status, 401, "{body}");
+        message_is(&body, "missing client certificate");
+
         server.abort();
     }
 }

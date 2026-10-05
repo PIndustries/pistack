@@ -38,7 +38,7 @@ pub use client::Client;
 pub use crypto::{RootKey, Sealed};
 pub use error::{KeepError, Result};
 pub use join::{authorize_join_token, create_join_token, redeem_join_token};
-pub use tls::Pki;
+pub use tls::{PeerIdentity, Pki};
 pub use types::*;
 
 #[derive(Default)]
