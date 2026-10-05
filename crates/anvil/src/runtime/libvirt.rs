@@ -2368,6 +2368,10 @@ exit 0
         assert!(args.contains("info"));
         assert!(args.contains("volumes/vol-1"));
         assert!(!args.contains(secret));
+        assert!(
+            !args.lines().any(|line| line == "map" || line == "unmap"),
+            "vm attach must not map the image on the host: {args}"
+        );
         let xml = std::fs::read_to_string(root.join("virshd").join("device.xml")).unwrap();
         assert!(xml.contains("protocol='rbd'"));
         assert!(xml.contains("volumes/vol-1"));

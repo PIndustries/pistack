@@ -31,6 +31,14 @@
 //! Replace `ubuntu` and `/usr/bin/youki` with the agent user and the youki
 //! path on the host.
 //!
+//! An RBD volume on a pod is mapped with `rbd device map`. The device path
+//! (`/dev/rbd/<pool>/<image>` when that link exists, otherwise `/dev/rbdN`)
+//! is stored as the volume's host path, and the pod bind-mounts that path.
+//! Detach and pod delete unmap it. A VM does not: libvirt keeps the image as
+//! a network disk. `PISTACK_RBD` selects the `rbd` binary. A non-root agent
+//! with `PISTACK_RBD_SUDO=1` runs map and unmap as `sudo -n`. The sudoers
+//! line allows only those commands. See the `rbdmap` module.
+//!
 //! When the agent is not root and sudo mode is off, the sandbox creates a
 //! user namespace and maps container uid 0 and gid 0 onto the agent's uid and
 //! gid with size 1. That map does not need `newuidmap`. Each pod container
@@ -43,6 +51,7 @@
 
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
+use pistack_rpc::proto::DiskTarget;
 use pistack_types::{kind, ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -205,6 +214,7 @@ impl MachineRuntime for YoukiRuntime {
                 }
             }
         }
+        unmap_recorded(&bundle).await?;
         remove_bundle(&bundle).await
     }
 
@@ -217,7 +227,8 @@ impl MachineRuntime for YoukiRuntime {
                 req.machine
             )));
         }
-        host_path_ok(&req.path)?;
+        let (path, rbd_mapped) = attach_host_path(req).await?;
+        host_path_ok(&path)?;
         let mut disks = read_disks(&bundle)?;
         let vol = req.volume.to_string();
         let device = if let Some(name) = req.device.as_deref() {
@@ -229,15 +240,17 @@ impl MachineRuntime for YoukiRuntime {
             next_device(&disks)?
         };
         if let Some(slot) = disks.iter_mut().find(|d| d.volume == vol) {
-            slot.path = req.path.clone();
+            slot.path = path;
             slot.device = device.clone();
             slot.read_only = req.read_only;
+            slot.rbd_mapped = rbd_mapped;
         } else {
             disks.push(AttachedDisk {
                 volume: vol,
-                path: req.path.clone(),
+                path,
                 device: device.clone(),
                 read_only: req.read_only,
+                rbd_mapped,
             });
         }
         write_disks(&bundle, &disks)?;
@@ -256,6 +269,8 @@ impl MachineRuntime for YoukiRuntime {
         }
         let vol = req.volume.to_string();
         let mut disks = read_disks(&bundle)?;
+        let recorded = disks.iter().find(|d| d.volume == vol).cloned();
+        release_rbd(req, recorded.as_ref()).await?;
         let before = disks.len();
         disks.retain(|d| d.volume != vol);
         if disks.len() != before {
@@ -747,6 +762,51 @@ struct AttachedDisk {
     device: String,
     #[serde(default)]
     read_only: bool,
+    /// The path is a host device this agent mapped from an RBD image.
+    #[serde(default, skip_serializing_if = "is_false")]
+    rbd_mapped: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Host path to record, and whether detach must unmap it.
+async fn attach_host_path(req: &super::VolumeAttach) -> ApiResult<(String, bool)> {
+    match &req.target {
+        Some(DiskTarget::Rbd {
+            pool,
+            image,
+            monitors,
+            user,
+            key_secret,
+        }) => {
+            let path =
+                super::rbdmap::map_image(pool, image, monitors, user, key_secret, req.read_only)
+                    .await?;
+            Ok((path, true))
+        }
+        _ => Ok((req.path.clone(), false)),
+    }
+}
+
+async fn release_rbd(req: &super::VolumeDetach, recorded: Option<&AttachedDisk>) -> ApiResult<()> {
+    match &req.target {
+        Some(DiskTarget::Rbd { pool, image, .. }) => super::rbdmap::unmap_image(pool, image).await,
+        _ => match recorded {
+            Some(disk) if disk.rbd_mapped => super::rbdmap::unmap_device(&disk.path).await,
+            _ => Ok(()),
+        },
+    }
+}
+
+async fn unmap_recorded(bundle: &Path) -> ApiResult<()> {
+    for disk in read_disks(bundle)? {
+        if disk.rbd_mapped {
+            super::rbdmap::unmap_device(&disk.path).await?;
+        }
+    }
+    Ok(())
 }
 
 struct PreparedVolume {
@@ -2931,6 +2991,11 @@ mod tests {
                 "PISTACK_YOUKI_TEST_EUID",
                 "PISTACK_YOUKI_TEST_EGID",
                 "PISTACK_YOUKI_TEST_USERNS",
+                "PISTACK_RBD",
+                "PISTACK_RBD_SUDO",
+                "PISTACK_RBD_SUDO_BIN",
+                "PISTACK_RBD_TEST_EUID",
+                "PISTACK_RBD_DEV_ROOT",
             ];
             let saved = keys
                 .into_iter()
@@ -2945,6 +3010,11 @@ mod tests {
                 NETNS_ENV,
                 "PISTACK_YOUKI_TEST_EGID",
                 "PISTACK_YOUKI_TEST_USERNS",
+                "PISTACK_RBD",
+                "PISTACK_RBD_SUDO",
+                "PISTACK_RBD_SUDO_BIN",
+                "PISTACK_RBD_TEST_EUID",
+                "PISTACK_RBD_DEV_ROOT",
             ] {
                 std::env::remove_var(key);
             }
@@ -3761,6 +3831,7 @@ mod tests {
                 path: "/dev/null".into(),
                 device: name,
                 read_only: false,
+                rbd_mapped: false,
             });
         }
         assert_eq!(
@@ -4003,6 +4074,7 @@ mod tests {
                 path: disk.to_string_lossy().into_owned(),
                 device: "vdb".into(),
                 read_only: true,
+                rbd_mapped: false,
             }],
         )
         .unwrap();
@@ -4112,6 +4184,360 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Stub `rbd`. `device list` and `showmapped` print the mapped image.
+    /// `device map` records it and prints `/dev/rbd0`. `device unmap` clears it.
+    fn write_rbd(path: &Path, log: &Path, state: &Path) {
+        let log_q = shell_quote(log);
+        let state_q = shell_quote(state);
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> {log_q}
+printf '\n' >> {log_q}
+if [ "$1" = device ] && [ "$2" = list ]; then
+  if [ -f {state_q} ]; then cat {state_q}; else printf '%s\n' '[]'; fi
+  exit 0
+fi
+if [ "$1" = showmapped ]; then
+  if [ -f {state_q} ]; then cat {state_q}; else printf '%s\n' '[]'; fi
+  exit 0
+fi
+if [ "$1" = device ] && [ "$2" = map ]; then
+  spec=$3
+  pool=${{spec%%/*}}
+  image=${{spec#*/}}
+  printf '[{{"id":"0","pool":"%s","namespace":"","name":"%s","snap":"-","device":"/dev/rbd0"}}]\n' "$pool" "$image" > {state_q}
+  printf '%s\n' /dev/rbd0
+  exit 0
+fi
+if [ "$1" = device ] && [ "$2" = unmap ]; then
+  printf '%s\n' '[]' > {state_q}
+  exit 0
+fi
+echo unexpected >&2
+exit 1
+"#,
+            log_q = log_q,
+            state_q = state_q,
+        );
+        write_executable(path, &body);
+    }
+
+    fn rbd_invocations(log: &str) -> Vec<Vec<String>> {
+        log.split("\n\n")
+            .map(|block| {
+                block
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|block| !block.is_empty())
+            .collect()
+    }
+
+    fn count_rbd(inv: &[Vec<String>], first: &str, second: &str) -> usize {
+        inv.iter()
+            .filter(|args| {
+                args.first().map(String::as_str) == Some(first)
+                    && args.get(1).map(String::as_str) == Some(second)
+            })
+            .count()
+    }
+
+    fn rbd_target(keyring: Option<String>) -> pistack_rpc::proto::DiskTarget {
+        pistack_rpc::proto::DiskTarget::Rbd {
+            pool: "volumes".into(),
+            image: "img-1".into(),
+            monitors: vec!["10.1.0.5:6789".into(), "mon.example".into()],
+            user: "pistack".into(),
+            key_secret: keyring,
+        }
+    }
+
+    fn rbd_attach(
+        machine: Id,
+        volume: Id,
+        target: pistack_rpc::proto::DiskTarget,
+    ) -> crate::runtime::VolumeAttach {
+        crate::runtime::VolumeAttach {
+            machine,
+            volume,
+            path: String::new(),
+            device: None,
+            read_only: true,
+            target: Some(target),
+        }
+    }
+
+    fn write_pod_mount(bundle: &Path, volume: &str) {
+        let plan = serde_json::json!({
+            "volumes": [{"name": "data", "source": {"volume": volume}}],
+            "containers": [{
+                "index": 0,
+                "mounts": [{
+                    "name": "data",
+                    "mount_path": "/data",
+                    "read_only": false,
+                    "sub_path": ""
+                }]
+            }]
+        });
+        std::fs::write(
+            bundle.join("mount-plan.json"),
+            serde_json::to_vec_pretty(&plan).unwrap(),
+        )
+        .unwrap();
+        let dir = bundle.join("containers").join("0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            br#"{"mounts":[{"destination":"/proc","type":"proc","source":"proc"}]}"#,
+        )
+        .unwrap();
+    }
+
+    fn mount_source(bundle: &Path, dest: &str) -> String {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("containers").join("0").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        cfg["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == dest)
+            .unwrap()["source"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn rbd_pod_maps_a_host_device_and_unmaps_on_detach() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-rbd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let rbd_log = tmp.join("rbd.log");
+        let rbd_state = tmp.join("mapped.json");
+        let rbd = tmp.join("rbd");
+        write_rbd(&rbd, &rbd_log, &rbd_state);
+        let _env = EnvGuard::set(&tmp.join("youki"), &tmp.join("state"));
+        std::env::set_var("PISTACK_RBD", &rbd);
+        std::env::set_var("PISTACK_RBD_TEST_EUID", "0");
+
+        let rt = YoukiRuntime;
+        let machine = Id::new(kind::MACHINE);
+        let volume = Id::new(kind::VOLUME);
+        let secret = "super-secret-value";
+        let missing = rbd_attach(
+            machine.clone(),
+            volume.clone(),
+            rbd_target(Some(secret.into())),
+        );
+        assert_eq!(
+            rt.attach_volume(&missing).await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert!(!rbd_log.exists());
+
+        let bundle = tmp.join("state").join(machine.to_string());
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), b"{}").unwrap();
+        write_pod_mount(&bundle, &volume.to_string());
+        let refused = rt.attach_volume(&missing).await.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Unavailable);
+        assert!(!refused.message.contains(secret));
+        assert!(!rbd_log.exists());
+
+        let keyring = tmp.join("keyring");
+        std::fs::write(&keyring, secret).unwrap();
+        let attach = rbd_attach(
+            machine.clone(),
+            volume.clone(),
+            rbd_target(Some(keyring.to_string_lossy().into_owned())),
+        );
+        assert_eq!(rt.attach_volume(&attach).await.unwrap(), "vdb");
+        let disks = read_disks(&bundle).unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].path, "/dev/rbd0");
+        assert!(disks[0].rbd_mapped);
+        assert_eq!(disks[0].device, "vdb");
+        assert_eq!(mount_source(&bundle, "/data"), "/dev/rbd0");
+        let mounted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("containers").join("0").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let data = mounted["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == "/data")
+            .unwrap();
+        assert_eq!(
+            data["options"],
+            serde_json::json!(["bind", "rprivate", "ro"])
+        );
+
+        assert_eq!(rt.attach_volume(&attach).await.unwrap(), "vdb");
+        assert_eq!(read_disks(&bundle).unwrap()[0].path, "/dev/rbd0");
+        let inv = rbd_invocations(&std::fs::read_to_string(&rbd_log).unwrap());
+        assert_eq!(count_rbd(&inv, "device", "map"), 1);
+        assert!(count_rbd(&inv, "device", "list") >= 2);
+        let map = inv
+            .iter()
+            .find(|args| {
+                args.first().map(String::as_str) == Some("device")
+                    && args.get(1).map(String::as_str) == Some("map")
+            })
+            .unwrap();
+        assert!(map.iter().any(|arg| arg == "volumes/img-1"));
+        assert!(map.iter().any(|arg| arg == "--id"));
+        assert!(map.iter().any(|arg| arg == "pistack"));
+        assert!(map.iter().any(|arg| arg == "-m"));
+        assert!(map
+            .iter()
+            .any(|arg| arg == "10.1.0.5:6789,mon.example:6789"));
+        assert!(map.iter().any(|arg| arg == "--keyring"));
+        assert!(map.iter().any(|arg| arg == keyring.to_str().unwrap()));
+        assert!(map.iter().any(|arg| arg == "--read-only"));
+        let logged = std::fs::read_to_string(&rbd_log).unwrap();
+        assert!(!logged.contains(secret));
+
+        rt.detach_volume(&crate::runtime::VolumeDetach {
+            machine: machine.clone(),
+            volume: volume.clone(),
+            path: String::new(),
+            device: None,
+            target: Some(rbd_target(Some(keyring.to_string_lossy().into_owned()))),
+        })
+        .await
+        .unwrap();
+        assert!(read_disks(&bundle).unwrap().is_empty());
+        let inv = rbd_invocations(&std::fs::read_to_string(&rbd_log).unwrap());
+        assert_eq!(count_rbd(&inv, "device", "unmap"), 1);
+        assert_eq!(std::fs::read_to_string(&rbd_state).unwrap().trim(), "[]");
+
+        let dev_root = tmp.join("dev");
+        let stable = dev_root.join("rbd").join("volumes").join("img-1");
+        std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/dev/rbd0", &stable).unwrap();
+        std::env::set_var("PISTACK_RBD_DEV_ROOT", &dev_root);
+        assert_eq!(rt.attach_volume(&attach).await.unwrap(), "vdb");
+        assert_eq!(
+            read_disks(&bundle).unwrap()[0].path,
+            stable.to_string_lossy().as_ref()
+        );
+        assert_eq!(mount_source(&bundle, "/data"), stable.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn rbd_sudo_maps_for_a_non_root_agent_and_delete_unmaps() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-rbd-sudo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = scopeguard_dir(&tmp);
+        let youki_log = tmp.join("youki.log");
+        let youki = tmp.join("youki");
+        write_script(&youki, &youki_log, 0);
+        let rbd_log = tmp.join("rbd.log");
+        let rbd_state = tmp.join("mapped.json");
+        let rbd = tmp.join("rbd");
+        write_rbd(&rbd, &rbd_log, &rbd_state);
+        let sudo_log = tmp.join("sudo.log");
+        let sudo = tmp.join("sudo");
+        write_sudo(&sudo, &sudo_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_RBD", &rbd);
+        std::env::set_var("PISTACK_RBD_SUDO", "1");
+        std::env::set_var("PISTACK_RBD_SUDO_BIN", &sudo);
+        std::env::set_var("PISTACK_RBD_TEST_EUID", "1000");
+
+        let keyring = tmp.join("keyring");
+        std::fs::write(&keyring, b"key-bytes").unwrap();
+        let rt = YoukiRuntime;
+        let machine = Id::new(kind::MACHINE);
+        let volume = Id::new(kind::VOLUME);
+        let bundle = state.join(machine.to_string());
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), b"{}").unwrap();
+        let attach = rbd_attach(
+            machine.clone(),
+            volume.clone(),
+            rbd_target(Some(keyring.to_string_lossy().into_owned())),
+        );
+        assert_eq!(rt.attach_volume(&attach).await.unwrap(), "vdb");
+        assert_eq!(read_disks(&bundle).unwrap()[0].path, "/dev/rbd0");
+
+        let rbd_arg = rbd.to_string_lossy().into_owned();
+        let sudo_lines = arg_lines(&std::fs::read_to_string(&sudo_log).unwrap());
+        assert!(
+            sudo_lines
+                .windows(4)
+                .any(|w| { w[0] == "-n" && w[1] == rbd_arg && w[2] == "device" && w[3] == "map" }),
+            "map was not run through sudo: {sudo_lines:?}"
+        );
+        assert!(sudo_lines
+            .iter()
+            .all(|line| line != "list" && line != "showmapped"));
+        let direct = rbd_invocations(&std::fs::read_to_string(&rbd_log).unwrap());
+        assert!(count_rbd(&direct, "device", "list") >= 1);
+
+        rt.delete(&machine).await.unwrap();
+        assert!(!bundle.exists());
+        let sudo_lines = arg_lines(&std::fs::read_to_string(&sudo_log).unwrap());
+        assert!(
+            sudo_lines.windows(4).any(|w| {
+                w[0] == "-n" && w[1] == rbd_arg && w[2] == "device" && w[3] == "unmap"
+            }),
+            "unmap was not run through sudo: {sudo_lines:?}"
+        );
+
+        std::env::set_var("PISTACK_RBD_TEST_EUID", "0");
+        let _ = std::fs::write(&sudo_log, b"");
+        let _ = std::fs::write(&rbd_log, b"");
+        let root_machine = Id::new(kind::MACHINE);
+        let root_bundle = state.join(root_machine.to_string());
+        std::fs::create_dir_all(&root_bundle).unwrap();
+        std::fs::write(root_bundle.join("config.json"), b"{}").unwrap();
+        let root_attach = rbd_attach(
+            root_machine,
+            volume,
+            rbd_target(Some(keyring.to_string_lossy().into_owned())),
+        );
+        assert_eq!(rt.attach_volume(&root_attach).await.unwrap(), "vdb");
+        assert_eq!(std::fs::read_to_string(&sudo_log).unwrap(), "");
+        let direct = rbd_invocations(&std::fs::read_to_string(&rbd_log).unwrap());
+        assert_eq!(count_rbd(&direct, "device", "map"), 1);
+        assert!(direct.iter().all(|args| args.iter().all(|arg| arg != "-n")));
     }
 
     fn ns_kinds(cfg: &serde_json::Value) -> Vec<&str> {
