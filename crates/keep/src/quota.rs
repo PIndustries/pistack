@@ -19,8 +19,35 @@
 //! and a multi-use token may be redeemed at most
 //! [`KeepConfig::max_join_token_uses`] times.
 //!
-//! Count, check and create run under one process-wide lock, so two
-//! concurrent creates cannot both take the last slot.
+//! ## How exact the limits are
+//!
+//! Count, check and create run under one process-wide lock
+//! ([`admission`]), so two concurrent creates in a process cannot both take
+//! the last slot. A join-token redeem re-checks `max_uses` inside a
+//! single-key compare-and-set (`Collection::modify`, retried on a revision
+//! mismatch).
+//!
+//! Across control-plane nodes the store has one writer. Followers answer
+//! every mutating request, `/rpc` included, with `409 not the leader`
+//! (`reject_follower_writes` in the binary) and only apply the leader's
+//! log. So every create runs in the leader's process, under this lock, and
+//! in steady state every limit is exact cluster-wide.
+//!
+//! The store has no transaction or compare-and-set that spans a count and
+//! an insert: `modify` covers one key, and a batch is atomic but cannot
+//! read. Nothing stronger is built here, because it would not help: the
+//! only way to over-shoot is two nodes accepting writes at once. That
+//! happens when a leader misses the election that replaced it. It keeps
+//! accepting writes until a vote request with a higher term reaches it.
+//! Each acting leader then admits up to the limit against its own copy, so
+//! each copy stays within the limit while they are apart. A node that then
+//! steps down applies the new leader's log after its own commit index, so
+//! its copy can hold its own rows from the split plus the new leader's.
+//! The bound per project (per cloud for join tokens) is therefore
+//! `limit × k`, where `k` is the number of nodes that accepted writes
+//! during the split: twice the limit with two. Redemptions of one join
+//! token have the same bound, `max_uses × k`. The new leader's copy, which
+//! the cluster follows from then on, never exceeds the limit.
 
 use parking_lot::{Mutex, MutexGuard};
 use pistack_store::Store;
@@ -40,6 +67,8 @@ pub const DEFAULT_MAX_CERTIFICATES_PER_PROJECT: u64 = 500;
 pub const DEFAULT_MAX_ACCESS_KEYS_PER_PROJECT: u64 = 100;
 pub const DEFAULT_MAX_LIVE_JOIN_TOKENS: u64 = 100;
 pub const DEFAULT_MAX_JOIN_TOKEN_USES: u64 = 100;
+/// Seven days.
+pub const DEFAULT_JOIN_TOKEN_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Module settings under `[modules.keep]` / `PISTACK__MODULES__KEEP__*`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +84,10 @@ pub struct KeepConfig {
     pub max_live_join_tokens: u64,
     /// Most redemptions a multi-use join token may allow (and its default).
     pub max_join_token_uses: u64,
+    /// How long an expired or used-up join token is kept before the
+    /// leader's sweep deletes it (see `sweep.rs`). `0` deletes it on the
+    /// next sweep.
+    pub join_token_grace_secs: u64,
 }
 
 impl Default for KeepConfig {
@@ -65,11 +98,17 @@ impl Default for KeepConfig {
             max_access_keys_per_project: DEFAULT_MAX_ACCESS_KEYS_PER_PROJECT,
             max_live_join_tokens: DEFAULT_MAX_LIVE_JOIN_TOKENS,
             max_join_token_uses: DEFAULT_MAX_JOIN_TOKEN_USES,
+            join_token_grace_secs: DEFAULT_JOIN_TOKEN_GRACE_SECS,
         }
     }
 }
 
 impl KeepConfig {
+    /// [`join_token_grace_secs`](Self::join_token_grace_secs) as a duration.
+    pub fn join_token_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.join_token_grace_secs)
+    }
+
     /// Read `[modules.keep]` from a loaded config. Missing section → defaults.
     pub fn from_config(cfg: &pistack_config::Config) -> std::result::Result<Self, String> {
         let c: Self = cfg.module("keep").map_err(|e| e.to_string())?;
@@ -102,7 +141,8 @@ impl KeepConfig {
     }
 }
 
-/// Held across count → check → create.
+/// Held across count → check → create. Process-wide; see the module docs
+/// for why that is cluster-wide in steady state and what a split can do.
 pub(crate) fn admission() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock()
@@ -198,5 +238,25 @@ mod tests {
         let zero =
             pistack_config::Config::from_toml("[modules.keep]\nmax_join_token_uses = 0\n").unwrap();
         assert!(KeepConfig::from_config(&zero).is_err());
+    }
+
+    #[test]
+    fn join_token_grace_defaults_to_a_week_and_can_be_set() {
+        let d = KeepConfig::default();
+        assert_eq!(d.join_token_grace_secs, 7 * 24 * 3600);
+        assert_eq!(
+            d.join_token_grace(),
+            std::time::Duration::from_secs(604_800)
+        );
+        let cfg = pistack_config::Config::from_toml(
+            "[modules.keep]
+join_token_grace_secs = 0
+",
+        )
+        .unwrap();
+        assert_eq!(
+            KeepConfig::from_config(&cfg).unwrap().join_token_grace_secs,
+            0
+        );
     }
 }

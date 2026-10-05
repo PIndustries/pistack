@@ -13,7 +13,11 @@
 //! unspent tokens exist at once, and a multi-use token allows at most
 //! `max_join_token_uses` redemptions (its default when none is asked for).
 //! A redeem re-checks the count inside the store write, so concurrent
-//! redemptions cannot overshoot `max_uses`.
+//! redemptions cannot overshoot `max_uses` (see `quota.rs` for the bound
+//! across a leadership split).
+//!
+//! Expired and used-up tokens are deleted by the leader's sweep after
+//! `join_token_grace_secs` (see `sweep.rs`).
 
 use chrono::{Duration, Utc};
 use pistack_store::Store;

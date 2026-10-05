@@ -983,3 +983,39 @@ async fn access_keys_over_http() {
     assert_eq!(bob_key.caller.principal, bob);
     assert_eq!(bob_key.caller.project, Some(proj));
 }
+
+#[tokio::test]
+async fn start_sweeps_dead_join_tokens_on_the_leader() {
+    let store = Store::in_memory().unwrap();
+    let (dead, _) = keep::create_join_token(&store, "dead", "admin", false, None).unwrap();
+    let (live, _) = keep::create_join_token(&store, "live", "admin", false, None).unwrap();
+    let col = store.collection::<keep::JoinToken>();
+    col.modify(&dead.meta.id, |t| {
+        t.spec.expires_at = chrono::Utc::now() - chrono::Duration::days(30);
+        Ok(())
+    })
+    .unwrap();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: CancellationToken::new(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    Keep::default().start(ctx.clone()).await.unwrap();
+    let mut gone = false;
+    for _ in 0..100 {
+        if col.try_get(&dead.meta.id).unwrap().is_none() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        gone,
+        "the leader's sweep should delete a token dead for 30 days"
+    );
+    assert!(col.try_get(&live.meta.id).unwrap().is_some());
+    ctx.shutdown.cancel();
+}
