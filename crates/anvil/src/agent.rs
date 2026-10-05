@@ -65,6 +65,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Entry point for the host agent: gather facts, pick runtimes, run until
 /// ctrl-c.
 pub async fn run_agent(opts: AgentOpts) -> anyhow::Result<()> {
+    // Pod mounts live under this directory. The binary is the only caller.
+    if std::env::var_os("PISTACK_DATA_DIR").is_none() {
+        std::env::set_var("PISTACK_DATA_DIR", &opts.data_dir);
+    }
     let mut facts = facts::gather_at(&opts.data_dir);
     let identity = agent_identity(&opts.data_dir, std::env::var(NODE_NAME_ENV).ok().as_deref())?;
     facts.node_name = identity.name;
@@ -526,6 +530,8 @@ impl Agent {
             CommandKind::DetachVolume => {
                 let req: VolumeDetach = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, volume = %req.volume, "anvil: detach volume");
+                // Unmount first. A busy mount must not be followed by an unmap.
+                crate::runtime::volfs::release_volume(&req.volume).await?;
                 self.runtimes.detach_volume(&req).await?;
                 Ok(serde_json::Value::Null)
             }
@@ -588,10 +594,11 @@ impl Agent {
 
 /// Attach, then confirm only when the host path is real.
 ///
-/// A local file or an LVM device is checked before the runtime records it.
-/// An RBD pod map is checked after the runtime publishes `/dev/rbdN` or
-/// the recorded path. A VM network disk has no host map and confirms with
-/// no path once the runtime attach succeeds. A failed check undoes the attach.
+/// A pod is the attach youki recorded in `disks.json`. The agent mounts a
+/// filesystem on that volume and confirms the mount directory. A VM local
+/// file or LVM device is checked as the host path. An RBD image on a VM has
+/// no host map and confirms with no path once the runtime attach succeeds.
+/// A failed check undoes the attach.
 async fn confirm_volume_attach(
     runtimes: &Runtimes,
     req: &VolumeAttach,
@@ -600,6 +607,14 @@ async fn confirm_volume_attach(
         host_path_ready(&req.path)?;
     }
     let device = runtimes.attach_volume(req).await?;
+    let recorded = recorded_disk_path(
+        &crate::runtime::youki::state_dir(),
+        &req.machine,
+        &req.volume,
+    );
+    if let Some(path) = recorded.filter(|path| !path.is_empty()) {
+        return confirm_pod_mount(runtimes, req, device, &path).await;
+    }
     match confirmed_host_path(req).await {
         Ok(host_path) => Ok(VolumeAttached { device, host_path }),
         Err(err) => {
@@ -616,6 +631,48 @@ async fn confirm_volume_attach(
                     volume = %req.volume,
                     error = %undo_err,
                     "anvil: undoing attach after the host path check failed"
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Mount the pod volume and record the directory. A mount or format error
+/// unmounts, detaches the loop device, and asks the runtime to unmap.
+async fn confirm_pod_mount(
+    runtimes: &Runtimes,
+    req: &VolumeAttach,
+    device: String,
+    recorded: &str,
+) -> ApiResult<VolumeAttached> {
+    match crate::runtime::volfs::mount_for_pod(req, recorded).await {
+        Ok(host_path) => Ok(VolumeAttached {
+            device,
+            host_path: Some(host_path),
+        }),
+        Err(err) => {
+            if let Err(undo_err) = crate::runtime::volfs::release_volume(&req.volume).await {
+                tracing::warn!(
+                    machine = %req.machine,
+                    volume = %req.volume,
+                    error = %undo_err,
+                    "anvil: unmounting a failed pod attach failed"
+                );
+            }
+            let undo = VolumeDetach {
+                machine: req.machine.clone(),
+                volume: req.volume.clone(),
+                path: req.path.clone(),
+                device: Some(device),
+                target: req.target.clone(),
+            };
+            if let Err(undo_err) = runtimes.detach_volume(&undo).await {
+                tracing::warn!(
+                    machine = %req.machine,
+                    volume = %req.volume,
+                    error = %undo_err,
+                    "anvil: undoing a pod attach after the mount failed"
                 );
             }
             Err(err)
@@ -1288,6 +1345,7 @@ pub fn report(m: RunningMachine) -> MachineReport {
 mod tests {
     use super::*;
     use crate::runtime::MachineRuntime;
+    use async_trait::async_trait;
 
     #[test]
     fn plug_uses_cloud_only_when_that_runtime_owns_vms() {
@@ -1916,6 +1974,7 @@ still here
             path: path.to_owned(),
             device: Some("vdb".into()),
             read_only: false,
+            fs_type: String::new(),
             target,
         }
     }
@@ -2009,5 +2068,370 @@ still here
             .unwrap_err();
         assert!(err.message.contains("does not exist"), "{err}");
         assert!(!err.message.contains("does not attach"), "{err}");
+    }
+
+    struct SavedEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SavedEnv {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn write_exe(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn shell_quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    fn tool_script(log: &std::path::Path, name: &str, extra: &str) -> String {
+        let quoted = shell_quote(log);
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{name}' \"$@\" >> {quoted}\nprintf '\\n' >> {quoted}\n{extra}\n",
+            name = name,
+            quoted = quoted,
+            extra = extra,
+        )
+    }
+
+    struct VolfsTools {
+        log: std::path::PathBuf,
+        losetup: std::path::PathBuf,
+        blkid: std::path::PathBuf,
+        mkfs: std::path::PathBuf,
+        mount: std::path::PathBuf,
+        umount: std::path::PathBuf,
+        empty: std::path::PathBuf,
+        mount_fail: std::path::PathBuf,
+    }
+
+    fn install_volfs_tools(dir: &std::path::Path) -> VolfsTools {
+        let log = dir.join("volfs.log");
+        let empty = dir.join("blkid-empty");
+        let mount_fail = dir.join("mount-fail");
+        let losetup = dir.join("losetup");
+        let blkid = dir.join("blkid");
+        let mkfs = dir.join("mkfs.ext4");
+        let mount = dir.join("mount");
+        let umount = dir.join("umount");
+        write_exe(
+            &losetup,
+            &tool_script(
+                &log,
+                "losetup",
+                "if [ \"$1\" = \"--find\" ]; then printf '%s\\n' /dev/loop7; exit 0; fi\nexit 0",
+            ),
+        );
+        write_exe(
+            &blkid,
+            &tool_script(
+                &log,
+                "blkid",
+                &format!(
+                    "if [ -f {} ]; then exit 2; fi\nprintf '%s\\n' ext4\nexit 0",
+                    shell_quote(&empty)
+                ),
+            ),
+        );
+        write_exe(&mkfs, &tool_script(&log, "mkfs.ext4", "exit 0"));
+        write_exe(
+            &mount,
+            &tool_script(
+                &log,
+                "mount",
+                &format!(
+                    "if [ -f {} ]; then echo 'mount failed: no such device' >&2; exit 1; fi\nexit 0",
+                    shell_quote(&mount_fail)
+                ),
+            ),
+        );
+        write_exe(&umount, &tool_script(&log, "umount", "exit 0"));
+        VolfsTools {
+            log,
+            losetup,
+            blkid,
+            mkfs,
+            mount,
+            umount,
+            empty,
+            mount_fail,
+        }
+    }
+
+    fn pod_bundle(state: &std::path::Path, machine: &Id) {
+        let bundle = state.join(machine.to_string());
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), b"{}").unwrap();
+    }
+
+    fn command_names(log: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut at_start = true;
+        for line in log.lines() {
+            if line.is_empty() {
+                at_start = true;
+                continue;
+            }
+            if at_start {
+                names.push(line.to_owned());
+                at_start = false;
+            }
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn pod_attach_records_the_mount_directory() {
+        let _youki = crate::runtime::youki::youki_env_lock().lock().await;
+        let _volfs = crate::runtime::volfs::env_lock().lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = install_volfs_tools(tmp.path());
+        let data = tmp.path().join("data");
+        let state = tmp.path().join("youki");
+        std::fs::create_dir_all(&data).unwrap();
+        let _saved = SavedEnv::capture(&[
+            "PISTACK_YOUKI_STATE",
+            "PISTACK_LOSETUP",
+            "PISTACK_BLKID",
+            "PISTACK_MKFS",
+            "PISTACK_MOUNT",
+            "PISTACK_UMOUNT",
+            "PISTACK_VOLFS_DATA_DIR",
+            "PISTACK_VOLFS_SUDO",
+            "PISTACK_VOLFS_TEST_EUID",
+        ]);
+        std::env::set_var("PISTACK_YOUKI_STATE", &state);
+        std::env::set_var("PISTACK_LOSETUP", &tools.losetup);
+        std::env::set_var("PISTACK_BLKID", &tools.blkid);
+        std::env::set_var("PISTACK_MKFS", &tools.mkfs);
+        std::env::set_var("PISTACK_MOUNT", &tools.mount);
+        std::env::set_var("PISTACK_UMOUNT", &tools.umount);
+        std::env::set_var("PISTACK_VOLFS_DATA_DIR", &data);
+        std::env::remove_var("PISTACK_VOLFS_SUDO");
+        std::env::set_var("PISTACK_VOLFS_TEST_EUID", "0");
+        std::fs::write(&tools.empty, b"1").unwrap();
+
+        let file = tmp.path().join("disk.raw");
+        std::fs::write(&file, b"volume").unwrap();
+        let req = attach_req(file.to_str().unwrap(), None);
+        pod_bundle(&state, &req.machine);
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::YoukiRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Container, rt);
+
+        let attached = confirm_volume_attach(&rts, &req).await.unwrap();
+        let mounted = data
+            .join("slab")
+            .join("mounts")
+            .join(req.volume.to_string());
+        assert_eq!(attached.host_path.as_deref(), mounted.to_str());
+        assert!(mounted.is_dir());
+        assert_eq!(
+            command_names(&std::fs::read_to_string(&tools.log).unwrap()),
+            vec![
+                "losetup".to_owned(),
+                "blkid".to_owned(),
+                "mkfs.ext4".to_owned(),
+                "mount".to_owned()
+            ]
+        );
+    }
+
+    /// A runtime that accepts the disk and does not write `disks.json`.
+    struct HoldRuntime;
+
+    #[async_trait]
+    impl MachineRuntime for HoldRuntime {
+        fn name(&self) -> &'static str {
+            "libvirt"
+        }
+
+        async fn start(&self, _req: &MachineRequest) -> ApiResult<RunningMachine> {
+            Err(ApiError::not_implemented("unused"))
+        }
+
+        async fn stop(&self, _id: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &Id) -> ApiResult<()> {
+            Ok(())
+        }
+
+        async fn list(&self) -> ApiResult<Vec<RunningMachine>> {
+            Ok(Vec::new())
+        }
+
+        async fn attach_volume(&self, req: &VolumeAttach) -> ApiResult<String> {
+            Ok(req.device.clone().unwrap_or_else(|| "vdb".into()))
+        }
+
+        async fn detach_volume(&self, _req: &VolumeDetach) -> ApiResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn vm_attach_keeps_the_file_path() {
+        let _volfs = crate::runtime::volfs::env_lock().lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("losetup.log");
+        let losetup = tmp.path().join("losetup");
+        write_exe(
+            &losetup,
+            &tool_script(&log, "losetup", "echo 'losetup should not run' >&2\nexit 1"),
+        );
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let _saved = SavedEnv::capture(&[
+            "PISTACK_LOSETUP",
+            "PISTACK_VOLFS_DATA_DIR",
+            "PISTACK_VOLFS_SUDO",
+            "PISTACK_VOLFS_TEST_EUID",
+        ]);
+        std::env::set_var("PISTACK_LOSETUP", &losetup);
+        std::env::set_var("PISTACK_VOLFS_DATA_DIR", &data);
+        std::env::remove_var("PISTACK_VOLFS_SUDO");
+        std::env::set_var("PISTACK_VOLFS_TEST_EUID", "0");
+
+        let file = tmp.path().join("disk.raw");
+        std::fs::write(&file, b"volume").unwrap();
+        let req = attach_req(file.to_str().unwrap(), None);
+        let rt: crate::runtime::SharedRuntime = Arc::new(HoldRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Vm, rt);
+
+        let attached = confirm_volume_attach(&rts, &req).await.unwrap();
+        assert_eq!(attached.host_path.as_deref(), file.to_str());
+        assert!(!log.exists());
+        let mounted = data
+            .join("slab")
+            .join("mounts")
+            .join(req.volume.to_string());
+        assert!(!mounted.exists());
+    }
+
+    #[tokio::test]
+    async fn pod_rbd_mount_failure_unmaps_the_device() {
+        let _youki = crate::runtime::youki::youki_env_lock().lock().await;
+        let _volfs = crate::runtime::volfs::env_lock().lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = install_volfs_tools(tmp.path());
+        let data = tmp.path().join("data");
+        let state = tmp.path().join("youki");
+        let dev_root = tmp.path().join("dev");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&dev_root).unwrap();
+        std::fs::write(&tools.empty, b"1").unwrap();
+        std::fs::write(&tools.mount_fail, b"1").unwrap();
+
+        let rbd_log = tmp.path().join("rbd.log");
+        let rbd_state = tmp.path().join("rbd-state");
+        let rbd = tmp.path().join("rbd");
+        write_exe(
+            &rbd,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {log}\nprintf '\\n' >> {log}\n\
+                 if [ \"$1\" = device ] && [ \"$2\" = list ]; then\n\
+                   if [ -s {state} ]; then cat {state}; else printf '%s\\n' '[]'; fi\n\
+                   exit 0\nfi\n\
+                 if [ \"$1\" = device ] && [ \"$2\" = map ]; then\n\
+                   printf '%s\\n' '[{{\"id\":\"0\",\"pool\":\"volumes\",\"namespace\":\"\",\"name\":\"img-1\",\"snap\":\"-\",\"device\":\"/dev/rbd0\"}}]' > {state}\n\
+                   printf '%s\\n' /dev/rbd0\nexit 0\nfi\n\
+                 if [ \"$1\" = device ] && [ \"$2\" = unmap ]; then\n\
+                   printf '%s\\n' '[]' > {state}\nexit 0\nfi\nexit 1\n",
+                log = shell_quote(&rbd_log),
+                state = shell_quote(&rbd_state),
+            ),
+        );
+
+        let _saved = SavedEnv::capture(&[
+            "PISTACK_YOUKI_STATE",
+            "PISTACK_LOSETUP",
+            "PISTACK_BLKID",
+            "PISTACK_MKFS",
+            "PISTACK_MOUNT",
+            "PISTACK_UMOUNT",
+            "PISTACK_VOLFS_DATA_DIR",
+            "PISTACK_VOLFS_SUDO",
+            "PISTACK_VOLFS_TEST_EUID",
+            "PISTACK_RBD",
+            "PISTACK_RBD_SUDO",
+            "PISTACK_RBD_SUDO_BIN",
+            "PISTACK_RBD_TEST_EUID",
+            "PISTACK_RBD_DEV_ROOT",
+        ]);
+        std::env::set_var("PISTACK_YOUKI_STATE", &state);
+        std::env::set_var("PISTACK_LOSETUP", &tools.losetup);
+        std::env::set_var("PISTACK_BLKID", &tools.blkid);
+        std::env::set_var("PISTACK_MKFS", &tools.mkfs);
+        std::env::set_var("PISTACK_MOUNT", &tools.mount);
+        std::env::set_var("PISTACK_UMOUNT", &tools.umount);
+        std::env::set_var("PISTACK_VOLFS_DATA_DIR", &data);
+        std::env::remove_var("PISTACK_VOLFS_SUDO");
+        std::env::set_var("PISTACK_VOLFS_TEST_EUID", "0");
+        std::env::set_var("PISTACK_RBD", &rbd);
+        std::env::remove_var("PISTACK_RBD_SUDO");
+        std::env::remove_var("PISTACK_RBD_SUDO_BIN");
+        std::env::set_var("PISTACK_RBD_TEST_EUID", "0");
+        std::env::set_var("PISTACK_RBD_DEV_ROOT", &dev_root);
+
+        let req = attach_req(
+            "",
+            Some(DiskTarget::Rbd {
+                pool: "volumes".into(),
+                image: "img-1".into(),
+                monitors: vec!["10.1.0.5:6789".into()],
+                user: "pistack".into(),
+                key_secret: None,
+            }),
+        );
+        pod_bundle(&state, &req.machine);
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::YoukiRuntime);
+        let mut rts = Runtimes::new();
+        rts.insert(MachineKind::Container, rt);
+
+        let err = confirm_volume_attach(&rts, &req).await.unwrap_err();
+        assert!(err.message.contains("mount"), "{err}");
+        let volfs_log = std::fs::read_to_string(&tools.log).unwrap();
+        let names = command_names(&volfs_log);
+        assert!(names.contains(&"blkid".to_owned()), "{volfs_log}");
+        assert!(names.contains(&"mkfs.ext4".to_owned()), "{volfs_log}");
+        assert!(names.contains(&"mount".to_owned()), "{volfs_log}");
+        assert!(names.contains(&"umount".to_owned()), "{volfs_log}");
+        assert!(!names.contains(&"losetup".to_owned()), "{volfs_log}");
+        let rbd_text = std::fs::read_to_string(&rbd_log).unwrap();
+        assert!(rbd_text.contains("unmap"), "{rbd_text}");
+        let disks = std::fs::read_to_string(state.join(req.machine.to_string()).join("disks.json"))
+            .unwrap_or_default();
+        assert!(!disks.contains(&req.volume.to_string()), "{disks}");
+        let mounted = data
+            .join("slab")
+            .join("mounts")
+            .join(req.volume.to_string());
+        assert!(!mounted.exists());
+        assert!(!mounted.with_extension("loop").exists());
     }
 }

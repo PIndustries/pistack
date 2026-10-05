@@ -13,6 +13,7 @@ pub mod libvirt;
 mod metal;
 pub mod mock;
 pub(crate) mod rbdmap;
+pub(crate) mod volfs;
 pub mod youki;
 
 use async_trait::async_trait;

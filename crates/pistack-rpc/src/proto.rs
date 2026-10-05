@@ -368,11 +368,11 @@ impl std::fmt::Debug for DiskTarget {
 /// Payload of [`CommandKind::AttachVolume`]. `path` is the host file `slab`
 /// created, or an LVM device path under `/dev`. `target` is set when the
 /// volume is an RBD image. A VM agent attaches that image as a network disk
-/// and leaves `path` empty. A pod agent maps the image to a host block
-/// device and records that device path for the pod mount. The agent may
-/// stage a copy of a regular file under its libvirt image directory when
-/// AppArmor will not let qemu open `path` in place. A block device is
-/// attached in place.
+/// and leaves `path` empty. A pod agent maps the image, mounts a filesystem
+/// on the block device, and records that directory. The agent may stage a
+/// copy of a regular file under its libvirt image directory when AppArmor
+/// will not let qemu open `path` in place. A block device is attached in
+/// place.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeAttach {
     pub machine: Id,
@@ -385,17 +385,24 @@ pub struct VolumeAttach {
     /// Slab attach target. Absent for a host path carried in `path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<DiskTarget>,
+    /// Filesystem to create when the block device has none.
+    ///
+    /// Empty means `ext4`. A pod attach formats only when `blkid` reports
+    /// no type. A VM attach ignores this field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fs_type: String,
 }
 
 /// What the guest disk was named, and the host path the agent checked.
 ///
-/// `host_path` is set when a local file, an LVM device node, or an RBD
-/// mapped device (`/dev/rbdN` or the recorded path) exists. A VM network
-/// disk has no host map, so `host_path` is absent.
+/// For a pod, `host_path` is the directory where the volume is mounted.
+/// For a VM, it is a local file or an LVM device node. A VM network disk
+/// has no host map, so `host_path` is absent.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeAttached {
     pub device: String,
-    /// Host file or device node the agent verified. Absent for a VM network disk.
+    /// Mount directory for a pod, or the file or device node for a VM.
+    /// Absent for a VM network disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_path: Option<String>,
 }
@@ -704,6 +711,7 @@ mod tests {
         .unwrap();
         assert!(old.target.is_none());
         assert_eq!(old.path, "/dev/vg/lv");
+        assert!(old.fs_type.is_empty());
 
         let secret = "super-secret-value";
         let with = serde_json::json!({

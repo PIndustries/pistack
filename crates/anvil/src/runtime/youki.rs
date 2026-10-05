@@ -22,8 +22,9 @@
 //! environment.
 //!
 //! Unpacking a layer keeps the permission bits from each tar header, including
-//! execute. Directory modes are applied after that layer's children are on
-//! disk, so a read-only directory does not block extraction. Setuid and
+//! execute. A directory image is copied the same way: each regular file keeps
+//! its mode, and a directory mode is applied after that directory's children
+//! are on disk, so a read-only directory does not block the copy. Setuid and
 //! setgid are kept only when the agent is root or sudo mode is on; otherwise
 //! those two bits are cleared. A symlink whose target resolves outside the
 //! rootfs is not followed.
@@ -2363,21 +2364,39 @@ fn copy_children(src: &Path, dst: &Path) -> ApiResult<()> {
         } else if meta.is_dir() {
             std::fs::create_dir_all(&to).map_err(|_| cannot_unpack())?;
             copy_children(&from, &to)?;
+            // After the children, same as a tar directory. A mode without
+            // owner write must not block the copy that just finished.
+            set_mode_nofollow(&to, source_mode(&meta))?;
         } else if meta.is_file() {
-            copy_file(&from, &to)?;
+            copy_file(&from, &to, source_mode(&meta))?;
         }
     }
     Ok(())
 }
 
-fn copy_file(from: &Path, to: &Path) -> ApiResult<()> {
+fn copy_file(from: &Path, to: &Path, mode: u32) -> ApiResult<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent).map_err(|_| cannot_unpack())?;
     }
     let mut input = std::fs::File::open(from).map_err(|_| cannot_unpack())?;
     let mut output = std::fs::File::create(to).map_err(|_| cannot_unpack())?;
     std::io::copy(&mut input, &mut output).map_err(|_| cannot_unpack())?;
-    Ok(())
+    set_file_mode(&output, mode)
+}
+
+/// Permission bits for a copied file or directory. Same mask as a tar header:
+/// `0o7777`, with setuid and setgid kept only when [`keep_setid`] is set.
+fn source_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        mask_mode(meta.permissions().mode(), keep_setid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
 }
 
 struct TarReader<R: Read> {
@@ -5467,6 +5486,62 @@ fi
         assert!(keep_setid());
     }
 
+    #[test]
+    fn directory_image_keeps_file_and_directory_modes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-youki-dirmode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _dir = TreeGuard(tmp.clone());
+
+        let src = tmp.join("src");
+        let bin = src.join("bin");
+        let ro = src.join("rodir");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&ro).unwrap();
+        let chmod = |path: &Path, mode: u32| {
+            let mut perms = std::fs::symlink_metadata(path).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
+
+        let tool = bin.join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        chmod(&tool, 0o755);
+        let secret = src.join("secret");
+        std::fs::write(&secret, b"hidden").unwrap();
+        chmod(&secret, 0o600);
+        let inside = ro.join("inside");
+        std::fs::write(&inside, b"in").unwrap();
+        chmod(&inside, 0o644);
+        chmod(&bin, 0o750);
+        chmod(&ro, 0o555);
+
+        let dst = tmp.join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        unpack_image(&src, &dst).unwrap();
+
+        assert_eq!(mode_of(&dst.join("bin").join("tool")), 0o755);
+        assert_eq!(
+            std::fs::read(dst.join("bin").join("tool")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert_eq!(mode_of(&dst.join("secret")), 0o600);
+        assert_eq!(std::fs::read(dst.join("secret")).unwrap(), b"hidden");
+        assert_eq!(mode_of(&dst.join("bin")), 0o750);
+        assert_eq!(mode_of(&dst.join("rodir")), 0o555);
+        assert_eq!(mode_of(&dst.join("rodir").join("inside")), 0o644);
+        assert_eq!(
+            std::fs::read(dst.join("rodir").join("inside")).unwrap(),
+            b"in"
+        );
+    }
+
     fn assert_layer_modes(root: &Path) {
         assert_eq!(mode_of(&root.join("bin").join("httpd")), 0o755);
         assert_eq!(
@@ -6326,6 +6401,7 @@ fi
             path: "/var/lib/pistack/volumes/disk".into(),
             device: None,
             read_only: false,
+            fs_type: String::new(),
             target: None,
         };
         assert_eq!(
@@ -6469,6 +6545,7 @@ exit 1
             path: String::new(),
             device: None,
             read_only: true,
+            fs_type: String::new(),
             target: Some(target),
         }
     }

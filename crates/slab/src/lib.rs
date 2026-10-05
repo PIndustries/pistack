@@ -5,7 +5,9 @@
 //!
 //! * [`types`] — `VolumeType`, `Volume`, `Snapshot`, `Backup`.
 //! * [`backend`] — the `BlockBackend` seam and the `local`, `lvm`, `rbd`
-//!   reference backends.
+//!   reference backends. A pod attach mounts the volume and records that
+//!   directory. The volume type param `fs_type` names the filesystem created
+//!   when the device has none, and defaults to `ext4`.
 //! * [`Client`] — the module core; the only writer of `status`. `forge`
 //!   uses [`Client::attach_info`], [`Client::begin_attach`],
 //!   [`Client::confirm_attach`] and [`Client::mark_detached`].
