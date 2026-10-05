@@ -405,8 +405,10 @@ mod tests {
     }
 
     fn guest_port(addr: IpAddr) -> Port {
-        let mut spec = PortSpec::default();
-        spec.fixed_ips = vec![addr];
+        let spec = PortSpec {
+            fixed_ips: vec![addr],
+            ..Default::default()
+        };
         Port {
             meta: Meta::new(kind::PORT, "demo", None),
             spec,
@@ -560,8 +562,10 @@ mod tests {
     }
 
     fn guest_net(external: bool) -> Network {
-        let mut spec = NetworkSpec::default();
-        spec.external = external;
+        let spec = NetworkSpec {
+            external,
+            ..Default::default()
+        };
         Network {
             meta: Meta::new(kind::NETWORK, "net", None),
             spec,
