@@ -256,6 +256,7 @@ pub fn runtime_from_wire(rt: RunningMachine) -> MachineRuntime {
         id: rt.id,
         addresses: rt.addresses,
         power: power_from_wire(rt.power),
+        message: rt.message,
     }
 }
 
@@ -668,6 +669,7 @@ mod tests {
                 id: req.id,
                 addresses: vec!["10.1.0.9".into()],
                 power: pistack_rpc::proto::PowerState::On,
+                message: String::new(),
             };
             q.ack(
                 "h1",

@@ -28,6 +28,9 @@ pub struct MachineRuntime {
     pub id: Id,
     pub addresses: Vec<String>,
     pub power: PowerState,
+    /// Operator note from the host. Empty when the host has nothing to add.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 #[async_trait]
@@ -89,6 +92,7 @@ impl HostDriver for MockDriver {
             id: m.meta.id.clone(),
             addresses: vec![format!("10.0.0.{n}")],
             power: PowerState::On,
+            message: String::new(),
         };
         st.machines.insert(m.meta.id.clone(), rt.clone());
         Ok(rt)

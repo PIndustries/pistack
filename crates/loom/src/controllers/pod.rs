@@ -27,6 +27,9 @@
 //! * `phase = Error` when the sandbox or a container cannot be started;
 //! * `status.probes` carries the host agent's liveness and readiness
 //!   streaks for each container.
+//! * a `Network` condition with status false means the sandbox is up and
+//!   the recorded address is not on an interface. The pod stays `Running`,
+//!   `pod_ip` stays empty, and Ready is false.
 //!
 //! The controller maps that to the pod: `Running`, `Succeeded` (exit 0),
 //! `Failed`, and restarts per `restart_policy` by bumping the machine's
@@ -972,6 +975,18 @@ impl PodController {
         // machine still looks exited, but the pod is on its way back up.
         let restart_in_flight = m.spec.restarts > m.status.restarts;
         let mmsg = m.status.message.clone();
+        let network_gap = m
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Network" && !c.status)
+            .map(|c| {
+                if c.message.is_empty() {
+                    mmsg.clone()
+                } else {
+                    c.message.clone()
+                }
+            });
         let names: Vec<(String, String)> = pod
             .spec
             .containers
@@ -1030,11 +1045,20 @@ impl PodController {
                     }
                     _ => {
                         s.phase = PodPhase::Running;
-                        s.pod_ip = addr.clone();
-                        s.message.clear();
                         let started = s.start_time.unwrap_or_else(Utc::now);
                         s.start_time = Some(started);
-                        apply_readiness(pod, &reports, s);
+                        if let Some(gap) = network_gap.as_deref() {
+                            s.pod_ip = None;
+                            s.message = gap.to_owned();
+                            set_condition(&mut s.conditions, "Network", false, "Rootless", gap);
+                            apply_readiness(pod, &reports, s);
+                            set_condition(&mut s.conditions, POD_READY, false, "NoNetwork", gap);
+                        } else {
+                            s.pod_ip = addr.clone();
+                            s.message.clear();
+                            s.conditions.retain(|c| c.kind != "Network");
+                            apply_readiness(pod, &reports, s);
+                        }
                     }
                 },
                 Phase::Error => {
@@ -1831,6 +1855,64 @@ mod tests {
             .conditions
             .iter()
             .all(|c| c.kind != LIVENESS_CONDITION));
+    }
+
+    #[tokio::test]
+    async fn rootless_network_gap_hides_the_address_and_is_not_ready() {
+        let fx = running_pod(
+            RestartPolicy::Always,
+            vec![ctr("web", None, None)],
+            vec![],
+            0,
+            0,
+            &[],
+        );
+        let message = "pod has no network: a rootless agent cannot attach the recorded address. Run the agent as root or set PISTACK_YOUKI_SUDO=1";
+        fx.store
+            .collection::<Machine>()
+            .modify(&fx.machine, |m| {
+                m.status.message = message.to_owned();
+                m.status
+                    .set_condition("Network", false, "Rootless", message);
+                Ok(())
+            })
+            .unwrap();
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert!(pod.status.pod_ip.is_none());
+        assert!(
+            pod.status.message.contains("pod has no network"),
+            "{}",
+            pod.status.message
+        );
+        let network = pod
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Network")
+            .unwrap();
+        assert!(!network.status);
+        assert_eq!(network.reason, "Rootless");
+        assert!(!pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "NoNetwork");
+
+        fx.store
+            .collection::<Machine>()
+            .modify(&fx.machine, |m| {
+                m.status.message.clear();
+                m.status.conditions.retain(|c| c.kind != "Network");
+                Ok(())
+            })
+            .unwrap();
+        pass(&fx.store).await;
+        let pod = load(&fx.store, &fx.pod);
+        assert_eq!(pod.status.phase, PodPhase::Running);
+        assert_eq!(pod.status.pod_ip.as_deref(), Some("10.1.0.8"));
+        assert!(pod.status.message.is_empty());
+        assert!(pod.status.conditions.iter().all(|c| c.kind != "Network"));
+        assert!(pod.status.is_ready());
+        assert_eq!(reason(&pod, POD_READY), "Running");
     }
 
     #[tokio::test]

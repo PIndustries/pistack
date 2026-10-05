@@ -62,15 +62,15 @@
 //! As root it only removes paths under `/var/lib/pistack/youki`, the default
 //! state directory. sudo resets the environment, so a custom
 //! `PISTACK_YOUKI_STATE` cannot widen that directory. `sudo -n` fails closed
-//! without a rule. Allow only the youki binary and that helper:
+//! without a rule. Allow only the youki binary, that helper, and `ip`:
 //!
 //! ```text
 //! # /etc/sudoers.d/pistack-youki
-//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup
+//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip
 //! ```
 //!
 //! Replace `ubuntu` and the paths with the agent user and the binaries on
-//! the host. Leave sudo's environment reset.
+//! the host. `ip` is often `/usr/sbin/ip`. Leave sudo's environment reset.
 //!
 //! In sudo mode the bundle directory is `0700`, so other host users cannot
 //! traverse it. ConfigMap and Secret volume directories are `0755` and their
@@ -105,8 +105,23 @@
 //! only when that controller is delegated and the cgroup directory is
 //! writable. `PISTACK_YOUKI_NETNS`, when it is an absolute path, is joined as
 //! the network namespace; a rootless agent skips that path when it is owned
-//! by another uid and keeps the sandbox's own network namespace.
+//! by another uid and keeps the sandbox's own network namespace. That
+//! variable wins over the wiring below.
+//!
+//! A pod whose ports name a network is placed in a named network namespace
+//! before `youki create`. The host end of a veth is set master of the same
+//! bridge a virtual machine tap would use. The other end is `eth0` (then
+//! `eth1`, ...) inside that namespace, with the recorded MAC, address, and,
+//! when a gateway is recorded, a default route. A root agent runs `ip`
+//! directly. In sudo mode those commands are `sudo -n <ip>`. A rootless
+//! agent cannot do this: it keeps the sandbox network namespace and reports
+//! that the pod has no network. A pod with no port attachment keeps the
+//! sandbox network namespace. Stop, delete, and a failed create remove the
+//! veth and the namespace. The next start creates the sandbox again so it
+//! joins the new namespace. Names left by a crashed create are removed
+//! before the next create.
 
+use super::podnet::{self, PodNetwork};
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
 use pistack_rpc::proto::{DiskTarget, ExecOutput};
@@ -159,6 +174,16 @@ struct Saved {
     /// Probe definitions only. The sandbox document itself is not stored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     probes: Vec<crate::probe::ContainerProbes>,
+    /// Named network namespace created for this pod. Empty when the sandbox
+    /// namespace was left alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    netns: String,
+    /// Host ends of the veth pairs. Empty when `netns` is empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    veths: Vec<String>,
+    /// Set when a rootless agent could not attach the recorded address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    network_message: String,
 }
 
 #[async_trait]
@@ -187,19 +212,53 @@ impl MachineRuntime for YoukiRuntime {
                     updated.probes = probes;
                     write_state(&bundle, &updated).await?;
                 }
+                // A rootless refusal stays on the record. Reporting the
+                // request address would say the guest has a network it does not.
+                let (addresses, message) = if saved.network_message.is_empty() {
+                    (nic_addresses(req), String::new())
+                } else {
+                    (Vec::new(), saved.network_message.clone())
+                };
                 return Ok(RunningMachine {
                     id,
-                    addresses: nic_addresses(req),
+                    addresses,
                     power: PowerState::On,
+                    message,
                 });
             }
         }
         let mode = resolve_run_mode()?;
         // user_data and ssh_keys are not written, logged, or passed to youki.
-        if let Some(plan) = sandbox_plan(req)? {
-            return start_pod(&bin, &mode, &bundle, req, &plan, prior.is_some()).await;
+        // PISTACK_YOUKI_NETNS skips this and is joined as the network namespace.
+        let net = match provision_network(&bundle, req, &mode).await {
+            Ok(net) => net,
+            Err(e) => {
+                if prior.is_none() {
+                    let _ = remove_bundle(&bundle, &mode.privilege).await;
+                }
+                return Err(e);
+            }
+        };
+        let plan = match sandbox_plan(req) {
+            Ok(plan) => plan,
+            Err(e) => {
+                drop_link(&mode, &net).await;
+                if prior.is_none() {
+                    let _ = remove_bundle(&bundle, &mode.privilege).await;
+                }
+                return Err(e);
+            }
+        };
+        if let Some(plan) = plan {
+            let started = start_pod(&bin, &mode, &bundle, req, &plan, prior.is_some(), &net).await;
+            if started.is_err() {
+                drop_link(&mode, &net).await;
+            }
+            return started;
         }
-        if let Err(e) = write_bundle(&bundle, req, &mode).await {
+        let host_netns = joined_netns(&net);
+        if let Err(e) = write_bundle(&bundle, req, &mode, host_netns).await {
+            drop_link(&mode, &net).await;
             if prior.is_none() {
                 let _ = remove_bundle(&bundle, &mode.privilege).await;
             }
@@ -207,38 +266,59 @@ impl MachineRuntime for YoukiRuntime {
         }
         let id_str = id.to_string();
         let io = workload_stdio(&bundle);
-        if prior.is_none() {
-            create_container(&bin, &mode, &bundle, &id_str, None, &io, Some(&bundle)).await?;
+        // Stop deleted the namespace. `youki start` does not join a new one,
+        // so a container that has a link is created again. A first start is too.
+        let create_new = prior.is_none() || joins_new_net(&net);
+        if create_new {
+            let wipe = if prior.is_none() {
+                Some(bundle.as_path())
+            } else {
+                None
+            };
+            if let Err(e) = create_container(&bin, &mode, &bundle, &id_str, None, &io, wipe).await {
+                drop_link(&mode, &net).await;
+                return Err(e);
+            }
             if let Err(e) = exec_detach(&bin, &mode, &["start", &id_str], None, &io).await {
                 // Create succeeded and start did not. Drop the container so a
                 // retry can create it again, and do not record it as running.
-                forget_failed_create(&bin, &mode, &id_str, Some(&bundle)).await;
+                // A restart keeps the bundle; the record is still on disk.
+                drop_link(&mode, &net).await;
+                if prior.is_none() {
+                    forget_failed_create(&bin, &mode, &id_str, Some(&bundle)).await;
+                } else {
+                    let _ = exec_youki(&bin, &mode, &["delete", "--force", &id_str], None).await;
+                }
                 return Err(e);
             }
-        } else {
-            exec_detach(&bin, &mode, &["start", &id_str], None, &io).await?;
+        } else if let Err(e) = exec_detach(&bin, &mode, &["start", &id_str], None, &io).await {
+            drop_link(&mode, &net).await;
+            return Err(e);
         }
         // youki may have loosened the bundle directory. The agent still owns
         // it unless youki changed the owner, in which case this is a no-op.
         let _ = privatize_bundle(&bundle, &mode.privilege);
-        let addresses = nic_addresses(req);
-        write_state(
+        let observed = observe(req, &net);
+        if let Err(e) = write_state(
             &bundle,
             &Saved {
                 id: id_str,
-                addresses: addresses.clone(),
+                addresses: observed.addresses.clone(),
                 power: PowerState::On,
                 containers: Vec::new(),
                 container_names: Vec::new(),
                 probes: Vec::new(),
+                netns: observed.netns.clone(),
+                veths: observed.veths.clone(),
+                network_message: observed.message.clone(),
             },
         )
-        .await?;
-        Ok(RunningMachine {
-            id,
-            addresses,
-            power: PowerState::On,
-        })
+        .await
+        {
+            drop_link(&mode, &net).await;
+            return Err(e);
+        }
+        Ok(running_from(id, &observed, PowerState::On))
     }
 
     async fn stop(&self, id: &Id) -> ApiResult<()> {
@@ -254,6 +334,9 @@ impl MachineRuntime for YoukiRuntime {
             return Ok(());
         }
         let mode = resolve_run_mode()?;
+        // Drop the veth and namespace before the kill, and before power is
+        // recorded Off, so a failed release is retried.
+        release_recorded(&mode, &saved, &bundle).await?;
         // Containers first, then the sandbox that owns their namespaces.
         let mut order: Vec<String> = saved.containers.iter().rev().cloned().collect();
         order.push(id.to_string());
@@ -261,6 +344,9 @@ impl MachineRuntime for YoukiRuntime {
             exec_youki(&bin, &mode, &["kill", cid, "SIGTERM"], None).await?;
         }
         saved.power = PowerState::Off;
+        saved.netns.clear();
+        saved.veths.clear();
+        saved.network_message.clear();
         write_state(&bundle, &saved).await
     }
 
@@ -274,6 +360,11 @@ impl MachineRuntime for YoukiRuntime {
         let mode = resolve_run_mode()?;
         let saved = read_state(&bundle).await?;
         let had_state = saved.is_some();
+        if let Some(saved) = saved.as_ref() {
+            release_recorded(&mode, saved, &bundle).await?;
+        } else if let Some((netns, veths)) = podnet::read_record(&bundle) {
+            podnet::release(&ip_privilege(&mode), &netns, &veths).await?;
+        }
         let mut order: Vec<String> = saved
             .map(|s| s.containers)
             .unwrap_or_default()
@@ -385,6 +476,7 @@ impl MachineRuntime for YoukiRuntime {
                 id: parse_id(&saved.id)?,
                 addresses: saved.addresses,
                 power: saved.power,
+                message: saved.network_message,
             });
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -644,9 +736,9 @@ const CLEANUP_ENV: &str = "PISTACK_YOUKI_CLEANUP";
 const DEFAULT_CLEANUP: &str = "/usr/local/sbin/pistack-youki-cleanup";
 const NETNS_ENV: &str = "PISTACK_YOUKI_NETNS";
 
-/// Sample sudoers rule. Operators replace the user and the two paths.
+/// Sample sudoers rule. Operators replace the user and the paths.
 const SUDOERS_SAMPLE: &str =
-    "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup";
+    "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip";
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -675,7 +767,7 @@ fn resolve_privilege() -> ApiResult<Privilege> {
         return match sudo_bin() {
             Some(sudo) => Ok(Privilege::Sudo { sudo }),
             None if unprivileged_userns_available() => Err(ApiError::unavailable(format!(
-                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary and the cleanup helper (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
+                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary, the cleanup helper, and ip (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
             ))),
             None => Err(privilege_unavailable()),
         };
@@ -688,7 +780,7 @@ fn resolve_privilege() -> ApiResult<Privilege> {
 
 fn privilege_unavailable() -> ApiError {
     ApiError::unavailable(format!(
-        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary and the cleanup helper (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
+        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary, the cleanup helper, and ip (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
     ))
 }
 
@@ -848,6 +940,107 @@ fn nic_addresses(req: &MachineRequest) -> Vec<String> {
         .map(|n| n.address.clone())
         .filter(|a| !a.is_empty())
         .collect()
+}
+
+fn ip_privilege(mode: &RunMode) -> podnet::IpPrivilege {
+    match &mode.privilege {
+        Privilege::Root => podnet::IpPrivilege::Direct,
+        Privilege::Sudo { sudo } => podnet::IpPrivilege::Sudo(sudo.clone()),
+        Privilege::Rootless { .. } => podnet::IpPrivilege::Rootless,
+    }
+}
+
+/// `PISTACK_YOUKI_NETNS` when it is set. Otherwise the namespace this runtime created.
+fn joined_netns(net: &PodNetwork) -> Option<PathBuf> {
+    if let Some(path) = requested_host_netns() {
+        return Some(path);
+    }
+    match net {
+        PodNetwork::Linked(link) => Some(link.path.clone()),
+        PodNetwork::None | PodNetwork::Refused(_) => None,
+    }
+}
+
+struct ObservedNet {
+    addresses: Vec<String>,
+    message: String,
+    netns: String,
+    veths: Vec<String>,
+}
+
+fn observe(req: &MachineRequest, net: &PodNetwork) -> ObservedNet {
+    match net {
+        PodNetwork::Linked(link) => ObservedNet {
+            addresses: nic_addresses(req),
+            message: String::new(),
+            netns: link.netns.clone(),
+            veths: link.veths.clone(),
+        },
+        PodNetwork::Refused(message) => ObservedNet {
+            addresses: Vec::new(),
+            message: message.clone(),
+            netns: String::new(),
+            veths: Vec::new(),
+        },
+        PodNetwork::None => ObservedNet {
+            addresses: nic_addresses(req),
+            message: String::new(),
+            netns: String::new(),
+            veths: Vec::new(),
+        },
+    }
+}
+
+fn running_from(id: Id, observed: &ObservedNet, power: PowerState) -> RunningMachine {
+    RunningMachine {
+        id,
+        addresses: observed.addresses.clone(),
+        power,
+        message: observed.message.clone(),
+    }
+}
+
+/// Create the pod namespace unless `PISTACK_YOUKI_NETNS` already names one.
+async fn provision_network(
+    bundle: &Path,
+    req: &MachineRequest,
+    mode: &RunMode,
+) -> ApiResult<PodNetwork> {
+    if requested_host_netns().is_some() {
+        return Ok(PodNetwork::None);
+    }
+    podnet::prepare(req, &ip_privilege(mode), bundle).await
+}
+
+/// Stop removed the namespace this pod was created in. The next create has
+/// to run again; `youki start` keeps the namespaces from `youki create`.
+fn joins_new_net(net: &PodNetwork) -> bool {
+    matches!(net, PodNetwork::Linked(_))
+}
+
+async fn drop_link(mode: &RunMode, net: &PodNetwork) {
+    if let PodNetwork::Linked(link) = net {
+        if let Err(err) = podnet::release(&ip_privilege(mode), &link.netns, &link.veths).await {
+            tracing::warn!(
+                netns = %link.netns,
+                error = %err,
+                "youki runtime: network teardown failed"
+            );
+        }
+    }
+}
+
+/// Remove a recorded namespace. Empty names do not run `ip`.
+async fn release_recorded(mode: &RunMode, saved: &Saved, bundle: &Path) -> ApiResult<()> {
+    let recorded = if !saved.netns.is_empty() || !saved.veths.is_empty() {
+        Some((saved.netns.clone(), saved.veths.clone()))
+    } else {
+        podnet::read_record(bundle)
+    };
+    let Some((netns, veths)) = recorded else {
+        return Ok(());
+    };
+    podnet::release(&ip_privilege(mode), &netns, &veths).await
 }
 
 fn parse_id(s: &str) -> ApiResult<Id> {
@@ -1404,7 +1597,12 @@ fn process_spec(launch: Option<&Launch>, cfg: &ImageConfig) -> (Vec<String>, Vec
     (proc, env, cwd)
 }
 
-async fn write_bundle(bundle: &Path, req: &MachineRequest, mode: &RunMode) -> ApiResult<()> {
+async fn write_bundle(
+    bundle: &Path,
+    req: &MachineRequest,
+    mode: &RunMode,
+    host_netns: Option<PathBuf>,
+) -> ApiResult<()> {
     let launch = launch_from(req);
     let image = choose_image(req, launch.as_ref())?;
     let limits = Limits {
@@ -1419,7 +1617,15 @@ async fn write_bundle(bundle: &Path, req: &MachineRequest, mode: &RunMode) -> Ap
     let bundle = bundle.to_path_buf();
     let mode = mode.clone();
     tokio::task::spawn_blocking(move || {
-        install_bundle(&bundle, &image, &hostname, &limits, launch.as_ref(), &mode)
+        install_bundle(
+            &bundle,
+            &image,
+            &hostname,
+            &limits,
+            launch.as_ref(),
+            &mode,
+            host_netns.as_deref(),
+        )
     })
     .await
     .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
@@ -1432,6 +1638,7 @@ fn install_bundle(
     limits: &Limits,
     launch: Option<&Launch>,
     mode: &RunMode,
+    host_netns: Option<&Path>,
 ) -> ApiResult<()> {
     std::fs::create_dir_all(bundle).map_err(|e| {
         ApiError::unavailable(format!("youki runtime: creating {}: {e}", bundle.display()))
@@ -1450,12 +1657,13 @@ fn install_bundle(
         let _ = std::fs::remove_file(&image_note);
     }
     let (args, env, cwd) = process_spec(launch, &cfg);
-    let netns = requested_host_netns();
+    let from_env = requested_host_netns();
+    let netns = from_env.as_deref().or(host_netns);
     let text = serde_json::to_vec_pretty(&mode.oci_config(
         Some(hostname),
         limits,
         (&args, &env, &cwd),
-        &sandbox_namespaces(mode, netns.as_deref()),
+        &sandbox_namespaces(mode, netns),
         &[],
     ))
     .map_err(|e| ApiError::internal(format!("youki runtime: encoding config: {e}")))?;
@@ -3060,7 +3268,7 @@ impl RunMode {
         pid: u32,
     ) -> ApiResult<()> {
         ensure_slab_sources(plan, &[])?;
-        let processes = prepare_pod(bundle, hostname, limits, plan, fallback_image, self)?;
+        let processes = prepare_pod(bundle, hostname, limits, plan, fallback_image, self, None)?;
         write_container_configs(bundle, plan, &processes, &[], limits, pid, self)
     }
 }
@@ -3072,12 +3280,13 @@ fn prepare_pod(
     plan: &PodPlan,
     fallback_image: &str,
     mode: &RunMode,
+    host_netns: Option<&Path>,
 ) -> ApiResult<Vec<PreparedProcess>> {
     std::fs::create_dir_all(bundle).map_err(|e| volume_io(bundle, e))?;
     privatize_bundle(bundle, &mode.privilege)?;
     materialize_volumes(bundle, plan, &mode.privilege)?;
     write_mount_plan(bundle, plan)?;
-    write_pause_rootfs(bundle, hostname, limits, mode)?;
+    write_pause_rootfs(bundle, hostname, limits, mode, host_netns)?;
     let mut processes = Vec::new();
     for (index, container) in plan.containers.iter().enumerate() {
         let image = choose_container_image(index, &container.image, fallback_image)
@@ -3111,18 +3320,20 @@ fn write_pause_rootfs(
     hostname: &str,
     limits: &Limits,
     mode: &RunMode,
+    host_netns: Option<&Path>,
 ) -> ApiResult<()> {
     let rootfs = bundle.join("rootfs");
     reset_dir(&rootfs, &mode.privilege)?;
     write_mode(&rootfs.join("pause"), PAUSE_ELF, 0o755)?;
     let args = vec!["/pause".to_string()];
     let env = vec![format!("PATH={DEFAULT_PATH}")];
-    let netns = requested_host_netns();
+    let from_env = requested_host_netns();
+    let netns = from_env.as_deref().or(host_netns);
     let spec = mode.oci_config(
         Some(hostname),
         limits,
         (&args, &env, "/"),
-        &sandbox_namespaces(mode, netns.as_deref()),
+        &sandbox_namespaces(mode, netns),
         &[],
     );
     write_json(&bundle.join("config.json"), &spec, 0o644)
@@ -3833,6 +4044,7 @@ async fn start_pod(
     req: &MachineRequest,
     plan: &PodPlan,
     prior: bool,
+    net: &PodNetwork,
 ) -> ApiResult<RunningMachine> {
     // Fail before youki create. A missing bind would otherwise land in
     // config.json and stay invisible to the live mount namespace.
@@ -3859,12 +4071,13 @@ async fn start_pod(
         req.name.clone()
     };
     let id = req.id.clone();
-    let addresses = nic_addresses(req);
+    let observed = observe(req, net);
     let bundle_prep = bundle.to_path_buf();
     let plan_prep = plan.clone();
     let host_prep = hostname;
     let image = req.image.clone();
     let mode_prep = mode.clone();
+    let host_netns = joined_netns(net);
     let prepared = tokio::task::spawn_blocking(move || {
         prepare_pod(
             &bundle_prep,
@@ -3873,6 +4086,7 @@ async fn start_pod(
             &plan_prep,
             &image,
             &mode_prep,
+            host_netns.as_deref(),
         )
     })
     .await
@@ -3888,10 +4102,15 @@ async fn start_pod(
     };
     let id_str = id.to_string();
     let pause = pause_stdio(bundle);
-    if !prior {
-        create_container(bin, mode, bundle, &id_str, None, &pause, Some(bundle)).await?;
+    // A stopped pod's namespace is gone. Create the sandbox again so it
+    // joins the one `provision_network` just made. `youki start` alone
+    // would keep the empty namespace from the first create.
+    let recreate = joins_new_net(net);
+    if !prior || recreate {
+        let wipe = if prior { None } else { Some(bundle) };
+        create_container(bin, mode, bundle, &id_str, None, &pause, wipe).await?;
         if let Err(e) = exec_detach(bin, mode, &["start", &id_str], None, &pause).await {
-            forget_failed_create(bin, mode, &id_str, Some(bundle)).await;
+            release_failed_create(bin, mode, bundle, &id_str, &[], prior).await;
             return Err(e);
         }
     } else {
@@ -3900,15 +4119,15 @@ async fn start_pod(
     let state = match run_youki(bin, mode, &["state", &id_str], None).await {
         Ok(output) => output,
         Err(e) => {
-            if !prior {
-                abort_new_pod(bin, mode, bundle, &id_str, &[]).await;
+            if !prior || recreate {
+                release_failed_create(bin, mode, bundle, &id_str, &[], prior).await;
             }
             return Err(e);
         }
     };
     let Some(pid) = parse_state_pid(&state.stdout) else {
-        if !prior {
-            abort_new_pod(bin, mode, bundle, &id_str, &[]).await;
+        if !prior || recreate {
+            release_failed_create(bin, mode, bundle, &id_str, &[], prior).await;
         }
         return Err(ApiError::unavailable(
             "youki runtime: sandbox state has no pid",
@@ -3933,8 +4152,8 @@ async fn start_pod(
     .await
     .map_err(|_| ApiError::unavailable("youki runtime: image unpack stopped"))?
     {
-        if !prior {
-            abort_new_pod(bin, mode, bundle, &id_str, &[]).await;
+        if !prior || recreate {
+            release_failed_create(bin, mode, bundle, &id_str, &[], prior).await;
         }
         return Err(e);
     }
@@ -3947,15 +4166,15 @@ async fn start_pod(
         if let Err(e) =
             create_container(bin, mode, &cpath, &cid, user_ns.as_deref(), &io, None).await
         {
-            if !prior {
-                abort_new_pod(bin, mode, bundle, &id_str, &started).await;
+            if !prior || recreate {
+                release_failed_create(bin, mode, bundle, &id_str, &started, prior).await;
             }
             return Err(e);
         }
         if let Err(e) = exec_detach(bin, mode, &["start", &cid], user_ns.as_deref(), &io).await {
-            if !prior {
+            if !prior || recreate {
                 let _ = exec_youki(bin, mode, &["delete", "--force", &cid], None).await;
-                abort_new_pod(bin, mode, bundle, &id_str, &started).await;
+                release_failed_create(bin, mode, bundle, &id_str, &started, prior).await;
             }
             return Err(e);
         }
@@ -3966,19 +4185,18 @@ async fn start_pod(
         bundle,
         &Saved {
             id: id_str,
-            addresses: addresses.clone(),
+            addresses: observed.addresses.clone(),
             power: PowerState::On,
             containers: started,
             container_names: plan.containers.iter().map(|c| c.name.clone()).collect(),
             probes: crate::probe::probes_in_user_data(req.user_data.as_deref()),
+            netns: observed.netns.clone(),
+            veths: observed.veths.clone(),
+            network_message: observed.message.clone(),
         },
     )
     .await?;
-    Ok(RunningMachine {
-        id,
-        addresses,
-        power: PowerState::On,
-    })
+    Ok(running_from(id, &observed, PowerState::On))
 }
 
 async fn abort_new_pod(
@@ -3993,6 +4211,26 @@ async fn abort_new_pod(
     }
     let _ = exec_youki(bin, mode, &["delete", "--force", sandbox_id], None).await;
     let _ = remove_bundle(bundle, &mode.privilege).await;
+}
+
+/// Drop containers from a create that did not finish. A first create also
+/// removes the bundle. A restart keeps it: the volume records still live there.
+async fn release_failed_create(
+    bin: &Path,
+    mode: &RunMode,
+    bundle: &Path,
+    sandbox_id: &str,
+    created: &[String],
+    prior: bool,
+) {
+    if prior {
+        for cid in created.iter().rev() {
+            let _ = exec_youki(bin, mode, &["delete", "--force", cid], None).await;
+        }
+        let _ = exec_youki(bin, mode, &["delete", "--force", sandbox_id], None).await;
+        return;
+    }
+    abort_new_pod(bin, mode, bundle, sandbox_id, created).await;
 }
 
 fn validate_exec(argv: &[String], env: &[(String, String)], cwd: Option<&str>) -> ApiResult<()> {
@@ -4656,6 +4894,7 @@ mod tests {
                 "PISTACK_RBD_SUDO_BIN",
                 "PISTACK_RBD_TEST_EUID",
                 "PISTACK_RBD_DEV_ROOT",
+                "PISTACK_IP_BIN",
             ];
             let saved = keys
                 .into_iter()
@@ -4677,6 +4916,7 @@ mod tests {
                 "PISTACK_RBD_SUDO_BIN",
                 "PISTACK_RBD_TEST_EUID",
                 "PISTACK_RBD_DEV_ROOT",
+                "PISTACK_IP_BIN",
             ] {
                 std::env::remove_var(key);
             }
@@ -5736,6 +5976,7 @@ fi
             },
             None,
             &RunMode::privileged(),
+            None,
         )
         .unwrap_err();
         assert!(err.message.contains("image rootfs is empty"), "{err}");
@@ -7922,6 +8163,540 @@ exit 0
             std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
             "a rejected state dir must not call youki"
         );
+    }
+
+    fn write_ip(path: &Path, log: &Path) {
+        let quoted = shell_quote(log);
+        write_exe(
+            path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {quoted}\nprintf '\\n' >> {quoted}\nexit 0\n"
+            ),
+        );
+    }
+
+    fn ip_seq(log: &str, seq: &[&str]) -> bool {
+        seq_count(log, seq) > 0
+    }
+
+    fn seq_count(log: &str, seq: &[&str]) -> usize {
+        let lines: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
+        lines
+            .windows(seq.len())
+            .filter(|window| *window == seq)
+            .count()
+    }
+
+    fn pod_image(tmp: &Path) -> String {
+        let image = tmp.join("image");
+        std::fs::create_dir_all(image.join("bin")).unwrap();
+        std::fs::write(image.join("marker"), b"keep").unwrap();
+        image.to_str().unwrap().to_owned()
+    }
+
+    fn lab_request(image: &str) -> MachineRequest {
+        let mut request = req("web", "not-a-path", "10.90.0.10");
+        request.id = Id::parse(kind::MACHINE, "mach-018f3a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5b").unwrap();
+        request.networks = vec!["labnet".into()];
+        request.nics = vec![
+            crate::runtime::NicAttachment {
+                network_id: "net-01a102de-3f33-73bf-86f7-57fe3b47f1ea".into(),
+                mac: "52:54:00:AA:BB:CC".into(),
+                address: "10.90.0.10".into(),
+                prefix: 24,
+                gateway: "10.90.0.1".into(),
+                routed: true,
+                segment_id: None,
+            },
+            crate::runtime::NicAttachment {
+                network_id: "net-01a102de-3f33-73bf-86f7-57fe3b47f1ea".into(),
+                mac: "52:54:00:11:22:33".into(),
+                address: "10.90.0.11".into(),
+                prefix: 24,
+                gateway: String::new(),
+                routed: false,
+                segment_id: Some(4),
+            },
+        ];
+        request.user_data = Some(sandbox_doc(image));
+        request
+    }
+
+    fn read_cfg(bundle: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn sudoers_sample_names_the_ip_binary() {
+        assert!(SUDOERS_SAMPLE.contains("/usr/bin/youki"));
+        assert!(SUDOERS_SAMPLE.contains("/usr/local/sbin/pistack-youki-cleanup"));
+        assert!(SUDOERS_SAMPLE.contains("/usr/sbin/ip"));
+        assert!(!SUDOERS_SAMPLE.contains("ip link"));
+    }
+
+    #[tokio::test]
+    async fn pod_joins_its_bridge_and_teardown_removes_the_namespace() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet");
+        let _dir = scopeguard_dir(&tmp);
+        let youki_log = tmp.join("youki.log");
+        let ip_log = tmp.join("ip.log");
+        let sudo_log = tmp.join("sudo.log");
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let sudo = tmp.join("sudo");
+        write_script(&youki, &youki_log, 0);
+        write_ip(&ip, &ip_log);
+        write_sudo(&sudo, &sudo_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        // A root agent ignores PISTACK_YOUKI_SUDO, including for ip.
+        std::env::set_var(SUDO_ENV, "1");
+        std::env::set_var(SUDO_BIN_ENV, &sudo);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+
+        let request = lab_request(&pod_image(&tmp));
+        let rt = YoukiRuntime;
+        let started = rt.start(&request).await.unwrap();
+        assert_eq!(
+            started.addresses,
+            vec!["10.90.0.10".to_string(), "10.90.0.11".to_string()]
+        );
+        assert!(started.message.is_empty(), "{}", started.message);
+        let bundle = state.join(request.id.to_string());
+        let cfg = read_cfg(&bundle);
+        assert_eq!(
+            ns_path(&cfg, "network").as_deref(),
+            Some("/var/run/netns/pn018f3a2b1c4d")
+        );
+
+        let log = std::fs::read_to_string(&ip_log).unwrap();
+        assert!(ip_seq(&log, &["link", "del", "vh525400aabbcc"]), "{log}");
+        assert!(ip_seq(&log, &["link", "del", "vp525400aabbcc"]), "{log}");
+        assert!(ip_seq(&log, &["link", "del", "vh525400112233"]), "{log}");
+        assert!(ip_seq(&log, &["netns", "del", "pn018f3a2b1c4d"]), "{log}");
+        assert!(ip_seq(&log, &["netns", "add", "pn018f3a2b1c4d"]), "{log}");
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "link",
+                    "add",
+                    "vh525400aabbcc",
+                    "type",
+                    "veth",
+                    "peer",
+                    "name",
+                    "vp525400aabbcc",
+                ]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &["link", "set", "vh525400aabbcc", "master", "pi01a102de3f33"]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(&log, &["link", "set", "vh525400aabbcc", "up"]),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &["link", "set", "vh525400112233", "master", "po01a102de3f33"]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &["link", "set", "vp525400aabbcc", "netns", "pn018f3a2b1c4d",]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "link",
+                    "set",
+                    "vp525400aabbcc",
+                    "name",
+                    "eth0",
+                ]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "link",
+                    "set",
+                    "eth0",
+                    "address",
+                    "52:54:00:aa:bb:cc",
+                ]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "addr",
+                    "add",
+                    "10.90.0.10/24",
+                    "dev",
+                    "eth0",
+                ]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(&log, &["-n", "pn018f3a2b1c4d", "link", "set", "lo", "up"]),
+            "{log}"
+        );
+        assert!(
+            ip_seq(&log, &["-n", "pn018f3a2b1c4d", "link", "set", "eth0", "up"]),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "link",
+                    "set",
+                    "vp525400112233",
+                    "name",
+                    "eth1",
+                ]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "addr",
+                    "add",
+                    "10.90.0.11/24",
+                    "dev",
+                    "eth1",
+                ]
+            ),
+            "{log}"
+        );
+        assert!(
+            ip_seq(
+                &log,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "10.90.0.1",
+                ]
+            ),
+            "{log}"
+        );
+        assert_eq!(seq_count(&log, &["route", "add", "default"]), 1, "{log}");
+        assert!(!log.contains("pistack0"), "{log}");
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap_or_default();
+        assert!(sudo_text.is_empty(), "root must not sudo ip: {sudo_text}");
+
+        let again = rt.start(&request).await.unwrap();
+        assert_eq!(again.addresses, started.addresses);
+        assert_eq!(
+            std::fs::read_to_string(&ip_log).unwrap(),
+            log,
+            "a running pod is not rewired"
+        );
+        let listed = rt.list().await.unwrap();
+        assert_eq!(listed[0].addresses, started.addresses);
+        assert!(listed[0].message.is_empty());
+
+        rt.stop(&request.id).await.unwrap();
+        let after_stop = std::fs::read_to_string(&ip_log).unwrap();
+        assert!(
+            seq_count(&after_stop, &["netns", "del", "pn018f3a2b1c4d"]) >= 2,
+            "{after_stop}"
+        );
+        assert!(
+            ip_seq(&after_stop, &["link", "del", "vh525400112233"]),
+            "{after_stop}"
+        );
+
+        // Stop deleted the namespace. The next start must create it again
+        // and create the sandbox again so youki joins that namespace.
+        let creates_before = count_arg(
+            &arg_lines(&std::fs::read_to_string(&youki_log).unwrap()),
+            "create",
+        );
+        let adds_before = seq_count(&after_stop, &["netns", "add", "pn018f3a2b1c4d"]);
+        let restarted = rt.start(&request).await.unwrap();
+        assert_eq!(restarted.addresses, started.addresses);
+        assert!(restarted.message.is_empty(), "{}", restarted.message);
+        let cfg = read_cfg(&bundle);
+        assert_eq!(
+            ns_path(&cfg, "network").as_deref(),
+            Some("/var/run/netns/pn018f3a2b1c4d")
+        );
+        let after_restart = std::fs::read_to_string(&ip_log).unwrap();
+        assert!(
+            seq_count(&after_restart, &["netns", "add", "pn018f3a2b1c4d"]) > adds_before,
+            "{after_restart}"
+        );
+        let creates_after = count_arg(
+            &arg_lines(&std::fs::read_to_string(&youki_log).unwrap()),
+            "create",
+        );
+        assert!(
+            creates_after > creates_before,
+            "sandbox must be created again ({creates_before} -> {creates_after})"
+        );
+
+        rt.delete(&request.id).await.unwrap();
+        let after_delete = std::fs::read_to_string(&ip_log).unwrap();
+        assert!(
+            seq_count(&after_delete, &["netns", "del", "pn018f3a2b1c4d"])
+                > seq_count(&log, &["netns", "del", "pn018f3a2b1c4d"]),
+            "{after_delete}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_create_removes_the_namespace() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet-fail");
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let ip_log = tmp.join("ip.log");
+        write_script(&youki, &tmp.join("youki.log"), 1);
+        write_ip(&ip, &ip_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        let request = lab_request(&pod_image(&tmp));
+        let err = YoukiRuntime.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        let log = std::fs::read_to_string(&ip_log).unwrap();
+        assert!(ip_seq(&log, &["netns", "add", "pn018f3a2b1c4d"]), "{log}");
+        assert!(
+            seq_count(&log, &["netns", "del", "pn018f3a2b1c4d"]) >= 2,
+            "{log}"
+        );
+        assert!(ip_seq(&log, &["link", "del", "vh525400aabbcc"]), "{log}");
+    }
+
+    #[tokio::test]
+    async fn sudo_prefixes_ip_when_the_agent_is_not_root() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet-sudo");
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let sudo = tmp.join("sudo");
+        let ip_log = tmp.join("ip.log");
+        let sudo_log = tmp.join("sudo.log");
+        write_script(&youki, &tmp.join("youki.log"), 0);
+        write_ip(&ip, &ip_log);
+        write_sudo(&sudo, &sudo_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "1000");
+        std::env::set_var("PISTACK_YOUKI_TEST_EGID", "1000");
+        std::env::set_var(SUDO_ENV, "1");
+        std::env::set_var(SUDO_BIN_ENV, &sudo);
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "0");
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        let request = lab_request(&pod_image(&tmp));
+        YoukiRuntime.start(&request).await.unwrap();
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+        let ip_path = ip.to_string_lossy().into_owned();
+        assert!(
+            ip_seq(
+                &sudo_text,
+                &["-n", &ip_path, "netns", "add", "pn018f3a2b1c4d"]
+            ),
+            "{sudo_text}"
+        );
+        assert!(
+            ip_seq(
+                &sudo_text,
+                &[
+                    "-n",
+                    &ip_path,
+                    "link",
+                    "set",
+                    "vh525400aabbcc",
+                    "master",
+                    "pi01a102de3f33",
+                ]
+            ),
+            "{sudo_text}"
+        );
+        let ip_text = std::fs::read_to_string(&ip_log).unwrap();
+        assert!(
+            ip_seq(
+                &ip_text,
+                &[
+                    "-n",
+                    "pn018f3a2b1c4d",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "10.90.0.1",
+                ]
+            ),
+            "{ip_text}"
+        );
+        // `ip -n <netns>` is the namespace selector. The sudo flag is only
+        // on the sudo argv, in front of the ip binary.
+        assert!(
+            !ip_text.contains(&ip_path),
+            "ip argv must not include the sudo wrapper: {ip_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rootless_agent_reports_that_the_pod_has_no_network() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet-rootless");
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let ip_log = tmp.join("ip.log");
+        write_script(&youki, &tmp.join("youki.log"), 0);
+        write_ip(&ip, &ip_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_YOUKI_TEST_EUID", "1000");
+        std::env::set_var("PISTACK_YOUKI_TEST_EGID", "1000");
+        std::env::set_var("PISTACK_YOUKI_TEST_USERNS", "1");
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        let request = lab_request(&pod_image(&tmp));
+        let rt = YoukiRuntime;
+        let started = rt.start(&request).await.unwrap();
+        assert!(started.power == PowerState::On);
+        assert!(started.addresses.is_empty(), "{:?}", started.addresses);
+        assert!(
+            started.message.contains("pod has no network"),
+            "{}",
+            started.message
+        );
+        assert!(
+            started.message.contains("PISTACK_YOUKI_SUDO"),
+            "{}",
+            started.message
+        );
+        let cfg = read_cfg(&state.join(request.id.to_string()));
+        assert!(ns_path(&cfg, "network").is_none(), "{cfg}");
+        assert!(std::fs::read_to_string(&ip_log)
+            .unwrap_or_default()
+            .is_empty());
+        let again = rt.start(&request).await.unwrap();
+        assert!(again.addresses.is_empty());
+        assert_eq!(again.message, started.message);
+        let listed = rt.list().await.unwrap();
+        assert_eq!(listed[0].message, started.message);
+        assert!(listed[0].addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bad_mac_is_rejected_before_ip() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet-mac");
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let ip_log = tmp.join("ip.log");
+        write_script(&youki, &tmp.join("youki.log"), 0);
+        write_ip(&ip, &ip_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        let mut request = lab_request(&pod_image(&tmp));
+        request.nics[0].mac = "not-a-mac".into();
+        let err = YoukiRuntime.start(&request).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
+        assert!(err.message.contains("mac"), "{err}");
+        assert!(std::fs::read_to_string(&ip_log)
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_netns_skips_the_veth() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet-env");
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let ip_log = tmp.join("ip.log");
+        write_script(&youki, &tmp.join("youki.log"), 0);
+        write_ip(&ip, &ip_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        let dev = tmp.join("dev.ns");
+        std::fs::write(&dev, b"ns").unwrap();
+        std::env::set_var(NETNS_ENV, &dev);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        let request = lab_request(&pod_image(&tmp));
+        let started = YoukiRuntime.start(&request).await.unwrap();
+        assert_eq!(started.addresses[0], "10.90.0.10");
+        assert!(started.message.is_empty(), "{}", started.message);
+        assert!(std::fs::read_to_string(&ip_log)
+            .unwrap_or_default()
+            .is_empty());
+        let cfg = read_cfg(&state.join(request.id.to_string()));
+        assert_eq!(
+            ns_path(&cfg, "network").as_deref(),
+            Some(dev.to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pod_without_a_port_does_not_call_ip() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("podnet-none");
+        let _dir = scopeguard_dir(&tmp);
+        let youki = tmp.join("youki");
+        let ip = tmp.join("ip");
+        let ip_log = tmp.join("ip.log");
+        write_script(&youki, &tmp.join("youki.log"), 0);
+        write_ip(&ip, &ip_log);
+        let state = tmp.join("state");
+        let _env = EnvGuard::set(&youki, &state);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        let image = pod_image(&tmp);
+        let mut request = req("web", "not-a-path", "10.1.0.5");
+        request.user_data = Some(sandbox_doc(&image));
+        let started = YoukiRuntime.start(&request).await.unwrap();
+        assert_eq!(started.addresses, vec!["10.1.0.5".to_string()]);
+        assert!(started.message.is_empty());
+        let cfg = read_cfg(&state.join(request.id.to_string()));
+        assert!(ns_path(&cfg, "network").is_none(), "{cfg}");
+        assert!(std::fs::read_to_string(&ip_log)
+            .unwrap_or_default()
+            .is_empty());
     }
 
     struct DirGuard(PathBuf);

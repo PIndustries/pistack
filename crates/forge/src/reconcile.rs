@@ -440,12 +440,14 @@ impl Reconciler {
         match driver.start(&m).await {
             Ok(rt) => {
                 tracing::info!(machine = %m.meta.id, name = %m.meta.name, host = %hid, addrs = ?rt.addresses, "forge: machine ready");
+                let network_message = rt.message.clone();
                 self.patch(&m.meta.id, |s| {
                     s.phase = Phase::Ready;
                     s.addresses = rt.addresses.clone();
                     s.power = rt.power;
                     s.message.clear();
                     s.set_condition("Running", true, "Started", "");
+                    note_network(s, &network_message);
                 })
                 .await?;
             }
@@ -496,14 +498,18 @@ impl Reconciler {
                 }
                 st.power = PowerState::Off;
             }
-            if !want_off {
+            let network_message = if !want_off {
                 crate::nic::ensure_ports(&self.store, &m).await?;
                 let rt = driver.start(&m).await?;
                 st.power = rt.power;
                 st.addresses = rt.addresses;
-            }
+                rt.message
+            } else {
+                String::new()
+            };
             st.restarts = restarts;
             st.message.clear();
+            note_network(&mut st, &network_message);
             Ok(st)
         }
         .await;
@@ -513,8 +519,9 @@ impl Reconciler {
                     s.power = st.power;
                     s.addresses = st.addresses.clone();
                     s.restarts = st.restarts;
-                    s.message.clear();
+                    s.message = st.message.clone();
                     s.set_condition("Running", st.power == PowerState::On, "PowerApplied", "");
+                    copy_network(s, &st);
                 })
                 .await?;
             }
@@ -616,6 +623,25 @@ fn pinned_hosts(m: &Machine, hosts: &[Host]) -> Option<Vec<Host>> {
     )
 }
 
+/// A host that could not attach the recorded address says so here.
+/// An empty message drops the condition. The Running condition stays.
+fn note_network(status: &mut MachineStatus, message: &str) {
+    if message.is_empty() {
+        status.conditions.retain(|c| c.kind != "Network");
+        return;
+    }
+    status.message = message.to_owned();
+    status.set_condition("Network", false, "Rootless", message);
+}
+
+fn copy_network(dest: &mut MachineStatus, src: &MachineStatus) {
+    if let Some(net) = src.conditions.iter().find(|c| c.kind == "Network") {
+        dest.set_condition("Network", net.status, &net.reason, &net.message);
+    } else {
+        dest.conditions.retain(|c| c.kind != "Network");
+    }
+}
+
 #[cfg(test)]
 mod pin_tests {
     use super::{pinned_hosts, volume_wait};
@@ -655,5 +681,28 @@ mod pin_tests {
         let pinned = pinned_hosts(&machine, &hosts).unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].meta.id, a.meta.id);
+    }
+
+    #[test]
+    fn a_network_note_is_a_false_condition_and_clears() {
+        let mut machine = new_machine("pod-web", None, MachineSpec::default());
+        let message = "pod has no network: a rootless agent cannot attach the recorded address. Run the agent as root or set PISTACK_YOUKI_SUDO=1";
+        super::note_network(&mut machine.status, message);
+        assert_eq!(machine.status.message, message);
+        let condition = machine
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Network")
+            .unwrap();
+        assert!(!condition.status);
+        assert_eq!(condition.reason, "Rootless");
+        assert_eq!(condition.message, message);
+        super::note_network(&mut machine.status, "");
+        assert!(machine
+            .status
+            .conditions
+            .iter()
+            .all(|c| c.kind != "Network"));
     }
 }

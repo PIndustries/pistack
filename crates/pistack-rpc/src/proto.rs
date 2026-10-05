@@ -433,6 +433,10 @@ pub struct RunningMachine {
     pub addresses: Vec<String>,
     #[serde(default)]
     pub power: PowerState,
+    /// Set when the runtime could not attach the recorded address.
+    /// Empty when the guest has that address, or when there was nothing to attach.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 /// Something an agent said, re-broadcast by the control plane so modules

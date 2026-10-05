@@ -641,6 +641,7 @@ impl MachineRuntime for MetalRuntime {
             id: req.id.clone(),
             addresses: addresses(req),
             power: PowerState::On,
+            message: String::new(),
         };
         if req.name == node {
             let image_path = resolve_image(&req.image)?;

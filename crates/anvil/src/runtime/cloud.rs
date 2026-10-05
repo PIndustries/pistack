@@ -96,6 +96,7 @@ impl MachineRuntime for CloudRuntime {
                     id,
                     addresses: nic_addresses(req),
                     power: PowerState::On,
+                    message: String::new(),
                 });
             }
             if pid_alive(saved.pid) {
@@ -264,6 +265,7 @@ impl MachineRuntime for CloudRuntime {
             id,
             addresses,
             power: PowerState::On,
+            message: String::new(),
         })
     }
 
@@ -376,6 +378,7 @@ impl MachineRuntime for CloudRuntime {
                 id: parse_id(&saved.id)?,
                 addresses: saved.addresses,
                 power,
+                message: String::new(),
             });
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
