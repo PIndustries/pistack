@@ -138,7 +138,20 @@ fn queue_attach(
         device,
         read_only: info.read_only,
         target,
+        fs_type: String::new(),
     })
+}
+
+/// Filesystem a pod attach creates when `blkid` reports none.
+///
+/// The volume type param `fs_type` wins. Blank and missing both mean `ext4`.
+fn fs_type_param(params: &BTreeMap<String, String>) -> String {
+    params
+        .get("fs_type")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("ext4")
+        .to_owned()
 }
 
 fn queue_detach(
@@ -769,7 +782,9 @@ impl Client {
             .await?
             .attach_info(&vol, &node)
             .await?;
-        let req = queue_attach(machine.clone(), id.clone(), device, &info)?;
+        let mut req = queue_attach(machine.clone(), id.clone(), device, &info)?;
+        let volume_type = self.get_volume_type(&vol.spec.volume_type)?;
+        req.fs_type = fs_type_param(&volume_type.spec.params);
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue.enqueue(&node, CommandKind::AttachVolume, payload)?;
         serde_json::from_value(ticket.wait().await?.into_api_result()?)
@@ -1766,8 +1781,10 @@ mod tests {
         assert!(attach.target.is_none());
         assert_eq!(attach.device.as_deref(), Some("vdb"));
         assert!(!attach.read_only);
+        assert!(attach.fs_type.is_empty());
         let file_wire = serde_json::to_value(&attach).expect("json");
         assert!(file_wire.get("target").is_none());
+        assert!(file_wire.get("fs_type").is_none());
 
         // Same shape LVM attach_info reports: /dev/{vg}/{id}.
         let lvm = AttachInfo::new(AttachTarget::Local {
@@ -1783,6 +1800,16 @@ mod tests {
         let wire = serde_json::to_value(&attach).expect("json");
         assert!(wire.get("target").is_none());
         assert_eq!(wire["path"], "/dev/vg0/vol-1");
+    }
+
+    #[test]
+    fn filesystem_type_defaults_to_ext4() {
+        let mut params = BTreeMap::new();
+        assert_eq!(fs_type_param(&params), "ext4");
+        params.insert("fs_type".into(), "  ".into());
+        assert_eq!(fs_type_param(&params), "ext4");
+        params.insert("fs_type".into(), " xfs ".into());
+        assert_eq!(fs_type_param(&params), "xfs");
     }
 
     #[test]

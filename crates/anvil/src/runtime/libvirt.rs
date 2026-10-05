@@ -2341,6 +2341,7 @@ exit 0
             path: String::new(),
             device: None,
             read_only: false,
+            fs_type: String::new(),
             target: Some(DiskTarget::Rbd {
                 pool: "volumes".into(),
                 image: "vol-1".into(),
@@ -2391,6 +2392,7 @@ exit 0
             path: file.to_string_lossy().into_owned(),
             device: None,
             read_only: false,
+            fs_type: String::new(),
             target: None,
         };
         let dev = rt.attach_volume(&file_req).await.unwrap();

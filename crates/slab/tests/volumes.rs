@@ -562,6 +562,7 @@ async fn local_file_attach_and_detach_use_the_agent_queue() {
     assert!(attach.target.is_none());
     assert_eq!(attach.device.as_deref(), Some("vdb"));
     assert!(!attach.read_only);
+    assert_eq!(attach.fs_type, "ext4");
 
     let agent = tokio::spawn({
         let queue = queue.clone();

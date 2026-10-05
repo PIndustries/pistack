@@ -6326,6 +6326,7 @@ fi
             path: "/var/lib/pistack/volumes/disk".into(),
             device: None,
             read_only: false,
+            fs_type: String::new(),
             target: None,
         };
         assert_eq!(
@@ -6469,6 +6470,7 @@ exit 1
             path: String::new(),
             device: None,
             read_only: true,
+            fs_type: String::new(),
             target: Some(target),
         }
     }
