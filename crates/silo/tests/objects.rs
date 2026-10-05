@@ -3260,3 +3260,88 @@ async fn xml_unsafe_legacy_object_still_readable_and_foreign_bucket() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
     assert_eq!(extract_error_code(&err), "NoSuchBucket");
 }
+
+#[tokio::test]
+async fn native_put_rejects_xml_unsafe_key() {
+    let (_dir, client, app, project, who) = app_with_max(64 * 1024);
+    let bucket = ensure_bucket(&app, &who, "native-xml").await;
+    let bucket_id = client
+        .list_buckets(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == bucket)
+        .unwrap()
+        .meta
+        .id;
+    let bucket_dir = client.root().join(bucket_id.to_string());
+
+    // Native PUT with control-char key → 400, nothing written, no temps.
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/a%01b"),
+        Some(b"nope".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: Value = serde_json::from_slice(&body).expect("json error");
+    let msg = err["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("XML-unsafe"), "{err}");
+    assert!(!msg.contains('\u{1}'), "{msg}");
+    assert!(!bucket_dir.join("a\u{1}b").exists());
+    assert!(
+        walkdir_tmp(&bucket_dir).is_empty(),
+        "leftover temps: {:?}",
+        walkdir_tmp(&bucket_dir)
+    );
+
+    // Normal key still works.
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/ok.txt"),
+        Some(b"yes".to_vec()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(std::fs::read(bucket_dir.join("ok.txt")).unwrap(), b"yes");
+
+    // Foreign/invisible bucket + bad key → visibility first (not InvalidArgument /
+    // XML-unsafe).
+    let stranger = project_caller(&Id::new(kind::PROJECT));
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/a%01b"),
+        Some(b"x".to_vec()),
+        "application/octet-stream",
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: Value = serde_json::from_slice(&body).expect("json");
+    let msg = err["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.contains("XML-unsafe"),
+        "must not reject key before visibility: {err}"
+    );
+}
