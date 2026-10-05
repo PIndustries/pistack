@@ -16,6 +16,8 @@
 //! GET       /cas/{id}/certificate         CA certificate PEM (any caller)
 //! GET       /cas/{id}/crl                 revoked serials, JSON (any caller)
 //! POST      /cas/{id}/revoke              (admin) { "serial": n }
+//! GET|POST  /access-keys                  list (no secrets) / create (secret shown once)
+//! GET|DELETE /access-keys/{id}            get / revoke
 //! GET|POST  /join-tokens                  (admin) list / mint (clear text shown once)
 //! GET|DELETE /join-tokens/{id}            (admin)
 //! POST      /join-tokens/redeem           (no auth) { "token": "pij_..." } -> JoinGrant
@@ -25,6 +27,11 @@
 //! readers may list and get but not read payloads or keys; members may
 //! create, rotate and delete; the key PEM of a certificate needs the admin
 //! role. CA and join-token operations are admin only except where noted.
+//!
+//! An access key's `{id}` is its secret's id (`sec-…`) or its access key id
+//! (`PIAK…`). Members create keys for themselves; naming another principal
+//! needs the admin role. Members may revoke any key in their project, as
+//! with secrets.
 //!
 //! `keep` has no reconciler: issuance is synchronous, so these handlers are
 //! the ones that fill `status`.
@@ -43,8 +50,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{
+    access_key::{is_access_key_id, AccessKey, CreatedAccessKey},
     ca::PEM_CONTENT_TYPE,
-    join::{create_join_token, redeem_join_token},
+    join::{create_join_token_with, redeem_join_token, NewJoinToken},
     paginate,
     types::*,
     Client,
@@ -76,6 +84,14 @@ pub fn router(client: Client) -> Router {
         .route("/cas/{id}/certificate", get(get_ca_certificate))
         .route("/cas/{id}/crl", get(get_ca_crl))
         .route("/cas/{id}/revoke", post(revoke_on_ca))
+        .route(
+            "/access-keys",
+            get(list_access_keys).post(create_access_key),
+        )
+        .route(
+            "/access-keys/{id}",
+            get(get_access_key).delete(revoke_access_key),
+        )
         .route(
             "/join-tokens",
             get(list_join_tokens).post(create_join_token_h),
@@ -392,12 +408,119 @@ async fn delete_secret(
 ) -> ApiResult<Response> {
     scope.require_write()?;
     let s = resolve::<Secret>(&c, &scope, &id)?;
-    if crate::client::is_private_key(&s.meta.labels) {
-        return Err(ApiError::conflict(
-            "this secret holds a certificate's key; delete the certificate instead",
-        ));
+    match crate::client::managed_role(&s.meta.labels) {
+        Some(crate::ca::ROLE_PRIVATE_KEY) => {
+            return Err(ApiError::conflict(
+                "this secret holds a certificate's key; delete the certificate instead",
+            ))
+        }
+        Some(crate::access_key::ROLE_ACCESS_KEY) => {
+            return Err(ApiError::conflict(
+                "this secret is an access key; revoke it with DELETE /secrets/access-keys/{id}",
+            ))
+        }
+        Some(_) => return Err(ApiError::conflict("this secret is managed by keep")),
+        None => {}
     }
     c.delete_secret(&s.meta.id)?;
+    Ok(no_content())
+}
+
+// ---- access keys -------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateAccessKey {
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Project id (admins only; others are scoped to their own).
+    #[serde(default)]
+    pub project: Option<Id>,
+    /// Principal the key acts as. Defaults to the caller; naming anyone
+    /// else needs the admin role.
+    #[serde(default)]
+    pub principal: Option<Id>,
+}
+
+/// `{id}` is a `sec-…` id or a `PIAK…` access key id.
+fn resolve_access_key(c: &Client, scope: &Scope, id: &str) -> ApiResult<AccessKey> {
+    let not_found = || ApiError::not_found(format!("access key {id} not found"));
+    let key = if is_access_key_id(id) {
+        c.find_access_key(id)?
+    } else {
+        let sid = Id::parse(pistack_types::kind::SECRET, id).ok_or_else(not_found)?;
+        c.get_access_key(&sid)?
+    };
+    if !scope.can_see(Some(&key.project)) {
+        return Err(not_found());
+    }
+    Ok(key)
+}
+
+async fn list_access_keys(
+    State(c): State<Client>,
+    scope: Scope,
+    ListParams(q): ListParams,
+) -> ApiResult<Json<Page<AccessKey>>> {
+    if !scope.is_cloud_admin() && scope.filter().is_none() {
+        return Err(ApiError::forbidden("a project scope is required"));
+    }
+    let keys: Vec<Secret> = c
+        .list_secrets(scope.filter())?
+        .into_iter()
+        .filter(crate::access_key::is_access_key)
+        .collect();
+    let page = paginate(keys, &q);
+    Ok(Json(Page {
+        items: page
+            .items
+            .iter()
+            .map(crate::access_key::view)
+            .collect::<crate::Result<_>>()?,
+        next: page.next,
+        total: page.total,
+    }))
+}
+
+async fn create_access_key(
+    State(c): State<Client>,
+    scope: Scope,
+    Body(req): Body<CreateAccessKey>,
+) -> ApiResult<Response> {
+    scope.require_write()?;
+    let project = scope
+        .target_project(req.project)?
+        .ok_or_else(|| ApiError::bad_request("an access key needs a project"))?;
+    let principal = match req.principal {
+        Some(p) if p != scope.caller().principal => {
+            scope.require_admin()?;
+            p
+        }
+        _ => scope.caller().principal.clone(),
+    };
+    let key: CreatedAccessKey = c.create_access_key(
+        &project,
+        &principal,
+        req.description.as_deref().unwrap_or(""),
+    )?;
+    Ok(created(key))
+}
+
+async fn get_access_key(
+    State(c): State<Client>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<AccessKey>> {
+    Ok(Json(resolve_access_key(&c, &scope, &id)?))
+}
+
+async fn revoke_access_key(
+    State(c): State<Client>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    scope.require_write()?;
+    let key = resolve_access_key(&c, &scope, &id)?;
+    c.revoke_access_key(&key.id)?;
     Ok(no_content())
 }
 
@@ -492,19 +615,13 @@ async fn create_certificate(
         ttl_days: req.ttl_days.unwrap_or_else(default_ttl_days),
         issuer: req.issuer,
     };
-    let mut cert = c.issue_certificate(project, &req.name, spec)?;
-    if req.description.is_some() || !req.labels.is_empty() {
-        let desc = req.description.unwrap_or_default();
-        let labels = req.labels;
-        cert = c
-            .store()
-            .collection::<Certificate>()
-            .modify(&cert.meta.id, |x| {
-                x.meta.description = desc.clone();
-                x.meta.labels = labels.clone();
-                Ok(())
-            })?;
-    }
+    let cert = c.issue_certificate_with(
+        project,
+        &req.name,
+        spec,
+        req.description.unwrap_or_default(),
+        req.labels,
+    )?;
     Ok(created(cert))
 }
 
@@ -652,6 +769,10 @@ pub struct CreateJoinToken {
     pub name: String,
     #[serde(default)]
     pub multi_use: bool,
+    /// Redemptions a multi-use token allows; default and maximum
+    /// `[modules.keep] max_join_token_uses`.
+    #[serde(default)]
+    pub max_uses: Option<u64>,
     /// Lifetime in seconds; default and maximum 24h.
     #[serde(default)]
     pub ttl_secs: Option<i64>,
@@ -693,12 +814,16 @@ async fn create_join_token_h(
         Some(s) => Some(Duration::seconds(s)),
         None => None,
     };
-    let (join_token, token) = create_join_token(
+    let (join_token, token) = create_join_token_with(
         c.store(),
-        &req.name,
-        &scope.caller().principal_name,
-        req.multi_use,
-        ttl,
+        &NewJoinToken {
+            name: &req.name,
+            created_by: &scope.caller().principal_name,
+            multi_use: req.multi_use,
+            max_uses: req.max_uses,
+            ttl,
+        },
+        c.limits(),
     )?;
     Ok(created(JoinTokenResponse { token, join_token }))
 }

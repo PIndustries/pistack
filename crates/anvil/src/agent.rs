@@ -32,6 +32,8 @@ use pistack_rpc::{AgentClient, RpcError, RPC_INSECURE_ENV};
 use pistack_types::{ApiError, Id, Phase, Resources};
 use tokio_util::sync::CancellationToken;
 
+use pistack_types::node::{self, NodeIdentity, NODE_NAME_ENV};
+
 use crate::facts::{self, HostFacts};
 use crate::probe::{self, ProbeBook, ProbeTarget};
 use crate::runtime::{select_runtimes, RunningMachine, Runtimes};
@@ -63,7 +65,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Entry point for the host agent: gather facts, pick runtimes, run until
 /// ctrl-c.
 pub async fn run_agent(opts: AgentOpts) -> anyhow::Result<()> {
-    let facts = facts::gather_at(&opts.data_dir);
+    let mut facts = facts::gather_at(&opts.data_dir);
+    let identity = agent_identity(&opts.data_dir, std::env::var(NODE_NAME_ENV).ok().as_deref())?;
+    facts.node_name = identity.name;
     let allow_mock = mock_allowed(&facts.capabilities);
     let runtimes = select_runtimes(&facts.capabilities, allow_mock);
     if runtimes.is_empty() {
@@ -130,21 +134,80 @@ fn normalize_join_token(token: Option<String>) -> Option<String> {
     }
 }
 
-/// Build the agent client. Prefer a persisted client certificate; otherwise
-/// enroll with the join token when present. Plain HTTP without a certificate
-/// only works when the control plane sets `PISTACK_RPC_INSECURE=1`.
+/// The node name this agent runs under, resolved once and kept in
+/// `<data_dir>/node.name` (see [`pistack_types::node`]). An agent that
+/// enrolled before the file existed keeps the name on its certificate, so
+/// upgrading never renames a host.
+pub fn agent_identity(
+    data_dir: &std::path::Path,
+    env: Option<&str>,
+) -> anyhow::Result<NodeIdentity> {
+    let enrolled = load_agent_pki(&data_dir.join("agent"))
+        .ok()
+        .flatten()
+        .and_then(|pki| cert_node_name(&pki.cert_pem));
+    let id =
+        node::resolve_node_name_with(data_dir, env, enrolled.as_deref(), node::system_hostname)?;
+    if let Some(old) = &id.replaced {
+        tracing::warn!(
+            node = %id.name,
+            previous = %old,
+            "{NODE_NAME_ENV} renamed this node; the control plane will see a new host"
+        );
+    }
+    tracing::info!(node = %id.name, source = %id.source, "anvil agent: node identity");
+    Ok(id)
+}
+
+/// Common name of the leaf certificate in `cert_pem`: the node name the
+/// control plane enrolled it under.
+pub fn cert_node_name(cert_pem: &str) -> Option<String> {
+    let certs = keep::tls::certs_from_pem(cert_pem).ok()?;
+    let leaf = certs.first()?;
+    keep::ca::common_name_from_der(leaf).ok()
+}
+
+/// Build the agent client. Prefer a persisted client certificate issued for
+/// `node`; otherwise enroll with the join token when present. A certificate
+/// for another node is replaced by re-enrolling, never used, because the
+/// control plane only accepts a certificate for its own node. Plain HTTP
+/// without a certificate only works when the control plane sets
+/// `PISTACK_RPC_INSECURE=1`.
 async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<AgentClient> {
     let base = join_url(&opts.join);
     let token = normalize_join_token(opts.token.clone());
     let cert_dir = opts.data_dir.join("agent");
 
     if let Some(pki) = load_agent_pki(&cert_dir)? {
-        tracing::info!("using persisted agent client certificate");
-        let mut client = AgentClient::with_mtls(&base, node, &pki.ca_pem, &pki)?;
-        if let Some(t) = token {
-            client = client.with_token(t);
+        match persisted_cert_use(
+            cert_node_name(&pki.cert_pem).as_deref(),
+            node,
+            token.is_some(),
+        ) {
+            CertUse::Keep => {
+                tracing::info!(node, "using persisted agent client certificate");
+                let mut client = AgentClient::with_mtls(&base, node, &pki.ca_pem, &pki)?;
+                if let Some(t) = token {
+                    client = client.with_token(t);
+                }
+                return Ok(client);
+            }
+            CertUse::Reenroll(cert_node) => {
+                tracing::warn!(
+                    node,
+                    cert_node = cert_node.as_deref().unwrap_or("?"),
+                    "persisted agent certificate is for another node; re-enrolling"
+                );
+            }
+            CertUse::Refuse(cert_node) => {
+                let cert_node = cert_node.as_deref().unwrap_or("an unreadable name");
+                anyhow::bail!(
+                    "agent certificate in {} is for node {cert_node}, but this node is {node}; \
+                     pass a join token to re-enroll as {node}, or set {NODE_NAME_ENV}={cert_node}",
+                    cert_dir.display()
+                );
+            }
         }
-        return Ok(client);
     }
 
     if let Some(t) = token.clone() {
@@ -174,6 +237,23 @@ async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<Agen
     }
 
     Ok(connect(&opts.join, node, opts.token.clone())?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CertUse {
+    Keep,
+    Reenroll(Option<String>),
+    Refuse(Option<String>),
+}
+
+/// What to do with a persisted certificate whose common name is `cert_node`
+/// when this agent runs as `node`.
+fn persisted_cert_use(cert_node: Option<&str>, node: &str, have_token: bool) -> CertUse {
+    match cert_node {
+        Some(cn) if cn == node => CertUse::Keep,
+        other if have_token => CertUse::Reenroll(other.map(str::to_owned)),
+        other => CertUse::Refuse(other.map(str::to_owned)),
+    }
 }
 
 /// Build the agent client. The join token is attached only when it is non-empty.
@@ -1011,6 +1091,125 @@ mod tests {
 
         let mock: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::default());
         assert!(!cloud_vm(&Runtimes::all(mock)));
+    }
+
+    fn issued_pki(store: &pistack_store::Store, cn: &str) -> Pki {
+        keep::Client::open(store)
+            .unwrap()
+            .issue_client_cert(cn)
+            .unwrap()
+    }
+
+    #[test]
+    fn cert_node_name_reads_the_enrolled_common_name() {
+        let store = pistack_store::Store::in_memory().unwrap();
+        let pki = issued_pki(&store, "rack1-n3");
+        assert_eq!(cert_node_name(&pki.cert_pem).as_deref(), Some("rack1-n3"));
+        assert_eq!(cert_node_name("not a pem"), None);
+    }
+
+    #[test]
+    fn persisted_cert_is_kept_only_for_its_own_node() {
+        assert_eq!(persisted_cert_use(Some("n1"), "n1", false), CertUse::Keep);
+        assert_eq!(persisted_cert_use(Some("n1"), "n1", true), CertUse::Keep);
+        assert_eq!(
+            persisted_cert_use(Some("n1"), "n2", true),
+            CertUse::Reenroll(Some("n1".into()))
+        );
+        assert_eq!(
+            persisted_cert_use(Some("n1"), "n2", false),
+            CertUse::Refuse(Some("n1".into()))
+        );
+        assert_eq!(persisted_cert_use(None, "n2", false), CertUse::Refuse(None));
+    }
+
+    #[test]
+    fn identity_survives_restart_and_adopts_an_existing_cert() {
+        let store = pistack_store::Store::in_memory().unwrap();
+        // An agent enrolled before node.name existed: the certificate's
+        // name wins over whatever the host is called today.
+        let dir = tempfile::tempdir().unwrap();
+        save_agent_pki(
+            &dir.path().join("agent"),
+            &issued_pki(&store, "enrolled-n1"),
+        )
+        .unwrap();
+        let id = agent_identity(dir.path(), None).unwrap();
+        assert_eq!(id.name, "enrolled-n1");
+        assert_eq!(id.source, node::NodeNameSource::Adopted);
+        // Restart: same name, now from the file.
+        let id = agent_identity(dir.path(), None).unwrap();
+        assert_eq!(id.name, "enrolled-n1");
+        assert_eq!(id.source, node::NodeNameSource::File);
+        // An explicit rename wins and sticks.
+        let id = agent_identity(dir.path(), Some("renamed")).unwrap();
+        assert_eq!(id.name, "renamed");
+        assert_eq!(id.replaced.as_deref(), Some("enrolled-n1"));
+        assert_eq!(agent_identity(dir.path(), None).unwrap().name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn rejoin_refreshes_the_cert_but_keeps_the_name() {
+        let store = pistack_store::Store::in_memory().unwrap();
+        keep::Client::open(&store).unwrap();
+        let (_, first) = keep::create_join_token(&store, "a", "admin", false, None).unwrap();
+        let (_, second) = keep::create_join_token(&store, "b", "admin", false, None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().nest(
+            RPC_PREFIX,
+            pistack_rpc::router_with_auth(
+                pistack_rpc::CommandQueue::default(),
+                store.clone(),
+                pistack_rpc::RpcAuth::open(),
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = |token: Option<&str>| AgentOpts {
+            join: format!("http://{addr}"),
+            token: token.map(str::to_owned),
+            data_dir: dir.path().to_owned(),
+        };
+        let cert = || std::fs::read_to_string(dir.path().join("agent/cert.pem")).unwrap();
+
+        // First start: resolve, enroll, persist.
+        let node = agent_identity(dir.path(), None).unwrap().name;
+        let client = connect_and_enroll(&opts(Some(&first)), &node)
+            .await
+            .unwrap();
+        assert_eq!(client.node_name(), node);
+        let enrolled = cert();
+        assert_eq!(cert_node_name(&enrolled).as_deref(), Some(node.as_str()));
+
+        // Restart without a token: same name, same certificate.
+        assert_eq!(agent_identity(dir.path(), None).unwrap().name, node);
+        let client = connect_and_enroll(&opts(None), &node).await.unwrap();
+        assert_eq!(client.node_name(), node);
+        assert_eq!(cert(), enrolled);
+
+        // Rejoin with a fresh token after the certificate is lost: a new
+        // certificate, the same name.
+        std::fs::remove_file(dir.path().join("agent/cert.pem")).unwrap();
+        assert_eq!(agent_identity(dir.path(), None).unwrap().name, node);
+        let client = connect_and_enroll(&opts(Some(&second)), &node)
+            .await
+            .unwrap();
+        assert_eq!(client.node_name(), node);
+        let refreshed = cert();
+        assert_ne!(refreshed, enrolled);
+        assert_eq!(cert_node_name(&refreshed).as_deref(), Some(node.as_str()));
+
+        // A certificate for another node is refused without a token.
+        let err = connect_and_enroll(&opts(None), "someone-else")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("someone-else") && err.contains(&node), "{err}");
+        server.abort();
     }
 
     #[test]

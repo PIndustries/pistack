@@ -16,7 +16,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use fabric::overlay::{
     is_private_ula, plan, DhcpLease, DhcpRoute, DnatRule, OverlayPlan, PlanFloat, PlanHost,
-    PlanNetwork, PlanPort, PlanProvider, PlanRouter, SegmentPlan, SgRule, PLAN_VERSION,
+    PlanNetwork, PlanPort, PlanProvider, PlanRouter, PortAddress, SegmentPlan, SgRule,
+    PLAN_VERSION,
 };
 use fabric::{
     Direction, EtherType, FloatingIp, Network, NetworkKind, Port, Protocol, Remote, Router,
@@ -509,6 +510,24 @@ fn port_endpoint(
     } else {
         (Vec::new(), Vec::new())
     };
+    // Every other fixed address is filtered too, with the rules of its own
+    // family, so a dual-stack port is not left open on its second address.
+    let mut extra = Vec::new();
+    for ip in &guest.port.spec.fixed_ips {
+        if ip.to_string() == address {
+            continue;
+        }
+        let (ingress, egress) = if guest.port.spec.port_security {
+            security_rules(&guest.port, ip.is_ipv6(), groups, ports)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        extra.push(PortAddress {
+            address: ip.to_string(),
+            ingress,
+            egress,
+        });
+    }
     Ok(PlanPort {
         id: guest.port.meta.id.to_string(),
         mac: guest.port.spec.mac.clone(),
@@ -516,6 +535,7 @@ fn port_endpoint(
         underlay: guest.underlay.to_string(),
         ingress,
         egress,
+        extra,
     })
 }
 
@@ -1612,5 +1632,40 @@ mod tests {
         assert_eq!(ing4[0].port_min, 22);
         assert_eq!(ing4[0].cidr, "0.0.0.0/0");
         assert!(eg4.is_empty());
+    }
+
+    #[test]
+    fn dual_stack_port_plans_rules_for_both_addresses() {
+        let mut group = SecurityGroup {
+            meta: Meta::new(kind::SECGROUP, "web", None),
+            spec: SecurityGroupSpec { rules: vec![] },
+            status: Default::default(),
+        };
+        let gid = group.meta.id.clone();
+        group.spec.rules = vec![
+            Rule::new(Direction::Ingress, EtherType::IPv4)
+                .protocol(Protocol::Tcp)
+                .ports(22, 22),
+            Rule::new(Direction::Ingress, EtherType::IPv6)
+                .protocol(Protocol::Tcp)
+                .ports(443, 443),
+        ];
+        let mut port = sg_port(&["10.90.0.5", "fd00::5"], &gid);
+        port.spec.mac = "52:54:00:00:00:55".into();
+        let guest = Guest {
+            port: port.clone(),
+            underlay: "10.1.0.1".parse().unwrap(),
+            node: "a".into(),
+        };
+        let groups = vec![group];
+        let got = port_endpoint(&guest, &groups, &[port], &[]).unwrap();
+        assert_eq!(got.address, "10.90.0.5");
+        assert_eq!(got.ingress.len(), 1);
+        assert_eq!(got.ingress[0].port_min, 22);
+        assert_eq!(got.extra.len(), 1);
+        assert_eq!(got.extra[0].address, "fd00::5");
+        assert_eq!(got.extra[0].ingress.len(), 1);
+        assert_eq!(got.extra[0].ingress[0].port_min, 443);
+        assert_eq!(got.extra[0].ingress[0].cidr, "::/0");
     }
 }

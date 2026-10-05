@@ -367,9 +367,12 @@ impl std::fmt::Debug for DiskTarget {
 
 /// Payload of [`CommandKind::AttachVolume`]. `path` is the host file `slab`
 /// created, or an LVM device path under `/dev`. `target` is set when the
-/// volume is an RBD image. The agent may stage a copy of a regular file
-/// under its libvirt image directory when AppArmor will not let qemu open
-/// `path` in place. A block device is attached in place.
+/// volume is an RBD image. A VM agent attaches that image as a network disk
+/// and leaves `path` empty. A pod agent maps the image to a host block
+/// device and records that device path for the pod mount. The agent may
+/// stage a copy of a regular file under its libvirt image directory when
+/// AppArmor will not let qemu open `path` in place. A block device is
+/// attached in place.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeAttach {
     pub machine: Id,
@@ -391,6 +394,10 @@ pub struct VolumeAttached {
 }
 
 /// Payload of [`CommandKind::DetachVolume`].
+///
+/// `target` is set when the disk was attached from an RBD image. A pod agent
+/// unmaps the host device it mapped at attach. A VM agent removes the network
+/// disk and does not unmap a host device.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeDetach {
     pub machine: Id,

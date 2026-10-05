@@ -7,11 +7,16 @@
 use chrono::Utc;
 use pistack_store::Store;
 use pistack_types::{Id, Phase};
+use std::collections::BTreeMap;
 
+use crate::access_key::{ACCESS_KEYS, ROLE_ACCESS_KEY};
 use crate::backend::KeyBackend;
-use crate::ca::{open_secret, seal_pem_secret, Ca, Issued, ROLE_LABEL, ROLE_PRIVATE_KEY};
+use crate::ca::{
+    open_secret, seal_pem_secret, Ca, Issued, RESERVED_LABEL_PREFIX, ROLE_LABEL, ROLE_PRIVATE_KEY,
+};
 use crate::crypto::RootKey;
 use crate::error::{KeepError, Result};
+use crate::quota::{self, KeepConfig, CERTIFICATES, SECRETS};
 use crate::tls::Pki;
 use crate::types::*;
 
@@ -19,7 +24,7 @@ use crate::types::*;
 pub const MAX_PAYLOAD: usize = 1 << 20;
 /// Limits on a secret's clear-text metadata, so labels, description and
 /// content type cannot carry more than the (sealed) payload is allowed to.
-/// Applied the same way on create and update.
+/// Applied the same way on create and update, and to certificates.
 pub const MAX_LABELS: usize = 64;
 pub const MAX_LABEL_KEY: usize = 128;
 pub const MAX_LABEL_VALUE: usize = 1024;
@@ -31,6 +36,7 @@ pub struct Client {
     store: Store,
     root_key: RootKey,
     ca: Ca,
+    limits: KeepConfig,
 }
 
 impl std::fmt::Debug for Client {
@@ -54,7 +60,66 @@ impl Client {
             store: store.clone(),
             root_key,
             ca,
+            limits: KeepConfig::configured().clone(),
         })
+    }
+
+    /// Replace the count limits (normally `[modules.keep]`).
+    pub fn with_limits(mut self, limits: KeepConfig) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> &KeepConfig {
+        &self.limits
+    }
+
+    /// Rows of `resource` in `project` that count against its quota. A
+    /// certificate's key secret counts as part of the certificate; an
+    /// access key counts under `access_keys`, not `secrets`.
+    pub(crate) fn count(&self, project: &Id, resource: &str) -> Result<u64> {
+        let n = if resource == CERTIFICATES {
+            self.store
+                .collection::<Certificate>()
+                .list(Some(project))?
+                .len()
+        } else {
+            let want = (resource == ACCESS_KEYS).then_some(ROLE_ACCESS_KEY);
+            self.store
+                .collection::<StoredSecret>()
+                .list(Some(project))?
+                .iter()
+                .filter(|s| managed_role(&s.meta.labels) == want)
+                .count()
+        };
+        Ok(n as u64)
+    }
+
+    /// Refuse one more `resource` in `project` at its limit. Call with
+    /// [`quota::admission`] held when a create follows.
+    pub(crate) fn admit(&self, project: Option<&Id>, resource: &str) -> Result<()> {
+        let Some(p) = project else {
+            return Ok(());
+        };
+        let default = match resource {
+            CERTIFICATES => self.limits.max_certificates_per_project,
+            ACCESS_KEYS => self.limits.max_access_keys_per_project,
+            _ => self.limits.max_secrets_per_project,
+        };
+        quota::admit(&self.store, p, resource, self.count(p, resource)?, default)
+    }
+
+    /// Mirror the current count into the project's usage.
+    pub(crate) fn note_usage(&self, project: Option<&Id>, resource: &str) {
+        let Some(p) = project else {
+            return;
+        };
+        match self.count(p, resource) {
+            Ok(n) => quota::record(&self.store, p, resource, n),
+            Err(e) => {
+                tracing::warn!(project = %p, resource, error = %e, "keep: usage was not counted")
+            }
+        }
     }
 
     pub fn store(&self) -> &Store {
@@ -92,7 +157,7 @@ impl Client {
             key_pem: issued.key_pem.clone(),
             ca_pem: self.ca.bundle_pem(),
         };
-        self.persist_certificate(None, &name, spec, issued)?;
+        self.persist_certificate(None, &name, spec, issued, String::new(), BTreeMap::new())?;
         Ok(pki)
     }
 
@@ -108,9 +173,21 @@ impl Client {
 
     // ---- secrets -----------------------------------------------------------
 
-    /// Decrypted payload of a secret.
+    /// Decrypted payload of a secret. An access key's secret is refused:
+    /// it is shown once at creation and otherwise only reaches
+    /// [`lookup_access_key`](Self::lookup_access_key).
     pub fn get_secret_payload(&self, id: &Id) -> Result<Vec<u8>> {
+        let s = self.store.collection::<Secret>().get(id)?;
+        if managed_role(&s.meta.labels) == Some(ROLE_ACCESS_KEY) {
+            return Err(KeepError::Conflict(
+                "an access key's secret is shown only once, when it is created".into(),
+            ));
+        }
         open_secret(&self.store, &self.root_key, id)
+    }
+
+    pub(crate) fn root_key(&self) -> &RootKey {
+        &self.root_key
     }
 
     pub fn get_secret(&self, id: &Id) -> Result<Secret> {
@@ -125,9 +202,14 @@ impl Client {
     pub fn create_secret(&self, mut secret: Secret, payload: &[u8]) -> Result<Secret> {
         check_payload(payload)?;
         check_metadata(&secret)?;
-        if secret.meta.labels.contains_key(ROLE_LABEL) {
+        if let Some(k) = secret
+            .meta
+            .labels
+            .keys()
+            .find(|k| k.starts_with(RESERVED_LABEL_PREFIX))
+        {
             return Err(KeepError::Invalid(format!(
-                "label {ROLE_LABEL} is reserved for keep"
+                "label {k} is reserved for keep ({RESERVED_LABEL_PREFIX}*)"
             )));
         }
         secret.status = SecretStatus {
@@ -145,21 +227,27 @@ impl Client {
         };
         let aad = stored.meta.id.to_string();
         stored.status.sealed = Some(self.root_key.seal(payload, aad.as_bytes())?);
-        Ok(public_secret(
-            self.store.collection::<StoredSecret>().create(stored)?,
-        ))
+        let project = stored.meta.project.clone();
+        let created = {
+            let _admission = quota::admission();
+            self.admit(project.as_ref(), SECRETS)?;
+            self.store.collection::<StoredSecret>().create(stored)?
+        };
+        self.note_usage(project.as_ref(), SECRETS);
+        Ok(public_secret(created))
     }
 
     /// Replace spec and metadata (not the payload). Honours `If-Match`.
-    /// The same metadata limits as create apply, and the reserved role
-    /// label cannot be added, changed or removed.
+    /// The same metadata limits as create apply, and keep's own labels
+    /// (`keep.pistack.io/*`) cannot be added, changed or removed.
     pub fn update_secret(&self, secret: Secret, expected_revision: Option<u64>) -> Result<Secret> {
         check_metadata(&secret)?;
         let col = self.store.collection::<StoredSecret>();
         let current = col.get(&secret.meta.id)?;
-        if secret.meta.labels.get(ROLE_LABEL) != current.meta.labels.get(ROLE_LABEL) {
+        if reserved_labels(&secret.meta.labels) != reserved_labels(&current.meta.labels) {
             return Err(KeepError::Conflict(format!(
-                "label {ROLE_LABEL} is managed by keep and cannot be changed"
+                "labels {RESERVED_LABEL_PREFIX}* are managed by keep and cannot be changed \
+                 (including {ROLE_LABEL})"
             )));
         }
         let stored = StoredSecret {
@@ -183,10 +271,23 @@ impl Client {
         check_payload(payload)?;
         let col = self.store.collection::<StoredSecret>();
         let mut cur = col.get(id)?;
-        if is_private_key(&cur.meta.labels) {
-            return Err(KeepError::Conflict(
-                "this secret holds a certificate's key; it cannot be rotated on its own".into(),
-            ));
+        match managed_role(&cur.meta.labels) {
+            Some(ROLE_PRIVATE_KEY) => {
+                return Err(KeepError::Conflict(
+                    "this secret holds a certificate's key; it cannot be rotated on its own".into(),
+                ))
+            }
+            Some(ROLE_ACCESS_KEY) => {
+                return Err(KeepError::Conflict(
+                    "an access key cannot be rotated; create a new one and revoke this one".into(),
+                ))
+            }
+            Some(_) => {
+                return Err(KeepError::Conflict(
+                    "this secret is managed by keep and cannot be rotated".into(),
+                ))
+            }
+            None => {}
         }
         if let Some(exp) = expected_revision {
             if exp != cur.meta.revision {
@@ -206,10 +307,16 @@ impl Client {
         Ok(public_secret(col.update(cur, Some(rev))?))
     }
 
+    /// Delete a secret. Deleting an access key's secret revokes the key.
     pub fn delete_secret(&self, id: &Id) -> Result<Secret> {
-        Ok(public_secret(
-            self.store.collection::<StoredSecret>().delete(id)?,
-        ))
+        let s = self.store.collection::<Secret>().get(id)?;
+        if managed_role(&s.meta.labels) == Some(ROLE_ACCESS_KEY) {
+            self.revoke_access_key(id)?;
+            return Ok(s);
+        }
+        let gone = self.store.collection::<StoredSecret>().delete(id)?;
+        self.note_usage(gone.meta.project.as_ref(), SECRETS);
+        Ok(public_secret(gone))
     }
 
     // ---- certificates ------------------------------------------------------
@@ -222,8 +329,26 @@ impl Client {
         name: &str,
         spec: CertificateSpec,
     ) -> Result<Certificate> {
+        self.issue_certificate_with(project, name, spec, String::new(), BTreeMap::new())
+    }
+
+    /// [`issue_certificate`](Self::issue_certificate) with a description
+    /// and labels, held to the same limits as a secret's. Nothing is issued
+    /// when they, or the project's `certificates` quota, refuse.
+    pub fn issue_certificate_with(
+        &self,
+        project: Option<Id>,
+        name: &str,
+        spec: CertificateSpec,
+        description: String,
+        labels: BTreeMap<String, String>,
+    ) -> Result<Certificate> {
+        check_meta_fields(&labels, &description)?;
+        // Early refusal so a full project does not spend a serial; the
+        // authoritative check is repeated under the lock in persist.
+        self.admit(project.as_ref(), CERTIFICATES)?;
         let issued = self.ca.issue(&spec)?;
-        self.persist_certificate(project, name, spec, issued)
+        self.persist_certificate(project, name, spec, issued, description, labels)
     }
 
     fn persist_certificate(
@@ -232,6 +357,26 @@ impl Client {
         name: &str,
         spec: CertificateSpec,
         issued: Issued,
+        description: String,
+        labels: BTreeMap<String, String>,
+    ) -> Result<Certificate> {
+        let created = {
+            let _admission = quota::admission();
+            self.admit(project.as_ref(), CERTIFICATES)?;
+            self.store_certificate(project.clone(), name, spec, issued, description, labels)?
+        };
+        self.note_usage(project.as_ref(), CERTIFICATES);
+        Ok(created)
+    }
+
+    fn store_certificate(
+        &self,
+        project: Option<Id>,
+        name: &str,
+        spec: CertificateSpec,
+        issued: Issued,
+        description: String,
+        labels: BTreeMap<String, String>,
     ) -> Result<Certificate> {
         let key_secret = seal_pem_secret(
             &self.store,
@@ -241,6 +386,8 @@ impl Client {
             &issued.key_pem,
         )?;
         let mut cert = Certificate::new(name, project, spec);
+        cert.meta.description = description;
+        cert.meta.labels = labels;
         cert.status = CertificateStatus {
             phase: Phase::Ready,
             serial: issued.serial,
@@ -304,6 +451,7 @@ impl Client {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.note_usage(cert.meta.project.as_ref(), CERTIFICATES);
         Ok(cert)
     }
 
@@ -331,14 +479,26 @@ fn check_payload(payload: &[u8]) -> Result<()> {
 }
 
 fn check_metadata(secret: &Secret) -> Result<()> {
-    let m = &secret.meta;
-    if m.labels.len() > MAX_LABELS {
+    check_meta_fields(&secret.meta.labels, &secret.meta.description)?;
+    if secret.spec.content_type.len() > MAX_CONTENT_TYPE {
+        return Err(KeepError::Invalid(format!(
+            "content_type exceeds {MAX_CONTENT_TYPE} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Label and description limits shared by secrets and certificates.
+pub(crate) fn check_meta_fields(
+    labels: &BTreeMap<String, String>,
+    description: &str,
+) -> Result<()> {
+    if labels.len() > MAX_LABELS {
         return Err(KeepError::Invalid(format!(
             "at most {MAX_LABELS} labels are allowed"
         )));
     }
-    if let Some((k, _)) = m
-        .labels
+    if let Some((k, _)) = labels
         .iter()
         .find(|(k, v)| k.is_empty() || k.len() > MAX_LABEL_KEY || v.len() > MAX_LABEL_VALUE)
     {
@@ -348,21 +508,24 @@ fn check_metadata(secret: &Secret) -> Result<()> {
             k.chars().take(32).collect::<String>()
         )));
     }
-    if m.description.len() > MAX_DESCRIPTION {
+    if description.len() > MAX_DESCRIPTION {
         return Err(KeepError::Invalid(format!(
             "description exceeds {MAX_DESCRIPTION} bytes"
-        )));
-    }
-    if secret.spec.content_type.len() > MAX_CONTENT_TYPE {
-        return Err(KeepError::Invalid(format!(
-            "content_type exceeds {MAX_CONTENT_TYPE} bytes"
         )));
     }
     Ok(())
 }
 
-pub(crate) fn is_private_key(labels: &std::collections::BTreeMap<String, String>) -> bool {
-    labels.get(ROLE_LABEL).map(String::as_str) == Some(ROLE_PRIVATE_KEY)
+/// The keep role (`keep.pistack.io/role`) of a secret keep manages itself.
+pub(crate) fn managed_role(labels: &BTreeMap<String, String>) -> Option<&str> {
+    labels.get(ROLE_LABEL).map(String::as_str)
+}
+
+fn reserved_labels(labels: &BTreeMap<String, String>) -> Vec<(&String, &String)> {
+    labels
+        .iter()
+        .filter(|(k, _)| k.starts_with(RESERVED_LABEL_PREFIX))
+        .collect()
 }
 
 /// Turn a CN into something that fits the resource-name rules.
@@ -646,5 +809,217 @@ mod tests {
             ),
             Err(KeepError::Backend(_))
         ));
+    }
+
+    fn limited(secrets: u64, certificates: u64) -> Client {
+        client().with_limits(KeepConfig {
+            max_secrets_per_project: secrets,
+            max_certificates_per_project: certificates,
+            ..KeepConfig::default()
+        })
+    }
+
+    fn denied(r: Result<impl std::fmt::Debug>) -> pistack_types::ApiError {
+        match r {
+            Err(KeepError::Denied(e)) => e,
+            other => panic!("expected a quota refusal, got {other:?}"),
+        }
+    }
+
+    fn mk(name: &str, project: &Id) -> Secret {
+        Secret::new(name, Some(project.clone()), SecretSpec::default())
+    }
+
+    fn cert_spec(cn: &str) -> CertificateSpec {
+        CertificateSpec {
+            common_name: cn.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn secrets_per_project_default_limit_is_exact() {
+        let c = limited(3, 10);
+        let p = Id::new(kind::PROJECT);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                c.create_secret(mk(&format!("s{i}"), &p), b"x")
+                    .unwrap()
+                    .meta
+                    .id,
+            );
+        }
+        let e = denied(c.create_secret(mk("s3", &p), b"x"));
+        assert_eq!(e.code, pistack_types::error::ErrorCode::QuotaExceeded);
+        assert_eq!(e.details["resource"], SECRETS);
+        assert_eq!(e.details["limit"], 3);
+        assert_eq!(e.details["used"], 3);
+        assert_eq!(
+            pistack_types::ApiError::from(KeepError::Denied(e))
+                .code
+                .status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        // Other projects and cloud-scoped secrets are not affected.
+        c.create_secret(mk("s0", &Id::new(kind::PROJECT)), b"x")
+            .unwrap();
+        c.create_secret(Secret::new("cloud", None, SecretSpec::default()), b"x")
+            .unwrap();
+        // A delete frees exactly one slot.
+        c.delete_secret(&ids[0]).unwrap();
+        c.create_secret(mk("s3", &p), b"x").unwrap();
+        assert!(c.create_secret(mk("s4", &p), b"x").is_err());
+    }
+
+    #[test]
+    fn gate_project_quota_overrides_the_default_and_records_usage() {
+        let c = limited(3, 10);
+        let store = c.store().clone();
+        let mut spec = gate::ProjectSpec::default();
+        spec.quotas.insert(SECRETS.into(), 5);
+        let p = store
+            .collection::<gate::Project>()
+            .create(gate::Project {
+                meta: pistack_types::Meta::new(kind::PROJECT, "roomy", None),
+                spec,
+                status: Default::default(),
+            })
+            .unwrap()
+            .meta
+            .id;
+        let mut last = None;
+        for i in 0..5 {
+            last = Some(c.create_secret(mk(&format!("s{i}"), &p), b"x").unwrap());
+        }
+        assert!(denied(c.create_secret(mk("s5", &p), b"x"))
+            .message
+            .contains("roomy"));
+        let usage = |store: &Store| {
+            store
+                .collection::<gate::Project>()
+                .get(&p)
+                .unwrap()
+                .status
+                .usage
+                .get(SECRETS)
+                .copied()
+        };
+        assert_eq!(usage(&store), Some(5));
+        c.delete_secret(&last.unwrap().meta.id).unwrap();
+        assert_eq!(usage(&store), Some(4));
+
+        // A disabled project refuses creates.
+        store
+            .collection::<gate::Project>()
+            .modify(&p, |x| {
+                x.spec.enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            denied(c.create_secret(mk("off", &p), b"x")).code,
+            pistack_types::error::ErrorCode::Forbidden
+        );
+    }
+
+    #[test]
+    fn certificates_per_project_limit_is_exact_and_keys_count_there() {
+        // One secret allowed, two certificates: the certificates' key
+        // secrets must not use up the secret slot.
+        let c = limited(1, 2);
+        let p = Id::new(kind::PROJECT);
+        c.issue_certificate(Some(p.clone()), "a", cert_spec("a"))
+            .unwrap();
+        let b = c
+            .issue_certificate(Some(p.clone()), "b", cert_spec("b"))
+            .unwrap();
+        let serial = c.store().get_meta::<u64>(crate::ca::META_SERIAL).unwrap();
+        let e = denied(c.issue_certificate(Some(p.clone()), "c", cert_spec("c")));
+        assert_eq!(e.details["resource"], CERTIFICATES);
+        assert_eq!(e.details["limit"], 2);
+        // Refused before signing: no serial spent, no key left behind.
+        assert_eq!(
+            c.store().get_meta::<u64>(crate::ca::META_SERIAL).unwrap(),
+            serial
+        );
+        assert_eq!(c.list_secrets(Some(&p)).unwrap().len(), 2);
+        c.create_secret(mk("only", &p), b"x").unwrap();
+        assert!(c.create_secret(mk("more", &p), b"x").is_err());
+        // Deleting a certificate frees a certificate slot.
+        c.delete_certificate(&b.meta.id).unwrap();
+        c.issue_certificate(Some(p.clone()), "c", cert_spec("c"))
+            .unwrap();
+        // Agent/server certificates (no project) are never limited.
+        c.issue_client_cert("agent-1").unwrap();
+    }
+
+    #[test]
+    fn concurrent_creates_cannot_overshoot_the_limit() {
+        let c = limited(5, 10);
+        let p = Id::new(kind::PROJECT);
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let c = c.clone();
+                let p = p.clone();
+                std::thread::spawn(move || c.create_secret(mk(&format!("s{i}"), &p), b"x").is_ok())
+            })
+            .collect();
+        let ok = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(ok, 5);
+        assert_eq!(c.list_secrets(Some(&p)).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn certificate_metadata_has_the_secret_limits() {
+        let c = client();
+        let p = Some(Id::new(kind::PROJECT));
+        let serial = c.store().get_meta::<u64>(crate::ca::META_SERIAL).unwrap();
+        let too_long = "d".repeat(MAX_DESCRIPTION + 1);
+        assert!(matches!(
+            c.issue_certificate_with(p.clone(), "x", cert_spec("x"), too_long, BTreeMap::new()),
+            Err(KeepError::Invalid(_))
+        ));
+        let mut many = BTreeMap::new();
+        for i in 0..=MAX_LABELS {
+            many.insert(format!("k{i}"), "v".to_owned());
+        }
+        assert!(matches!(
+            c.issue_certificate_with(p.clone(), "x", cert_spec("x"), String::new(), many),
+            Err(KeepError::Invalid(_))
+        ));
+        let mut big = BTreeMap::new();
+        big.insert("k".to_owned(), "v".repeat(MAX_LABEL_VALUE + 1));
+        assert!(matches!(
+            c.issue_certificate_with(p.clone(), "x", cert_spec("x"), String::new(), big),
+            Err(KeepError::Invalid(_))
+        ));
+        // Nothing was issued or stored.
+        assert_eq!(
+            c.store().get_meta::<u64>(crate::ca::META_SERIAL).unwrap(),
+            serial
+        );
+        assert!(c.list_certificates(p.as_ref()).unwrap().is_empty());
+
+        // At the limits it is accepted and stored in one write.
+        let mut labels = BTreeMap::new();
+        for i in 0..MAX_LABELS {
+            labels.insert(format!("k{i}"), "v".repeat(MAX_LABEL_VALUE));
+        }
+        let cert = c
+            .issue_certificate_with(
+                p.clone(),
+                "x",
+                cert_spec("x"),
+                "d".repeat(MAX_DESCRIPTION),
+                labels,
+            )
+            .unwrap();
+        assert_eq!(cert.meta.labels.len(), MAX_LABELS);
+        assert_eq!(cert.meta.revision, 1);
     }
 }

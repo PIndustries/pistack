@@ -236,6 +236,11 @@ pub struct JoinTokenSpec {
     /// `false` = burned on first redeem.
     #[serde(default)]
     pub multi_use: bool,
+    /// Most redemptions a multi-use token allows. Set on every token minted
+    /// since the cap exists; `None` only on older records, which expire
+    /// within the 24h token lifetime. Ignored for single-use tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u64>,
     /// Principal that created it (for the audit trail).
     pub created_by: String,
 }
@@ -259,9 +264,20 @@ pub fn join_token_expired(t: &JoinToken, now: DateTime<Utc>) -> bool {
     t.spec.expires_at <= now
 }
 
-/// Single-use and already redeemed.
+/// How many redemptions `t` allows: 1 for a single-use token, `max_uses`
+/// for a multi-use one (`None` only on records older than the cap).
+pub fn join_token_max_uses(t: &JoinToken) -> Option<u64> {
+    if t.spec.multi_use {
+        t.spec.max_uses
+    } else {
+        Some(1)
+    }
+}
+
+/// No redemptions left: a single-use token that was redeemed, or a
+/// multi-use token that reached `max_uses`.
 pub fn join_token_spent(t: &JoinToken) -> bool {
-    !t.spec.multi_use && t.status.uses > 0
+    join_token_max_uses(t).is_some_and(|max| t.status.uses >= max)
 }
 
 /// What `pistack agent --join` gets for a valid token: enough to request
@@ -346,6 +362,7 @@ mod tests {
                         hash: "h".into(),
                         expires_at: Utc::now(),
                         multi_use: false,
+                        max_uses: None,
                         created_by: "admin".into(),
                     },
                 )

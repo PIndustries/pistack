@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+pistack-config.workspace = true
+gate.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true

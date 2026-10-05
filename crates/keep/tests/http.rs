@@ -20,13 +20,26 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-/// Fake gateway auth: `X-Test-Caller: admin|member:<proj>|reader:<proj>|member-other:<proj>`.
+/// Fake gateway auth: `X-Test-Caller: admin|member:<proj>|reader:<proj>|member-other:<proj>`,
+/// or `as:<prin>:<role>:<proj>` for a fixed principal.
 async fn fake_auth(mut req: Request, next: Next) -> Response {
     let hdr = req
         .headers()
         .get("x-test-caller")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    if let Some(rest) = hdr.as_deref().and_then(|h| h.strip_prefix("as:")) {
+        let mut it = rest.splitn(3, ':');
+        let (prin, role, proj) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        req.extensions_mut().insert(Caller {
+            principal: prin.parse_id(),
+            principal_name: role.into(),
+            project: Some(proj.parse_id()),
+            roles: vec![role.into()],
+            system: false,
+        });
+        return next.run(req).await;
+    }
     if let Some(h) = hdr {
         let (role, proj) = h.split_once(':').unwrap_or((h.as_str(), ""));
         let project = (!proj.is_empty()).then(|| proj.parse_id());
@@ -624,4 +637,349 @@ async fn join_tokens_over_http() {
 fn base64_decode(s: &str) -> Vec<u8> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
+#[tokio::test]
+async fn limits_over_http() {
+    let (app, store) = boot().await;
+    // A gate project whose quota allows one secret and one certificate.
+    let mut spec = gate::ProjectSpec::default();
+    spec.quotas.insert("secrets".into(), 1);
+    spec.quotas.insert("certificates".into(), 1);
+    let proj = store
+        .collection::<gate::Project>()
+        .create(gate::Project {
+            meta: pistack_types::Meta::new(kind::PROJECT, "tight", None),
+            spec,
+            status: Default::default(),
+        })
+        .unwrap()
+        .meta
+        .id
+        .to_string();
+    let member = format!("member:{proj}");
+
+    let secret = |name: &str| json!({"name": name, "payload": "x"});
+    let (st, _) = call(&app, "POST", "/secrets", Some(&member), Some(secret("a"))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, e) = call(&app, "POST", "/secrets", Some(&member), Some(secret("b"))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"]["code"], "quota_exceeded", "{e}");
+    assert_eq!(e["error"]["details"]["resource"], "secrets", "{e}");
+    assert_eq!(e["error"]["details"]["limit"], 1, "{e}");
+
+    let cert = |name: &str| json!({"name": name, "common_name": name});
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/certificates",
+        Some(&member),
+        Some(cert("w1")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/certificates",
+        Some(&member),
+        Some(cert("w2")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"]["details"]["resource"], "certificates", "{e}");
+    // Usage is visible on the project.
+    let p = store
+        .collection::<gate::Project>()
+        .get(&serde_json::from_value(Value::String(proj.clone())).unwrap())
+        .unwrap();
+    assert_eq!(p.status.usage.get("secrets"), Some(&1));
+    assert_eq!(p.status.usage.get("certificates"), Some(&1));
+
+    // Certificate metadata has the secret limits.
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/certificates",
+        Some("admin"),
+        Some(json!({"name": "big", "common_name": "big", "description": "d".repeat(4097)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+
+    // A multi-use join token above the cap is refused; at the cap it is not.
+    let cap = keep::KeepConfig::configured().max_join_token_uses;
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/join-tokens",
+        Some("admin"),
+        Some(json!({"name": "over", "multi_use": true, "max_uses": cap + 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, t) = call(
+        &app,
+        "POST",
+        "/join-tokens",
+        Some("admin"),
+        Some(json!({"name": "at-cap", "multi_use": true, "max_uses": cap})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(t["join_token"]["spec"]["max_uses"], cap);
+}
+
+fn gate_principal(store: &Store, name: &str, project: &Id, role: &str) -> Id {
+    let id = store
+        .collection::<gate::Principal>()
+        .create(gate::Principal {
+            meta: pistack_types::Meta::new(kind::PRINCIPAL, name, None),
+            spec: Default::default(),
+            status: Default::default(),
+        })
+        .unwrap()
+        .meta
+        .id;
+    store
+        .collection::<gate::RoleBinding>()
+        .create(gate::RoleBinding {
+            meta: pistack_types::Meta::new(
+                gate::KIND_BINDING,
+                format!("{name}-{role}"),
+                Some(project.clone()),
+            ),
+            spec: gate::RoleBindingSpec {
+                principal: id.clone(),
+                role: role.into(),
+                scope: gate::Scope::Project {
+                    project: project.clone(),
+                },
+            },
+            status: Default::default(),
+        })
+        .unwrap();
+    id
+}
+
+fn gate_project(store: &Store, name: &str) -> Id {
+    store
+        .collection::<gate::Project>()
+        .create(gate::Project {
+            meta: pistack_types::Meta::new(kind::PROJECT, name, None),
+            spec: Default::default(),
+            status: Default::default(),
+        })
+        .unwrap()
+        .meta
+        .id
+}
+
+#[tokio::test]
+async fn access_keys_over_http() {
+    let (app, store) = boot().await;
+    let proj = gate_project(&store, "p1");
+    let other = gate_project(&store, "p2");
+    let alice = gate_principal(&store, "alice", &proj, "member");
+    let bob = gate_principal(&store, "bob", &proj, "member");
+    let carol = gate_principal(&store, "carol", &other, "member");
+    let eve = gate_principal(&store, "eve", &proj, "reader");
+    let as_ = |p: &Id, role: &str, pr: &Id| format!("as:{p}:{role}:{pr}");
+    let alice_h = as_(&alice, "member", &proj);
+    let carol_h = as_(&carol, "member", &other);
+
+    // Create: the secret is in this response only.
+    let (st, k) = call(
+        &app,
+        "POST",
+        "/access-keys",
+        Some(&alice_h),
+        Some(json!({"description": "ci"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{k}");
+    let akid = k["access_key_id"].as_str().unwrap().to_owned();
+    let id = k["id"].as_str().unwrap().to_owned();
+    let secret = k["secret_access_key"].as_str().unwrap().to_owned();
+    assert!(akid.starts_with("PIAK") && akid.len() == 20, "{k}");
+    assert_eq!(secret.len(), 40);
+    assert_eq!(k["project"], proj.to_string());
+    assert_eq!(k["principal"], alice.to_string());
+
+    // List and get (by sec- id and by PIAK id) carry no secret.
+    let (st, list) = call(&app, "GET", "/access-keys", Some(&alice_h), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list["items"].as_array().unwrap().len(), 1, "{list}");
+    assert!(!list.to_string().contains(&secret));
+    for key in [&id, &akid] {
+        let (st, g) = call(
+            &app,
+            "GET",
+            &format!("/access-keys/{key}"),
+            Some(&alice_h),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{g}");
+        assert_eq!(g["access_key_id"], akid.as_str());
+        assert!(g.get("secret_access_key").is_none(), "{g}");
+    }
+    // The generic secret routes show it but never its payload.
+    let (st, _) = call(&app, "GET", &format!("/secrets/{id}"), Some(&alice_h), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, e) = call(
+        &app,
+        "GET",
+        &format!("/secrets/{id}/payload"),
+        Some(&alice_h),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{e}");
+    let (st, e) = call(
+        &app,
+        "PUT",
+        &format!("/secrets/{id}/payload"),
+        Some(&alice_h),
+        Some(json!({"payload": "mine"})),
+    )
+    .await;
+    assert!(st.is_client_error(), "{st} {e}");
+    let (st, e) = call(
+        &app,
+        "DELETE",
+        &format!("/secrets/{id}"),
+        Some(&alice_h),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{e}");
+    let (st, e) = call(
+        &app,
+        "PUT",
+        &format!("/secrets/{id}"),
+        Some(&alice_h),
+        Some(json!({"labels": {}})),
+    )
+    .await;
+    assert!(st.is_client_error(), "{st} {e}");
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/secrets",
+        Some(&alice_h),
+        Some(json!({"name": "fake", "payload": "x",
+                    "labels": {"keep.pistack.io/role": "access-key"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+
+    // Another project sees nothing and cannot revoke.
+    let (_, list) = call(&app, "GET", "/access-keys", Some(&carol_h), None).await;
+    assert!(list["items"].as_array().unwrap().is_empty(), "{list}");
+    for key in [&id, &akid] {
+        let path = format!("/access-keys/{key}");
+        let (st, _) = call(&app, "GET", &path, Some(&carol_h), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = call(&app, "DELETE", &path, Some(&carol_h), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+    // Nor create a key in it.
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/access-keys",
+        Some(&carol_h),
+        Some(json!({"project": proj.to_string()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // A reader cannot create or revoke; a member cannot mint for someone else.
+    let eve_h = as_(&eve, "reader", &proj);
+    let (st, _) = call(&app, "POST", "/access-keys", Some(&eve_h), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/access-keys/{id}"),
+        Some(&eve_h),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/access-keys",
+        Some(&alice_h),
+        Some(json!({"principal": bob.to_string()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // A project admin can, for a principal with a role in the project.
+    let padmin = as_(&Id::new(kind::PRINCIPAL), "admin", &proj);
+    let (st, b) = call(
+        &app,
+        "POST",
+        "/access-keys",
+        Some(&padmin),
+        Some(json!({"principal": bob.to_string()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    assert_eq!(b["principal"], bob.to_string());
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/access-keys",
+        Some(&padmin),
+        Some(json!({"principal": carol.to_string()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    // A cloud admin must say which project.
+    let (st, _) = call(&app, "POST", "/access-keys", Some("admin"), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, all) = call(&app, "GET", "/access-keys", Some("admin"), None).await;
+    assert_eq!(all["items"].as_array().unwrap().len(), 2, "{all}");
+
+    // Revoke by PIAK id: gone everywhere, and lookup refuses it.
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/access-keys/{akid}"),
+        Some(&alice_h),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/access-keys/{id}"),
+        Some(&alice_h),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/access-keys/{akid}"),
+        Some(&alice_h),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let client = keep::Client::open(&store).unwrap();
+    assert!(matches!(
+        client.lookup_access_key(&akid),
+        Err(keep::KeepError::Unauthorized(_))
+    ));
+    let bob_key = client
+        .lookup_access_key(b["access_key_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bob_key.caller.principal, bob);
+    assert_eq!(bob_key.caller.project, Some(proj));
 }

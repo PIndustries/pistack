@@ -37,7 +37,7 @@ pub struct Assembly {
 }
 
 /// Every module in the binary, in mount order. Adding a module = one line.
-pub fn assemble(dev: bool) -> Assembly {
+pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig) -> Assembly {
     let gate_m = Arc::new(gate::Gate::default());
     let registry = Arc::new(forge::DriverRegistry::new());
     let queue = CommandQueue::new(QueueConfig::default());
@@ -59,7 +59,7 @@ pub fn assemble(dev: bool) -> Assembly {
         Arc::new(fabric_module()),
         Arc::new(slab::Slab::default().with_queue(queue.clone())),
         Arc::new(mold::Mold::default()),
-        Arc::new(silo::Silo),
+        Arc::new(silo::Silo::configured(silo_cfg)),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::default()),
         Arc::new(relay_module().with_queue(queue.clone())),
@@ -133,6 +133,14 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         }
     };
 
+    // One stable node name for this machine, shared with an agent that uses
+    // the same data dir. Kept in <data_dir>/node.name across restarts.
+    let node =
+        pistack_types::node::resolve_node_name(&opts.data_dir).context("resolving node name")?;
+    if let Some(old) = &node.replaced {
+        tracing::warn!(node = %node.name, previous = %old, "PISTACK_NODE_NAME renamed this node");
+    }
+
     let shutdown = CancellationToken::new();
     // Leadership starts false until establish_local / adopt decides; modules
     // that subscribe will stay idle until set below.
@@ -142,7 +150,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         events: events.clone(),
         shutdown: shutdown.clone(),
         public_url: public_url.clone(),
-        node_name: hostname(),
+        node_name: node.name.clone(),
         leadership: leadership.clone(),
     };
 
@@ -187,6 +195,8 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     tracing::info!(
         %cluster_id,
         %node_id,
+        node_name = %node.name,
+        node_name_source = %node.source,
         leader = established.leader,
         role = ?established.role,
         members = established.members.len(),
@@ -219,7 +229,12 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     // any module opens keep.
     let key_backend = keep::backend::configured().context("keep root-key backend")?;
     tracing::info!(backend = key_backend.name(), "keep: root-key backend");
-    let asm = assemble(opts.dev);
+    let silo_cfg = silo::SiloConfig::load().context("silo config")?;
+    tracing::info!(
+        max_object_bytes = silo_cfg.max_object_bytes,
+        "silo: max object size"
+    );
+    let asm = assemble(opts.dev, silo_cfg);
 
     // Start modules first so gate has generated its signing key before the
     // gateway asks for the verifier.
@@ -279,35 +294,4 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
         println!("{k}\t{}", String::from_utf8_lossy(&v));
     }
     Ok(())
-}
-
-fn hostname() -> String {
-    if let Ok(name) = std::env::var("PISTACK_NODE_NAME") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_owned();
-        }
-    }
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_else(|_| "localhost".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::hostname;
-
-    #[test]
-    fn hostname_prefers_env() {
-        // Serialise env mutation across tests in this process.
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::set_var("PISTACK_NODE_NAME", "lab-sim3");
-        assert_eq!(hostname(), "lab-sim3");
-        std::env::set_var("PISTACK_NODE_NAME", "  ");
-        let fallback = hostname();
-        assert!(!fallback.is_empty());
-        std::env::remove_var("PISTACK_NODE_NAME");
-    }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

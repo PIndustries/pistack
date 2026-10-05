@@ -48,6 +48,8 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
         Cmd::Key { cmd } => key(ctx, cmd, io).await,
+        Cmd::AccessKey { cmd } => access_key(ctx, cmd, io).await,
+        Cmd::JoinToken { cmd } => join_token(ctx, cmd, io).await,
         Cmd::Machine { cmd } => machine(ctx, cmd, io).await,
         Cmd::Size { cmd } => size(ctx, cmd, io).await,
         Cmd::Host { cmd } => host(ctx, cmd, io).await,
@@ -61,6 +63,10 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Snapshot { cmd } => snapshot(ctx, cmd, io).await,
         Cmd::Voltype { cmd } => voltype(ctx, cmd, io).await,
         Cmd::Image { cmd } => image(ctx, cmd, io).await,
+        Cmd::Deployment { cmd } => deployment(ctx, cmd, io).await,
+        Cmd::Service { cmd } => service(ctx, cmd, io).await,
+        Cmd::Job { cmd } => job(ctx, cmd, io).await,
+        Cmd::Ingress { cmd } => ingress(ctx, cmd, io).await,
         Cmd::Statefulset { cmd } => statefulset(ctx, cmd, io).await,
         Cmd::Daemonset { cmd } => daemonset(ctx, cmd, io).await,
         Cmd::Autoscaler { cmd } => autoscaler(ctx, cmd, io).await,
@@ -1013,6 +1019,92 @@ async fn key(ctx: &Ctx, cmd: KeyCmd, io: &mut Io<'_>) -> CliResult<()> {
     }
 }
 
+async fn access_key(ctx: &Ctx, cmd: AccessKeyCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("access-key");
+    match cmd {
+        AccessKeyCmd::List(a) => do_list(ctx, io, k, a).await,
+        AccessKeyCmd::Show(a) => do_show(ctx, io, k, a).await,
+        AccessKeyCmd::Delete(a) => {
+            // DELETE revokes; say so in the confirmation and result line.
+            let c = ctx.client()?;
+            let path = k.item_path(&a.name);
+            if !a.yes && !confirm(io, &format!("{} \"{}\"", k.noun, a.name))? {
+                writeln!(io.stderr, "aborted")?;
+                return Ok(());
+            }
+            c.delete(&path).await?;
+            writeln!(io.stdout, "{} \"{}\" revoked", k.noun, a.name)?;
+            Ok(())
+        }
+        AccessKeyCmd::Create(a) => {
+            let c = ctx.client()?;
+            let project = resolve_opt(&c, kind("project"), &a.project).await?;
+            let principal = resolve_opt(&c, kind("user"), &a.principal).await?;
+            let body = compact(json!({
+                "description": opt(a.description),
+                "project": project,
+                "principal": principal,
+            }));
+            let v = c.post(k.path, &body).await?;
+            match ctx.fmt.output {
+                Output::Table | Output::Wide => {
+                    let akid = str_at(&v, "/access_key_id");
+                    let id = str_at(&v, "/id");
+                    if id.is_empty() {
+                        writeln!(io.stdout, "{} \"{}\" created", k.noun, akid)?;
+                    } else {
+                        writeln!(
+                            io.stdout,
+                            "{} \"{}\" created ({})",
+                            k.noun,
+                            akid,
+                            short_id(&id)
+                        )?;
+                    }
+                    writeln!(
+                        io.stdout,
+                        "secret_access_key (shown once): {}",
+                        str_at(&v, "/secret_access_key")
+                    )?;
+                }
+                Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/secret_access_key"))?,
+                _ => print_one(io.stdout, ctx.fmt, &v)?,
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn join_token(ctx: &Ctx, cmd: JoinTokenCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("join-token");
+    match cmd {
+        JoinTokenCmd::List(a) => do_list(ctx, io, k, a).await,
+        JoinTokenCmd::Show(a) => do_show(ctx, io, k, a).await,
+        JoinTokenCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        JoinTokenCmd::Create(a) => {
+            let multi_use = a.multi_use || a.max_uses.is_some();
+            let body = compact(json!({
+                "name": a.name,
+                "multi_use": multi_use,
+                "max_uses": a.max_uses,
+                "ttl_secs": a.ttl_secs,
+            }));
+            let c = ctx.client()?;
+            let v = c.post(k.path, &body).await?;
+            let jt = v.get("join_token").cloned().unwrap_or_else(|| v.clone());
+            match ctx.fmt.output {
+                Output::Table | Output::Wide => {
+                    report(ctx, io, k, &jt, "created")?;
+                    writeln!(io.stdout, "token (shown once): {}", str_at(&v, "/token"))?;
+                }
+                Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/token"))?,
+                _ => print_one(io.stdout, ctx.fmt, &v)?,
+            }
+            Ok(())
+        }
+    }
+}
+
 // ---- compute nouns -----------------------------------------------------------------------
 
 async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
@@ -1493,6 +1585,39 @@ async fn upload(
 async fn pod(ctx: &Ctx, cmd: PodCmd, io: &mut Io<'_>) -> CliResult<i32> {
     match cmd {
         PodCmd::Exec(args) => pod_exec(ctx, args, io).await,
+        other => {
+            pod_rest(ctx, other, io).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn pod_rest(ctx: &Ctx, cmd: PodCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("pod");
+    match cmd {
+        PodCmd::List(a) => do_list(ctx, io, k, a).await,
+        PodCmd::Show(a) => do_show(ctx, io, k, a).await,
+        PodCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        PodCmd::Create(a) => {
+            let c = ctx.client()?;
+            let mut spec = json!({
+                "containers": [{
+                    "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                    "image": a.image,
+                }]
+            });
+            if !a.networks.is_empty() {
+                spec.as_object_mut()
+                    .unwrap()
+                    .insert("networks".into(), json!(a.networks));
+            }
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+        PodCmd::Exec(_) => Err(CliError::usage(
+            "pod exec is handled before the other pod commands",
+        )),
     }
 }
 
@@ -1557,6 +1682,143 @@ fn pick_container(names: &[String], requested: Option<&str>) -> CliResult<String
                 many.join(", ")
             ))),
         },
+    }
+}
+
+async fn deployment(ctx: &Ctx, cmd: DeploymentCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("deployment");
+    match cmd {
+        DeploymentCmd::List(a) => do_list(ctx, io, k, a).await,
+        DeploymentCmd::Show(a) => do_show(ctx, io, k, a).await,
+        DeploymentCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        DeploymentCmd::Create(a) => {
+            let c = ctx.client()?;
+            let spec = json!({
+                "replicas": a.replicas,
+                "template": {
+                    "labels": { "app": a.name },
+                    "spec": {
+                        "containers": [{
+                            "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                            "image": a.image,
+                        }]
+                    }
+                }
+            });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+        DeploymentCmd::Scale(a) => {
+            let c = ctx.client()?;
+            let id = resolve(&c, k, &a.name).await?;
+            let v = c
+                .post(
+                    &format!("{}/{}/scale", k.path, id),
+                    &json!({ "replicas": a.replicas }),
+                )
+                .await?;
+            report(ctx, io, k, &v, "scaled")
+        }
+    }
+}
+
+async fn service(ctx: &Ctx, cmd: ServiceCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("service");
+    match cmd {
+        ServiceCmd::List(a) => do_list(ctx, io, k, a).await,
+        ServiceCmd::Show(a) => do_show(ctx, io, k, a).await,
+        ServiceCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        ServiceCmd::Create(a) => {
+            let c = ctx.client()?;
+            let kind_s = match a.kind {
+                ServiceKindArg::ClusterIp => "ClusterIp",
+                ServiceKindArg::NodePort => "NodePort",
+                ServiceKindArg::LoadBalancer => "LoadBalancer",
+            };
+            let mut spec = json!({
+                "ports": [{ "port": a.port }],
+                "kind": kind_s,
+            });
+            if let Some(sel) = a.selector {
+                let (key, value) = sel
+                    .split_once('=')
+                    .ok_or_else(|| CliError::usage("selector must be key=value"))?;
+                let key = key.trim();
+                let value = value.trim();
+                if key.is_empty() || value.is_empty() {
+                    return Err(CliError::usage("selector needs both a key and a value"));
+                }
+                spec.as_object_mut()
+                    .unwrap()
+                    .insert("selector".into(), json!({ key: value }));
+            }
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+    }
+}
+
+async fn job(ctx: &Ctx, cmd: JobCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("job");
+    match cmd {
+        JobCmd::List(a) => do_list(ctx, io, k, a).await,
+        JobCmd::Show(a) => do_show(ctx, io, k, a).await,
+        JobCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        JobCmd::Create(a) => {
+            let c = ctx.client()?;
+            let restart = match a.restart {
+                JobRestartPolicyArg::Never => "Never",
+                JobRestartPolicyArg::OnFailure => "OnFailure",
+            };
+            let spec = json!({
+                "completions": a.completions,
+                "parallelism": a.parallelism,
+                "template": {
+                    "spec": {
+                        "restart_policy": restart,
+                        "containers": [{
+                            "name": a.container.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.name),
+                            "image": a.image,
+                        }]
+                    }
+                }
+            });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
+    }
+}
+
+async fn ingress(ctx: &Ctx, cmd: IngressCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("ingress");
+    match cmd {
+        IngressCmd::List(a) => do_list(ctx, io, k, a).await,
+        IngressCmd::Show(a) => do_show(ctx, io, k, a).await,
+        IngressCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        IngressCmd::Create(a) => {
+            let c = ctx.client()?;
+            if !a.path.starts_with('/') {
+                return Err(CliError::usage("path must start with /"));
+            }
+            let mut rule = json!({
+                "paths": [{
+                    "path": a.path,
+                    "backend": { "service": a.service, "port": a.port },
+                }]
+            });
+            if let Some(host) = a.host.filter(|s| !s.is_empty()) {
+                rule.as_object_mut()
+                    .unwrap()
+                    .insert("host".into(), json!(host));
+            }
+            let spec = json!({ "rules": [rule] });
+            let body = create_body(k, &a.name, &a.meta, spec)?;
+            let v = c.post(k.path, &body).await?;
+            report(ctx, io, k, &v, "created")
+        }
     }
 }
 

@@ -30,6 +30,7 @@ pub struct Client {
     store: Store,
     root: PathBuf,
     max_object_bytes: usize,
+    min_part_bytes: usize,
 }
 
 impl Client {
@@ -38,6 +39,7 @@ impl Client {
             store,
             root: root.into(),
             max_object_bytes: MAX_OBJECT_BYTES,
+            min_part_bytes: MIN_PART_BYTES,
         }
     }
 
@@ -49,6 +51,16 @@ impl Client {
 
     pub fn max_object_bytes(&self) -> usize {
         self.max_object_bytes
+    }
+
+    /// Minimum size of every multipart part except the last (default 5 MiB).
+    pub fn with_min_part_bytes(mut self, min: usize) -> Self {
+        self.min_part_bytes = min;
+        self
+    }
+
+    pub fn min_part_bytes(&self) -> usize {
+        self.min_part_bytes
     }
 
     pub fn store(&self) -> &Store {
