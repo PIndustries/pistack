@@ -5,7 +5,9 @@
 //! HTTP handlers, the reconciler, and other modules (`forge` attaches
 //! volumes through it). It is the only writer of `status`.
 
-use pistack_rpc::{CommandKind, CommandQueue, VolumeAttach, VolumeAttached, VolumeDetach};
+use pistack_rpc::{
+    CommandKind, CommandQueue, DiskTarget, VolumeAttach, VolumeAttached, VolumeDetach,
+};
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult, Id, Meta, Phase};
@@ -16,7 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::backend::{AttachInfo, AttachTarget, BlockBackend, LocalFileBackend, LvmBackend, RbdBackend};
+use crate::backend::{
+    AttachInfo, AttachTarget, BlockBackend, LocalFileBackend, LvmBackend, RbdBackend,
+};
 use crate::place;
 use crate::quota::{AllowAll, QuotaCheck, QuotaRequest};
 use crate::types::*;
@@ -81,13 +85,71 @@ pub struct Client {
     silo_root: PathBuf,
 }
 
-fn local_path(info: &AttachInfo) -> ApiResult<String> {
+/// Host path and optional network target for one attach or detach.
+///
+/// A local file or an LVM device is a host path. The agent treats a path
+/// under `/dev` as a block device. An RBD image is a disk target and does
+/// not need a path.
+fn attach_fields(info: &AttachInfo) -> ApiResult<(String, Option<DiskTarget>)> {
     match &info.target {
-        AttachTarget::Local { path } if !path.is_empty() => Ok(path.clone()),
-        _ => Err(ApiError::unprocessable(
-            "only a local file volume can be attached to a KVM guest",
+        AttachTarget::Local { path } if !path.is_empty() => Ok((path.clone(), None)),
+        AttachTarget::Rbd {
+            pool,
+            image,
+            monitors,
+            user,
+            key_secret,
+        } if !pool.is_empty() && !image.is_empty() => Ok((
+            String::new(),
+            Some(DiskTarget::Rbd {
+                pool: pool.clone(),
+                image: image.clone(),
+                monitors: monitors.clone(),
+                user: user.clone(),
+                key_secret: key_secret.clone(),
+            }),
+        )),
+        AttachTarget::Local { .. } => Err(ApiError::unprocessable("volume has no host path")),
+        AttachTarget::Rbd { .. } => Err(ApiError::unprocessable(
+            "rbd volume is missing a pool or image",
+        )),
+        AttachTarget::Iscsi { .. } | AttachTarget::Nvme { .. } => Err(ApiError::unprocessable(
+            "volume protocol cannot be attached through the host agent",
         )),
     }
+}
+
+fn queue_attach(
+    machine: Id,
+    volume: Id,
+    device: Option<String>,
+    info: &AttachInfo,
+) -> ApiResult<VolumeAttach> {
+    let (path, target) = attach_fields(info)?;
+    Ok(VolumeAttach {
+        machine,
+        volume,
+        path,
+        device,
+        read_only: info.read_only,
+        target,
+    })
+}
+
+fn queue_detach(
+    machine: Id,
+    volume: Id,
+    device: Option<String>,
+    info: &AttachInfo,
+) -> ApiResult<VolumeDetach> {
+    let (path, target) = attach_fields(info)?;
+    Ok(VolumeDetach {
+        machine,
+        volume,
+        path,
+        device,
+        target,
+    })
 }
 
 fn validate_name(name: &str) -> ApiResult<()> {
@@ -426,7 +488,8 @@ impl Client {
     }
 
     /// Ask the host that runs `machine` to hotplug this volume. Returns the
-    /// guest device name. The volume must be a local file.
+    /// guest device name. A local file or an LVM device is a host path. An
+    /// RBD image is a disk target.
     pub async fn plug_volume(
         &self,
         id: &Id,
@@ -438,16 +501,12 @@ impl Client {
         })?;
         let vol = self.ready_volume(id).await?;
         let node = place::node_for_machine(&self.store, machine)?;
-        let info = self.volume_backend(&vol).await?.attach_info(&vol, &node).await?;
-        let path = local_path(&info)?;
-        let req = VolumeAttach {
-            machine: machine.clone(),
-            volume: id.clone(),
-            path,
-            device,
-            read_only: info.read_only,
-            target: None,
-        };
+        let info = self
+            .volume_backend(&vol)
+            .await?
+            .attach_info(&vol, &node)
+            .await?;
+        let req = queue_attach(machine.clone(), id.clone(), device, &info)?;
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue.enqueue(&node, CommandKind::AttachVolume, payload)?;
         let attached: VolumeAttached =
@@ -458,6 +517,7 @@ impl Client {
     }
 
     /// Ask the host to unplug the volume. A disk that is already gone is success.
+    /// The payload uses the same path or target as attach.
     pub async fn unplug_volume(
         &self,
         id: &Id,
@@ -469,15 +529,12 @@ impl Client {
         })?;
         let vol = self.volumes().get(id)?;
         let node = place::node_for_machine(&self.store, machine)?;
-        let info = self.volume_backend(&vol).await?.attach_info(&vol, &node).await?;
-        let path = local_path(&info)?;
-        let req = VolumeDetach {
-            machine: machine.clone(),
-            volume: id.clone(),
-            path,
-            device,
-            target: None,
-        };
+        let info = self
+            .volume_backend(&vol)
+            .await?
+            .attach_info(&vol, &node)
+            .await?;
+        let req = queue_detach(machine.clone(), id.clone(), device, &info)?;
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue.enqueue(&node, CommandKind::DetachVolume, payload)?;
         ticket.wait().await?.into_api_result()?;
@@ -545,7 +602,10 @@ impl Client {
                 vol.status.phase
             )));
         }
-        self.volume_backend(&vol).await?.attach_info(&vol, host).await
+        self.volume_backend(&vol)
+            .await?
+            .attach_info(&vol, host)
+            .await
     }
 
     // ---- snapshots --------------------------------------------------------
@@ -650,9 +710,11 @@ impl Client {
                 backup.status.phase
             )));
         }
-        let key = backup.status.object_ref.as_deref().ok_or_else(|| {
-            ApiError::conflict(format!("backup {id} has no stored object"))
-        })?;
+        let key = backup
+            .status
+            .object_ref
+            .as_deref()
+            .ok_or_else(|| ApiError::conflict(format!("backup {id} has no stored object")))?;
         let bucket = self.backup_bucket(&backup)?;
         let (obj, bytes) = self.silo().get_object(&bucket.meta.id, key).await?;
         if bytes.len() as u64 != obj.status.size_bytes || obj.status.sha256.is_empty() {
@@ -1037,7 +1099,9 @@ impl Client {
         bytes: &[u8],
     ) -> ApiResult<()> {
         let (obj, got) = self.silo().get_object(&bucket.meta.id, key).await?;
-        if got != bytes || obj.status.size_bytes != bytes.len() as u64 || obj.status.sha256.is_empty()
+        if got != bytes
+            || obj.status.size_bytes != bytes.len() as u64
+            || obj.status.sha256.is_empty()
         {
             return Err(ApiError::internal("backup bytes were not stored"));
         }
@@ -1082,9 +1146,11 @@ impl Client {
                 return Ok(bucket);
             }
         }
-        if let Some(bucket) = silo.list_buckets(None)?.into_iter().find(|bucket| {
-            bucket.meta.name == target || bucket.meta.id.to_string() == target
-        }) {
+        if let Some(bucket) = silo
+            .list_buckets(None)?
+            .into_iter()
+            .find(|bucket| bucket.meta.name == target || bucket.meta.id.to_string() == target)
+        {
             return Ok(bucket);
         }
         Err(ApiError::not_found(format!(
@@ -1158,10 +1224,8 @@ fn bytes_to_gib(bytes: u64) -> u64 {
 }
 
 fn oversize(len: u64) -> ApiError {
-    ApiError::unavailable(format!("backup is {len} bytes, larger than 1 GiB")).with_detail(
-        "size_bytes",
-        serde_json::Value::from(len),
-    )
+    ApiError::unavailable(format!("backup is {len} bytes, larger than 1 GiB"))
+        .with_detail("size_bytes", serde_json::Value::from(len))
 }
 
 fn io_err(err: std::io::Error) -> ApiError {
@@ -1205,7 +1269,9 @@ async fn write_prefix(path: &Path, bytes: &[u8]) -> ApiResult<()> {
         .open(path)
         .await
         .map_err(io_err)?;
-    file.seek(std::io::SeekFrom::Start(0)).await.map_err(io_err)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(io_err)?;
     file.write_all(bytes).await.map_err(io_err)?;
     let len = file.metadata().await.map_err(io_err)?.len();
     if (bytes.len() as u64) > len {
@@ -1230,4 +1296,128 @@ async fn read_prefix(path: &Path, bytes: &[u8]) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids() -> (Id, Id) {
+        (Id::new("mach"), Id::new("vol"))
+    }
+
+    #[test]
+    fn local_file_and_lvm_keep_a_host_path() {
+        let (machine, volume) = ids();
+        let file = AttachInfo::new(AttachTarget::Local {
+            path: "/var/lib/pistack/volumes/data.raw".into(),
+        });
+        let attach = queue_attach(machine.clone(), volume.clone(), Some("vdb".into()), &file)
+            .expect("file attach");
+        assert_eq!(attach.path, "/var/lib/pistack/volumes/data.raw");
+        assert!(attach.target.is_none());
+        assert_eq!(attach.device.as_deref(), Some("vdb"));
+        assert!(!attach.read_only);
+        let file_wire = serde_json::to_value(&attach).expect("json");
+        assert!(file_wire.get("target").is_none());
+
+        // Same shape LVM attach_info reports: /dev/{vg}/{id}.
+        let lvm = AttachInfo::new(AttachTarget::Local {
+            path: "/dev/vg0/vol-1".into(),
+        });
+        let attach = queue_attach(machine.clone(), volume.clone(), None, &lvm).expect("lvm attach");
+        assert_eq!(attach.path, "/dev/vg0/vol-1");
+        assert!(attach.target.is_none());
+        let detach = queue_detach(machine, volume, Some("vdc".into()), &lvm).expect("lvm detach");
+        assert_eq!(detach.path, attach.path);
+        assert!(detach.target.is_none());
+        assert_eq!(detach.device.as_deref(), Some("vdc"));
+        let wire = serde_json::to_value(&attach).expect("json");
+        assert!(wire.get("target").is_none());
+        assert_eq!(wire["path"], "/dev/vg0/vol-1");
+    }
+
+    #[test]
+    fn rbd_target_is_on_attach_and_detach() {
+        let (machine, volume) = ids();
+        let mut info = AttachInfo::new(AttachTarget::Rbd {
+            pool: "volumes".into(),
+            image: "vol-1".into(),
+            monitors: vec!["10.1.0.5:6789".into()],
+            user: "pistack".into(),
+            key_secret: Some("/etc/pistack/ceph.keyring".into()),
+        });
+        info.read_only = true;
+        let attach = queue_attach(machine.clone(), volume.clone(), Some("vdd".into()), &info)
+            .expect("rbd attach");
+        assert!(attach.path.is_empty());
+        assert!(attach.read_only);
+        assert_eq!(attach.device.as_deref(), Some("vdd"));
+        match &attach.target {
+            Some(DiskTarget::Rbd {
+                pool,
+                image,
+                monitors,
+                user,
+                key_secret,
+            }) => {
+                assert_eq!(pool, "volumes");
+                assert_eq!(image, "vol-1");
+                assert_eq!(monitors, &vec!["10.1.0.5:6789".to_string()]);
+                assert_eq!(user, "pistack");
+                assert_eq!(key_secret.as_deref(), Some("/etc/pistack/ceph.keyring"));
+            }
+            other => panic!("expected rbd target, got {other:?}"),
+        }
+        let detach = queue_detach(machine, volume, Some("vdd".into()), &info).expect("rbd detach");
+        assert!(detach.path.is_empty());
+        assert_eq!(detach.target, attach.target);
+        let wire = serde_json::to_value(&attach).expect("json");
+        assert_eq!(wire["path"], "");
+        assert_eq!(wire["target"]["protocol"], "rbd");
+        assert_eq!(wire["target"]["pool"], "volumes");
+        assert_eq!(wire["target"]["image"], "vol-1");
+        assert_eq!(wire["target"]["monitors"][0], "10.1.0.5:6789");
+        assert_eq!(wire["target"]["user"], "pistack");
+        assert_eq!(wire["target"]["key_secret"], "/etc/pistack/ceph.keyring");
+        assert_eq!(wire["read_only"], true);
+    }
+
+    #[test]
+    fn empty_path_and_other_protocols_are_refused() {
+        let (machine, volume) = ids();
+        let empty = AttachInfo::new(AttachTarget::Local {
+            path: String::new(),
+        });
+        let err = queue_attach(machine.clone(), volume.clone(), None, &empty).expect_err("empty");
+        assert_eq!(err.code, ErrorCode::Unprocessable);
+
+        let iscsi = AttachInfo::new(AttachTarget::Iscsi {
+            portal: "10.0.0.1:3260".into(),
+            iqn: "iqn.2026-01.local:vol".into(),
+            lun: 0,
+            auth_secret: None,
+        });
+        let err = queue_attach(machine.clone(), volume.clone(), None, &iscsi).expect_err("iscsi");
+        assert_eq!(err.code, ErrorCode::Unprocessable);
+
+        let nvme = AttachInfo::new(AttachTarget::Nvme {
+            transport: "tcp".into(),
+            address: "10.0.0.2".into(),
+            port: 4420,
+            nqn: "nqn.2026-01.local:vol".into(),
+        });
+        let err = queue_detach(machine, volume, None, &nvme).expect_err("nvme");
+        assert_eq!(err.code, ErrorCode::Unprocessable);
+
+        let blank = AttachInfo::new(AttachTarget::Rbd {
+            pool: String::new(),
+            image: "vol-1".into(),
+            monitors: Vec::new(),
+            user: String::new(),
+            key_secret: None,
+        });
+        let err = queue_attach(Id::new("mach"), Id::new("vol"), None, &blank).expect_err("rbd");
+        assert_eq!(err.code, ErrorCode::Unprocessable);
+    }
 }
