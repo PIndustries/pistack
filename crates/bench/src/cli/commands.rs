@@ -48,6 +48,8 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
         Cmd::Key { cmd } => key(ctx, cmd, io).await,
+        Cmd::AccessKey { cmd } => access_key(ctx, cmd, io).await,
+        Cmd::JoinToken { cmd } => join_token(ctx, cmd, io).await,
         Cmd::Machine { cmd } => machine(ctx, cmd, io).await,
         Cmd::Size { cmd } => size(ctx, cmd, io).await,
         Cmd::Host { cmd } => host(ctx, cmd, io).await,
@@ -1010,6 +1012,92 @@ async fn key(ctx: &Ctx, cmd: KeyCmd, io: &mut Io<'_>) -> CliResult<()> {
                     writeln!(io.stdout, "secret (shown once): {}", str_at(&v, "/secret"))?;
                 }
                 Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/secret"))?,
+                _ => print_one(io.stdout, ctx.fmt, &v)?,
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn access_key(ctx: &Ctx, cmd: AccessKeyCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("access-key");
+    match cmd {
+        AccessKeyCmd::List(a) => do_list(ctx, io, k, a).await,
+        AccessKeyCmd::Show(a) => do_show(ctx, io, k, a).await,
+        AccessKeyCmd::Delete(a) => {
+            // DELETE revokes; say so in the confirmation and result line.
+            let c = ctx.client()?;
+            let path = k.item_path(&a.name);
+            if !a.yes && !confirm(io, &format!("{} \"{}\"", k.noun, a.name))? {
+                writeln!(io.stderr, "aborted")?;
+                return Ok(());
+            }
+            c.delete(&path).await?;
+            writeln!(io.stdout, "{} \"{}\" revoked", k.noun, a.name)?;
+            Ok(())
+        }
+        AccessKeyCmd::Create(a) => {
+            let c = ctx.client()?;
+            let project = resolve_opt(&c, kind("project"), &a.project).await?;
+            let principal = resolve_opt(&c, kind("user"), &a.principal).await?;
+            let body = compact(json!({
+                "description": opt(a.description),
+                "project": project,
+                "principal": principal,
+            }));
+            let v = c.post(k.path, &body).await?;
+            match ctx.fmt.output {
+                Output::Table | Output::Wide => {
+                    let akid = str_at(&v, "/access_key_id");
+                    let id = str_at(&v, "/id");
+                    if id.is_empty() {
+                        writeln!(io.stdout, "{} \"{}\" created", k.noun, akid)?;
+                    } else {
+                        writeln!(
+                            io.stdout,
+                            "{} \"{}\" created ({})",
+                            k.noun,
+                            akid,
+                            short_id(&id)
+                        )?;
+                    }
+                    writeln!(
+                        io.stdout,
+                        "secret_access_key (shown once): {}",
+                        str_at(&v, "/secret_access_key")
+                    )?;
+                }
+                Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/secret_access_key"))?,
+                _ => print_one(io.stdout, ctx.fmt, &v)?,
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn join_token(ctx: &Ctx, cmd: JoinTokenCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("join-token");
+    match cmd {
+        JoinTokenCmd::List(a) => do_list(ctx, io, k, a).await,
+        JoinTokenCmd::Show(a) => do_show(ctx, io, k, a).await,
+        JoinTokenCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        JoinTokenCmd::Create(a) => {
+            let multi_use = a.multi_use || a.max_uses.is_some();
+            let body = compact(json!({
+                "name": a.name,
+                "multi_use": multi_use,
+                "max_uses": a.max_uses,
+                "ttl_secs": a.ttl_secs,
+            }));
+            let c = ctx.client()?;
+            let v = c.post(k.path, &body).await?;
+            let jt = v.get("join_token").cloned().unwrap_or_else(|| v.clone());
+            match ctx.fmt.output {
+                Output::Table | Output::Wide => {
+                    report(ctx, io, k, &jt, "created")?;
+                    writeln!(io.stdout, "token (shown once): {}", str_at(&v, "/token"))?;
+                }
+                Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/token"))?,
                 _ => print_one(io.stdout, ctx.fmt, &v)?,
             }
             Ok(())
