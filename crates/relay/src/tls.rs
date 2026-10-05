@@ -259,6 +259,7 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
             )
             .unwrap();
@@ -281,6 +282,7 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
             )
             .unwrap();

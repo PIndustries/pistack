@@ -514,6 +514,7 @@ async fn health_checker_flips_online_then_offline() {
                 connection_limit: 0,
                 admin_up: true,
                 door: None,
+                routes: Vec::new(),
             },
         )
         .unwrap();
@@ -688,4 +689,101 @@ async fn missing_caller_is_unauthorized() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"]["code"], "unauthorized");
     assert_eq!(body["error"]["message"], "no credentials");
+}
+
+#[tokio::test]
+async fn listener_routes_are_validated_and_hold_their_pools() {
+    use pistack_types::error::ErrorCode;
+    let h = harness().await;
+    let meta = |k: &'static str, n: &str| pistack_types::Meta::new(k, n, Some(h.project.clone()));
+    let lb = h
+        .client
+        .create_balancer(
+            meta(kind::BALANCER, "routed"),
+            BalancerSpec {
+                vip_network: "tenant".into(),
+                provider: Provider::Relay,
+                ..BalancerSpec::default()
+            },
+        )
+        .unwrap();
+    let pool = |name: &str, protocol: PoolProtocol| {
+        h.client
+            .create_pool(
+                meta(kinds::POOL, name),
+                PoolSpec {
+                    balancer: lb.meta.id.clone(),
+                    protocol,
+                    algorithm: Algorithm::RoundRobin,
+                    session_persistence: None,
+                    health_monitor: None,
+                    admin_up: true,
+                },
+            )
+            .unwrap()
+    };
+    let default = pool("default", PoolProtocol::Http);
+    let api = pool("api", PoolProtocol::Http);
+    let udp = pool("udp", PoolProtocol::Udp);
+    let route = |host: Option<&str>, path: &str, pool: &Id| Route {
+        host: host.map(str::to_owned),
+        path: path.into(),
+        path_match: PathMatch::Prefix,
+        pool: pool.clone(),
+    };
+    let spec = |protocol: ListenerProtocol, routes: Vec<Route>| ListenerSpec {
+        balancer: lb.meta.id.clone(),
+        protocol,
+        port: 80,
+        default_pool: Some(default.meta.id.clone()),
+        connection_limit: 0,
+        admin_up: true,
+        door: None,
+        routes,
+    };
+    let refused = [
+        spec(
+            ListenerProtocol::Tcp,
+            vec![route(None, "/api", &api.meta.id)],
+        ),
+        spec(
+            ListenerProtocol::Http,
+            vec![route(None, "api", &api.meta.id)],
+        ),
+        spec(
+            ListenerProtocol::Http,
+            vec![route(Some("App.example.com"), "/", &api.meta.id)],
+        ),
+        spec(
+            ListenerProtocol::Http,
+            vec![route(Some("app:8080"), "/", &api.meta.id)],
+        ),
+        spec(ListenerProtocol::Http, vec![route(None, "/", &udp.meta.id)]),
+    ];
+    for bad in refused {
+        let err = h
+            .client
+            .create_listener(meta(kinds::LISTENER, "bad"), bad.clone())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "{bad:?}: {err}");
+    }
+    let lsn = h
+        .client
+        .create_listener(
+            meta(kinds::LISTENER, "web"),
+            spec(
+                ListenerProtocol::Http,
+                vec![route(Some("*.example.com"), "/api", &api.meta.id)],
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        h.client.listeners_using_pool(&api.meta.id).unwrap()[0]
+            .meta
+            .id,
+        lsn.meta.id
+    );
+    let err = h.client.delete_pool(&api.meta.id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    h.ctx.shutdown.cancel();
 }

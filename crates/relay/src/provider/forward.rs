@@ -336,11 +336,13 @@ mod tests {
                     connection_limit: 0,
                     admin_up: true,
                     door: None,
+                    routes: Vec::new(),
                 },
                 status: ListenerStatus::default(),
             },
             pool: Some((pool, member_rows)),
             tls: None,
+            routes: Vec::new(),
         }
     }
 

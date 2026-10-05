@@ -385,3 +385,112 @@ async fn ingress_programs_a_listener_and_delete_removes_it() {
     assert!(ready.message.contains("ingress relay is not configured"));
     assert!(stored.status.load_balancer.is_empty());
 }
+
+async fn http_req(addr: &str, host: &str, path: &str) -> String {
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.set_nodelay(true).unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf))
+        .await
+        .expect("timed out")
+        .unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn rule_path(path: &str, path_type: loom::PathType, svc: &str) -> IngressPath {
+    IngressPath {
+        path: path.into(),
+        path_type,
+        backend: IngressBackend {
+            service: svc.into(),
+            port: IntOrName::Int(80),
+        },
+    }
+}
+
+#[tokio::test]
+async fn ingress_routes_by_host_and_path() {
+    let (store, relay) = realizer();
+    let mut backends = Vec::new();
+    for (name, body) in [
+        ("web", &b"from-web"[..]),
+        ("api", &b"from-api"[..]),
+        ("docs", &b"from-docs"[..]),
+    ] {
+        let backend = listen().await;
+        let addr = backend.local_addr().unwrap();
+        spawn_http(backend, body);
+        let svc = service(
+            name,
+            ServiceKind::ClusterIp,
+            80,
+            addr.port(),
+            Protocol::Tcp,
+            vec![endpoint(addr)],
+        );
+        store.collection::<Service>().create(svc).unwrap();
+        backends.push(addr);
+    }
+    let mut edge = Ingress {
+        meta: Meta::new(loom::kinds::INGRESS, "routed", None),
+        spec: IngressSpec {
+            rules: vec![
+                IngressRule {
+                    host: Some("App.Example.com".into()),
+                    paths: vec![
+                        rule_path("/", loom::PathType::Prefix, "web"),
+                        rule_path("/api", loom::PathType::Prefix, "api"),
+                    ],
+                },
+                IngressRule {
+                    host: Some("*.docs.example.com".into()),
+                    paths: vec![rule_path("/guide", loom::PathType::Exact, "docs")],
+                },
+            ],
+            ..IngressSpec::default()
+        },
+        status: loom::IngressStatus::default(),
+    };
+    store.collection::<Ingress>().create(edge.clone()).unwrap();
+    let addr = relay.ensure_ingress(&edge).await.unwrap().remove(0);
+
+    let cases = [
+        ("app.example.com", "/", "from-web"),
+        ("app.example.com:80", "/apis", "from-web"),
+        ("app.example.com", "/api", "from-api"),
+        ("app.example.com", "/api/v1/things?x=1", "from-api"),
+        ("eu.docs.example.com", "/guide", "from-docs"),
+        ("eu.docs.example.com", "/guide/more", "404 Not Found"),
+        ("a.b.docs.example.com", "/guide", "404 Not Found"),
+        ("other.example.com", "/api", "404 Not Found"),
+    ];
+    for (host, path, want) in cases {
+        let got = http_req(&addr, host, path).await;
+        assert!(got.contains(want), "{host}{path}: {got}");
+    }
+
+    // A default backend catches what no rule matches.
+    edge.spec.default_backend = Some(IngressBackend {
+        service: "docs".into(),
+        port: IntOrName::Int(80),
+    });
+    edge.spec.rules.truncate(1);
+    store
+        .collection::<Ingress>()
+        .update(edge.clone(), None)
+        .unwrap();
+    let again = relay.ensure_ingress(&edge).await.unwrap().remove(0);
+    assert_eq!(again, addr);
+    let got = http_req(&addr, "other.example.com", "/api").await;
+    assert!(got.contains("from-docs"), "{got}");
+    let got = http_req(&addr, "app.example.com", "/api/x").await;
+    assert!(got.contains("from-api"), "{got}");
+
+    // Dropping a rule removes its pool.
+    let pools = store.collection::<relay::Pool>().list(None).unwrap();
+    let names: Vec<_> = pools.iter().map(|p| p.meta.name.clone()).collect();
+    assert_eq!(pools.len(), 3, "{names:?}");
+    assert!(!names.iter().any(|n| n.ends_with("-route-2")), "{names:?}");
+}

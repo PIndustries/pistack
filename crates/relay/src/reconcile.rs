@@ -224,11 +224,22 @@ impl Client {
             }
             _ => None,
         };
+        let mut routes = Vec::with_capacity(l.spec.routes.len());
+        for route in &l.spec.routes {
+            let pool = self.pools().get(&route.pool).map_err(store_err)?;
+            let members = self.active_members(&pool)?;
+            routes.push(crate::provider::RouteView {
+                route: route.clone(),
+                pool,
+                members,
+            });
+        }
         Ok(Some(ListenerView {
             balancer,
             listener: l.clone(),
             pool,
             tls,
+            routes,
         }))
     }
 
