@@ -127,13 +127,7 @@ impl Client {
     pub fn key_path(&self, bucket: &Id, key: &str) -> ApiResult<PathBuf> {
         validate_key(key)?;
         let dir = self.bucket_dir(bucket);
-        // Trailing-slash keys are S3 directory placeholders; store bytes under
-        // an internal leaf so the path is a regular file, not a directory.
-        let path = if key.ends_with('/') {
-            dir.join(key).join(".silo_dir_object")
-        } else {
-            dir.join(key)
-        };
+        let path = dir.join(key);
         if !path.starts_with(&dir) {
             return Err(ApiError::bad_request("object key escapes the bucket"));
         }

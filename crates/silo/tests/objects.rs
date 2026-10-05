@@ -2634,14 +2634,12 @@ async fn list_objects_v2_delimiter_pagination() {
     );
 }
 
-/// Identity edge case from #72: key equal to the common prefix (`a/`) is
-/// grouped into that CommonPrefix; paging with max=1/2 never duplicates or
-/// skips it.
+/// Trailing-slash keys stay rejected (directory placeholders are a
+/// separate change that needs a reserved-name storage guard).
 #[tokio::test]
-async fn list_objects_v2_key_equal_common_prefix_edge() {
+async fn trailing_slash_key_rejected_on_put_and_create_multipart() {
     let (_dir, client, app, project, who) = app_with_max(64 * 1024);
-    let bucket = ensure_bucket(&app, &who, "ls-edge").await;
-    // Trailing-slash key via Client (HTTP path normalization is finicky).
+    let bucket = ensure_bucket(&app, &who, "no-trail").await;
     let bucket_id = client
         .list_buckets(Some(&project))
         .unwrap()
@@ -2650,106 +2648,48 @@ async fn list_objects_v2_key_equal_common_prefix_edge() {
         .unwrap()
         .meta
         .id;
-    client
+
+    let err = client
         .put_object(&bucket_id, "a/", b"dir", None)
         .await
-        .expect("put a/");
-    put_key(&app, &who, &bucket, "a/1", b"1").await;
-    put_key(&app, &who, &bucket, "b", b"b").await;
+        .expect_err("put a/ must fail");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{err}");
 
-    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2&delimiter=/")).await;
-    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
-    assert_eq!(listed_contents_keys(&xml), vec!["b".to_owned()]);
-    // a/ must not appear as Contents.
-    assert!(!listed_contents_keys(&xml).iter().any(|k| k == "a/"));
-
-    let xml = list_objects_v2(
+    let (status, body, _) = call(
         &app,
-        &who,
-        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=1"),
+        "PUT",
+        &format!("/{bucket}/a/"),
+        Some(b"dir".to_vec()),
+        "application/octet-stream",
+        Some(&who),
     )
     .await;
-    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
     assert_eq!(
-        xml_tag(&xml, "NextContinuationToken").as_deref(),
-        Some("a/")
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
     );
 
-    let xml = list_objects_v2(
-        &app,
-        &who,
-        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=1&continuation-token=a/"),
-    )
-    .await;
-    assert_eq!(listed_contents_keys(&xml), vec!["b".to_owned()]);
-    assert!(listed_common_prefixes(&xml).is_empty());
-    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
-
-    let xml = list_objects_v2(
-        &app,
-        &who,
-        &format!("/{bucket}?list-type=2&delimiter=/&max-keys=2"),
-    )
-    .await;
-    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
-    assert_eq!(listed_contents_keys(&xml), vec!["b".to_owned()]);
-    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
-    // Only one CommonPrefix a/ in the full page.
-    assert_eq!(listed_common_prefixes(&xml).len(), 1);
-}
-
-#[tokio::test]
-async fn list_multipart_uploads_key_equal_common_prefix_edge() {
-    let (_dir, client, app, project, who) = app_multipart(64, 4);
-    let bucket = ensure_bucket(&app, &who, "mpu-edge").await;
-    let bucket_id = client
-        .list_buckets(Some(&project))
-        .unwrap()
-        .into_iter()
-        .find(|b| b.meta.name == bucket)
-        .unwrap()
-        .meta
-        .id;
-    // Trailing-slash key via Client (HTTP path normalization is finicky).
-    client
+    let err = client
         .create_multipart_upload(&bucket_id, "a/", None)
         .await
-        .expect("upload a/");
-    create_upload(&app, &who, &bucket, "a/1").await;
-    let b = create_upload(&app, &who, &bucket, "b").await;
+        .expect_err("create multipart a/ must fail");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{err}");
 
-    let xml = list_uploads(&app, &who, &format!("/{bucket}?uploads&delimiter=/")).await;
-    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
-    assert_eq!(listed_uploads(&xml), vec![("b".to_owned(), b.clone())]);
-
-    let xml = list_uploads(
+    let (status, body, _) = call(
         &app,
-        &who,
-        &format!("/{bucket}?uploads&delimiter=/&max-uploads=1"),
+        "POST",
+        &format!("/{bucket}/a/?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
     )
     .await;
-    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
-    assert_eq!(xml_tag(&xml, "NextKeyMarker").as_deref(), Some("a/"));
-    assert!(listed_uploads(&xml).is_empty());
-
-    let xml = list_uploads(
-        &app,
-        &who,
-        &format!("/{bucket}?uploads&delimiter=/&max-uploads=1&key-marker=a/"),
-    )
-    .await;
-    assert_eq!(listed_uploads(&xml), vec![("b".to_owned(), b.clone())]);
-    assert!(listed_common_prefixes(&xml).is_empty());
-    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
-
-    let xml = list_uploads(
-        &app,
-        &who,
-        &format!("/{bucket}?uploads&delimiter=/&max-uploads=2"),
-    )
-    .await;
-    assert_eq!(listed_common_prefixes(&xml), vec!["a/".to_owned()]);
-    assert_eq!(listed_uploads(&xml).len(), 1);
-    assert_eq!(listed_uploads(&xml)[0].0, "b");
-    assert_eq!(xml_tag(&xml, "IsTruncated").as_deref(), Some("false"));
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }

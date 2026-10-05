@@ -4,16 +4,15 @@
 //! S3-style `delimiter` / `CommonPrefixes` helpers.
 //!
 //! Shared by ListObjectsV2 and ListMultipartUploads so both APIs roll up
-//! keys the same way (including the Identity edge case: a key equal to the
-//! common prefix, e.g. `a/` with delimiter `/`, is grouped into that
-//! CommonPrefix, and resuming after that marker skips every key under it).
+//! keys the same way. Resuming after a common-prefix marker skips every
+//! key under that prefix so the next page neither duplicates nor skips it.
 
 /// After `prefix`, if `delimiter` appears in the remainder, return the
 /// rolled-up common prefix (including the delimiter).
 ///
-/// A key that equals the common prefix itself (e.g. key `a/` with prefix
-/// `""` and delimiter `/`) yields `Some("a/")` — S3 groups that key into
-/// the CommonPrefix rather than listing it as a Contents/Upload row.
+/// If a key equals the common prefix string (e.g. `a/` with delimiter `/`),
+/// S3 would group it into that CommonPrefix; silo currently rejects
+/// trailing-slash object keys, so this only matters for the string helper.
 pub(crate) fn common_prefix_after(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
     if delimiter.is_empty() || !key.starts_with(prefix) {
         return None;
@@ -106,7 +105,7 @@ mod tests {
 
     #[test]
     fn key_equal_to_common_prefix_is_grouped() {
-        // Identity edge case from ListMultipartUploads review.
+        // String-level: if such a key existed, it would roll up into the CP.
         assert_eq!(common_prefix_after("a/", "", "/"), Some("a/".to_owned()));
         assert_eq!(common_prefix_after("a/1", "", "/"), Some("a/".to_owned()));
         assert_eq!(common_prefix_after("a", "", "/"), None);
