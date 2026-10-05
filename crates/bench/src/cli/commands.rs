@@ -1477,73 +1477,6 @@ async fn upload(
     report(ctx, io, k, &v, &format!("uploaded ({size} bytes)"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compact_drops_nulls_recursively() {
-        let v = compact(json!({"a": null, "b": {"c": null, "d": 1}, "e": [null, 2]}));
-        assert_eq!(v, json!({"b": {"d": 1}, "e": [null, 2]}));
-    }
-
-    #[test]
-    fn create_body_shapes() {
-        let meta = MetaArgs {
-            description: Some("d".into()),
-            labels: vec!["env=prod".into()],
-        };
-        let flat = create_body(
-            kind("project"),
-            "p",
-            &meta,
-            json!({"enabled": false, "parent": null}),
-        )
-        .unwrap();
-        assert_eq!(
-            flat,
-            json!({"name": "p", "description": "d", "labels": {"env": "prod"}, "enabled": false})
-        );
-        let nested = create_body(
-            kind("machine"),
-            "m",
-            &meta,
-            json!({"size": "s", "image": "i"}),
-        )
-        .unwrap();
-        assert_eq!(nested["spec"], json!({"size": "s", "image": "i"}));
-        assert!(create_body(
-            kind("machine"),
-            "m",
-            &MetaArgs {
-                description: None,
-                labels: vec!["nope".into()]
-            },
-            json!({})
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn manifests_parse_multi_doc_and_lists() {
-        let docs =
-            parse_documents("kind: Machine\nname: a\n---\nkind: network\nname: b\n").unwrap();
-        assert_eq!(docs.len(), 2);
-        let docs = parse_documents(r#"[{"kind":"volume","name":"v"}]"#).unwrap();
-        assert_eq!(docs.len(), 1);
-        let docs = parse_documents("items:\n  - kind: size\n    name: s\n").unwrap();
-        assert_eq!(docs[0]["kind"], "size");
-        assert!(parse_documents("kind: [unclosed").is_err());
-    }
-
-    #[test]
-    fn merge_is_deep() {
-        let mut a = json!({"x": {"y": 1, "z": 2}, "k": [1]});
-        merge(&mut a, json!({"x": {"z": 3}, "k": [2]}));
-        assert_eq!(a, json!({"x": {"y": 1, "z": 3}, "k": [2]}));
-    }
-}
-
 async fn statefulset(ctx: &Ctx, cmd: StatefulsetCmd, io: &mut Io<'_>) -> CliResult<()> {
     let k = kind("statefulset");
     match cmd {
@@ -1705,5 +1638,72 @@ async fn stack(ctx: &Ctx, cmd: StackCmd, io: &mut Io<'_>) -> CliResult<()> {
                 .await?;
             report(ctx, io, k, &v, "rolled back")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_drops_nulls_recursively() {
+        let v = compact(json!({"a": null, "b": {"c": null, "d": 1}, "e": [null, 2]}));
+        assert_eq!(v, json!({"b": {"d": 1}, "e": [null, 2]}));
+    }
+
+    #[test]
+    fn create_body_shapes() {
+        let meta = MetaArgs {
+            description: Some("d".into()),
+            labels: vec!["env=prod".into()],
+        };
+        let flat = create_body(
+            kind("project"),
+            "p",
+            &meta,
+            json!({"enabled": false, "parent": null}),
+        )
+        .unwrap();
+        assert_eq!(
+            flat,
+            json!({"name": "p", "description": "d", "labels": {"env": "prod"}, "enabled": false})
+        );
+        let nested = create_body(
+            kind("machine"),
+            "m",
+            &meta,
+            json!({"size": "s", "image": "i"}),
+        )
+        .unwrap();
+        assert_eq!(nested["spec"], json!({"size": "s", "image": "i"}));
+        assert!(create_body(
+            kind("machine"),
+            "m",
+            &MetaArgs {
+                description: None,
+                labels: vec!["nope".into()]
+            },
+            json!({})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifests_parse_multi_doc_and_lists() {
+        let docs =
+            parse_documents("kind: Machine\nname: a\n---\nkind: network\nname: b\n").unwrap();
+        assert_eq!(docs.len(), 2);
+        let docs = parse_documents(r#"[{"kind":"volume","name":"v"}]"#).unwrap();
+        assert_eq!(docs.len(), 1);
+        let docs = parse_documents("items:\n  - kind: size\n    name: s\n").unwrap();
+        assert_eq!(docs[0]["kind"], "size");
+        assert!(parse_documents("kind: [unclosed").is_err());
+    }
+
+    #[test]
+    fn merge_is_deep() {
+        let mut a = json!({"x": {"y": 1, "z": 2}, "k": [1]});
+        merge(&mut a, json!({"x": {"z": 3}, "k": [2]}));
+        assert_eq!(a, json!({"x": {"y": 1, "z": 3}, "k": [2]}));
     }
 }
