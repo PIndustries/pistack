@@ -4,20 +4,36 @@
 //! Liveness and readiness checks run on the host that holds the pod.
 //!
 //! The agent reads probe definitions from the sandbox document (or from
-//! the runtime, after a restart) and connects to the pod's sandbox
-//! address. Results are consecutive streaks reported on the ordinary
-//! machine heartbeat. An `exec` handler is stored and reported
-//! unsupported; it does not count as a failed check.
+//! the runtime, after a restart). `http_get` and `tcp_socket` connect to
+//! the pod's sandbox address. `exec` runs its argv in the named container
+//! through the runtime that holds the pod. youki uses the same exec helper
+//! as `pi pod exec`, so `PISTACK_YOUKI_SUDO` and the rootless fallback apply
+//! unchanged. Exit code 0 is a pass. A non-zero exit or a timeout is a
+//! failure. Any other runtime reports the probe unsupported. An unsupported
+//! result does not count as a failed check and is not a pass.
+//!
+//! Results are consecutive streaks reported on the ordinary machine
+//! heartbeat. Period, timeout, and the success and failure thresholds are
+//! the same for every handler. Captured command output is capped and
+//! scrubbed before it is stored or logged. Probe env is not passed and is
+//! not logged.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use pistack_rpc::proto::{ProbeReport, PROBE_LIVENESS, PROBE_READINESS};
-use pistack_types::Id;
+use pistack_rpc::proto::{ExecOutput, ProbeReport, PROBE_LIVENESS, PROBE_READINESS};
+use pistack_types::{error::ErrorCode, ApiError, Id};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Most bytes of stdout and of stderr kept from one command probe.
+/// The stored message keeps a shorter scrubbed excerpt.
+pub(crate) const PROBE_EXEC_OUTPUT_CAP: usize = 1024;
+
+const PROBE_MESSAGE_CAP: usize = 160;
 
 const DEFAULT_PERIOD: u32 = 10;
 const DEFAULT_TIMEOUT: u32 = 1;
@@ -148,7 +164,9 @@ pub enum ProbeAction {
     Tcp {
         port: u16,
     },
-    Exec,
+    Exec {
+        command: Vec<String>,
+    },
     Missing,
 }
 
@@ -165,8 +183,10 @@ impl ProbeSpec {
         if let Some(tcp) = &self.tcp_socket {
             return ProbeAction::Tcp { port: tcp.port };
         }
-        if self.exec.is_some() {
-            return ProbeAction::Exec;
+        if let Some(exec) = &self.exec {
+            return ProbeAction::Exec {
+                command: exec.command.clone(),
+            };
         }
         ProbeAction::Missing
     }
@@ -232,6 +252,7 @@ struct Track {
     successes: u32,
     failures: u32,
     success: bool,
+    unsupported: bool,
     message: String,
 }
 
@@ -241,9 +262,11 @@ impl Track {
             self.successes = 0;
             self.failures = 0;
             self.success = false;
+            self.unsupported = true;
             self.message = outcome.message.clone();
             return;
         }
+        self.unsupported = false;
         if outcome.success {
             self.successes = self.successes.saturating_add(1);
             self.failures = 0;
@@ -355,6 +378,7 @@ impl Book {
                 successes: t.successes,
                 failures: t.failures,
                 message: t.message.clone(),
+                unsupported: t.unsupported,
             })
             .collect()
     }
@@ -393,6 +417,7 @@ fn new_track(container: String, kind: ProbeKind, spec: ProbeSpec, now: DateTime<
         successes: 0,
         failures: 0,
         success: false,
+        unsupported: false,
         message: String::new(),
     }
 }
@@ -493,11 +518,113 @@ struct SandboxProbeContainer {
     readiness_probe: Option<ProbeSpec>,
 }
 
-/// Run one check. `exec` and a probe with no handler are unsupported and
-/// do not count as a failed streak.
+/// What a runtime did with one command probe.
+///
+/// `Absent` means this runtime does not hold the machine. `Unsupported`
+/// means it cannot run a command inside a container. Neither is a pass,
+/// and neither counts as a failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommandProbeReply {
+    Absent,
+    Unsupported,
+    Finished { exit_code: i32, output: String },
+    TimedOut,
+    Failed { message: String },
+}
+
+/// A command probe needs at least one argument, and no argument may contain
+/// a NUL byte. youki would reject the same argv; checking it here keeps the
+/// probe message stable.
+pub(crate) fn validate_exec_argv(argv: &[String]) -> Result<(), &'static str> {
+    if argv.is_empty() || argv.iter().any(|arg| arg.is_empty()) {
+        return Err("exec command is empty");
+    }
+    if argv.iter().any(|arg| arg.contains('\0')) {
+        return Err("exec command contains a NUL byte");
+    }
+    Ok(())
+}
+
+/// Map a youki exec result onto a command-probe reply. A missing machine is
+/// absent, a timeout is a timeout, and `not_implemented` is unsupported.
+/// Other errors are failures. The output excerpt is capped by the caller.
+pub(crate) fn reply_from_exec(result: Result<ExecOutput, ApiError>) -> CommandProbeReply {
+    match result {
+        Ok(out) => CommandProbeReply::Finished {
+            exit_code: out.exit_code,
+            output: combine_output(&out.stdout, &out.stderr),
+        },
+        Err(err) if err.code == ErrorCode::NotImplemented => CommandProbeReply::Unsupported,
+        Err(err) if err.code == ErrorCode::NotFound && err.message.contains("not on this host") => {
+            CommandProbeReply::Absent
+        }
+        Err(err) if err.message.contains("timed out") => CommandProbeReply::TimedOut,
+        Err(err) => CommandProbeReply::Failed {
+            message: err.message,
+        },
+    }
+}
+
+fn combine_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (false, false) => format!("{stderr}\n{stdout}"),
+    }
+}
+
+pub(crate) fn outcome_of_reply(reply: CommandProbeReply) -> Outcome {
+    match reply {
+        CommandProbeReply::Absent | CommandProbeReply::Unsupported => {
+            Outcome::unsupported("exec probes are not supported")
+        }
+        CommandProbeReply::Finished { exit_code: 0, .. } => Outcome::ok(),
+        CommandProbeReply::Finished { exit_code, output } => {
+            Outcome::fail(exit_message(exit_code, &output))
+        }
+        CommandProbeReply::TimedOut => Outcome::fail("timed out"),
+        CommandProbeReply::Failed { message } => {
+            let message = scrub_probe_text(&message);
+            if message.is_empty() {
+                Outcome::fail("exec probe failed")
+            } else {
+                Outcome::fail(message)
+            }
+        }
+    }
+}
+
+fn exit_message(exit_code: i32, output: &str) -> String {
+    let output = scrub_probe_text(output);
+    if output.is_empty() {
+        format!("exit {exit_code}")
+    } else {
+        format!("exit {exit_code}: {output}")
+    }
+}
+
+/// Run one check when no runtime is available. An exec probe is unsupported,
+/// so it cannot become a pass.
+#[cfg(test)]
 pub async fn execute(check: &DueCheck) -> Outcome {
+    run(check, |_, _| async { CommandProbeReply::Unsupported }).await
+}
+
+/// Run one check. `exec` calls `exec_probe` with the probe argv and timeout.
+/// A probe with no handler is unsupported and does not count as a failure.
+pub async fn run<F, Fut>(check: &DueCheck, exec_probe: F) -> Outcome
+where
+    F: FnOnce(&[String], Duration) -> Fut,
+    Fut: Future<Output = CommandProbeReply>,
+{
     match &check.action {
-        ProbeAction::Exec => Outcome::unsupported("exec probes are not supported"),
+        ProbeAction::Exec { command } => {
+            if let Err(message) = validate_exec_argv(command) {
+                return Outcome::fail(message);
+            }
+            outcome_of_reply(exec_probe(command, check.timeout).await)
+        }
         ProbeAction::Missing => Outcome::unsupported("probe has no handler"),
         ProbeAction::Tcp { port } => tcp_probe(check, *port).await,
         ProbeAction::Http {
@@ -507,6 +634,84 @@ pub async fn execute(check: &DueCheck) -> Outcome {
             https,
         } => http_probe(check, path, *port, host.as_deref(), *https).await,
     }
+}
+
+fn scrub_probe_text(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.iter().copied().any(secret_probe_line) {
+        return String::new();
+    }
+    let flat = lines
+        .iter()
+        .map(|line| redact_probe_secrets(line.trim()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(PROBE_MESSAGE_CAP).collect()
+}
+
+fn secret_probe_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "begin private key",
+        "begin openssh",
+        "begin rsa private key",
+        "begin ec private key",
+        "ssh-ed25519",
+        "ssh-rsa",
+        "authorized_keys",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn redact_probe_secrets(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(rel) = rest.find(['=', ':']) {
+        let (head, tail) = rest.split_at(rel);
+        let sep = tail.chars().next().unwrap();
+        let after = &tail[sep.len_utf8()..];
+        out.push_str(head);
+        out.push(sep);
+        if key_is_secret(head) {
+            if head.to_ascii_lowercase().contains("authorization") {
+                out.push_str(" ***");
+                return out;
+            }
+            let spaces = after.len() - after.trim_start_matches(' ').len();
+            out.push_str(&after[..spaces]);
+            out.push_str("***");
+            let value = &after[spaces..];
+            let skip = value
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(value.len());
+            rest = &value[skip..];
+        } else {
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn key_is_secret(head: &str) -> bool {
+    let token = head
+        .rsplit(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | ';' | '(' | '{'))
+        .next()
+        .unwrap_or("");
+    let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    if token.is_empty() {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    ["password", "passwd", "secret", "token", "api_key", "apikey"]
+        .iter()
+        .any(|key| lower.contains(key))
+        || lower.contains("authorization")
 }
 
 fn connect_host<'a>(check: &'a DueCheck, host: Option<&'a str>) -> Result<&'a str, Outcome> {
@@ -827,6 +1032,7 @@ mod tests {
         let live = reports.iter().find(|r| r.kind == PROBE_LIVENESS).unwrap();
         assert_eq!(live.failures, 0);
         assert_eq!(live.successes, 0);
+        assert!(live.unsupported);
         assert_eq!(live.message, "exec probes are not supported");
         let ready = reports.iter().find(|r| r.kind == PROBE_READINESS).unwrap();
         assert_eq!(ready.failures, 1);
@@ -969,9 +1175,298 @@ mod tests {
         assert_eq!(failed.message, "http status 500");
 
         let mut exec = base.clone();
-        exec.action = ProbeAction::Exec;
+        exec.action = ProbeAction::Exec {
+            command: vec!["/bin/true".into()],
+        };
         let unsupported = execute(&exec).await;
         assert!(unsupported.unsupported);
+        assert!(!unsupported.success);
         assert_eq!(unsupported.message, "exec probes are not supported");
+    }
+
+    fn exec_check(command: Vec<String>, timeout: Duration) -> DueCheck {
+        DueCheck {
+            machine: Id::new(kind::MACHINE),
+            generation: 1,
+            container: "web".into(),
+            kind: PROBE_LIVENESS.into(),
+            action: ProbeAction::Exec { command },
+            timeout,
+            address: Some("127.0.0.1".into()),
+        }
+    }
+
+    #[test]
+    fn exec_argv_rejects_an_empty_command_and_a_nul_byte() {
+        assert_eq!(
+            validate_exec_argv(&[]).unwrap_err(),
+            "exec command is empty"
+        );
+        assert_eq!(
+            validate_exec_argv(&[String::new()]).unwrap_err(),
+            "exec command is empty"
+        );
+        assert_eq!(
+            validate_exec_argv(&["/bin/echo".into(), String::new()]).unwrap_err(),
+            "exec command is empty"
+        );
+        let nul = format!("a{}b", '\0');
+        assert_eq!(
+            validate_exec_argv(&["/bin/echo".into(), nul]).unwrap_err(),
+            "exec command contains a NUL byte"
+        );
+        assert!(validate_exec_argv(&["/bin/true".into()]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn exec_probe_maps_exit_timeout_and_drops_secrets() {
+        let check = exec_check(vec!["/bin/check".into()], Duration::from_secs(2));
+        let ok = run(&check, |argv, timeout| {
+            assert_eq!(argv, &["/bin/check".to_string()]);
+            assert_eq!(timeout, Duration::from_secs(2));
+            async {
+                CommandProbeReply::Finished {
+                    exit_code: 0,
+                    output: "password=hunter2".into(),
+                }
+            }
+        })
+        .await;
+        assert!(ok.success);
+        assert!(!ok.unsupported);
+        assert!(ok.message.is_empty());
+
+        let failed = run(&check, |_, _| async {
+            CommandProbeReply::Finished {
+                exit_code: 7,
+                output: "password=hunter2 status=down".into(),
+            }
+        })
+        .await;
+        assert!(!failed.success);
+        assert!(!failed.unsupported);
+        assert!(failed.message.starts_with("exit 7"), "{}", failed.message);
+        assert!(failed.message.contains("status=down"), "{}", failed.message);
+        assert!(!failed.message.contains("hunter2"), "{}", failed.message);
+        assert!(failed.message.contains("***"), "{}", failed.message);
+
+        let timed_out = run(&check, |_, _| async { CommandProbeReply::TimedOut }).await;
+        assert!(!timed_out.success);
+        assert!(!timed_out.unsupported);
+        assert_eq!(timed_out.message, "timed out");
+
+        let from_youki = outcome_of_reply(reply_from_exec(Err(ApiError::unavailable(
+            "youki runtime: exec timed out after 1s",
+        ))));
+        assert_eq!(from_youki.message, "timed out");
+        assert!(!from_youki.success);
+
+        let missing = outcome_of_reply(reply_from_exec(Err(ApiError::not_found(
+            "youki runtime: machine mach-1 is not on this host",
+        ))));
+        assert!(missing.unsupported);
+        assert!(!missing.success);
+
+        let key = outcome_of_reply(CommandProbeReply::Finished {
+            exit_code: 1,
+            output: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n".into(),
+        });
+        assert_eq!(key.message, "exit 1");
+        assert!(!key.message.contains("abc"));
+        assert!(!key.message.contains("PRIVATE"));
+
+        let leaked = outcome_of_reply(reply_from_exec(Err(ApiError::unavailable(
+            "youki runtime: exec failed: token=s3cret-value",
+        ))));
+        assert!(!leaked.unsupported);
+        assert!(
+            !leaked.message.contains("s3cret-value"),
+            "{}",
+            leaked.message
+        );
+
+        let long = "status=down ".repeat(40);
+        let truncated = run(&check, |_, _| {
+            let output = long.clone();
+            async move {
+                CommandProbeReply::Finished {
+                    exit_code: 2,
+                    output,
+                }
+            }
+        })
+        .await;
+        let excerpt = truncated
+            .message
+            .strip_prefix("exit 2: ")
+            .expect("failure keeps the exit code");
+        assert_eq!(excerpt.chars().count(), PROBE_MESSAGE_CAP);
+        assert!(excerpt.contains("status=down"));
+        assert!(excerpt.chars().count() < PROBE_EXEC_OUTPUT_CAP);
+    }
+
+    #[tokio::test]
+    async fn exec_validation_does_not_call_the_runtime() {
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let empty = exec_check(vec![], Duration::from_secs(1));
+        let outcome = run(&empty, |_, _| {
+            called.store(true, std::sync::atomic::Ordering::Relaxed);
+            async {
+                CommandProbeReply::Finished {
+                    exit_code: 0,
+                    output: String::new(),
+                }
+            }
+        })
+        .await;
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!outcome.success);
+        assert!(!outcome.unsupported);
+        assert_eq!(outcome.message, "exec command is empty");
+
+        let nul = exec_check(vec![format!("a{}b", '\0')], Duration::from_secs(1));
+        let outcome = run(&nul, |_, _| async {
+            CommandProbeReply::Finished {
+                exit_code: 0,
+                output: String::new(),
+            }
+        })
+        .await;
+        assert_eq!(outcome.message, "exec command contains a NUL byte");
+        assert!(!outcome.success);
+    }
+
+    #[tokio::test]
+    async fn exec_streaks_follow_period_and_thresholds() {
+        let book = ProbeBook::new();
+        let id = Id::new(kind::MACHINE);
+        let start = t0();
+        let spec = ProbeSpec {
+            http_get: None,
+            tcp_socket: None,
+            exec: Some(ExecSpec {
+                command: vec!["/bin/check".into()],
+            }),
+            initial_delay_seconds: 5,
+            period_seconds: 10,
+            timeout_seconds: 2,
+            success_threshold: 2,
+            failure_threshold: 3,
+        };
+        book.install(
+            &id,
+            vec![ContainerProbes {
+                container: "web".into(),
+                liveness: Some(spec.clone()),
+                readiness: Some(spec.clone()),
+            }],
+            start,
+        );
+        assert!(book.due(&[target(&id)], start).is_empty());
+
+        async fn settle(book: &ProbeBook, id: &Id, at: DateTime<Utc>, reply: CommandProbeReply) {
+            for check in book.due(&[target(id)], at) {
+                let outcome = run(&check, |argv, timeout| {
+                    assert_eq!(argv, &["/bin/check".to_string()]);
+                    assert_eq!(timeout, Duration::from_secs(2));
+                    let reply = reply.clone();
+                    async move { reply }
+                })
+                .await;
+                book.record(&check, &outcome);
+            }
+        }
+
+        settle(
+            &book,
+            &id,
+            later(start, 5),
+            CommandProbeReply::Finished {
+                exit_code: 1,
+                output: String::new(),
+            },
+        )
+        .await;
+        assert!(book.due(&[target(&id)], later(start, 5)).is_empty());
+        assert!(book.due(&[target(&id)], later(start, 14)).is_empty());
+
+        settle(&book, &id, later(start, 15), CommandProbeReply::TimedOut).await;
+        let live = book
+            .reports(&id)
+            .into_iter()
+            .find(|r| r.kind == PROBE_LIVENESS)
+            .unwrap();
+        assert_eq!(live.failures, 2);
+        assert!(live.failures < spec.failure_threshold);
+        assert!(!live.success);
+        assert!(!live.unsupported);
+        assert_eq!(live.message, "timed out");
+
+        settle(
+            &book,
+            &id,
+            later(start, 25),
+            CommandProbeReply::Finished {
+                exit_code: 9,
+                output: String::new(),
+            },
+        )
+        .await;
+        let live = book
+            .reports(&id)
+            .into_iter()
+            .find(|r| r.kind == PROBE_LIVENESS)
+            .unwrap();
+        assert_eq!(live.failures, spec.failure_threshold);
+        assert_eq!(live.message, "exit 9");
+
+        settle(
+            &book,
+            &id,
+            later(start, 35),
+            CommandProbeReply::Finished {
+                exit_code: 0,
+                output: String::new(),
+            },
+        )
+        .await;
+        let ready = book
+            .reports(&id)
+            .into_iter()
+            .find(|r| r.kind == PROBE_READINESS)
+            .unwrap();
+        assert_eq!(ready.successes, 1);
+        assert_eq!(ready.failures, 0);
+        assert!(ready.successes < spec.success_threshold);
+        assert!(ready.success);
+
+        settle(
+            &book,
+            &id,
+            later(start, 45),
+            CommandProbeReply::Finished {
+                exit_code: 0,
+                output: String::new(),
+            },
+        )
+        .await;
+        let ready = book
+            .reports(&id)
+            .into_iter()
+            .find(|r| r.kind == PROBE_READINESS)
+            .unwrap();
+        assert_eq!(ready.successes, spec.success_threshold);
+        assert_eq!(ready.failures, 0);
+
+        settle(&book, &id, later(start, 55), CommandProbeReply::Unsupported).await;
+        let live = book
+            .reports(&id)
+            .into_iter()
+            .find(|r| r.kind == PROBE_LIVENESS)
+            .unwrap();
+        assert!(live.unsupported);
+        assert_eq!(live.failures, 0);
+        assert_eq!(live.successes, 0);
+        assert!(!live.success);
     }
 }

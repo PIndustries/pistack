@@ -12,7 +12,9 @@
 //! The command poll and the heartbeat run as separate tasks on purpose: a
 //! `select!` that dropped an in-flight poll to send a heartbeat would lose
 //! any command the server had just marked delivered. Liveness and readiness
-//! probes run on their own tick and ride back on the heartbeat.
+//! probes run on their own tick and ride back on the heartbeat. An exec
+//! probe runs its argv through the runtime's command probe, which is youki
+//! exec on a youki host.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -828,7 +830,9 @@ struct HeartbeatTask {
     probes: Arc<ProbeBook>,
 }
 
-/// Runs due probes about once a second. Adoption from the runtime (so a
+/// Runs due probes about once a second. An exec probe asks the runtime that
+/// holds the pod to run the argv. youki uses its exec helper. Any other
+/// runtime reports the probe unsupported. Adoption from the runtime (so a
 /// restarted agent keeps checking) is slower, and only while nothing is
 /// tracked yet, so a host with no probes does not list machines every tick.
 struct ProbeLoop {
@@ -900,8 +904,21 @@ impl ProbeLoop {
             .collect();
         let due = self.probes.due(&targets, now);
         for check in due {
-            let outcome = probe::execute(&check).await;
-            if !outcome.success {
+            let outcome = probe::run(&check, |argv, timeout| {
+                let runtimes = self.runtimes.clone();
+                let machine = check.machine.clone();
+                let container = check.container.clone();
+                let argv = argv.to_vec();
+                async move {
+                    probe::reply_from_exec(
+                        runtimes
+                            .command_probe(&machine, &container, &argv, timeout)
+                            .await,
+                    )
+                }
+            })
+            .await;
+            if !outcome.success && !outcome.unsupported {
                 tracing::debug!(
                     machine = %check.machine,
                     container = %check.container,

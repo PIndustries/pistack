@@ -44,7 +44,9 @@ pod runs on youki.
 
 anvil drives youki directly when the binary is on the host. There is no
 containerd in the first runtime. Image bytes live in mold (and later silo).
-When youki is absent, anvil uses the mock runtime and says so.
+When youki is absent, anvil uses the mock runtime and says so. Command
+probes use that same youki exec path. When the runtime is not youki, the
+probe is reported unsupported.
 
 ## Licence
 

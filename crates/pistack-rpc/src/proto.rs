@@ -123,6 +123,8 @@ pub const PROBE_READINESS: &str = "readiness";
 /// `successes` and `failures` are the current consecutive streaks. A
 /// success clears `failures` and the other way around. The pod controller
 /// compares the streaks with the probe thresholds on the pod spec.
+/// `unsupported` means the runtime cannot run this probe. The streaks stay
+/// at zero. That is not a pass and not a failure.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ProbeReport {
     pub container: String,
@@ -136,6 +138,13 @@ pub struct ProbeReport {
     pub failures: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+    /// The runtime cannot run this probe. Streaks stay at zero.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unsupported: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // ---- machine command payloads ---------------------------------------------
@@ -636,6 +645,37 @@ mod tests {
         );
         assert!(exec_timeout(Some(0)).is_err());
         assert!(exec_timeout(Some(EXEC_TIMEOUT_MAX_SECS + 1)).is_err());
+    }
+
+    #[test]
+    fn probe_report_omits_a_false_unsupported_flag() {
+        let report = ProbeReport {
+            container: "web".into(),
+            kind: PROBE_LIVENESS.into(),
+            success: false,
+            successes: 0,
+            failures: 1,
+            message: "exit 1".into(),
+            unsupported: false,
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("unsupported").is_none());
+        let back: ProbeReport = serde_json::from_value(value).unwrap();
+        assert_eq!(back, report);
+
+        let unsupported = ProbeReport {
+            container: "web".into(),
+            kind: PROBE_READINESS.into(),
+            message: "exec probes are not supported".into(),
+            unsupported: true,
+            ..ProbeReport::default()
+        };
+        let value = serde_json::to_value(&unsupported).unwrap();
+        assert_eq!(value["unsupported"], true);
+        let back: ProbeReport = serde_json::from_value(value).unwrap();
+        assert!(back.unsupported);
+        assert_eq!(back.successes, 0);
+        assert_eq!(back.failures, 0);
     }
 
     fn sample_id(kind: &str) -> String {

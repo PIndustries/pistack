@@ -16,9 +16,11 @@ mod rbdmap;
 pub mod youki;
 
 use async_trait::async_trait;
+use pistack_rpc::proto::ExecOutput;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use cloud::CloudRuntime;
 pub use libvirt::LibvirtRuntime;
@@ -70,6 +72,27 @@ pub trait MachineRuntime: Send + Sync + 'static {
     async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
         let _ = id;
         Vec::new()
+    }
+
+    /// Run `argv` inside `container` for a command probe.
+    ///
+    /// youki runs it through the same exec helper as `pi pod exec`. Every
+    /// other runtime returns `not_implemented`. That is an unsupported probe,
+    /// not a pass and not a failure. A machine this runtime does not hold is
+    /// `not_found` with "not on this host" so the caller can ask the next
+    /// runtime.
+    async fn command_probe(
+        &self,
+        id: &Id,
+        container: &str,
+        argv: &[String],
+        timeout: Duration,
+    ) -> ApiResult<ExecOutput> {
+        let _ = (id, container, argv, timeout);
+        Err(ApiError::not_implemented(format!(
+            "{} does not run exec probes",
+            self.name()
+        )))
     }
 }
 
@@ -224,6 +247,35 @@ impl Runtimes {
         Vec::new()
     }
 
+    /// Run a command probe on the runtime that holds `id`.
+    ///
+    /// A runtime that does not hold the machine is skipped. A runtime that
+    /// cannot run a command in a container leaves the probe unsupported.
+    /// The first real result, including a non-zero exit, a timeout, or a
+    /// failed start, is returned as-is.
+    pub async fn command_probe(
+        &self,
+        id: &Id,
+        container: &str,
+        argv: &[String],
+        timeout: Duration,
+    ) -> ApiResult<ExecOutput> {
+        let mut unsupported = ApiError::not_implemented("exec probes are not supported");
+        for rt in self.distinct() {
+            match rt.command_probe(id, container, argv, timeout).await {
+                Ok(output) => return Ok(output),
+                Err(err) if err.code == pistack_types::error::ErrorCode::NotImplemented => {
+                    unsupported = err;
+                }
+                Err(err)
+                    if err.code == pistack_types::error::ErrorCode::NotFound
+                        && err.message.contains("not on this host") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(unsupported)
+    }
+
     /// Everything every runtime holds. A runtime that cannot list (a stub)
     /// contributes nothing rather than failing the whole report.
     pub async fn list(&self) -> Vec<RunningMachine> {
@@ -286,5 +338,56 @@ pub fn select(
         }
         _ if allow_mock => Some(Arc::new(MockRuntime::default())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pistack_types::{error::ErrorCode, kind};
+
+    #[tokio::test]
+    async fn command_probe_on_other_runtimes_is_unsupported() {
+        let id = Id::new(kind::MACHINE);
+        let argv = vec!["/bin/true".to_string()];
+        let timeout = Duration::from_secs(1);
+
+        let mock = Runtimes::all(Arc::new(MockRuntime::new()));
+        let err = mock
+            .command_probe(&id, "web", &argv, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented, "{err}");
+        let outcome = crate::probe::outcome_of_reply(crate::probe::reply_from_exec(Err(err)));
+        assert!(outcome.unsupported);
+        assert!(!outcome.success);
+        assert_eq!(outcome.message, "exec probes are not supported");
+
+        let mut libvirt = Runtimes::new();
+        libvirt.insert(MachineKind::Vm, Arc::new(LibvirtRuntime));
+        let err = libvirt
+            .command_probe(&id, "web", &argv, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented, "{err}");
+        let outcome = crate::probe::outcome_of_reply(crate::probe::reply_from_exec(Err(err)));
+        assert!(outcome.unsupported);
+        assert!(!outcome.success);
+
+        let mut cloud = Runtimes::new();
+        cloud.insert(MachineKind::Vm, Arc::new(CloudRuntime));
+        let err = cloud
+            .command_probe(&id, "web", &argv, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented, "{err}");
+
+        let mut metal = Runtimes::new();
+        metal.insert(MachineKind::Metal, Arc::new(MetalRuntime));
+        let err = metal
+            .command_probe(&id, "web", &argv, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented, "{err}");
     }
 }
