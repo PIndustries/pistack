@@ -418,3 +418,89 @@ async fn verifier_and_middleware_work_standalone() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn attach_caller_aws4_rules() {
+    use axum::{middleware, routing::get};
+    use gate::is_aws4_authorization;
+
+    assert!(is_aws4_authorization(
+        "AWS4-HMAC-SHA256 Credential=x/20200101/r/s3/aws4_request, Signature=ab"
+    ));
+    assert!(!is_aws4_authorization(
+        "AWS4-HMAC-SHA256garbage Credential=x"
+    ));
+
+    let store = Store::in_memory().unwrap();
+    let keys = gate::Keys::load_or_create(&store).unwrap();
+    let app = Router::new()
+        .route("/who", get(|| async { "ok" }))
+        .route("/silo/{*rest}", get(|| async { "silo-ok" }))
+        .layer(middleware::from_fn_with_state(
+            keys.verifier(),
+            gate::attach_caller,
+        ));
+
+    // AWS4 on a non-silo path → 401 (unrecognized scheme).
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/who")
+                .header(
+                    header::AUTHORIZATION,
+                    "AWS4-HMAC-SHA256 Credential=x/20200101/r/s3/aws4_request, Signature=ab",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Garbage scheme suffix on non-silo → 401.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/who")
+                .header(header::AUTHORIZATION, "AWS4-HMAC-SHA256garbage x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Duplicate Authorization → 401.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/who")
+                .header(header::AUTHORIZATION, "Bearer a")
+                .header(header::AUTHORIZATION, "Bearer b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Proper AWS4 under /silo is left alone (no bearer verify) → handler runs.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/silo/bucket/key")
+                .header(
+                    header::AUTHORIZATION,
+                    "AWS4-HMAC-SHA256 Credential=x/20200101/r/s3/aws4_request, Signature=ab",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(to_bytes(res.into_body(), 1024).await.unwrap(), "silo-ok");
+}

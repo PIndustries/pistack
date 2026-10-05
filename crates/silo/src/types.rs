@@ -21,37 +21,82 @@ pub const KIND_OBJECT: &str = "obj";
 /// max_object_bytes` (see [`SiloConfig`]).
 pub const MAX_OBJECT_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
+/// Default minimum size of every multipart part except the last (5 MiB).
+pub const MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+
+/// Default age after which an unfinished multipart upload is removed
+/// (7 days).
+pub const MULTIPART_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Default SigV4 region advertised under `[modules.silo] region`.
+pub const DEFAULT_REGION: &str = "pistack";
+
 /// Module settings under `[modules.silo]` / `PISTACK__MODULES__SILO__*`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SiloConfig {
     /// Largest accepted object body, in bytes.
     pub max_object_bytes: usize,
+    /// Seconds after initiation before an unfinished multipart upload's
+    /// staging is swept (default [`MULTIPART_TTL_SECS`]).
+    pub multipart_ttl_secs: u64,
+    /// Region name accepted in SigV4 credentials (default [`DEFAULT_REGION`]).
+    pub region: String,
 }
 
 impl Default for SiloConfig {
     fn default() -> Self {
         Self {
             max_object_bytes: MAX_OBJECT_BYTES,
+            multipart_ttl_secs: MULTIPART_TTL_SECS,
+            region: DEFAULT_REGION.to_owned(),
         }
     }
 }
 
 impl SiloConfig {
+    /// Reject `max_object_bytes = 0`, `multipart_ttl_secs = 0`, or an empty
+    /// `region` (unset fields use their defaults).
+    pub fn validate(&self) -> Result<(), pistack_config::ConfigError> {
+        let invalid = |message: &str| pistack_config::ConfigError::Module {
+            module: "silo".into(),
+            message: message.into(),
+        };
+        if self.max_object_bytes == 0 {
+            return Err(invalid("max_object_bytes must be greater than 0"));
+        }
+        if self.multipart_ttl_secs == 0 {
+            return Err(invalid("multipart_ttl_secs must be greater than 0"));
+        }
+        if self.region.trim().is_empty() {
+            return Err(invalid("region must not be empty"));
+        }
+        Ok(())
+    }
+
+    /// How long an unfinished multipart upload may sit before the sweep
+    /// removes it.
+    pub fn multipart_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.multipart_ttl_secs)
+    }
+
     /// Read `[modules.silo]` from a loaded config. Missing section → defaults.
+    /// A present section with `max_object_bytes = 0`,
+    /// `multipart_ttl_secs = 0`, or an empty `region` is rejected.
     pub fn from_config(cfg: &pistack_config::Config) -> Result<Self, pistack_config::ConfigError> {
-        cfg.module("silo")
+        let silo: Self = cfg.module("silo")?;
+        silo.validate()?;
+        Ok(silo)
     }
 
     /// Load process config (file + `PISTACK__*`) and take `[modules.silo]`.
     ///
-    /// On config load failure, returns defaults so the module still starts;
-    /// the error is logged by the caller when wired that way.
-    pub fn load() -> Self {
-        match pistack_config::Config::load(None) {
-            Ok(cfg) => Self::from_config(&cfg).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+    /// No config file → defaults (5 GiB, 7-day multipart TTL, region
+    /// `pistack`). Invalid silo settings (including a zero size or TTL, or
+    /// empty region) return an error so assemble can refuse to start.
+    pub fn load() -> Result<Self, pistack_config::ConfigError> {
+        let cfg = pistack_config::Config::load(None)?;
+        Self::from_config(&cfg)
     }
 }
 
@@ -181,6 +226,9 @@ pub fn validate_key(key: &str) -> ApiResult<()> {
     if key == ".blobs" || key.starts_with(".blobs/") {
         return Err(ApiError::bad_request("object key is reserved"));
     }
+    if key == ".uploads" || key.starts_with(".uploads/") {
+        return Err(ApiError::bad_request("object key is reserved"));
+    }
     for seg in key.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
             return Err(ApiError::bad_request(
@@ -213,6 +261,7 @@ mod tests {
         assert!(validate_key("/etc/passwd").is_err());
         assert!(validate_key("a//b").is_err());
         assert!(validate_key(".blobs/abcd").is_err());
+        assert!(validate_key(".uploads/x").is_err());
         assert!(validate_key(r"foo\bar").is_err());
     }
 
@@ -227,9 +276,58 @@ mod tests {
     #[test]
     fn silo_config_defaults() {
         assert_eq!(SiloConfig::default().max_object_bytes, MAX_OBJECT_BYTES);
+        assert_eq!(SiloConfig::default().region, DEFAULT_REGION);
         let cfg = pistack_config::Config::from_toml("[modules.silo]\nmax_object_bytes = 1048576\n")
             .unwrap();
         let silo = SiloConfig::from_config(&cfg).unwrap();
         assert_eq!(silo.max_object_bytes, 1024 * 1024);
+        assert_eq!(silo.multipart_ttl_secs, MULTIPART_TTL_SECS);
+        assert_eq!(silo.region, DEFAULT_REGION);
+        let cfg =
+            pistack_config::Config::from_toml("[modules.silo]\nregion = \"us-east-1\"\n").unwrap();
+        assert_eq!(SiloConfig::from_config(&cfg).unwrap().region, "us-east-1");
+    }
+
+    #[test]
+    fn silo_config_rejects_empty_region() {
+        let cfg = pistack_config::Config::from_toml("[modules.silo]\nregion = \"\"\n").unwrap();
+        let err = SiloConfig::from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("region"), "{err}");
+    }
+
+    #[test]
+    fn silo_config_multipart_ttl_default_and_override() {
+        let default = SiloConfig::default();
+        assert_eq!(default.multipart_ttl_secs, 7 * 24 * 60 * 60);
+        assert_eq!(
+            default.multipart_ttl(),
+            std::time::Duration::from_secs(MULTIPART_TTL_SECS)
+        );
+        assert!(default.validate().is_ok());
+
+        let cfg = pistack_config::Config::from_toml("").unwrap();
+        assert_eq!(SiloConfig::from_config(&cfg).unwrap(), default);
+
+        let cfg = pistack_config::Config::from_toml("[modules.silo]\nmultipart_ttl_secs = 3600\n")
+            .unwrap();
+        let silo = SiloConfig::from_config(&cfg).unwrap();
+        assert_eq!(silo.multipart_ttl_secs, 3600);
+        assert_eq!(silo.max_object_bytes, MAX_OBJECT_BYTES);
+    }
+
+    #[test]
+    fn silo_config_rejects_zero_multipart_ttl() {
+        let cfg =
+            pistack_config::Config::from_toml("[modules.silo]\nmultipart_ttl_secs = 0\n").unwrap();
+        let err = SiloConfig::from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("multipart_ttl_secs"), "{err}");
+    }
+
+    #[test]
+    fn silo_config_rejects_zero() {
+        let cfg =
+            pistack_config::Config::from_toml("[modules.silo]\nmax_object_bytes = 0\n").unwrap();
+        let err = SiloConfig::from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("max_object_bytes"), "{err}");
     }
 }

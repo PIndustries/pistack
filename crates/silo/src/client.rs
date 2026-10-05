@@ -23,6 +23,7 @@ use pistack_types::{ApiError, ApiResult, Id, Meta, Phase, Spec};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
@@ -30,6 +31,7 @@ pub struct Client {
     store: Store,
     root: PathBuf,
     max_object_bytes: usize,
+    min_part_bytes: usize,
 }
 
 impl Client {
@@ -38,6 +40,7 @@ impl Client {
             store,
             root: root.into(),
             max_object_bytes: MAX_OBJECT_BYTES,
+            min_part_bytes: MIN_PART_BYTES,
         }
     }
 
@@ -49,6 +52,16 @@ impl Client {
 
     pub fn max_object_bytes(&self) -> usize {
         self.max_object_bytes
+    }
+
+    /// Minimum size of every multipart part except the last (default 5 MiB).
+    pub fn with_min_part_bytes(mut self, min: usize) -> Self {
+        self.min_part_bytes = min;
+        self
+    }
+
+    pub fn min_part_bytes(&self) -> usize {
+        self.min_part_bytes
     }
 
     pub fn store(&self) -> &Store {
@@ -160,6 +173,24 @@ impl Client {
         S: Stream<Item = Result<Bytes, E>> + Send,
         E: std::fmt::Display,
     {
+        self.put_object_stream_sha(bucket_id, key, body, content_length, content_type, None)
+            .await
+    }
+
+    /// [`put_object_stream`] with an optional declared payload SHA-256.
+    pub async fn put_object_stream_sha<S, E>(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+        body: S,
+        content_length: Option<u64>,
+        content_type: Option<String>,
+        expected_sha256: Option<&str>,
+    ) -> ApiResult<Object>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send,
+        E: std::fmt::Display,
+    {
         if let Some(len) = content_length {
             if len > self.max_object_bytes as u64 {
                 return Err(ApiError::bad_request(object_too_large_message(
@@ -190,8 +221,14 @@ impl Client {
             }
         }
 
-        let written =
-            write_stream_atomic(&path, body, self.max_object_bytes, content_length).await?;
+        let written = write_stream_atomic(
+            &path,
+            body,
+            self.max_object_bytes,
+            content_length,
+            expected_sha256,
+        )
+        .await?;
 
         if bucket.spec.versioning {
             if let Some(prev) = existing {
@@ -496,6 +533,7 @@ async fn write_stream_atomic<S, E>(
     body: S,
     max: usize,
     content_length: Option<u64>,
+    expected_sha256: Option<&str>,
 ) -> ApiResult<Written>
 where
     S: Stream<Item = Result<Bytes, E>> + Send,
@@ -541,9 +579,19 @@ where
         file.flush().await.map_err(io_err)?;
         file.sync_all().await.map_err(io_err)?;
         drop(file);
+        let sha256 = hex_encode(sha.finalize().as_slice());
+        if let Some(want) = expected_sha256 {
+            let want = want.to_ascii_lowercase();
+            if !bool::from(sha256.as_bytes().ct_eq(want.as_bytes())) {
+                return Err(crate::multipart::s3_err(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided 'x-amz-content-sha256' header does not match what was computed.",
+                ));
+            }
+        }
         tokio::fs::rename(&tmp, dest).await.map_err(io_err)?;
         Ok(Written {
-            sha256: hex_encode(sha.finalize().as_slice()),
+            sha256,
             md5: hex_encode(md5.finalize().as_slice()),
             size,
         })

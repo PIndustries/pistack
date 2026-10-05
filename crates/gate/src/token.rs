@@ -191,10 +191,14 @@ pub fn verify(verifier: &Verifier, token: &str) -> ApiResult<Caller> {
 }
 
 fn bearer(parts: &Parts) -> ApiResult<&str> {
-    let raw = parts
-        .headers
-        .get(header::AUTHORIZATION)
-        .ok_or_else(|| ApiError::unauthorized("missing Authorization header"))?
+    let mut auths = parts.headers.get_all(header::AUTHORIZATION).iter();
+    let raw = auths
+        .next()
+        .ok_or_else(|| ApiError::unauthorized("missing Authorization header"))?;
+    if auths.next().is_some() {
+        return Err(ApiError::unauthorized("multiple Authorization headers"));
+    }
+    let raw = raw
         .to_str()
         .map_err(|_| ApiError::unauthorized("malformed Authorization header"))?;
     let (scheme, token) = raw
@@ -240,8 +244,29 @@ pub async fn require_caller(verifier: &Verifier, parts: &Parts) -> ApiResult<Cal
 /// passes through untouched so unauthenticated routes (login, discovery)
 /// keep working; handlers that need a caller use `AuthCaller` and get 401
 /// from the extractor.
+///
+/// On paths under `/silo`, an `Authorization: AWS4-HMAC-SHA256 <…>` header
+/// (scheme token followed by a space) is left for silo's SigV4 verifier.
+/// The same scheme on any other path is treated as an unrecognized bearer
+/// scheme (401). Multiple `Authorization` headers are always rejected.
 pub async fn attach_caller(State(verifier): State<Verifier>, req: Request, next: Next) -> Response {
-    if req.headers().contains_key(header::AUTHORIZATION) {
+    let auth_values: Vec<_> = req
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .collect();
+    if auth_values.len() > 1 {
+        return ApiError::unauthorized("multiple Authorization headers").into_response();
+    }
+    if let Some(raw) = auth_values.first() {
+        let Ok(s) = raw.to_str() else {
+            return ApiError::unauthorized("malformed Authorization header").into_response();
+        };
+        if is_aws4_authorization(s) && path_under_silo(req.uri().path()) {
+            return next.run(req).await;
+        }
+        // Outside /silo (or non-AWS4): fall through to bearer parsing → 401
+        // for unrecognized schemes.
         let (parts, body) = req.into_parts();
         match verifier.caller_from_parts(&parts) {
             Ok(caller) => {
@@ -253,6 +278,17 @@ pub async fn attach_caller(State(verifier): State<Verifier>, req: Request, next:
         }
     }
     next.run(req).await
+}
+
+/// `Authorization` scheme is exactly `AWS4-HMAC-SHA256` followed by a space.
+pub fn is_aws4_authorization(value: &str) -> bool {
+    const PREFIX: &[u8] = b"AWS4-HMAC-SHA256 ";
+    let v = value.as_bytes();
+    v.len() >= PREFIX.len() && v[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+}
+
+fn path_under_silo(path: &str) -> bool {
+    path == "/silo" || path.starts_with("/silo/")
 }
 
 #[cfg(test)]
@@ -268,6 +304,21 @@ mod tests {
             roles: vec!["member".into()],
             system: false,
         }
+    }
+
+    #[test]
+    fn aws4_scheme_requires_space() {
+        assert!(is_aws4_authorization(
+            "AWS4-HMAC-SHA256 Credential=x/20200101/pistack/s3/aws4_request, Signature=ab"
+        ));
+        assert!(is_aws4_authorization("aws4-hmac-sha256 Credential=x"));
+        assert!(!is_aws4_authorization("AWS4-HMAC-SHA256garbage"));
+        assert!(!is_aws4_authorization("AWS4-HMAC-SHA256"));
+        assert!(!is_aws4_authorization("Bearer tok"));
+        assert!(path_under_silo("/silo"));
+        assert!(path_under_silo("/silo/bucket/key"));
+        assert!(!path_under_silo("/identity/tokens"));
+        assert!(!path_under_silo("/siloevil"));
     }
 
     #[test]

@@ -9,29 +9,35 @@
 //! * [`tls::server_config`] / [`tls::client_config`] — rustls configs built
 //!   from `keep` material, so the gateway and agents can speak (m)TLS.
 //! * [`redeem_join_token`] — turn a join token into a grant and mark one use.
+//! * [`Client::lookup_access_key`] — the secret, project, principal and
+//!   project-scoped `Caller` of a live access key, for request signing
+//!   (S3 SigV4). Every unusable key gives one indistinguishable error.
 //! * The resource types in [`types`].
 //!
 //! Secret payloads and private keys are encrypted at rest with AES-256-GCM
 //! under one root key ([`crypto::RootKey`]). A [`backend::KeyBackend`],
 //! chosen with `PISTACK_KEEP_BACKEND`, keeps that key between restarts:
 //! * `software` (default): base64 in store meta `keep/root_key`.
-//! * `vault`: **partial**. Wrapped by a Vault Transit key over HTTP; only
-//!   the ciphertext is stored (`keep/root_key_wrapped`). Round-trips for
-//!   real and is tested against a mock Transit server; migrating an existing
-//!   software key, re-wrapping after Transit key rotation and a lab run
-//!   against real Vault are not done.
+//! * `vault`: wrapped by a Vault Transit key over HTTP; only the ciphertext
+//!   is stored (`keep/root_key_wrapped`). `pistack keep migrate-to-vault`
+//!   moves an existing software key in (one store transaction, verified
+//!   round-trip first), `pistack keep rewrap` follows a Transit key
+//!   rotation, and `pistack keep migrate-to-software` goes back. Tested
+//!   against a mock Transit server and, locally, a `vault server -dev`; not
+//!   yet run in the lab against a production Vault.
 //! * `pkcs11`: **parked**. Refused with an error; nothing pretends to work.
 //!
 //! Every path that needs the key, including [`read_payload`], goes through
 //! the configured backend; there is no fallback between backends.
 //!
-//! Count limits (`quota.rs`): `secrets` and `certificates` per project
-//! through gate's project quotas, with `[modules.keep]` defaults when a
+//! Count limits (`quota.rs`): `secrets`, `certificates` and `access_keys`
+//! per project through gate's project quotas, with `[modules.keep]` defaults when a
 //! project names none; cloud-wide caps on live join tokens and on a
 //! multi-use token's redemptions.
 //!
 //! HTTP lives under the `secrets` prefix; see `api.rs`.
 
+pub mod access_key;
 pub mod api;
 pub mod backend;
 pub mod ca;
@@ -50,6 +56,7 @@ use pistack_store::Store;
 use pistack_types::{ApiError, Id, Kind, ListQuery, Module, ModuleContext, ModuleInfo, Page};
 use std::sync::OnceLock;
 
+pub use access_key::{AccessKey, AccessKeyCredential, CreatedAccessKey};
 pub use backend::KeyBackend;
 pub use ca::{Ca, Issued};
 pub use client::Client;

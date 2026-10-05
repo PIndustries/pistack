@@ -216,12 +216,13 @@ impl RelayRealizer {
             }
         };
         let name = format!("ing-{}", ingress.meta.id);
+        let id = ingress.meta.id.to_string();
         let bound = ensure_forward(
             &client,
             ingress.meta.project.clone(),
             &name,
             INGRESS_LABEL,
-            &ingress.meta.id.to_string(),
+            &id,
             Provider::Relay,
             ListenerProtocol::Http,
             PoolProtocol::Http,
@@ -231,7 +232,35 @@ impl RelayRealizer {
             &routes,
         )
         .await?;
-        Ok(vec![bound])
+        // HTTPS rides a second balancer: relay keeps one socket per balancer.
+        let only_http = std::slice::from_ref(&name);
+        let cert = match ingress_cert(&client, ingress) {
+            Ok(Some(cert)) => cert,
+            Ok(None) => {
+                delete_unnamed(&client, INGRESS_LABEL, &id, only_http).await?;
+                return Ok(vec![bound]);
+            }
+            Err(e) => {
+                let _ = delete_unnamed(&client, INGRESS_LABEL, &id, only_http).await;
+                return Err(e);
+            }
+        };
+        let tls = ensure_forward(
+            &client,
+            ingress.meta.project.clone(),
+            &format!("{name}-tls"),
+            INGRESS_LABEL,
+            &id,
+            Provider::Relay,
+            ListenerProtocol::Terminated { cert },
+            PoolProtocol::Http,
+            443,
+            None,
+            &members,
+            &routes,
+        )
+        .await?;
+        Ok(vec![bound, tls])
     }
 
     pub async fn remove_ingress(&self, ingress: &Ingress) -> ApiResult<()> {
@@ -604,6 +633,52 @@ async fn ensure_forward(
         return Err(ApiError::unavailable("listener is not available"));
     }
     Ok(addr)
+}
+
+/// The keep certificate an ingress's `tls` entries name, if any.
+///
+/// Each entry's `secret_name` is a keep certificate name (or id) in the
+/// ingress's project. One listener presents one certificate, so every
+/// entry must name the same one.
+fn ingress_cert(client: &Client, ingress: &Ingress) -> ApiResult<Option<Id>> {
+    let mut names: Vec<&str> = Vec::new();
+    for tls in &ingress.spec.tls {
+        let name = tls.secret_name.trim();
+        if name.is_empty() {
+            return Err(ApiError::unprocessable(
+                "ingress tls entry needs a certificate name",
+            ));
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let name = match names.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => {
+            return Err(ApiError::unprocessable(format!(
+                "ingress tls names {} certificates ({}); one certificate per ingress is supported",
+                many.len(),
+                many.join(", ")
+            )))
+        }
+    };
+    let project = ingress.meta.project.as_ref();
+    let missing = || ApiError::unavailable(format!("ingress certificate '{name}' not found"));
+    let cert = match client
+        .store()
+        .collection::<keep::Certificate>()
+        .resolve(project, name)
+    {
+        Ok(cert) => cert,
+        Err(StoreError::NotFound(_)) => return Err(missing()),
+        Err(e) => return Err(e.into()),
+    };
+    if cert.meta.project.as_ref() != project {
+        return Err(missing());
+    }
+    Ok(Some(cert.meta.id))
 }
 
 /// Make `pool`'s members exactly `members`. True when anything changed.

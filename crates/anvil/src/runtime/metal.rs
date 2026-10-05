@@ -5,12 +5,15 @@
 //!
 //! A machine whose name is `PISTACK_NODE_NAME` is this host. `start`
 //! records it and `stop` does not power it off. Any other machine is a
-//! remote chassis: `start` sets `chassis bootdev pxe`, then runs
-//! `ipmitool chassis power on`, when the binary, a BMC address, and a
-//! password file are present, and stays unavailable when they are not.
-//! The requested image name is stored in metal state for later
-//! provisioning work; this runtime does not fetch or write disk images
-//! itself. On `delete`, a remote chassis is powered off and, when
+//! remote chassis. When the BMC address is an `http://` or `https://`
+//! URL, or `$PISTACK_METAL_BMC=redfish`, power and PXE use Redfish
+//! through `curl` (override with `$PISTACK_CURL`). Otherwise they use
+//! `ipmitool` as before. Before PXE or power-on, a non-`bare` image
+//! must resolve to an existing local file (absolute path, or a name
+//! under `$PISTACK_METAL_IMAGES`, default `/var/lib/pistack/metal/images`).
+//! Empty and `bare` skip that check. The resolved path is stored in
+//! metal state; this runtime still does not write the image onto the
+//! chassis. On `delete`, a remote chassis is powered off and, when
 //! `$PISTACK_METAL_CLEAN` names an executable, that helper runs with the
 //! machine id, BMC address, BMC user, and password file path. With the
 //! variable unset, delete does not pretend disks were wiped. The
@@ -20,9 +23,10 @@
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult, Id};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_STATE_DIR: &str = "/var/lib/pistack/metal";
+const DEFAULT_IMAGES_DIR: &str = "/var/lib/pistack/metal/images";
 
 /// This host, recorded as a single machine. There is no hypervisor.
 #[derive(Debug, Default)]
@@ -40,6 +44,78 @@ fn state_dir() -> PathBuf {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => PathBuf::from(DEFAULT_STATE_DIR),
     }
+}
+
+fn images_dir() -> PathBuf {
+    match std::env::var_os("PISTACK_METAL_IMAGES") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(DEFAULT_IMAGES_DIR),
+    }
+}
+
+fn has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+fn image_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && !name.contains("..")
+}
+
+fn regular_file(path: &Path) -> ApiResult<()> {
+    let meta = std::fs::symlink_metadata(path).map_err(|_| {
+        ApiError::unavailable(format!("metal image {} is not available", path.display()))
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() == 0 {
+        return Err(ApiError::unavailable(format!(
+            "metal image {} is not available",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Empty and `bare` need no file. Anything else must resolve to a local
+/// regular file before metal pretends an install image exists.
+fn resolve_image(image: &str) -> ApiResult<Option<PathBuf>> {
+    let image = image.trim();
+    if image.is_empty() || image == "bare" {
+        return Ok(None);
+    }
+    let path = Path::new(image);
+    if path.is_absolute() {
+        if image.contains('\0') || has_parent_dir(path) {
+            return Err(ApiError::bad_request("metal image path is not allowed"));
+        }
+        regular_file(path)?;
+        return Ok(Some(path.to_path_buf()));
+    }
+    if !image_name_ok(image) {
+        return Err(ApiError::bad_request(format!(
+            "metal image name {image:?} must be a file name, not a path"
+        )));
+    }
+    let root = images_dir();
+    let candidates = [
+        root.join(image),
+        root.join(format!("{image}.iso")),
+        root.join(format!("{image}.img")),
+        root.join(format!("{image}.qcow2")),
+    ];
+    for candidate in &candidates {
+        if candidate.is_file() {
+            regular_file(candidate)?;
+            return Ok(Some(candidate.clone()));
+        }
+    }
+    Err(ApiError::unavailable(format!(
+        "metal image {image} is not available under {}",
+        root.display()
+    )))
 }
 
 fn state_name(id: &Id) -> ApiResult<String> {
@@ -67,13 +143,24 @@ struct MetalRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bmc_user: Option<String>,
     /// Image name from the start request. Empty when the caller did not
-    /// ask for one. Recorded so a later provisioner can use it; metal
-    /// does not pull the bytes itself.
+    /// ask for one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     image: String,
-    /// True after a successful `chassis bootdev pxe` for this chassis.
+    /// Absolute path of the resolved local install file, when the request
+    /// named a non-`bare` image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_path: Option<String>,
+    /// True after a successful PXE boot override for this chassis.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pxe: bool,
+    /// `ipmi` or `redfish`. Older state files without this field default
+    /// to `ipmi`.
+    #[serde(default = "default_transport")]
+    transport: String,
+}
+
+fn default_transport() -> String {
+    "ipmi".to_owned()
 }
 
 fn read_record(path: &Path) -> ApiResult<Option<MetalRecord>> {
@@ -235,6 +322,184 @@ fn clip(s: &str) -> String {
     }
 }
 
+fn is_redfish(address: &str) -> bool {
+    let a = address.trim();
+    if a.starts_with("http://") || a.starts_with("https://") {
+        return true;
+    }
+    matches!(
+        std::env::var("PISTACK_METAL_BMC").ok().as_deref(),
+        Some("redfish")
+    )
+}
+
+fn curl_bin() -> ApiResult<PathBuf> {
+    match std::env::var_os("PISTACK_CURL") {
+        Some(v) if !v.is_empty() => {
+            let path = PathBuf::from(v);
+            if path.is_file() {
+                Ok(path)
+            } else {
+                Err(ApiError::unavailable("curl is not installed"))
+            }
+        }
+        Some(_) => Err(ApiError::unavailable("curl is not installed")),
+        None => which("curl").ok_or_else(|| ApiError::unavailable("curl is not installed")),
+    }
+}
+
+fn redfish_system() -> String {
+    match std::env::var("PISTACK_REDFISH_SYSTEM") {
+        Ok(v) if !v.trim().is_empty() => v.trim().trim_matches('/').to_owned(),
+        _ => "Systems/1".to_owned(),
+    }
+}
+
+fn redfish_base(address: &str) -> ApiResult<String> {
+    let raw = address.trim();
+    if raw.is_empty() || raw.len() > 512 {
+        return Err(ApiError::bad_request("bmc address is not a redfish url"));
+    }
+    if raw.chars().any(|c| {
+        c.is_control() || matches!(c, ';' | '|' | '&' | '$' | '`' | '\\' | '"' | '\'' | ' ')
+    }) {
+        return Err(ApiError::bad_request("bmc address is not a redfish url"));
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        let trimmed = raw.trim_end_matches('/');
+        if let Some(idx) = trimmed.find("/redfish/v1") {
+            return Ok(trimmed[..=idx + "/redfish/v1".len() - 1].to_owned());
+        }
+        return Ok(format!("{trimmed}/redfish/v1"));
+    }
+    let (host, port) = bmc_host(raw)?;
+    Ok(match port {
+        Some(p) => format!("https://{host}:{p}/redfish/v1"),
+        None => format!("https://{host}/redfish/v1"),
+    })
+}
+
+fn read_pass(pass: &Path) -> ApiResult<String> {
+    let bytes =
+        std::fs::read(pass).map_err(|_| ApiError::unavailable("bmc password file is missing"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return Err(ApiError::unavailable("bmc password file is missing"));
+    }
+    Ok(line.to_owned())
+}
+
+async fn redfish(
+    address: &str,
+    user: &str,
+    pass: &Path,
+    method: &str,
+    path: &str,
+    body: &str,
+    what: &str,
+) -> ApiResult<()> {
+    let bin = curl_bin()?;
+    let user = bmc_user(user)?;
+    let base = redfish_base(address)?;
+    let url = format!("{base}/{}", path.trim_start_matches('/'));
+    let password = read_pass(pass)?;
+    let cfg_dir = state_dir().join(".curl");
+    std::fs::create_dir_all(&cfg_dir).map_err(|e| {
+        ApiError::unavailable(format!("redfish curl config {}: {e}", cfg_dir.display()))
+    })?;
+    let cfg = cfg_dir.join(format!("cfg-{}", std::process::id()));
+    // curl --config: user = "name:password"
+    let escaped_user = user.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped_pass = password.replace('\\', "\\\\").replace('"', "\\\"");
+    let cfg_body = format!("user = \"{escaped_user}:{escaped_pass}\"\n");
+    std::fs::write(&cfg, cfg_body.as_bytes()).map_err(|e| {
+        ApiError::unavailable(format!("redfish curl config {}: {e}", cfg.display()))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&cfg)
+            .map_err(|e| {
+                ApiError::unavailable(format!("redfish curl config {}: {e}", cfg.display()))
+            })?
+            .permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(&cfg, perms);
+    }
+    let output = tokio::process::Command::new(&bin)
+        .args([
+            "-sS",
+            "-f",
+            "-k",
+            "--config",
+            cfg.to_str()
+                .ok_or_else(|| ApiError::internal("redfish curl config path"))?,
+            "-H",
+            "Content-Type: application/json",
+            "-X",
+            method,
+            &url,
+            "-d",
+            body,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    let _ = std::fs::remove_file(&cfg);
+    let output = output.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::unavailable("curl is not installed")
+        } else {
+            ApiError::unavailable(format!("curl failed to start: {e}"))
+        }
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = clip(&String::from_utf8_lossy(&output.stderr));
+    if detail.is_empty() {
+        Err(ApiError::unavailable(format!("redfish {what} failed")))
+    } else {
+        Err(ApiError::unavailable(format!(
+            "redfish {what} failed: {detail}"
+        )))
+    }
+}
+
+async fn redfish_power(address: &str, user: &str, pass: &Path, on: bool) -> ApiResult<()> {
+    let system = redfish_system();
+    let reset = if on { "On" } else { "ForceOff" };
+    let body = format!(r#"{{"ResetType":"{reset}"}}"#);
+    redfish(
+        address,
+        user,
+        pass,
+        "POST",
+        &format!("{system}/Actions/ComputerSystem.Reset"),
+        &body,
+        &format!("power {reset}"),
+    )
+    .await
+}
+
+async fn redfish_boot_pxe(address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    let system = redfish_system();
+    let body = r#"{"Boot":{"BootSourceOverrideEnabled":"Once","BootSourceOverrideTarget":"Pxe"}}"#;
+    redfish(
+        address,
+        user,
+        pass,
+        "PATCH",
+        &system,
+        body,
+        "boot override pxe",
+    )
+    .await
+}
+
 async fn ipmi(address: &str, user: &str, pass: &Path, words: &[&str], what: &str) -> ApiResult<()> {
     let bin = ipmitool_bin()?;
     let (host, port) = bmc_host(address)?;
@@ -285,6 +550,9 @@ async fn ipmi(address: &str, user: &str, pass: &Path, words: &[&str], what: &str
 }
 
 async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    if is_redfish(address) {
+        return redfish_power(address, user, pass, power == "on").await;
+    }
     ipmi(
         address,
         user,
@@ -298,6 +566,9 @@ async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResu
 /// Next boot from the network. Does not install an image; it only points
 /// the chassis at PXE so a provisioner can take over.
 async fn bootdev_pxe(address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    if is_redfish(address) {
+        return redfish_boot_pxe(address, user, pass).await;
+    }
     ipmi(
         address,
         user,
@@ -372,13 +643,16 @@ impl MachineRuntime for MetalRuntime {
             power: PowerState::On,
         };
         if req.name == node {
+            let image_path = resolve_image(&req.image)?;
             write_state(&MetalRecord {
                 machine: running.clone(),
                 local: true,
                 bmc_address: None,
                 bmc_user: None,
                 image: req.image.clone(),
+                image_path: image_path.map(|p| p.display().to_string()),
                 pxe: false,
+                transport: "ipmi".to_owned(),
             })?;
             return Ok(running);
         }
@@ -391,7 +665,14 @@ impl MachineRuntime for MetalRuntime {
         let Some(user) = req.bmc_user.as_deref().filter(|s| !s.trim().is_empty()) else {
             return Err(ApiError::bad_request("bmc user is required"));
         };
-        ipmitool_bin()?;
+        let image_path = resolve_image(&req.image)?;
+        let transport = if is_redfish(address) {
+            curl_bin()?;
+            "redfish"
+        } else {
+            ipmitool_bin()?;
+            "ipmi"
+        };
         let pass = pass_file(&req.id)?;
         bootdev_pxe(address, user, &pass).await?;
         chassis("on", address, user, &pass).await?;
@@ -401,7 +682,9 @@ impl MachineRuntime for MetalRuntime {
             bmc_address: Some(address.to_owned()),
             bmc_user: Some(user.to_owned()),
             image: req.image.clone(),
+            image_path: image_path.map(|p| p.display().to_string()),
             pxe: true,
+            transport: transport.to_owned(),
         })?;
         Ok(running)
     }
@@ -420,7 +703,11 @@ impl MachineRuntime for MetalRuntime {
                     .bmc_user
                     .as_deref()
                     .ok_or_else(|| ApiError::unavailable("bmc user is missing"))?;
-                ipmitool_bin()?;
+                if is_redfish(address) {
+                    curl_bin()?;
+                } else {
+                    ipmitool_bin()?;
+                }
                 let pass = pass_file(id)?;
                 chassis("off", address, user, &pass).await?;
                 let mut record = record;
@@ -441,7 +728,11 @@ impl MachineRuntime for MetalRuntime {
                 if let (Some(address), Some(user)) =
                     (record.bmc_address.as_deref(), record.bmc_user.as_deref())
                 {
-                    ipmitool_bin()?;
+                    if is_redfish(address) {
+                        curl_bin()?;
+                    } else {
+                        ipmitool_bin()?;
+                    }
                     let pass = pass_file(id)?;
                     chassis("off", address, user, &pass).await?;
                     clean_remote(id, address, user, &pass).await?;
@@ -695,6 +986,7 @@ mod tests {
         let record = super::read_state(&remote.id).unwrap().unwrap();
         assert!(record.pxe);
         assert_eq!(record.image, "bare");
+        assert!(record.image_path.is_none());
 
         rt.stop(&remote.id).await.unwrap();
         let text = std::fs::read_to_string(&log).unwrap();
@@ -758,8 +1050,13 @@ mod tests {
         let _tool = Var::set("PISTACK_IPMITOOL", tool.to_str().unwrap());
         let _dir = Var::set("PISTACK_IPMI_DIR", passes.to_str().unwrap());
         let _log = Var::set("PISTACK_IPMI_LOG", log.to_str().unwrap());
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let iso = images.join("install.iso");
+        std::fs::write(&iso, b"iso-bytes").unwrap();
         let _clean = Var::set("PISTACK_METAL_CLEAN", clean.to_str().unwrap());
         let _clog = Var::set("PISTACK_METAL_CLEAN_LOG", clean_log.to_str().unwrap());
+        let _images = Var::set("PISTACK_METAL_IMAGES", images.to_str().unwrap());
 
         let rt = MetalRuntime;
         let mut remote = req("shelf");
@@ -771,6 +1068,7 @@ mod tests {
         let running = rt.start(&remote).await.unwrap();
         let record = super::read_state(&running.id).unwrap().unwrap();
         assert_eq!(record.image, "install.iso");
+        assert_eq!(record.image_path.as_deref(), Some(iso.to_str().unwrap()));
         assert!(record.pxe);
 
         rt.delete(&running.id).await.unwrap();
@@ -781,6 +1079,147 @@ mod tests {
         assert!(cleaned.contains(pass.to_str().unwrap()), "{cleaned}");
         assert!(!cleaned.contains("s3cret-do-not-log"), "{cleaned}");
         assert!(super::read_state(&running.id).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_requires_resolvable_image_before_pxe() {
+        let _guard = env_lock().lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "pistack-metal-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state");
+        let passes = dir.join("pass");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&passes).unwrap();
+        std::fs::create_dir_all(&images).unwrap();
+        let log = dir.join("ipmi.log");
+        let tool = dir.join("ipmitool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_IPMI_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tool, perms).unwrap();
+        }
+        let _state = Var::set("PISTACK_METAL_STATE", state.to_str().unwrap());
+        let _node = Var::set("PISTACK_NODE_NAME", "fleet");
+        let _tool = Var::set("PISTACK_IPMITOOL", tool.to_str().unwrap());
+        let _dir = Var::set("PISTACK_IPMI_DIR", passes.to_str().unwrap());
+        let _log = Var::set("PISTACK_IPMI_LOG", log.to_str().unwrap());
+        let _images = Var::set("PISTACK_METAL_IMAGES", images.to_str().unwrap());
+
+        let rt = MetalRuntime;
+        let mut remote = req("shelf");
+        remote.image = "missing-install".into();
+        remote.bmc_address = Some("10.9.1.8".into());
+        remote.bmc_user = Some("root".into());
+        let pass = passes.join(remote.id.to_string());
+        std::fs::write(&pass, "s3cret-do-not-log\n").unwrap();
+
+        let err = rt.start(&remote).await.unwrap_err();
+        assert!(err.message.contains("not available"), "{}", err.message);
+        assert!(!log.exists(), "missing image must not call ipmitool");
+
+        let iso = images.join("missing-install.iso");
+        std::fs::write(&iso, b"iso-bytes").unwrap();
+        let running = rt.start(&remote).await.unwrap();
+        let record = super::read_state(&running.id).unwrap().unwrap();
+        assert_eq!(record.image, "missing-install");
+        assert_eq!(record.image_path.as_deref(), Some(iso.to_str().unwrap()));
+        assert!(record.pxe);
+        assert!(log.exists());
+
+        let abs = dir.join("abs.img");
+        std::fs::write(&abs, b"abs").unwrap();
+        let mut with_abs = req("other");
+        with_abs.image = abs.to_str().unwrap().into();
+        with_abs.bmc_address = Some("10.9.1.9".into());
+        with_abs.bmc_user = Some("root".into());
+        let pass2 = passes.join(with_abs.id.to_string());
+        std::fs::write(&pass2, "s3cret-do-not-log\n").unwrap();
+        let running2 = rt.start(&with_abs).await.unwrap();
+        let record2 = super::read_state(&running2.id).unwrap().unwrap();
+        assert_eq!(record2.image_path.as_deref(), Some(abs.to_str().unwrap()));
+
+        rt.delete(&running.id).await.unwrap();
+        rt.delete(&running2.id).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_redfish_uses_curl_not_ipmitool() {
+        let _guard = env_lock().lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "pistack-metal-redfish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state");
+        let passes = dir.join("pass");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&passes).unwrap();
+        let log = dir.join("curl.log");
+        let curl = dir.join("curl");
+        std::fs::write(
+            &curl,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PISTACK_CURL_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&curl).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&curl, perms).unwrap();
+        }
+        let _state = Var::set("PISTACK_METAL_STATE", state.to_str().unwrap());
+        let _node = Var::set("PISTACK_NODE_NAME", "fleet");
+        let _curl = Var::set("PISTACK_CURL", curl.to_str().unwrap());
+        let _dir = Var::set("PISTACK_IPMI_DIR", passes.to_str().unwrap());
+        let _log = Var::set("PISTACK_CURL_LOG", log.to_str().unwrap());
+        std::env::remove_var("PISTACK_IPMITOOL");
+
+        let rt = MetalRuntime;
+        let mut remote = req("shelf");
+        remote.bmc_address = Some("https://bmc.example/redfish/v1".into());
+        remote.bmc_user = Some("root".into());
+        let pass = passes.join(remote.id.to_string());
+        std::fs::write(&pass, "s3cret-do-not-log\n").unwrap();
+
+        let running = rt.start(&remote).await.unwrap();
+        let record = super::read_state(&running.id).unwrap().unwrap();
+        assert_eq!(record.transport, "redfish");
+        assert!(record.pxe);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("PATCH"), "{text}");
+        assert!(text.contains("BootSourceOverrideTarget"), "{text}");
+        assert!(text.contains("POST"), "{text}");
+        assert!(text.contains("ComputerSystem.Reset"), "{text}");
+        assert!(text.contains("https://bmc.example/redfish/v1"), "{text}");
+        assert!(!text.contains("s3cret-do-not-log"), "{text}");
+
+        rt.stop(&running.id).await.unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("ForceOff"), "{text}");
+
+        rt.delete(&running.id).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

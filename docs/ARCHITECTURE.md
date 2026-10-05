@@ -36,7 +36,7 @@ pub trait Module {
 }
 ```
 
-`ModuleContext` carries the store, the event bus, a shutdown token, the public URL, the node name, and cluster leadership. Controllers watch leadership and stay idle on followers. Modules never bind ports or open files themselves (beacon's DNS listener is the documented exception; it defaults to `127.0.0.1:5353` unless `PISTACK_DNS_LISTEN` is set). The node name is `PISTACK_NODE_NAME` when set, otherwise the host name.
+`ModuleContext` carries the store, the event bus, a shutdown token, the public URL, the node name, and cluster leadership. Controllers watch leadership and stay idle on followers. Modules never bind ports or open files themselves (beacon's DNS listener is the documented exception). DNS listen rules: when `PISTACK_DNS_LISTEN` is set it is honored exactly as a single `host:port` or a comma-separated multi-bind list; when unset, beacon binds the server's private/cluster listen address (the same private unicast used for advertise) on port `5353`; when no private address is known it falls back to `127.0.0.1:5353`. Defaults never use `0.0.0.0`. The node name is the one stable identity a machine has: the agent enrolls, says hello, heartbeats, and polls under it; forge keys the host record by it; loom stamps it as `pistack.io/hostname`; the server passes it to modules. It is picked once and kept in `<data_dir>/node.name`, so a restart, a host rename, or a re-enroll keeps it. Order: `PISTACK_NODE_NAME` (written back to the file, so it is also how to rename a node on purpose), then `node.name`, then the common name of a certificate the agent already enrolled with, then the host name, then a minted `node-<hex>`. A server and an agent sharing a data dir share the name. On `/rpc`, a client certificate speaks only for the node named in it (403 otherwise); an agent whose saved certificate names another node re-enrolls when it has a join token and refuses to start when it does not. `<data_dir>/node.id` is the separate raft member id for control-plane membership.
 
 ## Who owns what
 
@@ -53,7 +53,7 @@ pub trait Module {
 | shelf | Share, ShareAccess | CephFS / NFS |
 | beacon | Zone, RecordSet | its own authoritative server (hickory) |
 | relay | Balancer, Listener, Pool, Member, HealthMonitor | OVN LB (L4), Pingora (L7) |
-| keep | Secret, Certificate, CertificateAuthority | root key: software store (default), Vault Transit (partial), PKCS#11 (parked) |
+| keep | Secret, Certificate, CertificateAuthority | root key: software store (default), Vault Transit, PKCS#11 (parked) |
 | blueprint | Stack, Workflow, Kit | every other module |
 | gauge | Metric (Prometheus), Alarm, UsageRecord | anvil reports, events |
 | bench | none | all APIs (CLI + console) |
@@ -73,6 +73,8 @@ One scheduler in `forge` places every workload. It reads `Host` inventory report
 ## Security
 
 `keep` is the cloud CA. Every server and agent gets a certificate at join; every API call is mTLS or bearer-token over TLS. `gate` issues signed tokens (verifiable without a store lookup) and evaluates one policy document for the whole cloud.
+
+Secret payloads and CA keys are sealed with AES-256-GCM under one root key. `PISTACK_KEEP_BACKEND` picks where that key lives between restarts: in the store (`software`, the default) or wrapped by a Vault Transit key (`vault`), in which case only Vault's ciphertext is stored and the server asks Vault to unwrap it once at startup. There is no fallback between backends: a store keyed by one backend refuses to start under the other. Moving between them, and following a Transit key rotation, are offline operator commands on a stopped node (`pistack keep migrate-to-vault`, `migrate-to-software`, `rewrap`, `status`). Each migration verifies the round trip with Vault first, then swaps the keys in one store transaction, so a crash leaves either the old key or the new one, never neither. The commands change one node's store, so they run on every control-plane node.
 
 ## One system
 

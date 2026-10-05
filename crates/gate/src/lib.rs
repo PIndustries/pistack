@@ -31,7 +31,10 @@ use std::sync::OnceLock;
 
 pub use policy::authorize;
 pub use quota::{check_quota, check_quota_in, record_usage};
-pub use token::{attach_caller, require_caller, verify, AuthCaller, Claims, Keys, Verifier};
+pub use token::{
+    attach_caller, is_aws4_authorization, require_caller, verify, AuthCaller, Claims, Keys,
+    Verifier,
+};
 pub use types::*;
 
 /// Environment variable that fixes the bootstrap admin password.
