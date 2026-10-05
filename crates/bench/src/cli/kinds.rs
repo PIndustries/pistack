@@ -248,6 +248,45 @@ pub static KINDS: &[KindDef] = &[
         wide: WIDE_GLOBAL,
     },
     KindDef {
+        noun: "access-key",
+        aliases: &["accesskeys", "access-keys", "akey"],
+        path: "/secrets/access-keys",
+        id_prefix: "sec",
+        update: UpdateStyle::None,
+        flat_create: true,
+        columns: &[
+            col!("NAME", "/access_key_id"),
+            col!("ID", id),
+            col!("PROJECT", short "/project"),
+            col!("PRINCIPAL", short "/principal"),
+            col!("DESCRIPTION", description),
+            col!("AGE", created),
+        ],
+        wide: &[col!("FULL-ID", full_id)],
+    },
+    KindDef {
+        noun: "join-token",
+        aliases: &["jointokens", "join-tokens", "jtok"],
+        path: "/secrets/join-tokens",
+        id_prefix: "jtok",
+        update: UpdateStyle::None,
+        flat_create: true,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("MULTI", "/spec/multi_use"),
+            col!("MAX-USES", "/spec/max_uses"),
+            col!("USES", "/status/uses"),
+            col!("EXPIRES", "/spec/expires_at"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("CREATED-BY", "/spec/created_by"),
+            col!("LAST-USED", "/status/last_used"),
+            col!("FULL-ID", full_id),
+        ],
+    },
+    KindDef {
         noun: "machine",
         aliases: &["machines", "mach", "vm", "server"],
         path: "/compute/machines",
@@ -737,6 +776,10 @@ mod tests {
         assert_eq!(by_noun("DaemonSet").unwrap().noun, "daemonset");
         assert_eq!(by_noun("hpa").unwrap().noun, "autoscaler");
         assert_eq!(by_noun("stack").unwrap().path, "/blueprint/stacks");
+        assert_eq!(by_noun("access-key").unwrap().path, "/secrets/access-keys");
+        assert_eq!(by_noun("akey").unwrap().noun, "access-key");
+        assert_eq!(by_noun("join-token").unwrap().path, "/secrets/join-tokens");
+        assert_eq!(by_noun("jtok").unwrap().noun, "join-token");
         assert!(by_noun("bogus").is_none());
     }
 

@@ -102,6 +102,18 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: KeyCmd,
     },
+    /// Access keys for request signing.
+    #[command(alias = "accesskeys", alias = "akey")]
+    AccessKey {
+        #[command(subcommand)]
+        cmd: AccessKeyCmd,
+    },
+    /// Join tokens for `pistack agent --join` (admin).
+    #[command(alias = "jointokens", alias = "jtok")]
+    JoinToken {
+        #[command(subcommand)]
+        cmd: JoinTokenCmd,
+    },
     /// Machines: VMs, containers, bare metal.
     Machine {
         #[command(subcommand)]
@@ -428,6 +440,36 @@ pub struct KeyCreate {
     pub expires_at: Option<String>,
 }
 crud!(KeyCmd, KeyCreate);
+
+#[derive(Args, Debug)]
+pub struct AccessKeyCreate {
+    /// Human-readable note on the key.
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Project (name or id); default: the current scope.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Principal the key acts as (name or id); default: you.
+    #[arg(long)]
+    pub principal: Option<String>,
+}
+crud!(AccessKeyCmd, AccessKeyCreate);
+
+#[derive(Args, Debug)]
+pub struct JoinTokenCreate {
+    pub name: String,
+    /// Allow more than one redemption.
+    #[arg(long)]
+    pub multi_use: bool,
+    /// Max redemptions for a multi-use token (implies --multi-use).
+    /// Default and maximum come from the server (typically 100).
+    #[arg(long, value_name = "N")]
+    pub max_uses: Option<u64>,
+    /// Lifetime in seconds (default and maximum 86400 = 24h).
+    #[arg(long, value_name = "SECS")]
+    pub ttl_secs: Option<i64>,
+}
+crud!(JoinTokenCmd, JoinTokenCreate);
 
 // ---- compute -----------------------------------------------------------------
 
