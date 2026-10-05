@@ -4837,10 +4837,6 @@ fi
         .unwrap();
     }
 
-    fn shell_quote(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-    }
-
     fn write_executable(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
         let mut perms = std::fs::metadata(path).unwrap().permissions();
