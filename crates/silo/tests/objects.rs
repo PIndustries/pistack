@@ -1810,9 +1810,9 @@ async fn upload_part_copy_errors() {
 }
 
 #[tokio::test]
-async fn upload_part_copy_source_bucket_not_visible() {
-    // Source in another project is invisible via load_bucket (same as GET).
-    let (_dir, _client, app, _project, who) = app_multipart(64, 4);
+async fn upload_part_copy_cross_project_access_denied() {
+    // Cross-project copy-source must be AccessDenied (not not-found).
+    let (_dir, client, app, _project, who) = app_multipart(64, 4);
     let other = Id::new(kind::PROJECT);
     let stranger = project_caller(&other);
     let src_bucket = ensure_bucket(&app, &stranger, "secret-src").await;
@@ -1852,22 +1852,111 @@ async fn upload_part_copy_source_bucket_not_visible() {
     .await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
         "{}",
         String::from_utf8_lossy(&body)
     );
-    let code = extract_error_code(&String::from_utf8_lossy(&body));
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+
+    // No part was written; staging has no part files or leftover temps.
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{dst_bucket}/out.bin?uploadId={upload_id}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert!(
-        code == "NoSuchBucket"
-            || code == "NoSuchKey"
-            || code.is_empty()
-            || body_has_not_found(&body),
-        "code={code} body={}",
+        !String::from_utf8_lossy(&body).contains("<Part>"),
+        "ListParts must be empty: {}",
         String::from_utf8_lossy(&body)
+    );
+    let dst = client
+        .list_buckets(Some(&who.project.clone().unwrap()))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == dst_bucket)
+        .unwrap();
+    let staging = staging_dir(&client, &dst.meta.id, &upload_id);
+    assert!(staging.exists(), "upload staging should still exist");
+    let leftovers: Vec<_> = std::fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-") || n.starts_with("part-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no part or .tmp-* files after AccessDenied: {leftovers:?}"
     );
 }
 
-fn body_has_not_found(body: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(body);
-    s.contains("not found") || s.contains("NoSuch")
+#[tokio::test]
+async fn upload_part_copy_nonexistent_source_bucket_access_denied() {
+    let (_dir, client, app, _project, who) = app_multipart(64, 4);
+    let dst_bucket = ensure_bucket(&app, &who, "dst-missing-src").await;
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{dst_bucket}/out.bin?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+
+    let (status, body, _) = call_with_headers(
+        &app,
+        "PUT",
+        &format!("/{dst_bucket}/out.bin?partNumber=1&uploadId={upload_id}"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+        &[("x-amz-copy-source", "/no-such-bucket-xyz/any-key")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/{dst_bucket}/out.bin?uploadId={upload_id}"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(!String::from_utf8_lossy(&body).contains("<Part>"));
+    let dst = client
+        .list_buckets(Some(&who.project.clone().unwrap()))
+        .unwrap()
+        .into_iter()
+        .find(|b| b.meta.name == dst_bucket)
+        .unwrap();
+    let staging = staging_dir(&client, &dst.meta.id, &upload_id);
+    let leftovers: Vec<_> = std::fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-") || n.starts_with("part-"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
 }

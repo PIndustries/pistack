@@ -25,8 +25,10 @@
 //! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
 //! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) are supported.
 //! **UploadPartCopy** (`x-amz-copy-source` on UploadPart) streams from a
-//! source object the caller can `load_bucket` (same project visibility as
-//! GET). CopyObject (copy-source without `partNumber`) and copy-source
+//! source object in a bucket visible to the caller. A foreign-project or
+//! nonexistent copy-source bucket returns `AccessDenied` (existence is not
+//! leaked); a missing key in a visible bucket is still `NoSuchKey`.
+//! CopyObject (copy-source without `partNumber`) and copy-source
 //! `versionId` are `NotImplemented`. Single-PUT ETag is the content MD5
 //! hex (quoted); completed multipart ETag is `{md5-of-part-md5s}-{n}`
 //! (quoted).
@@ -39,7 +41,7 @@
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
 use crate::copy;
-use crate::http::{content_type_header, load_bucket};
+use crate::http::{content_type_header, load_bucket, load_copy_source_bucket};
 use crate::multipart::{self, s3_code_of};
 use crate::sigv4::{self, ExpectedPayloadSha256};
 use crate::types::*;
@@ -254,8 +256,9 @@ async fn upload_part_copy_inner(
         .parse()
         .map_err(|_| multipart::s3_err("InvalidArgument", "partNumber must be a number"))?;
 
-    // Same project-visibility check as GET (load_bucket → visible).
-    let src_bucket = load_bucket(&c, who, &src.bucket)?;
+    // Visibility before any dest part file is opened/created. Foreign or
+    // nonexistent source buckets → AccessDenied (do not leak existence).
+    let src_bucket = load_copy_source_bucket(&c, who, &src.bucket)?;
     let (src_obj, mut file) = match c.open_object(&src_bucket.meta.id, &src.key).await {
         Ok(v) => v,
         Err(e) if e.status() == StatusCode::NOT_FOUND => {
