@@ -8,6 +8,7 @@ use axum::{
     http::{header, Request, StatusCode},
     Router,
 };
+use md5::Md5;
 use pistack_store::Store;
 use pistack_types::{kind, Caller, Id};
 use serde_json::{json, Value};
@@ -18,6 +19,14 @@ use tower::ServiceExt;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::Digest;
+    Md5::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -48,12 +57,13 @@ async fn call(
     if let Some(c) = caller {
         req = req.extension(c.clone());
     }
+    let payload = body.unwrap_or_default();
+    if method == "PUT" || method == "POST" {
+        req = req.header(header::CONTENT_LENGTH, payload.len().to_string());
+    }
     let resp = app
         .clone()
-        .oneshot(
-            req.body(Body::from(body.unwrap_or_default()))
-                .expect("request"),
-        )
+        .oneshot(req.body(Body::from(payload)).expect("request"))
         .await
         .expect("response");
     let status = resp.status();
@@ -65,17 +75,22 @@ async fn call(
     (status, bytes, headers)
 }
 
-#[tokio::test]
-async fn put_and_get_object_on_temp_store() {
+fn app_with_max(max: usize) -> (tempfile::TempDir, Client, Router, Id, Caller) {
     let dir = tempfile::tempdir().expect("tempdir");
     let (events, _rx) = tokio::sync::broadcast::channel(16);
     let store = Store::open(dir.path().join("state.redb"), events).expect("open store");
     let root = dir.path().join("silo");
-    let client = Client::new(store, &root);
+    let client = Client::new(store, &root).with_max_object_bytes(max);
     let app = http::router(client.clone());
-
     let project = Id::new(kind::PROJECT);
     let who = project_caller(&project);
+    (dir, client, app, project, who)
+}
+
+#[tokio::test]
+async fn put_and_get_object_on_temp_store() {
+    let (dir, client, app, project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let root = dir.path().join("silo");
 
     let (status, body, _) = call(
         &app,
@@ -104,6 +119,7 @@ async fn put_and_get_object_on_temp_store() {
 
     let payload = b"hello silo".to_vec();
     let want = sha256_hex(&payload);
+    let want_md5 = md5_hex(&payload);
     let (status, body, _) = call(
         &app,
         "PUT",
@@ -119,6 +135,7 @@ async fn put_and_get_object_on_temp_store() {
     assert_eq!(obj["spec"]["key"], "hello.txt");
     assert_eq!(obj["spec"]["bucket"], bucket_id);
     assert_eq!(obj["status"]["sha256"], want);
+    assert_eq!(obj["status"]["md5"], want_md5);
     assert_eq!(obj["status"]["size_bytes"], payload.len() as u64);
     assert_eq!(obj["project"], project.to_string());
 
@@ -138,7 +155,7 @@ async fn put_and_get_object_on_temp_store() {
     assert_eq!(got, payload);
     assert_eq!(
         headers.get(header::ETAG).and_then(|v| v.to_str().ok()),
-        Some(format!("\"{want}\"").as_str())
+        Some(format!("\"{want_md5}\"").as_str())
     );
 
     let nested = b"nested".to_vec();
@@ -292,4 +309,318 @@ async fn missing_caller_is_unauthorized() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{err}");
     assert_eq!(err["error"]["code"], "unauthorized");
     assert_eq!(err["error"]["message"], "no credentials");
+}
+
+#[tokio::test]
+async fn configured_max_rejects_oversize_without_writing_gib() {
+    // Cap at 64 bytes so the test stays tiny.
+    let (_dir, client, app, _project, who) = app_with_max(64);
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        "/buckets",
+        Some(json!({"name": "tiny"}).to_string().into_bytes()),
+        "application/json",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let bucket: Value = serde_json::from_slice(&body).unwrap();
+    let bucket_id = bucket["id"].as_str().unwrap();
+
+    let too_big = vec![b'x'; 65];
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/big.bin"),
+        Some(too_big.clone()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("larger than"),
+        "{err}"
+    );
+
+    let id = Id::parse(kind::BUCKET, bucket_id).unwrap();
+    let err = client
+        .put_object(&id, "via-client.bin", &too_big, None)
+        .await
+        .expect_err("oversize");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+    // Exactly at the limit still works.
+    let ok = vec![b'y'; 64];
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/ok.bin"),
+        Some(ok.clone()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, got, _) = call(
+        &app,
+        "GET",
+        &format!("/buckets/{bucket_id}/objects/ok.bin"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, ok);
+}
+
+#[tokio::test]
+async fn streaming_put_get_round_trip() {
+    let (dir, _client, app, _project, who) = app_with_max(1024 * 1024);
+    let root = dir.path().join("silo");
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        "/buckets",
+        Some(json!({"name": "stream"}).to_string().into_bytes()),
+        "application/json",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let bucket: Value = serde_json::from_slice(&body).unwrap();
+    let bucket_id = bucket["id"].as_str().unwrap().to_owned();
+
+    // Multi-chunk-sized payload (not huge, but larger than a single write buffer).
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let want_sha = sha256_hex(&payload);
+    let want_md5 = md5_hex(&payload);
+
+    let (status, body, _) = call(
+        &app,
+        "PUT",
+        &format!("/buckets/{bucket_id}/objects/chunky.bin"),
+        Some(payload.clone()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    let obj: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{obj}");
+    assert_eq!(obj["status"]["sha256"], want_sha);
+    assert_eq!(obj["status"]["md5"], want_md5);
+    assert_eq!(obj["status"]["size_bytes"], payload.len() as u64);
+    assert_eq!(
+        std::fs::read(root.join(&bucket_id).join("chunky.bin")).unwrap(),
+        payload
+    );
+
+    let (status, got, headers) = call(
+        &app,
+        "GET",
+        &format!("/buckets/{bucket_id}/objects/chunky.bin"),
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, payload);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(payload.len().to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn s3_put_get_list_prefix_and_pagination() {
+    let (_dir, _client, app, _project, who) = app_with_max(1024 * 1024);
+
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        "/buckets",
+        Some(json!({"name": "photos"}).to_string().into_bytes()),
+        "application/json",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let a = b"alpha".to_vec();
+    let b = b"bravo".to_vec();
+    let c = b"charlie".to_vec();
+    for (key, payload) in [("docs/a.txt", &a), ("docs/b.txt", &b), ("other/c.txt", &c)] {
+        let (status, body, headers) = call(
+            &app,
+            "PUT",
+            &format!("/photos/{key}"),
+            Some(payload.clone()),
+            "text/plain",
+            Some(&who),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{} {}",
+            key,
+            String::from_utf8_lossy(&body)
+        );
+        let etag = headers
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert_eq!(etag, format!("\"{}\"", md5_hex(payload)));
+    }
+
+    let (status, got, headers) = call(
+        &app,
+        "GET",
+        "/photos/docs/a.txt",
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, a);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain")
+    );
+
+    let (status, _, headers) = call(
+        &app,
+        "HEAD",
+        "/photos/docs/a.txt",
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+
+    let (status, body, headers) = call(
+        &app,
+        "GET",
+        "/photos?list-type=2&prefix=docs/",
+        None,
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml")
+    );
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Key>docs/a.txt</Key>"), "{xml}");
+    assert!(xml.contains("<Key>docs/b.txt</Key>"), "{xml}");
+    assert!(!xml.contains("other/c.txt"), "{xml}");
+    assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        "/photos?list-type=2&max-keys=1",
+        None,
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+    assert!(xml.contains("<NextContinuationToken>"), "{xml}");
+    // First key lexicographically among the three.
+    assert!(xml.contains("<Key>docs/a.txt</Key>"), "{xml}");
+    assert!(!xml.contains("docs/b.txt"), "{xml}");
+
+    // Continue from the token.
+    let token = xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .unwrap()
+        .split("</NextContinuationToken>")
+        .next()
+        .unwrap();
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        &format!("/photos?list-type=2&max-keys=1&continuation-token={token}"),
+        None,
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Key>docs/b.txt</Key>"), "{xml}");
+
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        "/photos/docs/a.txt",
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body, _) = call(
+        &app,
+        "GET",
+        "/photos/docs/a.txt",
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8_lossy(&body).contains("NoSuchKey")
+            || String::from_utf8_lossy(&body).contains("not found")
+    );
 }

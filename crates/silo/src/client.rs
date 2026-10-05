@@ -5,23 +5,31 @@
 //!
 //! Bytes for the current generation of a key live at
 //! `{root}/{bucket-id}/{key}`, where `root` is `$PISTACK_DATA_DIR/silo` in
-//! the module. `status.sha256` is the content address of those bytes.
-//! With bucket versioning, the previous generation's bytes are kept at
+//! the module. `status.sha256` is the content address of those bytes;
+//! `status.md5` is the S3 single-PUT ETag. With bucket versioning, the
+//! previous generation's bytes are kept at
 //! `{root}/{bucket-id}/.blobs/{sha256}` and the old record stays with
 //! `status.latest = false`.
+//!
+//! Puts stream the request body to a temp file (hashing as they go), then
+//! rename into place. Gets can stream the file back without buffering it.
 
 use crate::types::*;
+use bytes::Bytes;
+use futures::Stream;
+use md5::Md5;
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult, Id, Meta, Phase, Spec};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
 pub struct Client {
     store: Store,
     root: PathBuf,
+    max_object_bytes: usize,
 }
 
 impl Client {
@@ -29,7 +37,18 @@ impl Client {
         Self {
             store,
             root: root.into(),
+            max_object_bytes: MAX_OBJECT_BYTES,
         }
+    }
+
+    /// Cap for a single PUT. Used by HTTP and by [`Self::put_object`].
+    pub fn with_max_object_bytes(mut self, max: usize) -> Self {
+        self.max_object_bytes = max;
+        self
+    }
+
+    pub fn max_object_bytes(&self) -> usize {
+        self.max_object_bytes
     }
 
     pub fn store(&self) -> &Store {
@@ -102,6 +121,7 @@ impl Client {
         Ok(path)
     }
 
+    /// Buffering convenience over [`Self::put_object_stream`].
     pub async fn put_object(
         &self,
         bucket_id: &Id,
@@ -109,13 +129,47 @@ impl Client {
         bytes: &[u8],
         content_type: Option<String>,
     ) -> ApiResult<Object> {
-        if bytes.len() > MAX_OBJECT_BYTES {
-            return Err(ApiError::bad_request("object is larger than 1 GiB"));
+        if bytes.len() > self.max_object_bytes {
+            return Err(ApiError::bad_request(object_too_large_message(
+                self.max_object_bytes,
+            )));
+        }
+        let owned = Bytes::copy_from_slice(bytes);
+        let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(owned) });
+        self.put_object_stream(
+            bucket_id,
+            key,
+            stream,
+            Some(bytes.len() as u64),
+            content_type,
+        )
+        .await
+    }
+
+    /// Stream `body` to a temp file under the bucket, hash while writing,
+    /// then atomically rename onto `{bucket}/{key}`.
+    pub async fn put_object_stream<S, E>(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+        body: S,
+        content_length: Option<u64>,
+        content_type: Option<String>,
+    ) -> ApiResult<Object>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send,
+        E: std::fmt::Display,
+    {
+        if let Some(len) = content_length {
+            if len > self.max_object_bytes as u64 {
+                return Err(ApiError::bad_request(object_too_large_message(
+                    self.max_object_bytes,
+                )));
+            }
         }
         validate_key(key)?;
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
         let path = self.key_path(&bucket.meta.id, key)?;
-        let sha = sha256_hex(bytes);
         let existing = self.find_current(&bucket, key)?;
         let version = existing
             .as_ref()
@@ -135,7 +189,9 @@ impl Client {
                     .await?;
             }
         }
-        write_atomic(&path, bytes).await?;
+
+        let written =
+            write_stream_atomic(&path, body, self.max_object_bytes, content_length).await?;
 
         if bucket.spec.versioning {
             if let Some(prev) = existing {
@@ -143,14 +199,23 @@ impl Client {
                 old.status.latest = false;
                 self.store.collection::<Object>().update(old, None)?;
             }
-            return self.insert_object(&bucket, key, ctype, sha, bytes.len() as u64, version);
+            return self.insert_object(
+                &bucket,
+                key,
+                ctype,
+                written.sha256,
+                written.md5,
+                written.size,
+                version,
+            );
         }
 
         if let Some(prev) = existing {
             let mut next = prev;
             next.spec.content_type = ctype;
-            next.status.sha256 = sha;
-            next.status.size_bytes = bytes.len() as u64;
+            next.status.sha256 = written.sha256;
+            next.status.md5 = written.md5;
+            next.status.size_bytes = written.size;
             next.status.version = version;
             next.status.latest = true;
             return self
@@ -159,23 +224,22 @@ impl Client {
                 .update(next, None)
                 .map_err(Into::into);
         }
-        self.insert_object(&bucket, key, ctype, sha, bytes.len() as u64, version)
+        self.insert_object(
+            &bucket,
+            key,
+            ctype,
+            written.sha256,
+            written.md5,
+            written.size,
+            version,
+        )
     }
 
+    /// Read the whole object into memory (callers that already buffer).
     pub async fn get_object(&self, bucket_id: &Id, key: &str) -> ApiResult<(Object, Vec<u8>)> {
-        validate_key(key)?;
-        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
-        let obj = self
-            .find_current(&bucket, key)?
-            .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))?;
-        let path = self.key_path(&bucket.meta.id, key)?;
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ApiError::not_found(format!("object '{key}' not found")));
-            }
-            Err(e) => return Err(io_err(e)),
-        };
+        let (obj, mut file) = self.open_object(bucket_id, key).await?;
+        let mut bytes = Vec::with_capacity(obj.status.size_bytes as usize);
+        file.read_to_end(&mut bytes).await.map_err(io_err)?;
         let got = sha256_hex(&bytes);
         if got != obj.status.sha256 {
             return Err(ApiError::internal(format!(
@@ -184,6 +248,45 @@ impl Client {
             )));
         }
         Ok((obj, bytes))
+    }
+
+    /// Open the object file for streaming. Verifies size matches status;
+    /// SHA-256 is checked by callers that buffer, or left to disk integrity.
+    pub async fn open_object(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+    ) -> ApiResult<(Object, tokio::fs::File)> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let obj = self
+            .find_current(&bucket, key)?
+            .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))?;
+        let path = self.key_path(&bucket.meta.id, key)?;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ApiError::not_found(format!("object '{key}' not found")));
+            }
+            Err(e) => return Err(io_err(e)),
+        };
+        let meta = file.metadata().await.map_err(io_err)?;
+        if meta.len() != obj.status.size_bytes {
+            return Err(ApiError::internal(format!(
+                "object '{key}' size mismatch: status {}, disk {}",
+                obj.status.size_bytes,
+                meta.len()
+            )));
+        }
+        Ok((obj, file))
+    }
+
+    /// Object metadata only (no body). Used by HEAD.
+    pub fn head_object(&self, bucket_id: &Id, key: &str) -> ApiResult<Object> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        self.find_current(&bucket, key)?
+            .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))
     }
 
     pub async fn delete_object(&self, bucket_id: &Id, key: &str) -> ApiResult<Object> {
@@ -214,11 +317,31 @@ impl Client {
 
     /// Latest generation of each key in the bucket, ordered by key.
     pub fn list_objects(&self, bucket_id: &Id) -> ApiResult<Vec<Object>> {
+        self.list_objects_filtered(bucket_id, None, None, usize::MAX)
+            .map(|(items, _)| items)
+    }
+
+    /// Latest generation of each key, optionally filtered by `prefix` and
+    /// starting after `after_key` (exclusive), capped at `limit`.
+    /// Returns `(page, truncated)`.
+    pub fn list_objects_filtered(
+        &self,
+        bucket_id: &Id,
+        prefix: Option<&str>,
+        after_key: Option<&str>,
+        limit: usize,
+    ) -> ApiResult<(Vec<Object>, bool)> {
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
         let all = self.objects_for_bucket(&bucket)?;
         let mut keys: Vec<String> = all.iter().map(|o| o.spec.key.clone()).collect();
         keys.sort();
         keys.dedup();
+        if let Some(p) = prefix {
+            keys.retain(|k| k.starts_with(p));
+        }
+        if let Some(after) = after_key {
+            keys.retain(|k| k.as_str() > after);
+        }
         let mut out = Vec::new();
         for key in keys {
             let matches = all.iter().filter(|o| o.spec.key == key).cloned().collect();
@@ -226,15 +349,19 @@ impl Client {
                 out.push(cur);
             }
         }
-        Ok(out)
+        let truncated = out.len() > limit;
+        out.truncate(limit);
+        Ok((out, truncated))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_object(
         &self,
         bucket: &Bucket,
         key: &str,
         content_type: String,
         sha: String,
+        md5: String,
         size: u64,
         version: u64,
     ) -> ApiResult<Object> {
@@ -247,6 +374,7 @@ impl Client {
         obj.meta.name = obj.meta.id.to_string();
         obj.status = ObjectStatus {
             sha256: sha,
+            md5,
             size_bytes: size,
             version,
             latest: true,
@@ -357,19 +485,68 @@ async fn remove_file(path: &Path) -> ApiResult<()> {
     }
 }
 
-async fn write_atomic(dest: &Path, bytes: &[u8]) -> ApiResult<()> {
+struct Written {
+    sha256: String,
+    md5: String,
+    size: u64,
+}
+
+async fn write_stream_atomic<S, E>(
+    dest: &Path,
+    body: S,
+    max: usize,
+    content_length: Option<u64>,
+) -> ApiResult<Written>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
-        file.write_all(bytes).await.map_err(io_err)?;
+        let mut sha = Sha256::new();
+        let mut md5 = Md5::new();
+        let mut size: u64 = 0;
+        let mut body = std::pin::pin!(body);
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+            let next = size.saturating_add(chunk.len() as u64);
+            if next > max as u64 {
+                return Err(ApiError::bad_request(object_too_large_message(max)));
+            }
+            if let Some(len) = content_length {
+                if next > len {
+                    return Err(ApiError::bad_request(
+                        "body longer than Content-Length".to_owned(),
+                    ));
+                }
+            }
+            sha.update(&chunk);
+            md5.update(&chunk);
+            file.write_all(&chunk).await.map_err(io_err)?;
+            size = next;
+        }
+        if let Some(len) = content_length {
+            if size != len {
+                return Err(ApiError::bad_request(format!(
+                    "body length {size} does not match Content-Length {len}"
+                )));
+            }
+        }
         file.flush().await.map_err(io_err)?;
         file.sync_all().await.map_err(io_err)?;
         drop(file);
         tokio::fs::rename(&tmp, dest).await.map_err(io_err)?;
-        Ok(())
+        Ok(Written {
+            sha256: hex_encode(sha.finalize().as_slice()),
+            md5: hex_encode(md5.finalize().as_slice()),
+            size,
+        })
     }
     .await;
     if result.is_err() {
