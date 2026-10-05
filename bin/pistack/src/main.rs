@@ -20,6 +20,7 @@
 //! The `keep` commands run on a stopped node's store; see `keepcmd.rs`.
 
 mod cluster;
+mod fabricchoice;
 mod gateway;
 mod keepcmd;
 mod listen;
