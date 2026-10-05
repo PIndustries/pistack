@@ -295,7 +295,7 @@ impl Api for ServiceSpec {
             return Err(ApiError::bad_request("spec.ports must not be empty"));
         }
         let mut seen = BTreeSet::new();
-        let mut node_ports = BTreeSet::new();
+        let mut node_ports = BTreeMap::new();
         for p in &self.ports {
             if p.port == 0 {
                 return Err(ApiError::bad_request("port must be 1-65535"));
@@ -319,7 +319,11 @@ impl Api for ServiceSpec {
                         NODE_PORT_RANGE.end()
                     )));
                 }
-                if !node_ports.insert(node_port) {
+                // The tcp and udp sides of one port may share a node port.
+                if node_ports
+                    .insert(node_port, p.port)
+                    .is_some_and(|had| had != p.port)
+                {
                     return Err(ApiError::bad_request(format!(
                         "node_port {node_port} is listed twice"
                     )));
@@ -907,6 +911,12 @@ mod tests {
         assert!(spec(ServiceKind::NodePort, &[(80, Some(8080))])
             .validate(None)
             .is_err());
+        let mut shared = spec(
+            ServiceKind::NodePort,
+            &[(53, Some(30053)), (53, Some(30053))],
+        );
+        shared.ports[1].protocol = Protocol::Udp;
+        assert!(shared.validate(None).is_ok());
         assert!(spec(
             ServiceKind::NodePort,
             &[(80, Some(30080)), (81, Some(30080))]
