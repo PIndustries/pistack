@@ -1859,6 +1859,7 @@ dependencies = [
  "clap",
  "fabric",
  "forge",
+ "futures",
  "gate",
  "gauge",
  "http",

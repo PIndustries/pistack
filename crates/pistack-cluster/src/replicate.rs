@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::discover::Announce;
-use crate::group::{admit, ClusterError, Member, Role};
+use crate::group::{ClusterError, Member, Role};
 
 /// Shortest wait after the last sign of a leader or candidate before a
 /// follower campaigns.
@@ -31,15 +31,79 @@ pub fn seed_membership(node_id: &str, api: &str) -> Vec<Member> {
     vec![Member::voter(node_id, api)]
 }
 
-/// Same rules as admit(), except a node id that is already a member keeps its
-/// role and updates its api. Do not insert a duplicate.
+/// A server that asks to join is a learner, new or not. A member that comes
+/// back through join has a store it cannot vouch for (a downloaded snapshot
+/// or a copy), so it is demoted and its api updated; no duplicate is added.
+/// The leader promotes learners with [`plan_promotions`] once they caught up.
 pub fn join_membership(members: &[Member], node_id: &str, api: &str) -> Vec<Member> {
-    if let Some(index) = members.iter().position(|member| member.id == node_id) {
-        let mut next = members.to_vec();
-        next[index].api = api.to_owned();
-        return next;
+    let mut next = members.to_vec();
+    match next.iter_mut().find(|member| member.id == node_id) {
+        Some(member) => {
+            member.api = api.to_owned();
+            member.role = Role::Learner;
+        }
+        None => next.push(Member::learner(node_id, api)),
     }
-    admit(members, Member::learner(node_id, api))
+    next
+}
+
+/// How many voters a membership should have: three once three servers are
+/// members, otherwise the voters it already has (at least one). The second
+/// server stays a learner, as [`crate::admit`] always did.
+pub fn voter_target(members: &[Member]) -> usize {
+    let voters = members
+        .iter()
+        .filter(|member| member.role == Role::Voter)
+        .count();
+    if members.len() >= 3 {
+        3.max(voters)
+    } else {
+        voters.max(1)
+    }
+}
+
+/// Learners to promote now, as the next membership, or `None`. Only learners
+/// for which `caught_up` says yes are promoted, in member order, up to
+/// [`voter_target`]. A step that would leave an even voter count short of
+/// the target waits, so one voter and two learners become three voters
+/// together rather than two voters that both must answer.
+pub fn plan_promotions(
+    members: &[Member],
+    caught_up: impl Fn(&str) -> bool,
+) -> Option<Vec<Member>> {
+    let voters = members
+        .iter()
+        .filter(|member| member.role == Role::Voter)
+        .count();
+    let target = voter_target(members);
+    if voters >= target {
+        return None;
+    }
+    let ready: Vec<usize> = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.role == Role::Learner && caught_up(&member.id))
+        .map(|(index, _)| index)
+        .collect();
+    let mut take = (target - voters).min(ready.len());
+    if take > 0 && voters + take != target && (voters + take) % 2 == 0 {
+        take -= 1;
+    }
+    if take == 0 {
+        return None;
+    }
+    let mut next = members.to_vec();
+    for index in ready.into_iter().take(take) {
+        next[index].role = Role::Voter;
+    }
+    Some(next)
+}
+
+/// True when `id` is a voter in `members`.
+pub fn is_voter(members: &[Member], id: &str) -> bool {
+    members
+        .iter()
+        .any(|member| member.id == id && member.role == Role::Voter)
 }
 
 pub fn accepts_writes(role: Role, leader: bool) -> bool {
@@ -318,22 +382,64 @@ mod tests {
     }
 
     #[test]
-    fn seed_then_join_follows_admit_and_updates_api() {
+    fn every_join_is_a_learner_and_a_returning_voter_is_demoted() {
         let members = seed_membership("a", "http://a");
         let two = join_membership(&members, "b", "http://b");
         assert_eq!(two[0], Member::voter("a", "http://a"));
         assert_eq!(two[1], Member::learner("b", "http://b"));
         let three = join_membership(&two, "c", "http://c");
         assert_eq!(three.len(), 3);
-        assert!(three.iter().all(|member| member.role == Role::Voter));
-        let again = join_membership(&three, "b", "http://b2");
+        assert_eq!(three[2], Member::learner("c", "http://c"));
+        assert_eq!(
+            three.iter().filter(|m| m.role == Role::Voter).count(),
+            1,
+            "a join never adds a voter by itself"
+        );
+        let voters = vec![
+            Member::voter("a", "http://a"),
+            Member::voter("b", "http://b"),
+            Member::voter("c", "http://c"),
+        ];
+        let again = join_membership(&voters, "c", "http://c2");
         assert_eq!(again.len(), 3);
+        assert_eq!(again[2], Member::learner("c", "http://c2"));
         assert_eq!(again[0].role, Role::Voter);
-        assert_eq!(again[1].id, "b");
         assert_eq!(again[1].role, Role::Voter);
-        assert_eq!(again[1].api, "http://b2");
-        assert_eq!(again[2].id, "c");
-        assert_eq!(again[2].role, Role::Voter);
+    }
+
+    #[test]
+    fn learners_are_promoted_only_when_caught_up_and_never_to_an_even_pair() {
+        let all = |_: &str| true;
+        let none = |_: &str| false;
+        // Two servers: the second stays a learner.
+        let two = vec![Member::voter("a", "a"), Member::learner("b", "b")];
+        assert!(plan_promotions(&two, all).is_none());
+        // One voter, two learners: wait for both, then promote both.
+        let three = vec![
+            Member::voter("a", "a"),
+            Member::learner("b", "b"),
+            Member::learner("c", "c"),
+        ];
+        assert!(plan_promotions(&three, none).is_none());
+        assert!(plan_promotions(&three, |id| id == "b").is_none());
+        let next = plan_promotions(&three, all).unwrap();
+        assert!(next.iter().all(|m| m.role == Role::Voter));
+        // A rejoined voter: two voters and a caught-up learner make three.
+        let rejoin = vec![
+            Member::voter("a", "a"),
+            Member::voter("b", "b"),
+            Member::learner("c", "c"),
+        ];
+        assert!(plan_promotions(&rejoin, none).is_none());
+        let next = plan_promotions(&rejoin, |id| id == "c").unwrap();
+        assert!(next.iter().all(|m| m.role == Role::Voter));
+        // Three voters already: a fourth server stays a learner.
+        let mut four = next.clone();
+        four.push(Member::learner("d", "d"));
+        assert!(plan_promotions(&four, all).is_none());
+        assert!(is_voter(&four, "a"));
+        assert!(!is_voter(&four, "d"));
+        assert!(!is_voter(&four, "zz"));
     }
 
     #[test]
