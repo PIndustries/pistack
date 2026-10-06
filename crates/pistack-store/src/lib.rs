@@ -36,10 +36,21 @@ pub enum StoreError {
     Conflict(String),
     #[error("revision mismatch: expected {expected}, found {found}")]
     Revision { expected: u64, found: u64 },
+    /// This node is not the leader. Ordinary writes are refused; follower
+    /// apply and cluster bookkeeping still go through.
+    #[error("not the leader")]
+    NotLeader,
     #[error("storage: {0}")]
     Storage(String),
     #[error("codec: {0}")]
     Codec(#[from] serde_json::Error),
+}
+
+impl StoreError {
+    /// True when the write fence refused this write after stand-down.
+    pub fn is_not_leader(&self) -> bool {
+        matches!(self, Self::NotLeader)
+    }
 }
 
 impl From<redb::Error> for StoreError {
@@ -70,6 +81,7 @@ impl From<StoreError> for ApiError {
             StoreError::Revision { expected, found } => ApiError::conflict(format!(
                 "resource changed: expected revision {expected}, found {found}"
             )),
+            StoreError::NotLeader => ApiError::conflict("not the leader"),
             StoreError::Storage(m) => ApiError::internal(m),
             StoreError::Codec(e) => ApiError::internal(e.to_string()),
         }
@@ -90,6 +102,12 @@ pub trait Backend: Send + Sync + 'static {
     fn batch(&self, ops: Vec<Op>) -> Result<()>;
     fn set_record_log(&self, on: bool);
     fn set_log_term(&self, term: u64);
+    /// When set, ordinary writes fail with [`StoreError::NotLeader`]. Cleared
+    /// when this node becomes leader; set when it stands down. Apply and
+    /// follower bookkeeping bypass it.
+    fn set_write_fence(&self, on: bool);
+    /// True while [`Store::apply_entries`] is copying the leader's log.
+    fn set_applying(&self, on: bool);
     fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>>;
     /// Current record flag. `apply_entries` turns recording off, then restores this.
     fn record_log(&self) -> bool;
@@ -137,6 +155,20 @@ fn is_bookkeeping(op: &Op) -> bool {
             ))
 }
 
+/// Membership keys the follow loop writes after stepping down. When recording
+/// is on they still go in the log (a leader's `/cluster/join` must); when the
+/// write fence is up they are allowed without logging.
+fn is_follower_meta(op: &Op) -> bool {
+    let (table, key) = match op {
+        Op::Put { table, key, .. } | Op::Delete { table, key } => (table.as_str(), key.as_str()),
+    };
+    table == "meta" && matches!(key, "members" | "cluster_leader_id")
+}
+
+fn allowed_when_fenced(op: &Op) -> bool {
+    is_bookkeeping(op) || is_follower_meta(op)
+}
+
 fn log_key(index: u64) -> String {
     format!("cluster_log/{index:020}")
 }
@@ -175,6 +207,12 @@ pub struct RedbBackend {
     db: Database,
     record: AtomicBool,
     term: AtomicU64,
+    /// Set on stand-down; cleared on become-leader. See [`Backend::set_write_fence`].
+    fenced: AtomicBool,
+    /// Set for the duration of [`Store::apply_entries`].
+    applying: AtomicBool,
+    /// Holds across fence flag changes and the fence check in [`Backend::batch`].
+    gate: parking_lot::Mutex<()>,
 }
 
 impl RedbBackend {
@@ -192,6 +230,9 @@ impl RedbBackend {
             db,
             record: AtomicBool::new(false),
             term: AtomicU64::new(0),
+            fenced: AtomicBool::new(false),
+            applying: AtomicBool::new(false),
+            gate: parking_lot::Mutex::new(()),
         })
     }
 
@@ -208,6 +249,9 @@ impl RedbBackend {
             db,
             record: AtomicBool::new(false),
             term: AtomicU64::new(0),
+            fenced: AtomicBool::new(false),
+            applying: AtomicBool::new(false),
+            gate: parking_lot::Mutex::new(()),
         })
     }
 
@@ -276,7 +320,13 @@ impl Backend for RedbBackend {
     }
 
     fn batch(&self, ops: Vec<Op>) -> Result<()> {
-        let recording = self.record.load(Ordering::Acquire);
+        let _gate = self.gate.lock();
+        let recording = self.record.load(Ordering::Relaxed);
+        let applying = self.applying.load(Ordering::Relaxed);
+        let fenced = self.fenced.load(Ordering::Relaxed);
+        if fenced && !applying && ops.iter().any(|op| !allowed_when_fenced(op)) {
+            return Err(StoreError::NotLeader);
+        }
         let tx = self.db.begin_write()?;
         {
             let mut res = tx.open_table(RESOURCES)?;
@@ -350,11 +400,22 @@ impl Backend for RedbBackend {
     }
 
     fn set_record_log(&self, on: bool) {
-        self.record.store(on, Ordering::Release);
+        let _gate = self.gate.lock();
+        self.record.store(on, Ordering::Relaxed);
     }
 
     fn set_log_term(&self, term: u64) {
         self.term.store(term, Ordering::Release);
+    }
+
+    fn set_write_fence(&self, on: bool) {
+        let _gate = self.gate.lock();
+        self.fenced.store(on, Ordering::Relaxed);
+    }
+
+    fn set_applying(&self, on: bool) {
+        let _gate = self.gate.lock();
+        self.applying.store(on, Ordering::Relaxed);
     }
 
     fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>> {
@@ -469,6 +530,12 @@ impl Store {
         self.backend.set_log_term(term);
     }
 
+    /// Refuse ordinary writes until [`Self::set_write_fence`] is cleared.
+    /// Cluster stand-down sets this; become-leader clears it.
+    pub fn set_write_fence(&self, on: bool) {
+        self.backend.set_write_fence(on);
+    }
+
     pub fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>> {
         self.backend.read_log(after, limit)
     }
@@ -496,6 +563,7 @@ impl Store {
     pub fn apply_entries(&self, entries: &[LogEntry]) -> Result<()> {
         let prev = self.backend.record_log();
         self.set_record_log(false);
+        self.backend.set_applying(true);
         let result = (|| {
             let mut have = self.commit_index()?;
             for entry in entries {
@@ -521,6 +589,7 @@ impl Store {
             }
             Ok(())
         })();
+        self.backend.set_applying(false);
         self.set_record_log(prev);
         result
     }
@@ -1100,5 +1169,172 @@ mod tests {
         );
         let err = store.snapshot_file(&src, &dst).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    /// A write that reaches the store after stand-down is refused; the key is
+    /// unchanged. Follower apply and membership bookkeeping still succeed.
+    #[test]
+    fn write_fence_refuses_ordinary_writes_after_stand_down() {
+        let store = Store::in_memory().unwrap();
+        store.set_log_term(3);
+        store.set_record_log(true);
+        store.put_meta("kept", &"yes".to_string()).unwrap();
+        assert_eq!(store.commit_index().unwrap(), 1);
+
+        // stand_down order: fence on, then logging off.
+        store.set_write_fence(true);
+        store.set_record_log(false);
+
+        let err = store.put_meta("late", &"no".to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::NotLeader), "{err}");
+        assert!(store.get_meta::<String>("late").unwrap().is_none());
+        assert_eq!(
+            store.get_meta::<String>("kept").unwrap().as_deref(),
+            Some("yes")
+        );
+        assert_eq!(store.commit_index().unwrap(), 1);
+
+        // Follow-loop membership writes are allowed and stay out of the log.
+        store
+            .put_meta("cluster_leader_id", &"other".to_string())
+            .unwrap();
+        store.put_meta("members", &"[]".to_string()).unwrap();
+        store.put_meta("cluster_term", &4u64).unwrap();
+        assert_eq!(store.commit_index().unwrap(), 1);
+
+        // Follower apply still copies the leader's log at the next index.
+        let entry = LogEntry {
+            index: 2,
+            term: 4,
+            ops: vec![LogOp {
+                table: "meta".into(),
+                key: "from_leader".into(),
+                value: Some(serde_json::to_vec("ok").unwrap()),
+            }],
+        };
+        store.apply_entries(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(
+            store.get_meta::<String>("from_leader").unwrap().as_deref(),
+            Some("ok")
+        );
+        assert_eq!(store.commit_index().unwrap(), 2);
+    }
+
+    /// A write already inside `batch` when the fence rises is refused: the
+    /// wrapper blocks until stand-down finishes, then the real batch sees the
+    /// fence and leaves the store unchanged.
+    #[test]
+    fn write_fence_refuses_a_write_that_commits_after_stand_down() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        struct HoldBatch {
+            inner: RedbBackend,
+            hold: AtomicBool,
+            entered: Mutex<Option<mpsc::Sender<()>>>,
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+
+        impl Backend for HoldBatch {
+            fn get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>> {
+                self.inner.get(table, key)
+            }
+            fn put(&self, table: &str, key: &str, value: &[u8]) -> Result<()> {
+                self.batch(vec![Op::Put {
+                    table: table.into(),
+                    key: key.into(),
+                    value: value.to_vec(),
+                }])
+            }
+            fn delete(&self, table: &str, key: &str) -> Result<bool> {
+                let existed = self.get(table, key)?.is_some();
+                self.batch(vec![Op::Delete {
+                    table: table.into(),
+                    key: key.into(),
+                }])?;
+                Ok(existed)
+            }
+            fn scan(&self, table: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+                self.inner.scan(table, prefix)
+            }
+            fn batch(&self, ops: Vec<Op>) -> Result<()> {
+                if self.hold.load(Ordering::SeqCst) {
+                    if let Some(tx) = self.entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.release.lock().unwrap().take() {
+                        let _ = rx.recv_timeout(Duration::from_secs(5));
+                    }
+                }
+                self.inner.batch(ops)
+            }
+            fn set_record_log(&self, on: bool) {
+                self.inner.set_record_log(on)
+            }
+            fn set_log_term(&self, term: u64) {
+                self.inner.set_log_term(term)
+            }
+            fn set_write_fence(&self, on: bool) {
+                self.inner.set_write_fence(on)
+            }
+            fn set_applying(&self, on: bool) {
+                self.inner.set_applying(on)
+            }
+            fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>> {
+                self.inner.read_log(after, limit)
+            }
+            fn record_log(&self) -> bool {
+                self.inner.record_log()
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let backend = Arc::new(HoldBatch {
+            inner: RedbBackend::in_memory().unwrap(),
+            hold: AtomicBool::new(false),
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let (events, _) = broadcast::channel(8);
+        let store = Store::new(backend.clone(), events);
+        store.set_log_term(5);
+        store.set_record_log(true);
+        store.put_meta("before", &"one".to_string()).unwrap();
+        let commit = store.commit_index().unwrap();
+
+        backend.hold.store(true, Ordering::SeqCst);
+        let writer = {
+            let store = store.clone();
+            thread::spawn(move || store.put_meta("racer", &"split".to_string()))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer did not enter batch");
+        store.set_write_fence(true);
+        store.set_record_log(false);
+        release_tx.send(()).unwrap();
+        let err = writer.join().unwrap().unwrap_err();
+        assert!(matches!(err, StoreError::NotLeader), "{err}");
+        assert!(store.get_meta::<String>("racer").unwrap().is_none());
+        assert_eq!(store.commit_index().unwrap(), commit);
+    }
+
+    #[test]
+    fn write_fence_clears_when_leading_again() {
+        let store = Store::in_memory().unwrap();
+        store.set_write_fence(true);
+        store.set_record_log(false);
+        assert!(matches!(
+            store.put_meta("x", &1u64).unwrap_err(),
+            StoreError::NotLeader
+        ));
+        store.set_record_log(true);
+        store.set_write_fence(false);
+        store.put_meta("x", &1u64).unwrap();
+        assert_eq!(store.get_meta::<u64>("x").unwrap(), Some(1));
     }
 }

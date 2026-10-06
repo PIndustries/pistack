@@ -88,6 +88,9 @@ pub fn sweep_join_tokens(store: &Store, now: DateTime<Utc>, grace: Duration) -> 
             }
             // Someone deleted it first; nothing left to do.
             Err(StoreError::NotFound(_)) => {}
+            Err(StoreError::NotLeader) => {
+                tracing::debug!(token = %t.meta.id, "keep sweep: not the leader");
+            }
             Err(e) => {
                 report.failed += 1;
                 tracing::warn!(token = %t.meta.id, error = %e, "keep sweep: delete failed");

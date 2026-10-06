@@ -93,7 +93,11 @@ impl Reconciler {
                 },
             }
             if let Err(e) = self.reconcile_once().await {
-                tracing::warn!(error = %e, "forge: reconcile pass failed");
+                if e.to_string() == "not the leader" {
+                    tracing::debug!(error = %e, "forge: reconcile stopped; not the leader");
+                } else {
+                    tracing::warn!(error = %e, "forge: reconcile pass failed");
+                }
             }
         }
         tracing::info!("forge: reconciler stopped");
@@ -150,7 +154,11 @@ impl Reconciler {
                 self.converge(m, &hosts, &mut alloc, &size_of).await
             };
             if let Err(e) = res {
-                tracing::warn!(machine = %id, error = %e, "forge: machine reconcile failed");
+                if e.to_string() == "not the leader" {
+                    tracing::debug!(machine = %id, error = %e, "forge: machine reconcile stopped; not the leader");
+                } else {
+                    tracing::warn!(machine = %id, error = %e, "forge: machine reconcile failed");
+                }
             }
         }
         // Binding record for fabric ports. Runs even when the overlay
