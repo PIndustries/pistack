@@ -485,6 +485,31 @@ pub(crate) mod fake {
         if let Some(lsps) = st.tables.get_mut("Logical_Switch_Port") {
             lsps.retain(|r| r.get("_uuid").is_some_and(|u| referenced.contains(u)));
         }
+        // `Port_Group.ports` refers to switch ports weakly: a deleted
+        // port just drops out of its groups.
+        let live: Vec<Value> = st
+            .tables
+            .get("Logical_Switch_Port")
+            .map(|ps| ps.iter().filter_map(|r| r.get("_uuid").cloned()).collect())
+            .unwrap_or_default();
+        if let Some(groups) = st.tables.get_mut("Port_Group") {
+            for g in groups.iter_mut() {
+                let ports = elems(g.get("ports"));
+                if ports.iter().any(|p| !live.contains(p)) {
+                    let kept: Vec<Value> = ports.into_iter().filter(|p| live.contains(p)).collect();
+                    g.insert("ports".into(), set(kept));
+                }
+            }
+        }
+        // ACLs are not a root table: rows no group or switch points at go.
+        let acls: Vec<Value> = ["Port_Group", "Logical_Switch"]
+            .iter()
+            .filter_map(|t| st.tables.get(*t))
+            .flat_map(|rs| rs.iter().flat_map(|r| elems(r.get("acls"))))
+            .collect();
+        if let Some(rows) = st.tables.get_mut("ACL") {
+            rows.retain(|r| r.get("_uuid").is_some_and(|u| acls.contains(u)));
+        }
     }
 
     #[async_trait]
