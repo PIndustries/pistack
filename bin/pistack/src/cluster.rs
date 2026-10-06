@@ -471,7 +471,7 @@ pub async fn reject_follower_writes(
     if (read && !rpc) || path == "/healthz" || path == "/" || path.starts_with("/cluster") {
         return next.run(req).await;
     }
-    if handle.leader.load(Ordering::Relaxed) {
+    if handle.leader.load(Ordering::Acquire) {
         return next.run(req).await;
     }
     if rpc {
@@ -520,7 +520,7 @@ async fn join(
     Json(body): Json<JoinRequest>,
 ) -> Result<Json<ClusterStatus>, ApiError> {
     enforce_join(&handle.store, &headers)?;
-    if !handle.leader.load(Ordering::Relaxed) {
+    if !handle.leader.load(Ordering::Acquire) {
         return Err(not_leader(&handle));
     }
     let node_id = body.node_id.trim();
@@ -902,6 +902,11 @@ fn adopt_term(handle: &ClusterHandle, term: u64) -> anyhow::Result<bool> {
 
 /// Stop leading. Writes and controllers stop at once; the follow loop finds
 /// who leads now.
+///
+/// The reverse of [`become_leader`]: the flag and the signal drop first,
+/// then logging stops. Logging cannot wait longer than this, because the
+/// follow loop's next pass stores the new leader id and membership, and a
+/// follower that logged those would split from the leader it follows.
 fn stand_down(handle: &ClusterHandle, reason: &str) {
     if !handle.leader.swap(false, Ordering::Relaxed) {
         return;
@@ -1043,17 +1048,29 @@ async fn ask_votes(peers: &[String], request: &VoteRequest, need: usize) -> (usi
     (grants, newest)
 }
 
+/// Take leadership for `term`.
+///
+/// The store starts logging writes before anything can see this node as
+/// leader. The leader flag opens the API to writes, and the leadership
+/// signal starts controllers that write at once (seeds, first reconcile
+/// passes). A write that lands before logging is on never reaches the
+/// followers, so this node's store would split from theirs. Turning logging
+/// on first is safe while the node still follows: API writes and
+/// controllers are held back by the flag and the signal, and the cluster
+/// bookkeeping a follower writes (term and vote) is never logged.
 fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     handle.term.store(term, Ordering::Relaxed);
-    handle.leader.store(true, Ordering::Relaxed);
+    handle.store.set_log_term(term);
+    handle.store.set_record_log(true);
+    // Release pairs with the Acquire loads that admit API writes, so a
+    // request that sees the flag also sees logging on.
+    handle.leader.store(true, Ordering::Release);
     handle.leadership.set(true);
     *guard(&handle.leader_api) = handle.self_api.clone();
     *guard(&handle.last_heard) = Instant::now();
     *guard(&handle.leader_contact) = Some(Instant::now());
     *guard(&handle.pull_error) = None;
     *guard(&handle.role) = Role::Voter;
-    handle.store.set_log_term(term);
-    handle.store.set_record_log(true);
     handle
         .store
         .put_meta("cluster_leader_id", &handle.node_id)?;
@@ -1353,6 +1370,7 @@ mod tests {
     use super::*;
     use axum::middleware;
     use pistack_cluster::{choose, should_discover, BootChoice};
+    use pistack_store::Backend;
     use std::sync::Arc;
 
     fn open_store(dir: &Path) -> Store {
@@ -1596,6 +1614,24 @@ mod tests {
         dir: tempfile::TempDir,
         ready: &Established,
     ) -> LiveVoter {
+        start_voter_with(
+            id,
+            listener,
+            store,
+            dir,
+            ready,
+            Leadership::new(ready.leader),
+        )
+    }
+
+    fn start_voter_with(
+        id: &str,
+        listener: tokio::net::TcpListener,
+        store: Store,
+        dir: tempfile::TempDir,
+        ready: &Established,
+        leadership: Leadership,
+    ) -> LiveVoter {
         let addr = listener.local_addr().unwrap();
         let api = format!("http://{addr}");
         let path = dir.path().join("state.redb");
@@ -1607,7 +1643,7 @@ mod tests {
             path,
             ready,
             None,
-            Leadership::new(ready.leader),
+            leadership,
         ));
         let serve_stop = CancellationToken::new();
         let app = router(handle.clone())
@@ -1888,6 +1924,267 @@ mod tests {
         assert_eq!(sim.term(), winner.term());
         assert!(winner.leads());
         sim.loop_stop.cancel();
+    }
+
+    /// Wraps the store backend and notes every moment the leadership signal
+    /// is up while the store is not logging writes. A write in such a moment
+    /// would land unlogged and never reach the followers.
+    struct LogProbe {
+        inner: pistack_store::RedbBackend,
+        leadership: Leadership,
+        unlogged: Mutex<Vec<&'static str>>,
+    }
+
+    impl LogProbe {
+        fn new(leadership: &Leadership) -> Arc<Self> {
+            Arc::new(Self {
+                inner: pistack_store::RedbBackend::in_memory().unwrap(),
+                leadership: leadership.clone(),
+                unlogged: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn check(&self, at: &'static str) {
+            if self.leadership.is_leader() && !self.inner.record_log() {
+                guard(&self.unlogged).push(at);
+            }
+        }
+
+        fn store(self: &Arc<Self>) -> Store {
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            Store::new(self.clone(), events)
+        }
+
+        fn gaps(&self) -> Vec<&'static str> {
+            locked(&self.unlogged)
+        }
+    }
+
+    impl pistack_store::Backend for LogProbe {
+        fn get(&self, table: &str, key: &str) -> pistack_store::Result<Option<Vec<u8>>> {
+            self.check("get");
+            self.inner.get(table, key)
+        }
+        fn put(&self, table: &str, key: &str, value: &[u8]) -> pistack_store::Result<()> {
+            self.check("put");
+            self.inner.put(table, key, value)
+        }
+        fn delete(&self, table: &str, key: &str) -> pistack_store::Result<bool> {
+            self.check("delete");
+            self.inner.delete(table, key)
+        }
+        fn scan(&self, table: &str, prefix: &str) -> pistack_store::Result<Vec<(String, Vec<u8>)>> {
+            self.check("scan");
+            self.inner.scan(table, prefix)
+        }
+        fn batch(&self, ops: Vec<pistack_store::Op>) -> pistack_store::Result<()> {
+            self.check("batch");
+            self.inner.batch(ops)
+        }
+        fn set_record_log(&self, on: bool) {
+            self.inner.set_record_log(on);
+            self.check("set_record_log");
+        }
+        fn set_log_term(&self, term: u64) {
+            self.check("set_log_term");
+            self.inner.set_log_term(term);
+        }
+        fn read_log(&self, after: u64, limit: usize) -> pistack_store::Result<Vec<LogEntry>> {
+            self.check("read_log");
+            self.inner.read_log(after, limit)
+        }
+        fn record_log(&self) -> bool {
+            self.inner.record_log()
+        }
+    }
+
+    fn seed_voter(store: &Store, id: &str, members: &[Member], term: u64) {
+        store.put_meta("cluster_id", &"c1".to_string()).unwrap();
+        store.put_meta("node_id", &id.to_string()).unwrap();
+        store.put_meta("members", &members.to_vec()).unwrap();
+        store.put_meta("cluster_term", &term).unwrap();
+    }
+
+    /// The log entry that wrote meta `key`, if any.
+    fn entry_for(store: &Store, key: &str) -> Option<LogEntry> {
+        store
+            .read_log(0, 1024)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.ops.iter().any(|op| op.key == key))
+    }
+
+    /// A node promoted to leader logs the first write made the moment the
+    /// leadership signal rises, the way a controller seeds on promotion. A
+    /// follower then copies that write and keeps replicating: no split.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_leaders_first_write_is_logged_and_replicated() {
+        let term = 6u64;
+        let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_api = format!("http://{}", a_listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &a_api),
+            Member::voter("sim2", "http://127.0.0.1:9"),
+            Member::voter("sim3", "http://127.0.0.1:9"),
+        ];
+
+        // sim2 led term 6 and logged one write; sim copied it.
+        let old_dir = tempfile::tempdir().unwrap();
+        let old = open_store(old_dir.path());
+        seed_voter(&old, "sim2", &members, term);
+        old.set_log_term(term);
+        old.set_record_log(true);
+        old.put_meta("before", &"one".to_string()).unwrap();
+        old.set_record_log(false);
+
+        let leadership = Leadership::new(false);
+        let probe = LogProbe::new(&leadership);
+        let store = probe.store();
+        seed_voter(&store, "sim", &members, term);
+        store.apply_entries(&old.read_log(0, 64).unwrap()).unwrap();
+        assert_eq!(store.commit_index().unwrap(), 1);
+        let ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: String::new(),
+            term,
+            members: members.clone(),
+        };
+        let sim = start_voter_with(
+            "sim",
+            a_listener,
+            store.clone(),
+            tempfile::tempdir().unwrap(),
+            &ready,
+            leadership.clone(),
+        );
+
+        // Writes the instant the signal rises, like a controller's seed.
+        let writer = {
+            let store = store.clone();
+            let leadership = leadership.clone();
+            std::thread::spawn(move || {
+                while !leadership.is_leader() {
+                    std::hint::spin_loop();
+                }
+                store.put_meta("first", &"yes".to_string()).unwrap();
+            })
+        };
+        become_leader(&sim.handle, term + 1).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            probe.gaps().is_empty(),
+            "the leadership signal was up while writes were not logged: {:?}",
+            probe.gaps()
+        );
+        let first = entry_for(&store, "first").expect("the first write was not logged");
+        assert_eq!(first.term, term + 1);
+
+        // The follower copies it, and a second pull finds nothing forked.
+        pull_log(&sim.api, &old).await.unwrap();
+        assert_eq!(marker(&old, "first").as_deref(), Some("yes"));
+        assert_eq!(old.commit_index().unwrap(), store.commit_index().unwrap());
+        let tip = old.commit_index().unwrap();
+        assert_eq!(
+            old.log_term_at(tip).unwrap(),
+            store.log_term_at(tip).unwrap()
+        );
+        store.put_meta("second", &"yes".to_string()).unwrap();
+        pull_log(&sim.api, &old).await.unwrap();
+        assert_eq!(marker(&old, "second").as_deref(), Some("yes"));
+        assert!(probe.gaps().is_empty(), "{:?}", probe.gaps());
+        sim.kill();
+    }
+
+    /// The reverse: a leader that steps down drops the signal before it
+    /// stops logging, then logs nothing of its own. The follow loop's
+    /// bookkeeping after stepping down stays out of the log, so the node
+    /// copies the new leader's writes without a split.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_that_steps_down_logs_nothing_and_follows_without_a_split() {
+        let term = 6u64;
+        let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_api = format!("http://{}", a_listener.local_addr().unwrap());
+        let b_api = format!("http://{}", b_listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &a_api),
+            Member::voter("sim2", &b_api),
+            Member::voter("sim3", "http://127.0.0.1:9"),
+        ];
+
+        // Set up the way establish_local does: logging on, then leading.
+        let leadership = Leadership::new(false);
+        let probe = LogProbe::new(&leadership);
+        let store = probe.store();
+        seed_voter(&store, "sim", &members, term);
+        store.set_log_term(term);
+        store.set_record_log(true);
+        let leading = Established {
+            role: Role::Voter,
+            leader: true,
+            leader_api: a_api.clone(),
+            term,
+            members: members.clone(),
+        };
+        let sim = start_voter_with(
+            "sim",
+            a_listener,
+            store.clone(),
+            tempfile::tempdir().unwrap(),
+            &leading,
+            leadership.clone(),
+        );
+        store.put_meta("before", &"one".to_string()).unwrap();
+        assert!(entry_for(&store, "before").is_some());
+
+        let b_dir = tempfile::tempdir().unwrap();
+        let b_store = open_store(b_dir.path());
+        seed_voter(&b_store, "sim2", &members, term);
+        pull_log(&sim.api, &b_store).await.unwrap();
+        assert_eq!(marker(&b_store, "before").as_deref(), Some("one"));
+        let following = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: a_api.clone(),
+            term,
+            members: members.clone(),
+        };
+        let sim2 = start_voter("sim2", b_listener, b_store.clone(), b_dir, &following);
+
+        stand_down(&sim.handle, "a voter reports a newer term");
+        assert!(!sim.leads());
+        assert!(!leadership.is_leader());
+        assert!(!probe.inner.record_log(), "a follower must not log");
+        assert!(
+            probe.gaps().is_empty(),
+            "logging stopped while the leadership signal was still up: {:?}",
+            probe.gaps()
+        );
+
+        // What the follow loop stores once it hears the new leader.
+        let commit = store.commit_index().unwrap();
+        store
+            .put_meta("cluster_leader_id", &"sim2".to_string())
+            .unwrap();
+        store.put_meta("members", &members).unwrap();
+        assert_eq!(store.commit_index().unwrap(), commit);
+
+        // sim2 leads term 7 and writes; sim copies it without a split.
+        become_leader(&sim2.handle, term + 1).unwrap();
+        b_store.put_meta("after", &"two".to_string()).unwrap();
+        pull_log(&sim2.api, &store).await.unwrap();
+        assert_eq!(marker(&store, "after").as_deref(), Some("two"));
+        assert_eq!(
+            store.commit_index().unwrap(),
+            b_store.commit_index().unwrap()
+        );
+        let tip = store.commit_index().unwrap();
+        assert_eq!(store.log_term_at(tip).unwrap(), Some(term + 1));
+        assert!(probe.gaps().is_empty(), "{:?}", probe.gaps());
+        sim.kill();
+        sim2.kill();
     }
 
     /// A pre-vote moves no term, and a node with a live leader refuses it.
