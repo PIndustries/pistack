@@ -10,14 +10,27 @@ use pistack_store::Store;
 use pistack_types::module::CancellationToken;
 use pistack_types::{kind, Caller, Id, Module, ModuleContext};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tower::ServiceExt;
 
 struct Harness {
     router: axum::Router,
 }
 
+/// The gauge ring persists under `$PISTACK_DATA_DIR/gauge`. Point it at a
+/// temporary directory, once per test process and before any router
+/// attaches the ring, so a test run never writes into the source tree.
+fn isolated_data_dir() {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("PISTACK_DATA_DIR", dir.path());
+        dir
+    });
+}
+
 fn harness() -> Harness {
+    isolated_data_dir();
     let store = Store::in_memory().unwrap();
     let gauge = Gauge;
     let ctx = ModuleContext {
@@ -66,6 +79,10 @@ fn json_body(status: StatusCode, raw: &str) -> Value {
 #[tokio::test]
 async fn crossing_sample_fires_alarm() {
     let h = harness();
+    // Count from whatever the ring already holds, so samples left by an
+    // earlier run or another test cannot change the result.
+    let (st, raw) = h.call("GET", "/samples?metric=cpu.usage", None).await;
+    let before = json_body(st, &raw).as_array().map_or(0, Vec::len);
 
     let (st, raw) = h
         .call(
@@ -125,7 +142,7 @@ async fn crossing_sample_fires_alarm() {
     let (st, raw) = h.call("GET", "/samples?metric=cpu.usage", None).await;
     let samples = json_body(st, &raw);
     assert_eq!(st, StatusCode::OK, "{samples}");
-    assert_eq!(samples.as_array().unwrap().len(), 2);
+    assert_eq!(samples.as_array().unwrap().len(), before + 2);
 }
 
 fn admin_caller() -> Caller {
