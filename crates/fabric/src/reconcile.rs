@@ -69,6 +69,10 @@ fn finish<K: Observed>(
     outcome: ApiResult<()>,
     mut extra: impl FnMut(&mut K),
 ) -> Phase {
+    if matches!(&outcome, Err(e) if e.message == "not the leader") {
+        tracing::debug!(kind = K::KIND, %id, "reconcile stopped; not the leader");
+        return Phase::Updating;
+    }
     let (phase, msg) = match &outcome {
         Ok(()) => (Phase::Ready, String::new()),
         Err(e) => (Phase::Error, e.to_string()),
@@ -93,6 +97,10 @@ fn finish<K: Observed>(
         }
         // Deleted while we worked; the Deleted event cleans up.
         Err(StoreError::NotFound(_)) => phase,
+        Err(StoreError::NotLeader) => {
+            tracing::debug!(kind = K::KIND, %id, "status write skipped; not the leader");
+            Phase::Updating
+        }
         Err(StoreError::Conflict(reason)) if reason == "reconcile superseded" => {
             tracing::debug!(kind = K::KIND, %id, "spec changed during reconcile");
             Phase::Updating

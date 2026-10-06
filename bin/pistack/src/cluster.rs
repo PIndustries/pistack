@@ -904,14 +904,21 @@ fn adopt_term(handle: &ClusterHandle, term: u64) -> anyhow::Result<bool> {
 /// who leads now.
 ///
 /// The reverse of [`become_leader`]: the flag and the signal drop first,
-/// then logging stops. Logging cannot wait longer than this, because the
-/// follow loop's next pass stores the new leader id and membership, and a
-/// follower that logged those would split from the leader it follows.
+/// then the store write fence rises, then logging stops. The fence refuses
+/// ordinary writes that were already in flight, so they cannot land
+/// unlogged after logging stops. Logging cannot stay on longer than this,
+/// because the follow loop's next pass stores the new leader id and
+/// membership, and a follower that logged those would split from the leader
+/// it follows.
 fn stand_down(handle: &ClusterHandle, reason: &str) {
     if !handle.leader.swap(false, Ordering::Relaxed) {
         return;
     }
     handle.leadership.set(false);
+    // Fence ordinary writes before logging stops so an in-flight controller
+    // or API write cannot land unlogged after this point. Follow-loop
+    // membership keys and apply_entries bypass the fence.
+    handle.store.set_write_fence(true);
     handle.store.set_record_log(false);
     *guard(&handle.leader_contact) = None;
     *guard(&handle.leader_api) = String::new();
@@ -1062,6 +1069,9 @@ fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     handle.term.store(term, Ordering::Relaxed);
     handle.store.set_log_term(term);
     handle.store.set_record_log(true);
+    // Clear the stand-down fence only after logging is on, so a concurrent
+    // writer cannot slip an unlogged row through the gap.
+    handle.store.set_write_fence(false);
     // Release pairs with the Acquire loads that admit API writes, so a
     // request that sees the flag also sees logging on.
     handle.leader.store(true, Ordering::Release);
@@ -1186,7 +1196,11 @@ fn not_leader(handle: &ClusterHandle) -> ApiError {
 }
 
 fn store_err(err: impl std::fmt::Display) -> ApiError {
-    ApiError::internal(err.to_string())
+    let text = err.to_string();
+    if text == "not the leader" {
+        return ApiError::conflict("not the leader");
+    }
+    ApiError::internal(text)
 }
 
 fn enforce_join(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -1989,6 +2003,14 @@ mod tests {
             self.check("set_log_term");
             self.inner.set_log_term(term);
         }
+        fn set_write_fence(&self, on: bool) {
+            self.inner.set_write_fence(on);
+            self.check("set_write_fence");
+        }
+        fn set_applying(&self, on: bool) {
+            self.inner.set_applying(on);
+            self.check("set_applying");
+        }
         fn read_log(&self, after: u64, limit: usize) -> pistack_store::Result<Vec<LogEntry>> {
             self.check("read_log");
             self.inner.read_log(after, limit)
@@ -2185,6 +2207,68 @@ mod tests {
         assert!(probe.gaps().is_empty(), "{:?}", probe.gaps());
         sim.kill();
         sim2.kill();
+    }
+
+    /// After stand-down the write fence refuses an ordinary put (the in-flight
+    /// race is covered in the store crate). Follower apply still succeeds, so
+    /// the node can copy the new leader without a split.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_after_stand_down_is_refused_and_apply_still_works() {
+        let term = 6u64;
+        let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_api = format!("http://{}", a_listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &a_api),
+            Member::voter("sim2", "http://127.0.0.1:9"),
+            Member::voter("sim3", "http://127.0.0.1:9"),
+        ];
+
+        let leadership = Leadership::new(false);
+        let probe = LogProbe::new(&leadership);
+        let store = probe.store();
+        seed_voter(&store, "sim", &members, term);
+        store.set_log_term(term);
+        store.set_record_log(true);
+        let leading = Established {
+            role: Role::Voter,
+            leader: true,
+            leader_api: a_api.clone(),
+            term,
+            members: members.clone(),
+        };
+        let sim = start_voter_with(
+            "sim",
+            a_listener,
+            store.clone(),
+            tempfile::tempdir().unwrap(),
+            &leading,
+            leadership.clone(),
+        );
+        store.put_meta("before", &"one".to_string()).unwrap();
+        let commit = store.commit_index().unwrap();
+
+        stand_down(&sim.handle, "a voter reports a newer term");
+        let err = store
+            .put_meta("inflight", &"split".to_string())
+            .unwrap_err();
+        assert!(matches!(err, pistack_store::StoreError::NotLeader), "{err}");
+        assert!(store.get_meta::<String>("inflight").unwrap().is_none());
+        assert_eq!(store.commit_index().unwrap(), commit);
+        assert!(!probe.inner.record_log());
+
+        let entry = LogEntry {
+            index: commit + 1,
+            term: term + 1,
+            ops: vec![pistack_store::LogOp {
+                table: "meta".into(),
+                key: "after".into(),
+                value: Some(serde_json::to_vec("two").unwrap()),
+            }],
+        };
+        store.apply_entries(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(marker(&store, "after").as_deref(), Some("two"));
+        assert_eq!(store.commit_index().unwrap(), commit + 1);
+        sim.kill();
     }
 
     /// A pre-vote moves no term, and a node with a live leader refuses it.

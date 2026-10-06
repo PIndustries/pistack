@@ -1012,6 +1012,12 @@ mod tests {
         fn set_log_term(&self, term: u64) {
             self.inner.set_log_term(term)
         }
+        fn set_write_fence(&self, on: bool) {
+            self.inner.set_write_fence(on)
+        }
+        fn set_applying(&self, on: bool) {
+            self.inner.set_applying(on)
+        }
         fn read_log(&self, after: u64, limit: usize) -> pistack_store::Result<Vec<LogEntry>> {
             self.inner.read_log(after, limit)
         }
