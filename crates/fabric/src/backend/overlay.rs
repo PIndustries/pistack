@@ -211,6 +211,7 @@ mod tests {
         let blocked = RouterView {
             router: router.clone(),
             gateway: Some((missing, port())),
+            gateway_subnet: None,
             interfaces: vec![],
         };
         assert_eq!(
@@ -220,6 +221,7 @@ mod tests {
         let open = RouterView {
             router,
             gateway: None,
+            gateway_subnet: None,
             interfaces: vec![],
         };
         backend.ensure_router(&open).await.unwrap();

@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! OVN northbound backend. Networks, subnets, machine ports and security
-//! groups are written to OVN's northbound database; routers and floating
-//! IPs still return `not_implemented` and land in follow-ups. The doc comment
-//! on each of those is the contract for the real thing.
+//! OVN northbound backend. Networks, subnets, machine ports, security
+//! groups, routers and floating IPs are written to OVN's northbound
+//! database. The doc comment on each method is its contract.
 //!
 //! The PiStack store stays the record. OVN holds a copy the leader writes:
 //! * Every row fabric creates carries `external_ids:pistack:id=<our id>`,
@@ -22,7 +21,12 @@
 //!   the port id, a provider network's uplink is `provnet-<net id>`.
 //!   A security group is `Port_Group.name = pg_<sg uuid without dashes>`
 //!   (OVN names must be identifiers), and every port with port security
-//!   also joins `pg_pistack_drop`. Later: `Logical_Router.name = pr-<rtr id>`.
+//!   also joins `pg_pistack_drop`. A router is `Logical_Router.name =
+//!   pr-<rtr id>` and each of its ports is `lrp-<port id>`.
+//! * Router gateway ports are scheduled on the chassis listed in
+//!   `PISTACK_OVN_GATEWAY_CHASSIS`. With none listed the gateway port has
+//!   no chassis, so outbound NAT and floating IPs do not leave the
+//!   cluster.
 //!
 //! On each host, OVS and `ovn-controller` realise the switches. The agent
 //! plugs a machine's tap or a pod's link into the integration bridge with
@@ -39,6 +43,7 @@ use async_trait::async_trait;
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult, Id, Leadership};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -50,6 +55,9 @@ pub const NB_ENV: &str = "PISTACK_OVN_NB";
 pub const DEFAULT_NB: &str = "unix:/var/run/ovn/ovnnb_db.sock";
 /// The OVS bridge `ovn-controller` manages on every host.
 pub const INTEGRATION_BRIDGE: &str = "br-int";
+/// Environment variable listing the chassis that may host router gateway
+/// ports, highest priority first, comma separated.
+pub const GATEWAY_CHASSIS_ENV: &str = "PISTACK_OVN_GATEWAY_CHASSIS";
 /// The cluster term, as the cluster saves it in the store.
 const TERM_KEY: &str = "cluster_term";
 
@@ -64,6 +72,8 @@ pub struct OvnBackend {
     pub nb_endpoint: String,
     nb: Arc<dyn Transport>,
     attached: OnceLock<Attached>,
+    /// Chassis for router gateway ports, highest priority first.
+    gateway_chassis: Vec<String>,
 }
 
 impl std::fmt::Debug for OvnBackend {
@@ -92,7 +102,7 @@ impl OvnBackend {
             Ok(ep) => Arc::new(ovsdb::Client::new(ep)),
             Err(e) => Arc::new(BadEndpoint(format!("{NB_ENV}: {}", e.message))),
         };
-        Self::with_transport(nb_endpoint, nb)
+        Self::with_transport(nb_endpoint, nb).with_gateway_chassis(chassis_from_env())
     }
 
     /// Endpoint from `PISTACK_OVN_NB`, else [`DEFAULT_NB`].
@@ -109,15 +119,14 @@ impl OvnBackend {
             nb_endpoint: nb_endpoint.into(),
             nb,
             attached: OnceLock::new(),
+            gateway_chassis: Vec::new(),
         }
     }
 
-    fn todo(&self, op: &str) -> ApiError {
-        ApiError::not_implemented(format!(
-            "ovn backend: {op} not implemented (nb={})",
-            self.nb_endpoint
-        ))
-        .with_detail("op", op)
+    /// Chassis that may host router gateway ports, highest priority first.
+    pub fn with_gateway_chassis(mut self, chassis: Vec<String>) -> Self {
+        self.gateway_chassis = chassis;
+        self
     }
 
     fn term(&self) -> u64 {
@@ -384,6 +393,280 @@ impl OvnBackend {
         }
         Ok(())
     }
+
+    /// Take every switch port matching `cond` off its switch and delete it.
+    async fn drop_switch_ports(&self, cond: Vec<Value>) -> ApiResult<()> {
+        let found = self
+            .run(vec![ovsdb::select("Logical_Switch_Port", cond)])
+            .await?;
+        let mut ops = Vec::new();
+        for row in ovsdb::rows(&found[0]) {
+            let Some(u) = ovsdb::row_uuid(&row) else {
+                continue;
+            };
+            ops.push(ovsdb::mutate(
+                "Logical_Switch",
+                vec![includes("ports", uuid(&u))],
+                vec![json!(["ports", "delete", set([uuid(&u)])])],
+            ));
+            ops.push(ovsdb::delete(
+                "Logical_Switch_Port",
+                vec![eq("_uuid", uuid(&u))],
+            ));
+        }
+        if !ops.is_empty() {
+            self.run(ops).await?;
+        }
+        Ok(())
+    }
+
+    /// One router port and its `type=router` peer on the switch.
+    async fn ensure_router_port(&self, rtr: &Id, router: &str, want: &RouterPort) -> ApiResult<()> {
+        let port = &want.port;
+        let mac = port.spec.mac.trim();
+        if mac.is_empty() {
+            return Err(ApiError::unavailable(format!(
+                "ovn: router port {} has no mac yet",
+                port.meta.id
+            )));
+        }
+        let lrp = lrp_name(&port.meta.id);
+        let mut ext = self.tags(rtr, port.meta.project.as_ref());
+        ext.push(("pistack:port".into(), port.meta.id.to_string()));
+        let row = json!({
+            "name": lrp,
+            "mac": mac,
+            "networks": set([json!(want.network)]),
+            "external_ids": map(ext),
+        });
+        let lrp_uuid = self
+            .ensure_row(
+                "Logical_Router_Port",
+                by_name(&lrp),
+                row,
+                onto_router(router, "ports"),
+            )
+            .await?;
+        if want.gateway {
+            self.set_gateway_chassis(rtr, &lrp, &lrp_uuid).await?;
+        }
+        let name = port.meta.id.to_string();
+        let mut ext = self.tags(&port.meta.id, port.meta.project.as_ref());
+        ext.push(("pistack:device".into(), rtr.to_string()));
+        let row = json!({
+            "name": name,
+            "type": "router",
+            "addresses": "router",
+            "options": map([("router-port", lrp.as_str())]),
+            "external_ids": map(ext),
+        });
+        self.ensure_row(
+            "Logical_Switch_Port",
+            by_name(&name),
+            row,
+            onto_switch(&switch_name(&port.spec.network)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Point the gateway port at one `Gateway_Chassis` row per configured
+    /// chassis. Rewrites the rows only when the chassis or priorities differ.
+    async fn set_gateway_chassis(&self, rtr: &Id, lrp: &str, lrp_uuid: &str) -> ApiResult<()> {
+        let n = self.gateway_chassis.len();
+        let mut want: Vec<(String, i64)> = self
+            .gateway_chassis
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), (n - i) as i64))
+            .collect();
+        let at = vec![eq("_uuid", uuid(lrp_uuid))];
+        let found = self
+            .run(vec![ovsdb::select("Logical_Router_Port", at.clone())])
+            .await?;
+        let held = uuid_strings(
+            ovsdb::rows(&found[0])
+                .first()
+                .and_then(|r| r.get("gateway_chassis")),
+        );
+        let old = if held.is_empty() {
+            Vec::new()
+        } else {
+            let ops = held
+                .iter()
+                .map(|u| ovsdb::select("Gateway_Chassis", vec![eq("_uuid", uuid(u))]))
+                .collect();
+            let out = self.run(ops).await?;
+            out.iter().flat_map(ovsdb::rows).collect()
+        };
+        let mut have: Vec<(String, i64)> = old
+            .iter()
+            .map(|r| {
+                (
+                    r["chassis_name"].as_str().unwrap_or("").to_string(),
+                    r["priority"].as_i64().unwrap_or(0),
+                )
+            })
+            .collect();
+        have.sort();
+        let order = want.clone();
+        want.sort();
+        if have == want {
+            return Ok(());
+        }
+        let mut ops = Vec::new();
+        let mut names = Vec::new();
+        for (i, (chassis, priority)) in order.iter().enumerate() {
+            let n = format!("gc{i}");
+            ops.push(ovsdb::insert(
+                "Gateway_Chassis",
+                json!({
+                    "name": format!("{lrp}_{chassis}"),
+                    "chassis_name": chassis,
+                    "priority": priority,
+                    "external_ids": map(self.tags(rtr, None)),
+                }),
+                &n,
+            ));
+            names.push(ovsdb::named(&n));
+        }
+        ops.push(ovsdb::update(
+            "Logical_Router_Port",
+            at,
+            json!({ "gateway_chassis": set(names) }),
+        ));
+        for u in &held {
+            ops.push(ovsdb::delete("Gateway_Chassis", vec![eq("_uuid", uuid(u))]));
+        }
+        self.run(ops).await?;
+        Ok(())
+    }
+
+    /// Make the rows of `table` that router `rtr` owns (tagged with its id,
+    /// held in router column `col`) the set `want`. Rows are the same when
+    /// the `key` columns match; any difference replaces the whole set in one
+    /// transaction, and a match writes nothing.
+    async fn ensure_router_set(
+        &self,
+        rtr: &Id,
+        router: &str,
+        table: &str,
+        col: &str,
+        want: Vec<Value>,
+        key: &[&str],
+    ) -> ApiResult<()> {
+        let found = self
+            .run(vec![ovsdb::select(table, tagged("pistack:id", rtr))])
+            .await?;
+        let have = ovsdb::rows(&found[0]);
+        let keys = |rows: &[Value]| {
+            let mut out: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let k: Vec<Value> = key
+                        .iter()
+                        .map(|c| ovsdb::canon(r.get(*c).unwrap_or(&json!(["set", []]))))
+                        .collect();
+                    Value::Array(k).to_string()
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        if keys(&have) == keys(&want) {
+            return Ok(());
+        }
+        let mut ops = vec![ovsdb::present("Logical_Router", by_name(router))];
+        let old: Vec<Value> = have
+            .iter()
+            .filter_map(ovsdb::row_uuid)
+            .map(|u| uuid(&u))
+            .collect();
+        if !old.is_empty() {
+            ops.push(ovsdb::mutate(
+                "Logical_Router",
+                by_name(router),
+                vec![json!([col, "delete", set(old.clone())])],
+            ));
+            for u in old {
+                ops.push(ovsdb::delete(table, vec![eq("_uuid", u)]));
+            }
+        }
+        let mut names = Vec::new();
+        for (i, row) in want.into_iter().enumerate() {
+            let n = format!("row{i}");
+            ops.push(ovsdb::insert(table, row, &n));
+            names.push(ovsdb::named(&n));
+        }
+        if !names.is_empty() {
+            ops.push(ovsdb::mutate(
+                "Logical_Router",
+                by_name(router),
+                vec![json!([col, "insert", set(names)])],
+            ));
+        }
+        self.run(ops).await?;
+        Ok(())
+    }
+}
+
+/// A router port as the router wants it.
+struct RouterPort {
+    port: Port,
+    /// `<address>/<prefix>` on the port's subnet.
+    network: String,
+    gateway: bool,
+}
+
+fn chassis_from_env() -> Vec<String> {
+    std::env::var(GATEWAY_CHASSIS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn router_name(id: &Id) -> String {
+    format!("pr-{id}")
+}
+
+fn lrp_name(port: &Id) -> String {
+    format!("lrp-{port}")
+}
+
+/// `<address>/<prefix>` for a router port on `subnet`: the port's address
+/// inside the subnet, else the subnet gateway.
+fn port_network(port: &Port, subnet: &Subnet) -> ApiResult<String> {
+    let cidr = subnet.spec.cidr;
+    let ip = port
+        .spec
+        .fixed_ips
+        .iter()
+        .copied()
+        .find(|ip| cidr.contains(ip))
+        .or(subnet.spec.gateway)
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "ovn: router port {} has no address on subnet {}",
+                port.meta.id, subnet.meta.id
+            ))
+        })?;
+    Ok(format!("{ip}/{}", cidr.prefix_len()))
+}
+
+/// Operations that put the row inserted as `new` into router `router`'s
+/// column `col`, and abort if that router does not exist.
+fn onto_router(router: &str, col: &str) -> Vec<Value> {
+    vec![
+        ovsdb::present("Logical_Router", by_name(router)),
+        ovsdb::mutate(
+            "Logical_Router",
+            by_name(router),
+            vec![json!([col, "insert", set([ovsdb::named("new")])])],
+        ),
+    ]
 }
 
 fn switch_name(net: &Id) -> String {
@@ -651,6 +934,32 @@ fn uuid_strings(v: Option<&Value>) -> Vec<String> {
     out
 }
 
+fn ext_value(row: &Value, key: &str) -> Option<String> {
+    row["external_ids"][1]
+        .as_array()?
+        .iter()
+        .find(|p| p[0] == key)
+        .and_then(|p| p[1].as_str().map(str::to_string))
+}
+
+/// Operations that take each NAT row off whatever router holds it and
+/// delete it.
+fn unhook_nat(rows: &[Value]) -> Vec<Value> {
+    let mut ops = Vec::new();
+    for row in rows {
+        let Some(u) = ovsdb::row_uuid(row) else {
+            continue;
+        };
+        ops.push(ovsdb::mutate(
+            "Logical_Router",
+            vec![includes("nat", uuid(&u))],
+            vec![json!(["nat", "delete", set([uuid(&u)])])],
+        ));
+        ops.push(ovsdb::delete("NAT", vec![eq("_uuid", uuid(&u))]));
+    }
+    ops
+}
+
 fn ext_has(row: &Value, key: &str) -> bool {
     row["external_ids"][1]
         .as_array()
@@ -878,25 +1187,7 @@ impl NetBackend for OvnBackend {
     /// succeeds. `Port_Group.ports` refers to switch ports weakly, so the
     /// port leaves its groups with it.
     async fn delete_port(&self, id: &Id) -> ApiResult<()> {
-        let name = id.to_string();
-        let found = self
-            .run(vec![ovsdb::select("Logical_Switch_Port", by_name(&name))])
-            .await?;
-        for row in ovsdb::rows(&found[0]) {
-            let Some(u) = ovsdb::row_uuid(&row) else {
-                continue;
-            };
-            self.run(vec![
-                ovsdb::mutate(
-                    "Logical_Switch",
-                    vec![includes("ports", uuid(&u))],
-                    vec![json!(["ports", "delete", set([uuid(&u)])])],
-                ),
-                ovsdb::delete("Logical_Switch_Port", vec![eq("_uuid", uuid(&u))]),
-            ])
-            .await?;
-        }
-        Ok(())
+        self.drop_switch_ports(by_name(&id.to_string())).await
     }
 
     /// `Logical_Router`:
@@ -907,26 +1198,170 @@ impl NetBackend for OvnBackend {
     ///   `networks = ["<gateway>/<prefix>"]`, linked from the
     ///   `Logical_Switch_Port` `type=router`,
     ///   `options:router-port=lrp-<port id>`, `addresses=["router"]`.
-    /// * Gateway: an LRP on the external switch the same way, plus
-    ///   `Gateway_Chassis` rows (one per gateway-capable chassis, priority
-    ///   descending) so the port is scheduled; a default
-    ///   `Logical_Router_Static_Route` `ip_prefix=0.0.0.0/0`,
-    ///   `nexthop=<external subnet gateway>`; and a `NAT` row
-    ///   `type=snat`, `logical_ip=<each interface cidr>`,
-    ///   `external_ip=<gateway port fixed ip>` so tenant traffic can leave.
+    /// * Gateway: an LRP on the external switch the same way, with
+    ///   `networks = ["<gateway port ip>/<external subnet prefix>"]`, plus
+    ///   `Gateway_Chassis` rows `name = lrp-<port id>_<chassis>` (one per
+    ///   chassis in `PISTACK_OVN_GATEWAY_CHASSIS`, priority descending) so
+    ///   the port is scheduled; a default `Logical_Router_Static_Route`
+    ///   `ip_prefix=0.0.0.0/0` (`::/0` for IPv6),
+    ///   `nexthop=<external subnet gateway>`; and a `NAT` row per IPv4
+    ///   interface subnet, `type=snat`, `logical_ip=<interface cidr>`,
+    ///   `external_ip=<gateway port fixed ip>`, so tenant traffic can leave.
     /// * `spec.routes` become `Logical_Router_Static_Route` rows
     ///   (`ip_prefix`, `nexthop`).
-    /// * Everything carries `external_ids:pistack:id = <rtr id>`; the
-    ///   reconciler diffs existing LRP/NAT/route rows against the view and
-    ///   removes the extras.
-    async fn ensure_router(&self, _view: &RouterView) -> ApiResult<()> {
-        Err(self.todo("ensure_router"))
+    /// * LRPs, routes, router NAT rows and gateway chassis carry
+    ///   `external_ids:pistack:id = <rtr id>` (LRPs also `pistack:port`).
+    ///   Each ensure compares them with the view: LRPs no longer wanted go
+    ///   with their switch peers, and the route and router NAT sets are
+    ///   replaced only when they differ. Floating IP NAT rows on the router
+    ///   carry their own id and are left alone.
+    async fn ensure_router(&self, view: &RouterView) -> ApiResult<()> {
+        let r = &view.router;
+        let id = &r.meta.id;
+        let name = router_name(id);
+        let mut ports = Vec::new();
+        for (subnet, port) in &view.interfaces {
+            ports.push(RouterPort {
+                port: port.clone(),
+                network: port_network(port, subnet)?,
+                gateway: false,
+            });
+        }
+        let mut external_ip = None;
+        let mut nexthop = None;
+        if let Some((net, port)) = &view.gateway {
+            let subnet = view.gateway_subnet.as_ref().ok_or_else(|| {
+                ApiError::unavailable(format!(
+                    "ovn: router {id} gateway port has no subnet on network {}",
+                    net.meta.id
+                ))
+            })?;
+            let network = port_network(port, subnet)?;
+            external_ip = port
+                .spec
+                .fixed_ips
+                .iter()
+                .copied()
+                .find(|ip| subnet.spec.cidr.contains(ip));
+            nexthop = subnet.spec.gateway;
+            ports.push(RouterPort {
+                port: port.clone(),
+                network,
+                gateway: true,
+            });
+        }
+
+        let row = json!({
+            "name": name,
+            "options": map([
+                ("always_learn_from_arp_request", "false"),
+                ("dynamic_neigh_routers", "true"),
+            ]),
+            "external_ids": map(self.tags(id, r.meta.project.as_ref())),
+        });
+        self.ensure_row("Logical_Router", by_name(&name), row, vec![])
+            .await?;
+        for p in &ports {
+            self.ensure_router_port(id, &name, p).await?;
+        }
+
+        // Router ports no longer in the view go, with their switch peers.
+        let keep: BTreeSet<String> = ports.iter().map(|p| lrp_name(&p.port.meta.id)).collect();
+        let found = self
+            .run(vec![ovsdb::select(
+                "Logical_Router_Port",
+                tagged("pistack:id", id),
+            )])
+            .await?;
+        for row in ovsdb::rows(&found[0]) {
+            if row["name"].as_str().is_some_and(|n| keep.contains(n)) {
+                continue;
+            }
+            let Some(u) = ovsdb::row_uuid(&row) else {
+                continue;
+            };
+            self.run(vec![
+                ovsdb::mutate(
+                    "Logical_Router",
+                    vec![includes("ports", uuid(&u))],
+                    vec![json!(["ports", "delete", set([uuid(&u)])])],
+                ),
+                ovsdb::delete("Logical_Router_Port", vec![eq("_uuid", uuid(&u))]),
+            ])
+            .await?;
+            if let Some(peer) = ext_value(&row, "pistack:port") {
+                let mut cond = by_name(&peer);
+                cond.push(eq("type", json!("router")));
+                self.drop_switch_ports(cond).await?;
+            }
+        }
+
+        let tags = map(self.tags(id, r.meta.project.as_ref()));
+        let mut routes = Vec::new();
+        if let Some(nh) = nexthop {
+            let any = if nh.is_ipv4() { "0.0.0.0/0" } else { "::/0" };
+            routes.push(json!({
+                "ip_prefix": any,
+                "nexthop": nh.to_string(),
+                "external_ids": tags.clone(),
+            }));
+        }
+        for sr in &r.spec.routes {
+            routes.push(json!({
+                "ip_prefix": sr.destination.trunc().to_string(),
+                "nexthop": sr.nexthop.to_string(),
+                "external_ids": tags.clone(),
+            }));
+        }
+        self.ensure_router_set(
+            id,
+            &name,
+            "Logical_Router_Static_Route",
+            "static_routes",
+            routes,
+            &["ip_prefix", "nexthop"],
+        )
+        .await?;
+
+        let mut snat = Vec::new();
+        if let Some(IpAddr::V4(ext)) = external_ip {
+            for (subnet, _) in &view.interfaces {
+                if subnet.spec.cidr.addr().is_ipv4() {
+                    snat.push(json!({
+                        "type": "snat",
+                        "logical_ip": subnet.spec.cidr.trunc().to_string(),
+                        "external_ip": ext.to_string(),
+                        "external_ids": tags.clone(),
+                    }));
+                }
+            }
+        }
+        self.ensure_router_set(
+            id,
+            &name,
+            "NAT",
+            "nat",
+            snat,
+            &["type", "logical_ip", "external_ip"],
+        )
+        .await
     }
 
-    /// `lr-del pr-<rtr id>` (cascades LRPs, NAT, routes); delete the
-    /// matching `type=router` LSPs on each switch.
-    async fn delete_router(&self, _id: &Id) -> ApiResult<()> {
-        Err(self.todo("delete_router"))
+    /// Delete `pr-<rtr id>`; its LRPs, NAT rows, routes and gateway chassis
+    /// go with it (none of those tables is a root table). Then take the
+    /// router's `type=router` ports off their switches. A second delete
+    /// succeeds.
+    async fn delete_router(&self, id: &Id) -> ApiResult<()> {
+        self.run(vec![ovsdb::delete(
+            "Logical_Router",
+            by_name(&router_name(id)),
+        )])
+        .await?;
+        self.drop_switch_ports(vec![
+            includes("external_ids", map([("pistack:device", id.to_string())])),
+            eq("type", json!("router")),
+        ])
+        .await
     }
 
     /// One `Port_Group` per security group:
@@ -985,21 +1420,77 @@ impl NetBackend for OvnBackend {
     /// subnet (`view.router`):
     /// * `type = dnat_and_snat`, `external_ip = <fip address>`,
     ///   `logical_ip = <target fixed ip>`, `logical_port = <port id>`,
-    ///   `external_mac = <gateway port mac>` (distributed FIP, so the
-    ///   chassis hosting the VM answers ARP directly),
-    ///   `options:stateless = false`,
-    ///   `external_ids:pistack:id = <fip id>`.
+    ///   `external_mac = <target port mac>` (distributed: the chassis
+    ///   hosting the machine answers ARP and forwards directly; a port
+    ///   without a mac yet gets neither column and goes through the
+    ///   gateway), `options:stateless = false`,
+    ///   `external_ids:pistack:id = <fip id>`, `pistack:router = <rtr id>`.
+    /// * A matching row writes nothing. A changed target or router replaces
+    ///   the row in one transaction.
     /// * Disassociate (`target: None`): remove the NAT row matching
     ///   `external_ids:pistack:id`.
+    /// * No router joining the port's subnet to the floating IP's network
+    ///   is an `unavailable` error, retried by the reconciler.
     /// * The address itself is reserved in the external subnet by fabric's
     ///   IPAM; OVN needs nothing for an unassociated FIP.
-    async fn associate_fip(&self, _view: &FipView) -> ApiResult<()> {
-        Err(self.todo("associate_fip"))
+    async fn associate_fip(&self, view: &FipView) -> ApiResult<()> {
+        let fip = &view.fip;
+        let id = &fip.meta.id;
+        let Some((port, fixed)) = &view.target else {
+            return self.delete_fip(id).await;
+        };
+        let address = fip.spec.address.ok_or_else(|| {
+            ApiError::unavailable(format!("ovn: floating ip {id} has no address yet"))
+        })?;
+        let router = view.router.as_ref().ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "ovn: no router joins port {} to network {}",
+                port.meta.id, fip.spec.network
+            ))
+        })?;
+        let mut ext = self.tags(id, fip.meta.project.as_ref());
+        ext.push(("pistack:router".into(), router.meta.id.to_string()));
+        let mac = port.spec.mac.trim();
+        let (logical_port, external_mac) = if mac.is_empty() {
+            (set([]), set([]))
+        } else {
+            (set([json!(port.meta.id.to_string())]), set([json!(mac)]))
+        };
+        let row = json!({
+            "type": "dnat_and_snat",
+            "external_ip": address.to_string(),
+            "logical_ip": fixed.to_string(),
+            "logical_port": logical_port,
+            "external_mac": external_mac,
+            "options": map([("stateless", "false")]),
+            "external_ids": map(ext),
+        });
+        let found = self
+            .run(vec![ovsdb::select("NAT", tagged("pistack:id", id))])
+            .await?;
+        let have = ovsdb::rows(&found[0]);
+        if let [one] = have.as_slice() {
+            if ovsdb::row_matches(one, &row) {
+                return Ok(());
+            }
+        }
+        let mut ops = unhook_nat(&have);
+        ops.push(ovsdb::insert("NAT", row, "new"));
+        ops.extend(onto_router(&router_name(&router.meta.id), "nat"));
+        self.run(ops).await?;
+        Ok(())
     }
 
     /// Remove any `NAT` row with `external_ids:pistack:id = <fip id>`.
-    async fn delete_fip(&self, _id: &Id) -> ApiResult<()> {
-        Err(self.todo("delete_fip"))
+    async fn delete_fip(&self, id: &Id) -> ApiResult<()> {
+        let found = self
+            .run(vec![ovsdb::select("NAT", tagged("pistack:id", id))])
+            .await?;
+        let ops = unhook_nat(&ovsdb::rows(&found[0]));
+        if !ops.is_empty() {
+            self.run(ops).await?;
+        }
+        Ok(())
     }
 }
 
@@ -1008,8 +1499,9 @@ mod tests {
     use super::*;
     use crate::backend::ovsdb::fake::FakeDb;
     use crate::types::{
-        HostRoute, NetworkSpec, NetworkStatus, PortSpec, PortStatus, SecurityGroupSpec,
-        SecurityGroupStatus, SubnetSpec, SubnetStatus,
+        FloatingIp, FloatingIpSpec, FloatingIpStatus, HostRoute, NetworkSpec, NetworkStatus,
+        PortSpec, PortStatus, Router, RouterSpec, RouterStatus, SecurityGroupSpec,
+        SecurityGroupStatus, StaticRoute, SubnetSpec, SubnetStatus,
     };
     use pistack_types::{kind, Meta};
 
@@ -1290,11 +1782,278 @@ mod tests {
         assert_eq!(ext(&ls[0], "pistack:term").as_deref(), Some("7"));
     }
 
+    fn router_port(net: &Network, subnet: &Subnet, rtr: &Id, mac: &str, ip: &str) -> Port {
+        let mut p = port(net, mac, &[ip]);
+        p.spec.device = Some(rtr.clone());
+        p.spec.subnet = Some(subnet.meta.id.clone());
+        p
+    }
+
+    /// An external network, a tenant network, and a router joining them
+    /// with one static route.
+    async fn routed() -> (Arc<FakeDb>, OvnBackend, RouterView) {
+        let (db, b) = backend();
+        let b = b.with_gateway_chassis(vec!["gw-a".into(), "gw-b".into()]);
+        let mut outside = net(NetworkKind::Overlay);
+        outside.spec.external = true;
+        let esub = subnet(&outside, "203.0.113.0/24", "203.0.113.1");
+        let tenant = net(NetworkKind::Overlay);
+        let tsub = subnet(&tenant, "10.0.0.0/24", "10.0.0.1");
+        b.ensure_network(&outside).await.unwrap();
+        b.ensure_network(&tenant).await.unwrap();
+        let router = Router {
+            meta: Meta::new(kind::ROUTER, "r", tenant.meta.project.clone()),
+            spec: RouterSpec {
+                external_network: Some(outside.meta.id.clone()),
+                interfaces: vec![tsub.meta.id.clone()],
+                routes: vec![StaticRoute {
+                    destination: "192.168.0.0/16".parse().unwrap(),
+                    nexthop: "10.0.0.254".parse().unwrap(),
+                }],
+            },
+            status: RouterStatus::default(),
+        };
+        let gw = router_port(
+            &outside,
+            &esub,
+            &router.meta.id,
+            "fa:16:3e:00:00:01",
+            "203.0.113.10",
+        );
+        let iface = router_port(
+            &tenant,
+            &tsub,
+            &router.meta.id,
+            "fa:16:3e:00:00:02",
+            "10.0.0.1",
+        );
+        let view = RouterView {
+            router,
+            gateway: Some((outside, gw)),
+            gateway_subnet: Some(esub),
+            interfaces: vec![(tsub, iface)],
+        };
+        (db, b, view)
+    }
+
+    fn named(db: &FakeDb, table: &str, name: &str) -> Option<Value> {
+        db.rows(table).into_iter().find(|r| r["name"] == name)
+    }
+
+    fn route_pairs(db: &FakeDb) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = db
+            .rows("Logical_Router_Static_Route")
+            .iter()
+            .map(|r| {
+                (
+                    r["ip_prefix"].as_str().unwrap().to_string(),
+                    r["nexthop"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn nat_of(db: &FakeDb, kind: &str) -> Vec<Value> {
+        db.rows("NAT")
+            .into_iter()
+            .filter(|r| r["type"] == kind)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn the_routed_parts_still_say_not_implemented() {
-        let (_db, b) = backend();
-        let err = b.delete_router(&Id::new(kind::ROUTER)).await.unwrap_err();
-        assert!(err.message.contains("not implemented"));
+    async fn a_router_gets_ports_peers_gateway_routes_and_snat() {
+        let (db, b, view) = routed().await;
+        b.ensure_router(&view).await.unwrap();
+        let rid = &view.router.meta.id;
+        let lr = named(&db, "Logical_Router", &format!("pr-{rid}")).unwrap();
+        assert_eq!(
+            opt(&lr, "options", "dynamic_neigh_routers").as_deref(),
+            Some("true")
+        );
+
+        let (tsub, iface) = &view.interfaces[0];
+        let lrp = named(
+            &db,
+            "Logical_Router_Port",
+            &format!("lrp-{}", iface.meta.id),
+        )
+        .unwrap();
+        assert_eq!(lrp["mac"], "fa:16:3e:00:00:02");
+        assert_eq!(ovsdb::canon(&lrp["networks"]), json!("10.0.0.1/24"));
+        let peer = named(&db, "Logical_Switch_Port", &iface.meta.id.to_string()).unwrap();
+        assert_eq!(peer["type"], "router");
+        assert_eq!(
+            opt(&peer, "options", "router-port"),
+            Some(format!("lrp-{}", iface.meta.id))
+        );
+        let ls = named(&db, "Logical_Switch", &switch_name(&tsub.spec.network)).unwrap();
+        assert!(ovsdb::elems(ls.get("ports")).contains(&peer["_uuid"]));
+
+        let (_, gw) = view.gateway.as_ref().unwrap();
+        let glrp = named(&db, "Logical_Router_Port", &format!("lrp-{}", gw.meta.id)).unwrap();
+        assert_eq!(ovsdb::canon(&glrp["networks"]), json!("203.0.113.10/24"));
+        let mut chassis: Vec<(String, i64)> = db
+            .rows("Gateway_Chassis")
+            .iter()
+            .map(|r| {
+                (
+                    r["chassis_name"].as_str().unwrap().to_string(),
+                    r["priority"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        chassis.sort();
+        assert_eq!(chassis, vec![("gw-a".into(), 2), ("gw-b".into(), 1)]);
+        assert_eq!(ovsdb::elems(glrp.get("gateway_chassis")).len(), 2);
+
+        assert_eq!(
+            route_pairs(&db),
+            vec![
+                ("0.0.0.0/0".into(), "203.0.113.1".into()),
+                ("192.168.0.0/16".into(), "10.0.0.254".into()),
+            ]
+        );
+        let snat = nat_of(&db, "snat");
+        assert_eq!(snat.len(), 1);
+        assert_eq!(snat[0]["logical_ip"], "10.0.0.0/24");
+        assert_eq!(snat[0]["external_ip"], "203.0.113.10");
+
+        let writes = db.writes();
+        b.ensure_router(&view).await.unwrap();
+        assert_eq!(db.writes(), writes, "a repeat writes nothing");
+    }
+
+    #[tokio::test]
+    async fn dropping_an_interface_and_a_route_removes_only_those() {
+        let (db, b, mut view) = routed().await;
+        b.ensure_router(&view).await.unwrap();
+        let (_, iface) = view.interfaces.pop().unwrap();
+        view.router.spec.interfaces.clear();
+        view.router.spec.routes.clear();
+        b.ensure_router(&view).await.unwrap();
+
+        assert_eq!(db.rows("Logical_Router_Port").len(), 1);
+        assert!(named(&db, "Logical_Switch_Port", &iface.meta.id.to_string()).is_none());
+        assert_eq!(
+            route_pairs(&db),
+            vec![("0.0.0.0/0".into(), "203.0.113.1".into())]
+        );
+        assert!(nat_of(&db, "snat").is_empty());
+        assert_eq!(db.rows("Gateway_Chassis").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_without_its_subnet_waits() {
+        let (_db, b, mut view) = routed().await;
+        view.gateway_subnet = None;
+        let err = b.ensure_router(&view).await.unwrap_err();
+        assert!(err.message.contains("has no subnet"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_router_takes_its_rows_and_switch_peers() {
+        let (db, b, view) = routed().await;
+        b.ensure_router(&view).await.unwrap();
+        b.delete_router(&view.router.meta.id).await.unwrap();
+        for table in [
+            "Logical_Router",
+            "Logical_Router_Port",
+            "Logical_Router_Static_Route",
+            "NAT",
+            "Gateway_Chassis",
+        ] {
+            assert!(db.rows(table).is_empty(), "{table} left behind");
+        }
+        assert!(db
+            .rows("Logical_Switch_Port")
+            .iter()
+            .all(|r| r["type"] != "router"));
+        assert_eq!(db.rows("Logical_Switch").len(), 2);
+        b.delete_router(&view.router.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_floating_ip_is_one_nat_row_that_follows_its_port() {
+        let (db, b, view) = routed().await;
+        b.ensure_router(&view).await.unwrap();
+        let (outside, _) = view.gateway.clone().unwrap();
+        let tenant_net = {
+            let (tsub, _) = &view.interfaces[0];
+            let mut n = net(NetworkKind::Overlay);
+            n.meta.id = tsub.spec.network.clone();
+            n.meta.project = tsub.meta.project.clone();
+            n
+        };
+        let vm = port(&tenant_net, "fa:16:3e:00:00:05", &["10.0.0.5", "10.0.0.6"]);
+        b.ensure_port(&tenant_net, &vm, &[]).await.unwrap();
+        let fip = FloatingIp {
+            meta: Meta::new(kind::FLOATING_IP, "f", tenant_net.meta.project.clone()),
+            spec: FloatingIpSpec {
+                network: outside.meta.id.clone(),
+                address: Some("203.0.113.20".parse().unwrap()),
+                port: Some(vm.meta.id.clone()),
+            },
+            status: FloatingIpStatus::default(),
+        };
+        let at = |ip: &str| FipView {
+            fip: fip.clone(),
+            target: Some((vm.clone(), ip.parse().unwrap())),
+            router: Some(view.router.clone()),
+        };
+
+        b.associate_fip(&at("10.0.0.5")).await.unwrap();
+        let dnat = nat_of(&db, "dnat_and_snat");
+        assert_eq!(dnat.len(), 1);
+        assert_eq!(dnat[0]["external_ip"], "203.0.113.20");
+        assert_eq!(dnat[0]["logical_ip"], "10.0.0.5");
+        assert_eq!(
+            ovsdb::canon(&dnat[0]["logical_port"]),
+            json!(vm.meta.id.to_string())
+        );
+        assert_eq!(
+            ovsdb::canon(&dnat[0]["external_mac"]),
+            json!("fa:16:3e:00:00:05")
+        );
+        let lr = db.rows("Logical_Router").pop().unwrap();
+        assert!(ovsdb::elems(lr.get("nat")).contains(&dnat[0]["_uuid"]));
+
+        let writes = db.writes();
+        b.associate_fip(&at("10.0.0.5")).await.unwrap();
+        b.ensure_router(&view).await.unwrap();
+        assert_eq!(db.writes(), writes, "repeats write nothing");
+        assert_eq!(
+            nat_of(&db, "dnat_and_snat").len(),
+            1,
+            "router keeps the fip row"
+        );
+
+        b.associate_fip(&at("10.0.0.6")).await.unwrap();
+        let dnat = nat_of(&db, "dnat_and_snat");
+        assert_eq!(dnat.len(), 1);
+        assert_eq!(dnat[0]["logical_ip"], "10.0.0.6");
+
+        let off = FipView {
+            fip: fip.clone(),
+            target: None,
+            router: None,
+        };
+        b.associate_fip(&off).await.unwrap();
+        assert!(nat_of(&db, "dnat_and_snat").is_empty());
+        assert_eq!(nat_of(&db, "snat").len(), 1, "router snat stays");
+
+        b.associate_fip(&at("10.0.0.5")).await.unwrap();
+        b.delete_fip(&fip.meta.id).await.unwrap();
+        assert!(nat_of(&db, "dnat_and_snat").is_empty());
+        b.delete_fip(&fip.meta.id).await.unwrap();
+
+        let lost = FipView {
+            router: None,
+            ..at("10.0.0.5")
+        };
+        let err = b.associate_fip(&lost).await.unwrap_err();
+        assert!(err.message.contains("no router joins"));
     }
     fn sg(rules: Vec<Rule>) -> SecurityGroup {
         SecurityGroup {
