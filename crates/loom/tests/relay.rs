@@ -947,3 +947,82 @@ async fn a_demoted_leader_closes_its_ingress_listener() {
     let again = ing.status.load_balancer[0].clone();
     assert!(String::from_utf8_lossy(&http_get(&again).await).ends_with("edge"));
 }
+
+#[tokio::test]
+async fn leading_again_in_one_process_rebinds_the_node_port_cleanly() {
+    use loom::controllers::service::{ServiceController, DEFAULT_SERVICE_CIDR};
+    let store = Store::in_memory().unwrap();
+    let node_port = free_node_port();
+    let mut svc = service(
+        "np-regain",
+        ServiceKind::NodePort,
+        80,
+        8080,
+        Protocol::Tcp,
+        vec![],
+    );
+    svc.spec.ports[0].node_port = Some(node_port);
+    let id = store.collection::<Service>().create(svc).unwrap().meta.id;
+    let at = format!("127.0.0.1:{node_port}");
+    let relay =
+        std::sync::Arc::new(RelayRealizer::new().with_node_address("127.0.0.1".parse().unwrap()));
+    relay.bind_store(store.clone());
+    let controller = ServiceController::new(
+        store.clone(),
+        DEFAULT_SERVICE_CIDR.parse().unwrap(),
+        relay.clone() as std::sync::Arc<dyn ServiceRealizer>,
+    );
+    let balancers = store.collection::<relay::Balancer>();
+    let node_record = || {
+        balancers
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .find(|lb| lb.meta.name.ends_with(&format!("-node-{node_port}")))
+            .expect("node port balancer")
+    };
+    let realized = || {
+        store
+            .collection::<Service>()
+            .get(&id)
+            .unwrap()
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Realized")
+            .map(|c| (c.status, c.message.clone()))
+    };
+
+    // Lead: the node port opens.
+    controller.reconcile_once().await.unwrap();
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+    let first = node_record().meta.id;
+
+    // Lose the lead. Another server leads and moves the record to itself.
+    controller.stop_leading().await;
+    closed(&at).await;
+    let mut moved = node_record();
+    moved.spec.vip_address = Some("10.89.0.11".parse().unwrap());
+    moved.status.vip = moved.spec.vip_address;
+    balancers.update(moved, None).unwrap();
+
+    // Lead again in the same process: a new record on the same address,
+    // bound without tripping over a socket of our own.
+    for _ in 0..3 {
+        controller.reconcile_once().await.unwrap();
+        let (ok, why) = realized().expect("realized condition");
+        assert!(ok, "node port did not come back: {why}");
+        assert!(!why.contains("in use"), "{why}");
+    }
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+    let again = node_record();
+    assert_ne!(again.meta.id, first);
+    assert_eq!(again.spec.vip_address, Some("127.0.0.1".parse().unwrap()));
+
+    // And once more: lose and regain without anyone else in between.
+    controller.stop_leading().await;
+    closed(&at).await;
+    controller.reconcile_once().await.unwrap();
+    assert!(realized().unwrap().0);
+    assert!(tokio::net::TcpStream::connect(&at).await.is_ok());
+}
