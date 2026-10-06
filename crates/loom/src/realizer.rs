@@ -80,11 +80,102 @@ pub struct RelayRealizer {
     store: OnceLock<Store>,
     providers: Providers,
     node_address: IpAddr,
-    /// Balancers this process has programmed. Sockets live in the process
-    /// that bound them, so a balancer another server (or an earlier run)
-    /// marked ready is programmed here once before it counts as live.
-    /// Values are the owner label (service or ingress) each was built for.
-    local: Mutex<HashMap<Id, &'static str>>,
+    /// Listeners this process opened or is opening.
+    held: Held,
+}
+
+/// One listener this process opened, or started to open.
+struct Holding {
+    /// The owner label (service or ingress) it was built for.
+    owner: &'static str,
+    /// Programmed here and seen ready. Sockets live in the process that
+    /// bound them, so a balancer another server (or an earlier run) marked
+    /// ready is programmed here once before it counts as live.
+    ready: bool,
+}
+
+/// What this process holds open, and how often each owner let go of it.
+///
+/// A balancer is recorded before its socket is bound, so losing the lead
+/// closes it even when the pass that bound it failed afterwards. A pass
+/// that was still binding when its owner let go closes what it opened
+/// before it returns.
+#[derive(Default)]
+struct Held {
+    ids: Mutex<HashMap<Id, Holding>>,
+    /// Bumped by every release of an owner label.
+    releases: Mutex<HashMap<&'static str, u64>>,
+    /// Test hook: stop right after the bind until told to go on.
+    #[cfg(test)]
+    pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+impl Held {
+    fn ids(&self) -> std::sync::MutexGuard<'_, HashMap<Id, Holding>> {
+        self.ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// How many times `owner` has let go so far.
+    fn term(&self, owner: &'static str) -> u64 {
+        self.releases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(owner)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record `id` before its socket is bound.
+    fn opening(&self, id: &Id, owner: &'static str) {
+        self.ids().entry(id.clone()).or_insert(Holding {
+            owner,
+            ready: false,
+        });
+    }
+
+    fn ready_here(&self, id: &Id) -> bool {
+        self.ids().get(id).is_some_and(|h| h.ready)
+    }
+
+    fn mark_ready(&self, id: &Id, owner: &'static str) {
+        self.ids()
+            .insert(id.clone(), Holding { owner, ready: true });
+    }
+
+    /// Start a new term for `owner` and hand back every id it holds.
+    fn release(&self, owner: &'static str) -> Vec<Id> {
+        *self
+            .releases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(owner)
+            .or_insert(0) += 1;
+        let mut ids = self.ids();
+        let gone: Vec<Id> = ids
+            .iter()
+            .filter(|(_, h)| h.owner == owner)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &gone {
+            ids.remove(id);
+        }
+        gone
+    }
+
+    #[cfg(test)]
+    async fn paused(&self) {
+        let hook = self
+            .pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some((reached, go)) = hook {
+            reached.notify_one();
+            go.notified().await;
+        }
+    }
 }
 
 impl RelayRealizer {
@@ -96,7 +187,7 @@ impl RelayRealizer {
                 Arc::new(RelayL7Provider::new()),
             ]),
             node_address: node_port_address(),
-            local: Mutex::new(HashMap::new()),
+            held: Held::default(),
         }
     }
 
@@ -161,7 +252,7 @@ impl RelayRealizer {
             keep.push(name.clone());
             let members = endpoint_addrs(endpoints, port)?;
             let bound = ensure_forward(
-                &self.local,
+                &self.held,
                 &client,
                 service.meta.project.clone(),
                 &name,
@@ -188,7 +279,7 @@ impl RelayRealizer {
             let name = format!("{base}-node-{node_port}");
             keep.push(name.clone());
             ensure_forward(
-                &self.local,
+                &self.held,
                 &client,
                 service.meta.project.clone(),
                 &name,
@@ -230,7 +321,7 @@ impl RelayRealizer {
         let name = format!("ing-{}", ingress.meta.id);
         let id = ingress.meta.id.to_string();
         let bound = ensure_forward(
-            &self.local,
+            &self.held,
             &client,
             ingress.meta.project.clone(),
             &name,
@@ -259,7 +350,7 @@ impl RelayRealizer {
             }
         };
         let tls = ensure_forward(
-            &self.local,
+            &self.held,
             &client,
             ingress.meta.project.clone(),
             &format!("{name}-tls"),
@@ -278,22 +369,10 @@ impl RelayRealizer {
     }
 
     /// Close every listener this process opened for owners of `label`.
-    async fn release_label(&self, label: &str) {
-        let ids: Vec<Id> = {
-            let mut local = self
-                .local
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let ids = local
-                .iter()
-                .filter(|(_, owner)| **owner == label)
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            for id in &ids {
-                local.remove(id);
-            }
-            ids
-        };
+    /// That includes listeners whose pass failed after the bind, and a
+    /// pass still binding closes what it opened when it finishes.
+    async fn release_label(&self, label: &'static str) {
+        let ids = self.held.release(label);
         if ids.is_empty() {
             return;
         }
@@ -487,7 +566,7 @@ fn projects_match(a: &Option<Id>, b: &Option<Id>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn ensure_forward(
-    local: &Mutex<HashMap<Id, &'static str>>,
+    held: &Held,
     client: &Client,
     project: Option<Id>,
     name: &str,
@@ -501,6 +580,7 @@ async fn ensure_forward(
     members: &[SocketAddr],
     routes: &[RoutePlan],
 ) -> ApiResult<String> {
+    let term = held.term(owner_label);
     let existing = match client.balancers().get_by_name(project.as_ref(), name) {
         Ok(lb) if lb.spec.vip_network != VIP_NETWORK || lb.spec.provider != provider => {
             return Err(ApiError::unavailable("listener is not available"));
@@ -648,72 +728,86 @@ async fn ensure_forward(
     }
 
     let provider_handle = client.provider_for(&lb)?;
-    let live = provider_handle.ensure_balancer(&lb).await?;
-    let lb = client
-        .balancers()
-        .get(&lb.meta.id)
-        .map_err(ApiError::from)?;
-    let listener = client
-        .listeners()
-        .get(&listener.meta.id)
-        .map_err(ApiError::from)?;
-    let programmed_here = local
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(&lb.meta.id);
-    let aligned = programmed_here
-        && lb.status.phase == Phase::Ready
-        && lb.status.provider_ref.as_deref() == Some(live.provider_ref.as_str())
-        && listener.status.phase == Phase::Ready
-        && listener.status.provider_ref.as_deref() == Some(live.provider_ref.as_str());
-    if !aligned {
-        client.update_balancer(&lb.meta.id, None, |_| Ok(()))?;
-        client.reconcile_balancer(&lb.meta.id).await;
-    }
-    if changed || !aligned {
-        client.touch_pool(&pool.meta.id);
-        client.reconcile_pool(&pool.meta.id).await;
-    }
-    for route_pool in &route_pools {
-        if !aligned || stale_routes.contains(&route_pool.meta.id) {
-            client.touch_pool(&route_pool.meta.id);
-            client.reconcile_pool(&route_pool.meta.id).await;
+    let programmed_here = held.ready_here(&lb.meta.id);
+    // Recorded before the bind, so losing the lead closes this socket even
+    // when the rest of the pass fails.
+    held.opening(&lb.meta.id, owner_label);
+    let id = lb.meta.id.clone();
+    let result: ApiResult<String> = async {
+        let live = provider_handle.ensure_balancer(&lb).await?;
+        let lb = client
+            .balancers()
+            .get(&lb.meta.id)
+            .map_err(ApiError::from)?;
+        let listener = client
+            .listeners()
+            .get(&listener.meta.id)
+            .map_err(ApiError::from)?;
+        let aligned = programmed_here
+            && lb.status.phase == Phase::Ready
+            && lb.status.provider_ref.as_deref() == Some(live.provider_ref.as_str())
+            && listener.status.phase == Phase::Ready
+            && listener.status.provider_ref.as_deref() == Some(live.provider_ref.as_str());
+        if !aligned {
+            client.update_balancer(&lb.meta.id, None, |_| Ok(()))?;
+            client.reconcile_balancer(&lb.meta.id).await;
         }
-    }
+        if changed || !aligned {
+            client.touch_pool(&pool.meta.id);
+            client.reconcile_pool(&pool.meta.id).await;
+        }
+        for route_pool in &route_pools {
+            if !aligned || stale_routes.contains(&route_pool.meta.id) {
+                client.touch_pool(&route_pool.meta.id);
+                client.reconcile_pool(&route_pool.meta.id).await;
+            }
+        }
+        #[cfg(test)]
+        held.paused().await;
 
-    let lb = client
-        .balancers()
-        .get(&lb.meta.id)
-        .map_err(ApiError::from)?;
-    let listener = client
-        .listeners()
-        .get(&listener.meta.id)
-        .map_err(ApiError::from)?;
-    if listener.status.phase != Phase::Ready {
-        let msg = if !listener.status.message.is_empty() {
-            listener.status.message
-        } else if lb.status.phase != Phase::Ready && !lb.status.message.is_empty() {
-            lb.status.message
-        } else {
-            "listener is not available".into()
-        };
-        return Err(ApiError::unavailable(msg));
+        let lb = client
+            .balancers()
+            .get(&lb.meta.id)
+            .map_err(ApiError::from)?;
+        let listener = client
+            .listeners()
+            .get(&listener.meta.id)
+            .map_err(ApiError::from)?;
+        if listener.status.phase != Phase::Ready {
+            let msg = if !listener.status.message.is_empty() {
+                listener.status.message
+            } else if lb.status.phase != Phase::Ready && !lb.status.message.is_empty() {
+                lb.status.message
+            } else {
+                "listener is not available".into()
+            };
+            return Err(ApiError::unavailable(msg));
+        }
+        held.mark_ready(&lb.meta.id, owner_label);
+        let addr = listener
+            .status
+            .provider_ref
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::unavailable("listener is not available"))?;
+        // A udp socket cannot be probed with a connect; its bind is the proof.
+        if listener.spec.protocol != ListenerProtocol::Udp && !listener_answers(&addr).await {
+            return Err(ApiError::unavailable("listener is not available"));
+        }
+        Ok(addr)
     }
-    local
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(lb.meta.id.clone(), owner_label);
-    let addr = listener
-        .status
-        .provider_ref
-        .clone()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::unavailable("listener is not available"))?;
-    // A udp socket cannot be probed with a connect; its bind is the proof.
-    if listener.spec.protocol != ListenerProtocol::Udp && !listener_answers(&addr).await {
-        return Err(ApiError::unavailable("listener is not available"));
+    .await;
+    if held.term(owner_label) != term {
+        // The owner let go while this pass was binding: whatever it opened
+        // belongs to a term that is over.
+        held.ids().remove(&id);
+        client.providers().stop_everywhere(&id).await;
+        tracing::info!(balancer = %id, name, "loom: closed a listener opened while losing the lead");
+        return Err(ApiError::unavailable(
+            "lead was lost while the listener was opening",
+        ));
     }
-    Ok(addr)
+    result
 }
 
 /// The keep certificate an ingress's `tls` entries name, if any.
@@ -838,4 +932,131 @@ async fn delete_unnamed(client: &Client, label: &str, id: &str, keep: &[String])
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ServiceSpec, ServiceStatus};
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn is_open(at: &str) -> bool {
+        TcpStream::connect(at).await.is_ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_the_lead_mid_bind_closes_the_listener() {
+        let store = Store::in_memory().unwrap();
+        let relay = Arc::new(RelayRealizer::new().with_node_address([127, 0, 0, 1].into()));
+        relay.bind_store(store.clone());
+        let node_port = free_port();
+        let mut svc = Service {
+            meta: Meta::new(kinds::SERVICE, "mid-bind", None),
+            spec: ServiceSpec {
+                ports: vec![ServicePort {
+                    name: "http".into(),
+                    protocol: Protocol::Tcp,
+                    port: 80,
+                    target_port: Some(8080),
+                    node_port: None,
+                }],
+                kind: ServiceKind::NodePort,
+                ..ServiceSpec::default()
+            },
+            status: ServiceStatus::default(),
+        };
+        svc.status.node_ports.insert(80, node_port);
+        let at = format!("127.0.0.1:{node_port}");
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let go = Arc::new(tokio::sync::Notify::new());
+        *relay.held.pause.lock().unwrap() = Some((reached.clone(), go.clone()));
+
+        let pass = {
+            let relay = relay.clone();
+            let svc = svc.clone();
+            tokio::spawn(async move { relay.realize(&svc, &[]).await })
+        };
+        // The cluster-side listener goes first; let it finish.
+        reached.notified().await;
+        go.notify_one();
+        // The node port is bound and the pass has not returned yet.
+        reached.notified().await;
+        assert!(is_open(&at).await, "node port should be bound mid-pass");
+        relay.release().await;
+        go.notify_one();
+        let err = pass.await.unwrap().unwrap_err();
+        assert!(err.message.contains("lead was lost"), "{}", err.message);
+        assert!(
+            !is_open(&at).await,
+            "a bind in flight survived losing the lead"
+        );
+        assert!(relay.held.ids().is_empty());
+
+        // The next term opens it again on the same address.
+        *relay.held.pause.lock().unwrap() = None;
+        relay.realize(&svc, &[]).await.unwrap();
+        assert!(is_open(&at).await);
+        relay.release().await;
+        assert!(!is_open(&at).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_that_fails_after_the_bind_is_still_closed() {
+        let store = Store::in_memory().unwrap();
+        let relay = Arc::new(RelayRealizer::new().with_node_address([127, 0, 0, 1].into()));
+        relay.bind_store(store.clone());
+        let port = free_port();
+        let bind = SocketAddr::from(([127, 0, 0, 1], port));
+        let at = bind.to_string();
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let go = Arc::new(tokio::sync::Notify::new());
+        *relay.held.pause.lock().unwrap() = Some((reached.clone(), go.clone()));
+        let pass = {
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                let client = relay.client().unwrap();
+                ensure_forward(
+                    &relay.held,
+                    &client,
+                    None,
+                    "after-bind",
+                    SERVICE_LABEL,
+                    "svc",
+                    Provider::Forward,
+                    ListenerProtocol::Tcp,
+                    PoolProtocol::Tcp,
+                    port,
+                    Some(bind),
+                    &[],
+                    &[],
+                )
+                .await
+            })
+        };
+        reached.notified().await;
+        assert!(is_open(&at).await);
+        // Make the rest of the pass fail with the socket already open.
+        for l in store.collection::<relay::Listener>().list(None).unwrap() {
+            store
+                .collection::<relay::Listener>()
+                .delete(&l.meta.id)
+                .unwrap();
+        }
+        go.notify_one();
+        assert!(pass.await.unwrap().is_err());
+        assert!(is_open(&at).await, "the failed pass left its socket open");
+
+        // Losing the lead closes it all the same.
+        relay.release_services().await;
+        assert!(!is_open(&at).await);
+    }
 }
