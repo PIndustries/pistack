@@ -92,8 +92,8 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
 /// variable uses the cluster's saved choice (see `fabricchoice`), which
 /// `run` puts back into the variable before modules are assembled.
 /// `PISTACK_RELAY_BACKEND=forward` mounts the in-process forwarder and HTTP
-/// proxy, and `mock` keeps the mock. Unset follows the fabric: `hostnat` or
-/// `overlay` gets the forwarder, anything else the mock. `run` refuses any
+/// proxy, and `mock` keeps the mock. Unset follows the fabric: `hostnat`,
+/// `overlay` or `ovn` gets the forwarder, anything else the mock. `run` refuses any
 /// other value before it gets here.
 fn relay_module() -> relay::Relay {
     let backend = relay::RelayBackend::from_env().unwrap_or_else(|e| {
@@ -108,6 +108,7 @@ fn fabric_module() -> fabric::Fabric {
     match std::env::var("PISTACK_FABRIC_BACKEND").ok().as_deref() {
         Some("hostnat") => fabric::Fabric::hostnat(),
         Some("overlay") => fabric::Fabric::overlay(),
+        Some("ovn") => fabric::Fabric::ovn(),
         _ => fabric::Fabric::default(),
     }
 }

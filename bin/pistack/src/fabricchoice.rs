@@ -25,7 +25,7 @@ const META_KEY: &str = "fabric_backend";
 
 /// Values a server may set. `mock` is an explicit opt-out that is also
 /// saved, so a laptop cluster can say so on purpose.
-const KNOWN: [&str; 3] = ["hostnat", "overlay", "mock"];
+const KNOWN: [&str; 4] = ["hostnat", "overlay", "ovn", "mock"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Choice {
@@ -128,7 +128,7 @@ fn record(store: &Store, raw: Option<&str>, leader: bool) -> anyhow::Result<Choi
         if !KNOWN.contains(&v) {
             tracing::error!(
                 value = v,
-                "{FABRIC_BACKEND_ENV} is not hostnat, overlay or mock; ignoring it"
+                "{FABRIC_BACKEND_ENV} is not hostnat, overlay, ovn or mock; ignoring it"
             );
         }
     }

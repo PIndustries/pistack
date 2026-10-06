@@ -70,8 +70,8 @@ impl RelayBackend {
 
     /// The backend for an explicit `PISTACK_RELAY_BACKEND` value and the
     /// `PISTACK_FABRIC_BACKEND` value. An explicit value always wins. When
-    /// it is unset or empty, a server on a real datapath (`hostnat` or
-    /// `overlay`) gets `Forward`, so its balancers move traffic; anything
+    /// it is unset or empty, a server on a real datapath (`hostnat`,
+    /// `overlay` or `ovn`) gets `Forward`, so its balancers move traffic; anything
     /// else keeps `Mock`.
     pub fn choose(value: Option<&str>, fabric: Option<&str>) -> Result<Self, String> {
         let explicit = value.map(str::trim).is_some_and(|v| !v.is_empty());
@@ -79,7 +79,7 @@ impl RelayBackend {
             return Self::parse(value);
         }
         match fabric.map(str::trim) {
-            Some("hostnat") | Some("overlay") => Ok(Self::Forward),
+            Some("hostnat") | Some("overlay") | Some("ovn") => Ok(Self::Forward),
             _ => Ok(Self::Mock),
         }
     }
@@ -106,7 +106,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// The module. `Default` uses the mock provider so a single-node server is
 /// functional end to end. [`Relay::forward`] is the in-process L4 forwarder
 /// and the HTTP reverse proxy (`PISTACK_RELAY_BACKEND=forward`, or the
-/// default when the fabric backend is `hostnat` or `overlay`).
+/// default when the fabric backend is `hostnat`, `overlay` or `ovn`).
 pub struct Relay {
     providers: Providers,
     queue: Option<CommandQueue>,
@@ -251,6 +251,7 @@ mod backend_tests {
         assert_eq!(RelayBackend::choose(None, Some("mock")), Ok(Mock));
         assert_eq!(RelayBackend::choose(None, Some("hostnat")), Ok(Forward));
         assert_eq!(RelayBackend::choose(Some(""), Some("overlay")), Ok(Forward));
+        assert_eq!(RelayBackend::choose(None, Some("ovn")), Ok(Forward));
         assert_eq!(
             RelayBackend::choose(Some(" "), Some("overlay")),
             Ok(Forward)

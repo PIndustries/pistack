@@ -286,6 +286,9 @@ impl Client {
         if shared || hostnat_port || self.backend().name() == "hostnat" {
             return Some("hostnat".into());
         }
+        if self.backend().name() == "ovn" {
+            return Some("ovn".into());
+        }
         if self.backend().name() == "overlay" && matches!(net.spec.kind, NetworkKind::Overlay) {
             return Some("overlay".into());
         }
