@@ -441,6 +441,19 @@ async fn ensure_tcp_balancer_is_idempotent_and_converges_members() {
         .unwrap_err();
     assert_eq!(err.code, pistack_types::error::ErrorCode::Conflict);
 
+    // The module's background reconciler leaves loom's balancer alone:
+    // only the owner's own client programs it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let untouched = h.client.balancers().get(&lb.meta.id).unwrap();
+    assert_ne!(untouched.status.phase, Phase::Ready);
+    assert!(
+        !h.provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::EnsureBalancer { balancer, .. } if *balancer == lb.meta.id)),
+        "module reconciler must not program a loom balancer"
+    );
+    h.client.reconcile_balancer(&lb.meta.id).await;
     h.wait_lb(&lb.meta.id, |b| b.status.phase == Phase::Ready)
         .await;
     h.client.delete_balancer(&lb.meta.id).await.unwrap();

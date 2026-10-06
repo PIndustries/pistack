@@ -23,6 +23,11 @@ pub struct Client {
     store: Store,
     providers: Providers,
     queue: Option<CommandQueue>,
+    /// Leave balancers labelled `pistack.io/managed-by=loom` alone in the
+    /// reconcile paths. Set on the relay module's background reconciler:
+    /// loom binds and closes those sockets on its own providers, so a
+    /// second program here would bind the same address twice.
+    leave_loom: bool,
 }
 
 fn store_err(e: StoreError) -> ApiError {
@@ -35,7 +40,19 @@ impl Client {
             store,
             providers,
             queue: None,
+            leave_loom: false,
         }
+    }
+
+    /// Skip loom's balancers when reconciling (see the field doc).
+    pub fn leave_loom_managed(mut self) -> Self {
+        self.leave_loom = true;
+        self
+    }
+
+    /// True when this client's reconcile paths must not program `lb`.
+    pub(crate) fn leaves(&self, lb: &Balancer) -> bool {
+        self.leave_loom && lb.meta.labels.get(MANAGED_LABEL).map(String::as_str) == Some("loom")
     }
 
     /// Queue used by an edge door. Without one, that door stays unavailable.
@@ -447,8 +464,9 @@ impl Client {
     /// `vip_network` with one listener on `port` and one pool holding
     /// `members`. Idempotent: a second call with the same inputs changes
     /// nothing; a different member list is applied as adds and removes.
-    /// Returns the balancer; its `status` fills in once the reconciler has
-    /// run. The balancer is labelled `pistack.io/managed-by=loom`.
+    /// Returns the balancer; its `status` fills in once this client
+    /// reconciles it. The balancer is labelled `pistack.io/managed-by=loom`,
+    /// so the relay module's background reconciler leaves it to the caller.
     pub async fn ensure_tcp_balancer(
         &self,
         project: &Id,

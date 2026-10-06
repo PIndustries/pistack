@@ -80,6 +80,9 @@ impl Client {
                 return;
             }
         };
+        if self.leaves(&lb) {
+            return;
+        }
         if !stale(
             lb.status.observed_revision,
             lb.meta.revision,
@@ -154,6 +157,9 @@ impl Client {
                 return;
             }
         };
+        if self.leaves(&view.balancer) {
+            return;
+        }
         let result = match self.provider_for(&view.balancer) {
             Ok(p) => p.ensure_listener(&view).await,
             Err(e) => Err(e),
