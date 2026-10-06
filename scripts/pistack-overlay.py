@@ -1582,7 +1582,13 @@ def ensure_network(runner: Runner, created: set[str], net: Network) -> None:
 
 def ensure_fdb(runner: Runner, fdb: list[tuple[str, str, str]]) -> None:
     for dev, mac, dst in fdb:
-        runner.mutate([runner.bridge, "fdb", "replace", mac, "dev", dev, "dst", dst])
+        if mac == ZERO_MAC:
+            # The all-zero flood entry has one row per peer. Newer kernels
+            # refuse `replace` for it, so add it with `append`; an entry that
+            # is already there is the desired state.
+            runner.mutate_create([runner.bridge, "fdb", "append", mac, "dev", dev, "dst", dst])
+        else:
+            runner.mutate([runner.bridge, "fdb", "replace", mac, "dev", dev, "dst", dst])
 
 
 def move_into_netns(runner: Runner, netns: str, name: str, just_created: bool) -> None:
@@ -2652,6 +2658,24 @@ def _install_fakes(bindir: str, log_path: str) -> None:
             '    fh.write(json.dumps(sys.argv) + "\\n")',
             f'if {name!r} == "ip" and "link" in sys.argv and "show" in sys.argv:',
             "    sys.exit(1)",
+            # Like a 6.8 kernel: no `replace` for the all-zero flood entry,
+            # and a second `append` of the same entry says it exists.
+            f'if {name!r} == "bridge" and "fdb" in sys.argv and {ZERO_MAC!r} in sys.argv:',
+            '    if "replace" in sys.argv:',
+            '        sys.stderr.write("RTNETLINK answers: Operation not supported\\n")',
+            "        sys.exit(2)",
+            '    if "append" in sys.argv:',
+            f"        seen_path = {log_path + '.fdb'!r}",
+            "        key = json.dumps(sys.argv[1:])",
+            "        try:",
+            "            seen = open(seen_path, encoding='utf-8').read().splitlines()",
+            "        except FileNotFoundError:",
+            "            seen = []",
+            "        if key in seen:",
+            '            sys.stderr.write("RTNETLINK answers: File exists\\n")',
+            "            sys.exit(2)",
+            "        with open(seen_path, 'a', encoding='utf-8') as fh:",
+            '            fh.write(key + "\\n")',
             "sys.exit(0)",
             "",
         ]
@@ -2688,6 +2712,9 @@ def _check_log(first: list[list[str]], second: list[list[str]]) -> None:
     _assert(any(_has(argv, "7") for argv in vxlan), "vxlan create for vni 7")
     _assert(any(_has(argv, "8") for argv in vxlan), "vxlan create for vni 8")
     _assert(any(_has(argv, "fdb", "dst", "10.0.0.2") for argv in entries), "fdb dst 10.0.0.2")
+    flood = [argv for argv in entries if _has(argv, "fdb", ZERO_MAC) and "del" not in argv]
+    _assert(bool(flood), "peer flood fdb is written")
+    _assert(all("append" in argv for argv in flood), "peer flood fdb uses append, not replace")
     _assert(
         any(_has(argv, "fdb", "02:70:69:1f:f3:20", "dst", "10.0.0.2") for argv in entries),
         "remote mac fdb",
