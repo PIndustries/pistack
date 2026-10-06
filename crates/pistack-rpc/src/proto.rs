@@ -19,6 +19,7 @@
 use chrono::{DateTime, Utc};
 use pistack_types::{ApiError, Id, Phase, Resources};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Longest a command long-poll may hang before an empty reply.
@@ -175,6 +176,17 @@ pub enum PowerState {
     Unknown,
 }
 
+/// What fabric recorded once a port was realised. Mirrors the port binding:
+/// `vif_type` `ovs` carries `vif_details` `bridge` and `iface_id`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NicBinding {
+    /// `ovs`, `hostnat`, `overlay`, `mock`, ... Empty keeps the Linux bridge.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vif_type: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vif_details: BTreeMap<String, String>,
+}
+
 /// One NIC whose address was allocated by fabric. Empty `nics` on a
 /// [`MachineRequest`] means the shared `pistack` network.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -195,6 +207,10 @@ pub struct NicAttachment {
     /// host NAT bridge, including the shared `pistack` network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_id: Option<u32>,
+    /// Port binding. `vif_type` `ovs` plugs the interface into the OVS
+    /// bridge named in `vif_details` instead of a Linux bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<NicBinding>,
 }
 
 /// Payload of [`CommandKind::StartMachine`]: everything a runtime needs to
@@ -785,13 +801,19 @@ mod tests {
                 gateway: "10.90.0.1".into(),
                 routed: true,
                 segment_id: Some(7),
+                binding: None,
             },
         };
         let text = serde_json::to_string(&plug).unwrap();
         assert!(text.contains("\"segment_id\":7"));
         assert!(!text.contains("\"nic\""));
+        assert!(!text.contains("binding"));
         let back: PortPlug = serde_json::from_str(&text).unwrap();
         assert_eq!(back, plug);
+        let old: NicAttachment =
+            serde_json::from_str(r#"{"network_id":"n","mac":"m","address":"a","prefix":24}"#)
+                .unwrap();
+        assert!(old.binding.is_none());
         let logs: LogText = serde_json::from_str(r#"{"text":"boot ok"}"#).unwrap();
         assert_eq!(logs.text, "boot ok");
     }

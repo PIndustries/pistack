@@ -8,14 +8,21 @@
 //! and a veth instead of a tap. The host end stays on the bridge. The other
 //! end moves into a named network namespace that youki joins.
 //!
+//! When the port binding `vif_type` is `ovs`, the host end is added to that
+//! OVS bridge with `ovs-vsctl` instead of `ip link set master`. Stop, delete,
+//! and a failed create run `ovs-vsctl --if-exists del-port` before deleting
+//! the link. `$PISTACK_OVS_VSCTL_BIN` replaces `ovs-vsctl` the way
+//! `$PISTACK_IP_BIN` replaces `ip`.
+//!
 //! Names are short and checked before `ip` runs: `pn` plus 12 hex digits of
 //! the machine id for the namespace, `vh` / `vp` plus 12 hex digits of the
 //! MAC for the veth ends, and `eth0`, `eth1`, ... inside the namespace.
 //! `$PISTACK_IP_BIN`, when it is set, replaces `ip` (tests point this at a
 //! fake). A root agent runs that binary directly. Sudo mode runs
-//! `sudo -n <ip> ...`. A rootless agent cannot, and [`prepare`] says so
-//! without calling `ip`.
+//! `sudo -n <ip> ...` and `sudo -n <ovs-vsctl> ...`. A rootless agent cannot,
+//! and [`prepare`] says so without calling either.
 
+use super::ovsplug::{self, HostPlug};
 use super::{MachineRequest, NicAttachment};
 use pistack_types::{ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
@@ -45,6 +52,16 @@ pub(crate) struct PodLink {
     pub netns: String,
     pub path: PathBuf,
     pub veths: Vec<String>,
+    /// OVS ports to remove before the veth is deleted. Empty on a Linux bridge.
+    pub ovs: Vec<OvsLink>,
+}
+
+/// One host veth plugged into an OVS bridge. Recorded so stop and delete
+/// can `del-port` without the original request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OvsLink {
+    pub bridge: String,
+    pub ifname: String,
 }
 
 /// What [`prepare`] decided. `None` keeps the sandbox network namespace.
@@ -60,10 +77,10 @@ struct Attachment {
     host: String,
     peer: String,
     guest: String,
-    bridge: String,
     mac: String,
     cidr: String,
     gateway: String,
+    plug: HostPlug,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +94,16 @@ pub(crate) struct Plan {
 struct NetRecord {
     netns: String,
     veths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ovs: Vec<OvsLink>,
+}
+
+/// What was written beside the bundle, including OVS ports from a previous start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedNet {
+    pub netns: String,
+    pub veths: Vec<String>,
+    pub ovs: Vec<OvsLink>,
 }
 
 /// True when `nic` carries a port, not only an address string.
@@ -171,11 +198,13 @@ pub(crate) fn plan(req: &MachineRequest) -> ApiResult<Option<Plan>> {
 }
 
 fn attachment(index: usize, nic: &NicAttachment) -> ApiResult<Attachment> {
-    let bridge = crate::runtime::libvirt::port_bridge(nic)?;
-    if !bridge_name_ok(&bridge) {
-        return Err(ApiError::bad_request(
-            "youki runtime: port bridge is not allowed",
-        ));
+    let plug = ovsplug::host_plug(nic)?;
+    if let HostPlug::LinuxBridge { bridge } = &plug {
+        if !bridge_name_ok(bridge) {
+            return Err(ApiError::bad_request(
+                "youki runtime: port bridge is not allowed",
+            ));
+        }
     }
     let mac = canonical_mac(&nic.mac)?;
     let host = format!("vh{}", mac_hex(&mac));
@@ -210,21 +239,40 @@ fn attachment(index: usize, nic: &NicAttachment) -> ApiResult<Attachment> {
         host,
         peer,
         guest,
-        bridge,
         mac,
         cidr,
         gateway,
+        plug,
     })
 }
 
-/// `ip` argv for a fresh namespace, including the leftover delete that
-/// runs first. Delete commands tolerate a missing device.
-pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
-    let mut cmds = teardown_argv(plan);
-    cmds.push(vec!["netns".into(), "add".into(), plan.netns.clone()]);
+/// One step of namespace setup. `Ip` is an `ip` argv. The OVS steps are
+/// `ovs-vsctl`, built when the step runs so sudo and the binary path are
+/// the ones for this process.
+enum Step {
+    Ip(Vec<String>),
+    Plug {
+        bridge: String,
+        ifname: String,
+        iface_id: String,
+        mac: String,
+    },
+    Unplug {
+        bridge: String,
+        ifname: String,
+    },
+}
+
+fn steps(plan: &Plan) -> Vec<Step> {
+    let mut cmds = teardown_steps(plan);
+    cmds.push(Step::Ip(vec![
+        "netns".into(),
+        "add".into(),
+        plan.netns.clone(),
+    ]));
     let mut route = None;
     for att in &plan.attachments {
-        cmds.push(vec![
+        cmds.push(Step::Ip(vec![
             "link".into(),
             "add".into(),
             att.host.clone(),
@@ -233,28 +281,34 @@ pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
             "peer".into(),
             "name".into(),
             att.peer.clone(),
-        ]);
-        cmds.push(vec![
-            "link".into(),
-            "set".into(),
-            att.host.clone(),
-            "master".into(),
-            att.bridge.clone(),
-        ]);
-        cmds.push(vec![
+        ]));
+        match &att.plug {
+            HostPlug::LinuxBridge { bridge } => {
+                cmds.push(Step::Ip(ovsplug::linux_master_argv(&att.host, bridge)));
+            }
+            HostPlug::Ovs { bridge, iface_id } => {
+                cmds.push(Step::Plug {
+                    bridge: bridge.clone(),
+                    ifname: att.host.clone(),
+                    iface_id: iface_id.clone(),
+                    mac: att.mac.clone(),
+                });
+            }
+        }
+        cmds.push(Step::Ip(vec![
             "link".into(),
             "set".into(),
             att.host.clone(),
             "up".into(),
-        ]);
-        cmds.push(vec![
+        ]));
+        cmds.push(Step::Ip(vec![
             "link".into(),
             "set".into(),
             att.peer.clone(),
             "netns".into(),
             plan.netns.clone(),
-        ]);
-        cmds.push(vec![
+        ]));
+        cmds.push(Step::Ip(vec![
             "-n".into(),
             plan.netns.clone(),
             "link".into(),
@@ -262,8 +316,8 @@ pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
             att.peer.clone(),
             "name".into(),
             att.guest.clone(),
-        ]);
-        cmds.push(vec![
+        ]));
+        cmds.push(Step::Ip(vec![
             "-n".into(),
             plan.netns.clone(),
             "link".into(),
@@ -271,8 +325,8 @@ pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
             att.guest.clone(),
             "address".into(),
             att.mac.clone(),
-        ]);
-        cmds.push(vec![
+        ]));
+        cmds.push(Step::Ip(vec![
             "-n".into(),
             plan.netns.clone(),
             "addr".into(),
@@ -280,31 +334,31 @@ pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
             att.cidr.clone(),
             "dev".into(),
             att.guest.clone(),
-        ]);
+        ]));
         if att.guest == "eth0" {
-            cmds.push(vec![
+            cmds.push(Step::Ip(vec![
                 "-n".into(),
                 plan.netns.clone(),
                 "link".into(),
                 "set".into(),
                 "lo".into(),
                 "up".into(),
-            ]);
+            ]));
         }
-        cmds.push(vec![
+        cmds.push(Step::Ip(vec![
             "-n".into(),
             plan.netns.clone(),
             "link".into(),
             "set".into(),
             att.guest.clone(),
             "up".into(),
-        ]);
+        ]));
         if route.is_none() && !att.gateway.is_empty() {
             route = Some(att.gateway.clone());
         }
     }
     if let Some(gw) = route {
-        cmds.push(vec![
+        cmds.push(Step::Ip(vec![
             "-n".into(),
             plan.netns.clone(),
             "route".into(),
@@ -312,14 +366,63 @@ pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
             "default".into(),
             "via".into(),
             gw,
-        ]);
+        ]));
     }
     cmds
 }
 
+fn teardown_steps(plan: &Plan) -> Vec<Step> {
+    let mut cmds = Vec::new();
+    for att in &plan.attachments {
+        if let HostPlug::Ovs { bridge, .. } = &att.plug {
+            cmds.push(Step::Unplug {
+                bridge: bridge.clone(),
+                ifname: att.host.clone(),
+            });
+        }
+        cmds.push(Step::Ip(vec![
+            "link".into(),
+            "del".into(),
+            att.host.clone(),
+        ]));
+        if let Some(peer) = peer_of(&att.host) {
+            cmds.push(Step::Ip(vec!["link".into(), "del".into(), peer]));
+        }
+    }
+    if !plan.netns.is_empty() {
+        cmds.push(Step::Ip(vec![
+            "netns".into(),
+            "del".into(),
+            plan.netns.clone(),
+        ]));
+    }
+    cmds
+}
+
+fn ip_argv(steps: &[Step]) -> Vec<Vec<String>> {
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Ip(cmd) => Some(cmd.clone()),
+            Step::Plug { .. } | Step::Unplug { .. } => None,
+        })
+        .collect()
+}
+
+/// `ip` argv for a fresh namespace, including the leftover delete that
+/// runs first. Delete commands tolerate a missing device. OVS plug and
+/// unplug are not `ip` commands; [`apply`] runs those beside this list.
+pub(crate) fn setup_argv(plan: &Plan) -> Vec<Vec<String>> {
+    ip_argv(&steps(plan))
+}
+
 /// `ip` argv that removes the veth ends and the namespace.
+///
+/// Production teardown runs [`steps`], which also unplugs OVS ports. This
+/// projection is what the argv tests assert.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn teardown_argv(plan: &Plan) -> Vec<Vec<String>> {
-    teardown_names(&plan.netns, &plan.veths())
+    ip_argv(&teardown_steps(plan))
 }
 
 fn teardown_names(netns: &str, veths: &[String]) -> Vec<Vec<String>> {
@@ -341,11 +444,25 @@ impl Plan {
         self.attachments.iter().map(|a| a.host.clone()).collect()
     }
 
+    fn ovs_links(&self) -> Vec<OvsLink> {
+        self.attachments
+            .iter()
+            .filter_map(|att| match &att.plug {
+                HostPlug::Ovs { bridge, .. } => Some(OvsLink {
+                    bridge: bridge.clone(),
+                    ifname: att.host.clone(),
+                }),
+                HostPlug::LinuxBridge { .. } => None,
+            })
+            .collect()
+    }
+
     fn link(&self) -> PodLink {
         PodLink {
             netns: self.netns.clone(),
             path: self.path.clone(),
             veths: self.veths(),
+            ovs: self.ovs_links(),
         }
     }
 }
@@ -369,9 +486,9 @@ pub(crate) async fn prepare(
     if matches!(privilege, IpPrivilege::Rootless) {
         return Ok(PodNetwork::Refused(ROOTLESS_NETWORK_MESSAGE.to_owned()));
     }
-    write_record(bundle, &plan.netns, &plan.veths())?;
-    if let Err(err) = apply(privilege, &setup_argv(&plan)).await {
-        let _ = release(privilege, &plan.netns, &plan.veths()).await;
+    write_record(bundle, &plan)?;
+    if let Err(err) = apply(privilege, &plan).await {
+        let _ = release(privilege, &plan.netns, &plan.veths(), &plan.ovs_links()).await;
         return Err(err);
     }
     Ok(PodNetwork::Linked(plan.link()))
@@ -383,14 +500,25 @@ pub(crate) async fn release(
     privilege: &IpPrivilege,
     netns: &str,
     veths: &[String],
+    ovs: &[OvsLink],
 ) -> ApiResult<()> {
     if matches!(privilege, IpPrivilege::Rootless) {
         return Ok(());
     }
     let netns = if netns_name_ok(netns) { netns } else { "" };
     let veths: Vec<String> = veths.iter().filter(|n| veth_name_ok(n)).cloned().collect();
-    if netns.is_empty() && veths.is_empty() {
+    if netns.is_empty() && veths.is_empty() && ovs.is_empty() {
         return Ok(());
+    }
+    // Take the port off the OVS bridge before the link disappears. A hard
+    // failure leaves the link so the next teardown can try again.
+    for link in ovs {
+        if !ovsplug::bridge_ok(&link.bridge) || !veth_name_ok(&link.ifname) {
+            return Err(ApiError::unavailable(
+                "youki runtime: ovs port is not allowed",
+            ));
+        }
+        run_unplug(privilege, &link.bridge, &link.ifname).await?;
     }
     let mut first = None;
     for cmd in teardown_names(netns, &veths) {
@@ -406,7 +534,7 @@ pub(crate) async fn release(
     }
 }
 
-pub(crate) fn read_record(bundle: &Path) -> Option<(String, Vec<String>)> {
+pub(crate) fn read_record(bundle: &Path) -> Option<RecordedNet> {
     let bytes = std::fs::read(bundle.join("net.json")).ok()?;
     let rec: NetRecord = serde_json::from_slice(&bytes).ok()?;
     let netns = if netns_name_ok(&rec.netns) {
@@ -415,14 +543,19 @@ pub(crate) fn read_record(bundle: &Path) -> Option<(String, Vec<String>)> {
         String::new()
     };
     let veths: Vec<String> = rec.veths.into_iter().filter(|n| veth_name_ok(n)).collect();
-    if netns.is_empty() && veths.is_empty() {
+    let ovs: Vec<OvsLink> = rec
+        .ovs
+        .into_iter()
+        .filter(|link| ovsplug::bridge_ok(&link.bridge) && veth_name_ok(&link.ifname))
+        .collect();
+    if netns.is_empty() && veths.is_empty() && ovs.is_empty() {
         None
     } else {
-        Some((netns, veths))
+        Some(RecordedNet { netns, veths, ovs })
     }
 }
 
-fn write_record(bundle: &Path, netns: &str, veths: &[String]) -> ApiResult<()> {
+fn write_record(bundle: &Path, plan: &Plan) -> ApiResult<()> {
     std::fs::create_dir_all(bundle).map_err(|err| {
         ApiError::unavailable(format!(
             "youki runtime: creating {}: {err}",
@@ -430,8 +563,9 @@ fn write_record(bundle: &Path, netns: &str, veths: &[String]) -> ApiResult<()> {
         ))
     })?;
     let rec = NetRecord {
-        netns: netns.to_owned(),
-        veths: veths.to_vec(),
+        netns: plan.netns.clone(),
+        veths: plan.veths(),
+        ovs: plan.ovs_links(),
     };
     let text = serde_json::to_vec_pretty(&rec)
         .map_err(|err| ApiError::internal(format!("youki runtime: encoding net record: {err}")))?;
@@ -441,20 +575,109 @@ fn write_record(bundle: &Path, netns: &str, veths: &[String]) -> ApiResult<()> {
     })
 }
 
-async fn apply(privilege: &IpPrivilege, cmds: &[Vec<String>]) -> ApiResult<()> {
-    for cmd in cmds {
-        let result = run_ip(privilege, cmd).await;
-        if is_delete(cmd) {
-            if let Err(err) = result {
-                if !already_gone(&err.message) {
+async fn apply(privilege: &IpPrivilege, plan: &Plan) -> ApiResult<()> {
+    for step in steps(plan) {
+        match step {
+            Step::Ip(cmd) => {
+                let result = run_ip(privilege, &cmd).await;
+                if is_delete(&cmd) {
+                    if let Err(err) = result {
+                        if !already_gone(&err.message) {
+                            return Err(err);
+                        }
+                    }
+                } else if let Err(err) = result {
                     return Err(err);
                 }
             }
-        } else if let Err(err) = result {
-            return Err(err);
+            Step::Plug {
+                bridge,
+                ifname,
+                iface_id,
+                mac,
+            } => {
+                let argv = ovs_argv(privilege, true, &bridge, &ifname, Some((&iface_id, &mac)))?;
+                run_argv(&argv).await?;
+            }
+            Step::Unplug { bridge, ifname } => {
+                run_unplug(privilege, &bridge, &ifname).await?;
+            }
         }
     }
     Ok(())
+}
+
+/// `plug` builds add-port. Otherwise del-port. `extra` is `(iface_id, mac)`.
+fn ovs_argv(
+    privilege: &IpPrivilege,
+    plug: bool,
+    bridge: &str,
+    ifname: &str,
+    extra: Option<(&str, &str)>,
+) -> ApiResult<Vec<String>> {
+    let bin = ovsplug::ovs_vsctl_bin()
+        .map_err(|err| ApiError::unavailable(format!("youki runtime: {}", err.message)))?;
+    let bin = bin
+        .to_str()
+        .ok_or_else(|| ApiError::unavailable("youki runtime: ovs-vsctl path is not utf-8"))?;
+    let sudo = match privilege {
+        IpPrivilege::Sudo(path) => Some(
+            path.to_str()
+                .ok_or_else(|| ApiError::unavailable("youki runtime: sudo path is not utf-8"))?,
+        ),
+        IpPrivilege::Direct | IpPrivilege::Rootless => None,
+    };
+    Ok(if plug {
+        let (iface_id, mac) = extra.unwrap_or(("", ""));
+        ovsplug::plug_argv(sudo, bin, bridge, ifname, iface_id, mac)
+    } else {
+        ovsplug::unplug_argv(sudo, bin, bridge, ifname)
+    })
+}
+
+async fn run_unplug(privilege: &IpPrivilege, bridge: &str, ifname: &str) -> ApiResult<()> {
+    let argv = ovs_argv(privilege, false, bridge, ifname, None)?;
+    match run_argv(&argv).await {
+        Ok(()) => Ok(()),
+        Err(err) if ovsplug::already_gone(&err.message) || already_gone(&err.message) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn run_argv(argv: &[String]) -> ApiResult<()> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(ApiError::unavailable(
+            "youki runtime: ovs-vsctl arguments are empty",
+        ));
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ovs-vsctl");
+    match tokio::time::timeout(TOOL_WAIT, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = trim_msg(err.trim());
+            Err(ApiError::unavailable(if msg.is_empty() {
+                format!("youki runtime: {name} failed")
+            } else {
+                format!("youki runtime: {name} failed: {msg}")
+            }))
+        }
+        Ok(Err(err)) => Err(ApiError::unavailable(format!(
+            "youki runtime: cannot run {name}: {err}"
+        ))),
+        Err(_) => Err(ApiError::unavailable(format!(
+            "youki runtime: {name} timed out"
+        ))),
+    }
 }
 
 fn is_delete(cmd: &[String]) -> bool {
@@ -612,6 +835,7 @@ mod tests {
             gateway: gateway.into(),
             routed: !gateway.is_empty(),
             segment_id: segment,
+            binding: None,
         }
     }
 
@@ -840,5 +1064,314 @@ mod tests {
 
     fn owned(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    const IFACE: &str = "port-018f3a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5b";
+
+    fn ovs_nic() -> NicAttachment {
+        use pistack_rpc::proto::NicBinding;
+        use std::collections::BTreeMap;
+        let mut nic = nic("10.90.0.10", "52:54:00:aa:bb:cc", "10.90.0.1", None);
+        let mut details = BTreeMap::new();
+        details.insert("bridge".into(), "br-int".into());
+        details.insert("iface_id".into(), IFACE.into());
+        nic.binding = Some(NicBinding {
+            vif_type: "ovs".into(),
+            vif_details: details,
+        });
+        nic
+    }
+
+    struct EnvRestore {
+        ip: Option<std::ffi::OsString>,
+        ovs: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            let prev = Self {
+                ip: std::env::var_os(IP_BIN_ENV),
+                ovs: std::env::var_os(ovsplug::OVS_VSCTL_BIN_ENV),
+            };
+            std::env::remove_var(IP_BIN_ENV);
+            std::env::remove_var(ovsplug::OVS_VSCTL_BIN_ENV);
+            prev
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            restore(IP_BIN_ENV, self.ip.take());
+            restore(ovsplug::OVS_VSCTL_BIN_ENV, self.ovs.take());
+        }
+    }
+
+    fn restore(key: &str, prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn write_script(path: &Path, log: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
+        let text = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {quoted}\n{body}\n");
+        std::fs::write(path, text).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn positions(log: &str, seq: &[&str]) -> Vec<usize> {
+        let lines: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
+        lines
+            .windows(seq.len())
+            .enumerate()
+            .filter(|(_, window)| *window == seq)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pistack-podnet-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn an_ovs_port_is_plugged_and_unplugged_before_the_link_is_deleted() {
+        let _guard = crate::runtime::youki::youki_env_lock().lock().await;
+        let _env = EnvRestore::capture();
+        let tmp = temp_dir("ovs");
+        let log = tmp.join("tools.log");
+        let ip = tmp.join("ip");
+        let ovs = tmp.join("ovs-vsctl");
+        write_script(&ip, &log, "exit 0");
+        write_script(
+            &ovs,
+            &log,
+            "if [ \"$1\" = \"--if-exists\" ]; then\n  echo \"ovs-vsctl: no port named $4\" >&2\n  exit 1\nfi\nexit 0",
+        );
+        std::env::set_var(IP_BIN_ENV, &ip);
+        std::env::set_var(ovsplug::OVS_VSCTL_BIN_ENV, &ovs);
+
+        let plug = [
+            "--may-exist",
+            "add-port",
+            "br-int",
+            "vh525400aabbcc",
+            "--",
+            "set",
+            "Interface",
+            "vh525400aabbcc",
+            &format!("external_ids:iface-id={IFACE}"),
+            "external_ids:attached-mac=52:54:00:aa:bb:cc",
+            "external_ids:iface-status=active",
+        ];
+        let unplug = ["--if-exists", "del-port", "br-int", "vh525400aabbcc"];
+        let link_del = ["link", "del", "vh525400aabbcc"];
+
+        let bundle = tmp.join("bundle");
+        let req = request(vec![ovs_nic()]);
+        let got = prepare(&req, &IpPrivilege::Direct, &bundle).await.unwrap();
+        let PodNetwork::Linked(link) = got else {
+            panic!("expected a linked pod");
+        };
+        assert_eq!(link.ovs[0].bridge, "br-int");
+        assert_eq!(link.ovs[0].ifname, "vh525400aabbcc");
+        let recorded = read_record(&bundle).unwrap();
+        assert_eq!(recorded.ovs, link.ovs);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(positions(&text, &plug).len() == 1, "{text}");
+        assert!(!text.contains("master"), "{text}");
+        let unplugs = positions(&text, &unplug);
+        let dels = positions(&text, &link_del);
+        let plugged = positions(&text, &plug)[0];
+        assert!(!unplugs.is_empty() && !dels.is_empty(), "{text}");
+        assert!(unplugs[0] < dels[0] && dels[0] < plugged, "{text}");
+
+        release(&IpPrivilege::Direct, &link.netns, &link.veths, &link.ovs)
+            .await
+            .unwrap();
+        let after = std::fs::read_to_string(&log).unwrap();
+        let last_unplug = positions(&after, &unplug).pop().unwrap();
+        let last_del = positions(&after, &link_del).pop().unwrap();
+        assert!(last_unplug > plugged && last_unplug < last_del, "{after}");
+
+        // Sudo mode runs the same plug through `sudo -n`.
+        let sudo_log = tmp.join("sudo.log");
+        let sudo = tmp.join("sudo");
+        write_script(
+            &sudo,
+            &sudo_log,
+            "if [ \"$1\" = \"-n\" ]; then\n  shift\nfi\nexec \"$@\"",
+        );
+        let sudo_bundle = tmp.join("sudo-bundle");
+        let got = prepare(&req, &IpPrivilege::Sudo(sudo.clone()), &sudo_bundle)
+            .await
+            .unwrap();
+        let PodNetwork::Linked(link) = got else {
+            panic!("expected a linked pod");
+        };
+        let sudo_text = std::fs::read_to_string(&sudo_log).unwrap();
+        let mut sudo_plug = vec!["-n", ovs.to_str().unwrap()];
+        sudo_plug.extend_from_slice(&plug);
+        assert!(positions(&sudo_text, &sudo_plug).len() == 1, "{sudo_text}");
+        assert!(!sudo_text.contains("master"), "{sudo_text}");
+        release(
+            &IpPrivilege::Sudo(sudo),
+            &link.netns,
+            &link.veths,
+            &link.ovs,
+        )
+        .await
+        .unwrap();
+        let sudo_after = std::fs::read_to_string(&sudo_log).unwrap();
+        let mut sudo_unplug = vec!["-n", ovs.to_str().unwrap()];
+        sudo_unplug.extend_from_slice(&unplug);
+        let sudo_unplugs = positions(&sudo_after, &sudo_unplug);
+        let sudo_dels = positions(
+            &sudo_after,
+            &["-n", ip.to_str().unwrap(), "link", "del", "vh525400aabbcc"],
+        );
+        assert!(
+            !sudo_unplugs.is_empty() && !sudo_dels.is_empty(),
+            "{sudo_after}"
+        );
+        assert!(sudo_unplugs[0] < sudo_dels[0], "{sudo_after}");
+        let last_sudo_unplug = *sudo_unplugs.last().unwrap();
+        let last_sudo_del = *sudo_dels.last().unwrap();
+        assert!(last_sudo_unplug < last_sudo_del, "{sudo_after}");
+
+        // A Linux bridge port never calls ovs-vsctl.
+        let stamp = tmp.join("ovs-touched");
+        let linux_ovs = tmp.join("ovs-stamp");
+        write_script(
+            &linux_ovs,
+            &tmp.join("stamp.log"),
+            &format!(
+                "touch '{}'\nexit 1",
+                stamp.display().to_string().replace('\'', "'\\''")
+            ),
+        );
+        std::env::set_var(ovsplug::OVS_VSCTL_BIN_ENV, &linux_ovs);
+        let linux_log = tmp.join("linux.log");
+        let linux_ip = tmp.join("linux-ip");
+        write_script(&linux_ip, &linux_log, "exit 0");
+        std::env::set_var(IP_BIN_ENV, &linux_ip);
+        let linux_bundle = tmp.join("linux-bundle");
+        let linux = request(vec![nic(
+            "10.90.0.10",
+            "52:54:00:aa:bb:cc",
+            "10.90.0.1",
+            None,
+        )]);
+        let got = prepare(&linux, &IpPrivilege::Direct, &linux_bundle)
+            .await
+            .unwrap();
+        let PodNetwork::Linked(link) = got else {
+            panic!("expected a linux bridge link");
+        };
+        assert!(link.ovs.is_empty());
+        assert!(!stamp.exists(), "a linux bridge must not run ovs-vsctl");
+        let linux_text = std::fs::read_to_string(&linux_log).unwrap();
+        assert!(
+            positions(
+                &linux_text,
+                &["link", "set", "vh525400aabbcc", "master", "pi01a102de3f33"],
+            )
+            .len()
+                == 1,
+            "{linux_text}"
+        );
+        release(&IpPrivilege::Direct, &link.netns, &link.veths, &link.ovs)
+            .await
+            .unwrap();
+
+        // Rootless still refuses before either binary runs.
+        let rootless_stamp = tmp.join("rootless-stamp");
+        let rootless_ovs = tmp.join("rootless-ovs");
+        write_script(
+            &rootless_ovs,
+            &tmp.join("rootless-ovs.log"),
+            &format!(
+                "touch '{}'\nexit 0",
+                rootless_stamp.display().to_string().replace('\'', "'\\''")
+            ),
+        );
+        let rootless_ip = tmp.join("rootless-ip");
+        write_script(
+            &rootless_ip,
+            &tmp.join("rootless-ip.log"),
+            &format!(
+                "touch '{}'\nexit 0",
+                rootless_stamp.display().to_string().replace('\'', "'\\''")
+            ),
+        );
+        std::env::set_var(IP_BIN_ENV, &rootless_ip);
+        std::env::set_var(ovsplug::OVS_VSCTL_BIN_ENV, &rootless_ovs);
+        let rootless_bundle = tmp.join("rootless-bundle");
+        let got = prepare(&req, &IpPrivilege::Rootless, &rootless_bundle)
+            .await
+            .unwrap();
+        match got {
+            PodNetwork::Refused(message) => {
+                assert!(message.contains("pod has no network"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(read_record(&rootless_bundle).is_none());
+        assert!(
+            !rootless_stamp.exists(),
+            "a rootless agent must not run ip or ovs-vsctl"
+        );
+
+        // A failure after the plug still unplugs before deleting the link.
+        // Both fakes append to one log so del-port and link del stay ordered.
+        std::env::set_var(IP_BIN_ENV, &ip);
+        std::env::set_var(ovsplug::OVS_VSCTL_BIN_ENV, &ovs);
+        let fail_ip = tmp.join("fail-ip");
+        let fail_log = tmp.join("fail.log");
+        write_script(
+            &ovs,
+            &fail_log,
+            "if [ \"$1\" = \"--if-exists\" ]; then\n  echo \"ovs-vsctl: no port named $4\" >&2\n  exit 1\nfi\nexit 0",
+        );
+        write_script(
+            &fail_ip,
+            &fail_log,
+            "if [ \"$1\" = \"-n\" ] && [ \"$3\" = \"addr\" ]; then\n  echo \"cannot add address\" >&2\n  exit 1\nfi\nexit 0",
+        );
+        // Direct mode has no leading -n. The guest address command starts with -n.
+        std::env::set_var(IP_BIN_ENV, &fail_ip);
+        let fail_bundle = tmp.join("fail-bundle");
+        let err = prepare(&req, &IpPrivilege::Direct, &fail_bundle)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("cannot add address"), "{err}");
+        let failed = std::fs::read_to_string(&fail_log).unwrap();
+        let plugged = positions(&failed, &plug);
+        let unplugs = positions(&failed, &unplug);
+        let dels = positions(&failed, &link_del);
+        assert_eq!(plugged.len(), 1, "{failed}");
+        assert!(unplugs.len() >= 2, "{failed}");
+        assert!(dels.len() >= 2, "{failed}");
+        assert!(unplugs[0] < dels[0], "{failed}");
+        let cleanup = unplugs
+            .into_iter()
+            .find(|index| *index > plugged[0])
+            .unwrap();
+        let cleanup_del = dels.into_iter().find(|index| *index > plugged[0]).unwrap();
+        assert!(cleanup < cleanup_del, "{failed}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

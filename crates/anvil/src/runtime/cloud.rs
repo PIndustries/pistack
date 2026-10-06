@@ -11,13 +11,19 @@
 //! `user_data` and ssh keys are not logged and are not placed on the argv.
 //! The process is recorded only after it is still running.
 //!
-//! Each port is a tap on the bridge libvirt would use: the `po` overlay
-//! bridge when `segment_id` is set, otherwise the host NAT bridge. The guest
-//! is started with `--net tap=<tap>,mac=<mac>`. Taps are removed on stop and
-//! delete. Hot plug and unplug call `ch-remote add-net` and `remove-device`
-//! when that binary is available. `$PISTACK_IP_BIN` and `$PISTACK_CH_REMOTE`
-//! override those helpers. This runtime does not create bridges.
+//! Each port is a tap. On a Linux bridge the tap is
+//! `ip link set <tap> master <bridge>`: the `po` overlay bridge when
+//! `segment_id` is set, otherwise the host NAT bridge. When the port binding
+//! `vif_type` is `ovs`, the tap is added with `ovs-vsctl` to the bridge named
+//! in the binding, and stop, delete, and a failed create run
+//! `ovs-vsctl --if-exists del-port` before the tap is deleted. The guest is
+//! started with `--net tap=<tap>,mac=<mac>`. Hot plug and unplug call
+//! `ch-remote add-net` and `remove-device` when that binary is available.
+//! `$PISTACK_IP_BIN`, `$PISTACK_OVS_VSCTL_BIN`, and `$PISTACK_CH_REMOTE`
+//! override those helpers. This runtime does not create bridges. Virtual
+//! machines run `ovs-vsctl` directly.
 
+use super::ovsplug;
 use super::{MachineRequest, MachineRuntime, NicAttachment, PowerState, RunningMachine};
 use async_trait::async_trait;
 use pistack_rpc::proto::PortPlug;
@@ -63,6 +69,17 @@ struct SavedNet {
     tap: String,
     bridge: String,
     id: String,
+    /// The tap was added to an OVS bridge. Older state omits this and stays
+    /// on the Linux bridge.
+    #[serde(default, skip_serializing_if = "is_false")]
+    ovs: bool,
+    /// `iface-id` from the binding. Empty on a Linux bridge.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    iface_id: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 struct PortTap {
@@ -70,6 +87,8 @@ struct PortTap {
     tap: String,
     bridge: String,
     id: String,
+    ovs: bool,
+    iface_id: String,
 }
 
 #[async_trait]
@@ -497,7 +516,11 @@ pub async fn plug_port(req: &PortPlug) -> ApiResult<()> {
         .iter()
         .find(|n| n.mac.eq_ignore_ascii_case(&port.mac))
     {
-        if existing.bridge == port.bridge && existing.tap == port.tap {
+        if existing.bridge == port.bridge
+            && existing.tap == port.tap
+            && existing.ovs == port.ovs
+            && existing.iface_id == port.iface_id
+        {
             return Ok(());
         }
     }
@@ -510,13 +533,13 @@ pub async fn plug_port(req: &PortPlug) -> ApiResult<()> {
         .cloned()
     {
         remove_net_device(&remote, &socket, &existing).await?;
-        let _ = delete_tap(&existing.tap).await;
+        let _ = delete_tap(&existing.tap, &existing.bridge, existing.ovs).await;
         saved
             .nets
             .retain(|n| !n.mac.eq_ignore_ascii_case(&port.mac));
         write_state(&dir, &saved).await?;
     }
-    create_tap(&port.tap, &port.bridge).await?;
+    create_tap(port).await?;
     let spec = net_arg(&port.tap, &port.mac, &port.id);
     match add_net(&remote, &socket, &spec).await {
         Ok(stdout) => {
@@ -526,7 +549,7 @@ pub async fn plug_port(req: &PortPlug) -> ApiResult<()> {
             write_state(&dir, &saved).await
         }
         Err(e) => {
-            let _ = delete_tap(&port.tap).await;
+            let _ = delete_tap(&port.tap, &port.bridge, port.ovs).await;
             Err(e)
         }
     }
@@ -564,7 +587,7 @@ pub async fn unplug_port(req: &PortPlug) -> ApiResult<()> {
         let remote = resolve_ch_remote()?;
         remove_net_device(&remote, &socket, &net).await?;
     }
-    delete_tap(&net.tap).await?;
+    delete_tap(&net.tap, &net.bridge, net.ovs).await?;
     saved.nets.remove(idx);
     write_state(&dir, &saved).await
 }
@@ -593,12 +616,18 @@ fn require_socket(saved: &Saved) -> ApiResult<PathBuf> {
 fn plan_ports(nics: &[NicAttachment]) -> ApiResult<Vec<PortTap>> {
     let mut out: Vec<PortTap> = Vec::with_capacity(nics.len());
     for nic in nics {
-        let bridge = crate::runtime::libvirt::port_bridge(nic)?;
-        if !bridge_name_ok(&bridge) {
-            return Err(ApiError::bad_request(
-                "cloud-hypervisor runtime: port bridge is not allowed",
-            ));
-        }
+        let plug = ovsplug::host_plug(nic)?;
+        let (bridge, ovs, iface_id) = match plug {
+            ovsplug::HostPlug::LinuxBridge { bridge } => {
+                if !bridge_name_ok(&bridge) {
+                    return Err(ApiError::bad_request(
+                        "cloud-hypervisor runtime: port bridge is not allowed",
+                    ));
+                }
+                (bridge, false, String::new())
+            }
+            ovsplug::HostPlug::Ovs { bridge, iface_id } => (bridge, true, iface_id),
+        };
         let tap = tap_name(&nic.mac)?;
         if out.iter().any(|port| port.tap == tap) {
             return Err(ApiError::bad_request(
@@ -610,6 +639,8 @@ fn plan_ports(nics: &[NicAttachment]) -> ApiResult<Vec<PortTap>> {
             tap,
             bridge,
             id: device_id_for(&nic.mac)?,
+            ovs,
+            iface_id,
         });
     }
     Ok(out)
@@ -733,7 +764,7 @@ fn resolve_ch_remote() -> ApiResult<PathBuf> {
 
 async fn create_ports(ports: &[PortTap]) -> ApiResult<()> {
     for (i, port) in ports.iter().enumerate() {
-        if let Err(e) = create_tap(&port.tap, &port.bridge).await {
+        if let Err(e) = create_tap(port).await {
             release_taps(&ports[..i]).await;
             return Err(e);
         }
@@ -741,26 +772,47 @@ async fn create_ports(ports: &[PortTap]) -> ApiResult<()> {
     Ok(())
 }
 
-async fn create_tap(tap: &str, bridge: &str) -> ApiResult<()> {
-    if !tap_name_ok(tap) || !bridge_name_ok(bridge) {
+async fn create_tap(port: &PortTap) -> ApiResult<()> {
+    if !tap_name_ok(&port.tap) {
+        return Err(ApiError::unavailable(
+            "cloud-hypervisor runtime: tap bridge is not allowed",
+        ));
+    }
+    if port.ovs {
+        if !ovsplug::bridge_ok(&port.bridge) || !ovsplug::iface_id_ok(&port.iface_id) {
+            return Err(ApiError::unavailable(
+                "cloud-hypervisor runtime: tap bridge is not allowed",
+            ));
+        }
+    } else if !bridge_name_ok(&port.bridge) {
         return Err(ApiError::unavailable(
             "cloud-hypervisor runtime: tap bridge is not allowed",
         ));
     }
     let bin = ip_bin()?;
     // A crash can leave this port's tap behind. It is ours to replace.
-    match run_tool(&bin, &["link", "del", tap]).await {
+    // Take an OVS port off the bridge before deleting the link.
+    if port.ovs {
+        unplug_ovs(&port.bridge, &port.tap).await?;
+    }
+    match run_tool(&bin, &["link", "del", &port.tap]).await {
         Ok(_) => {}
         Err(e) if tap_missing(&e.message) => {}
         Err(e) => return Err(e),
     }
-    run_tool(&bin, &["tuntap", "add", "mode", "tap", "name", tap]).await?;
-    if let Err(e) = run_tool(&bin, &["link", "set", tap, "master", bridge]).await {
-        let _ = delete_tap(tap).await;
+    run_tool(&bin, &["tuntap", "add", "mode", "tap", "name", &port.tap]).await?;
+    if port.ovs {
+        if let Err(e) = plug_ovs(&port.bridge, &port.tap, &port.iface_id, &port.mac).await {
+            let _ = delete_tap(&port.tap, &port.bridge, true).await;
+            return Err(e);
+        }
+    } else if let Err(e) = run_tool(&bin, &["link", "set", &port.tap, "master", &port.bridge]).await
+    {
+        let _ = delete_tap(&port.tap, &port.bridge, false).await;
         return Err(e);
     }
-    if let Err(e) = run_tool(&bin, &["link", "set", tap, "up"]).await {
-        let _ = delete_tap(tap).await;
+    if let Err(e) = run_tool(&bin, &["link", "set", &port.tap, "up"]).await {
+        let _ = delete_tap(&port.tap, &port.bridge, port.ovs).await;
         return Err(e);
     }
     Ok(())
@@ -768,7 +820,7 @@ async fn create_tap(tap: &str, bridge: &str) -> ApiResult<()> {
 
 async fn release_taps(ports: &[PortTap]) {
     for port in ports {
-        let _ = delete_tap(&port.tap).await;
+        let _ = delete_tap(&port.tap, &port.bridge, port.ovs).await;
     }
 }
 
@@ -776,7 +828,7 @@ async fn delete_taps(nets: &[SavedNet]) -> (Vec<SavedNet>, Option<ApiError>) {
     let mut left = Vec::new();
     let mut err = None;
     for net in nets {
-        match delete_tap(&net.tap).await {
+        match delete_tap(&net.tap, &net.bridge, net.ovs).await {
             Ok(()) => {}
             Err(e) => {
                 if err.is_none() {
@@ -789,16 +841,70 @@ async fn delete_taps(nets: &[SavedNet]) -> (Vec<SavedNet>, Option<ApiError>) {
     (left, err)
 }
 
-async fn delete_tap(name: &str) -> ApiResult<()> {
-    if !tap_name_ok(name) {
+/// Remove the tap. An OVS port is unplugged first. A hard `del-port` failure
+/// leaves the link so the next stop can unplug it.
+async fn delete_tap(tap: &str, bridge: &str, ovs: bool) -> ApiResult<()> {
+    if !tap_name_ok(tap) {
         return Ok(());
     }
+    if ovs {
+        unplug_ovs(bridge, tap).await?;
+    }
     let bin = ip_bin()?;
-    match run_tool(&bin, &["link", "del", name]).await {
+    match run_tool(&bin, &["link", "del", tap]).await {
         Ok(_) => Ok(()),
         Err(e) if tap_missing(&e.message) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+async fn plug_ovs(bridge: &str, tap: &str, iface_id: &str, mac: &str) -> ApiResult<()> {
+    let argv = ovs_command(true, bridge, tap, Some((iface_id, mac)))?;
+    run_argv(&argv).await.map(|_| ())
+}
+
+async fn unplug_ovs(bridge: &str, tap: &str) -> ApiResult<()> {
+    if !ovsplug::bridge_ok(bridge) || !tap_name_ok(tap) {
+        return Err(ApiError::unavailable(
+            "cloud-hypervisor runtime: ovs port is not allowed",
+        ));
+    }
+    let argv = ovs_command(false, bridge, tap, None)?;
+    match run_argv(&argv).await {
+        Ok(_) => Ok(()),
+        Err(e) if ovsplug::already_gone(&e.message) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn ovs_command(
+    plug: bool,
+    bridge: &str,
+    tap: &str,
+    extra: Option<(&str, &str)>,
+) -> ApiResult<Vec<String>> {
+    let bin = ovsplug::ovs_vsctl_bin().map_err(|err| {
+        ApiError::unavailable(format!("cloud-hypervisor runtime: {}", err.message))
+    })?;
+    let bin = bin.to_str().ok_or_else(|| {
+        ApiError::unavailable("cloud-hypervisor runtime: ovs-vsctl path is not utf-8")
+    })?;
+    Ok(if plug {
+        let (iface_id, mac) = extra.unwrap_or(("", ""));
+        ovsplug::plug_argv(None, bin, bridge, tap, iface_id, mac)
+    } else {
+        ovsplug::unplug_argv(None, bin, bridge, tap)
+    })
+}
+
+async fn run_argv(argv: &[String]) -> ApiResult<String> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(ApiError::unavailable(
+            "cloud-hypervisor runtime: ovs-vsctl arguments are empty",
+        ));
+    };
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_tool(Path::new(program), &refs).await
 }
 
 fn tap_missing(msg: &str) -> bool {
@@ -867,6 +973,8 @@ impl From<&PortTap> for SavedNet {
             tap: port.tap.clone(),
             bridge: port.bridge.clone(),
             id: port.id.clone(),
+            ovs: port.ovs,
+            iface_id: port.iface_id.clone(),
         }
     }
 }
@@ -1056,11 +1164,12 @@ mod tests {
     use pistack_rpc::proto::PortPlug;
     use pistack_types::{error::ErrorCode, Resources};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::OnceLock;
 
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        // Same lock as youki: both tests swap `PISTACK_IP_BIN` and
+        // `PISTACK_OVS_VSCTL_BIN`. Sharing it keeps a fake binary in place
+        // for the whole test, so the suite never falls through to a host tool.
+        crate::runtime::youki::youki_env_lock()
     }
 
     struct EnvGuard {
@@ -1070,6 +1179,7 @@ mod tests {
         node: Option<std::ffi::OsString>,
         ip: Option<std::ffi::OsString>,
         remote: Option<std::ffi::OsString>,
+        ovs: Option<std::ffi::OsString>,
     }
 
     impl EnvGuard {
@@ -1081,12 +1191,14 @@ mod tests {
                 node: std::env::var_os("PISTACK_NODE_NAME"),
                 ip: std::env::var_os("PISTACK_IP_BIN"),
                 remote: std::env::var_os("PISTACK_CH_REMOTE"),
+                ovs: std::env::var_os(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV),
             };
             std::env::set_var("PISTACK_CLOUD_HYPERVISOR_BIN", bin);
             std::env::set_var("PISTACK_CLOUD_STATE", state);
             std::env::remove_var("PISTACK_CLOUD_KERNEL");
             std::env::remove_var("PISTACK_IP_BIN");
             std::env::remove_var("PISTACK_CH_REMOTE");
+            std::env::remove_var(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV);
             prev
         }
     }
@@ -1099,6 +1211,7 @@ mod tests {
             restore("PISTACK_NODE_NAME", self.node.take());
             restore("PISTACK_IP_BIN", self.ip.take());
             restore("PISTACK_CH_REMOTE", self.remote.take());
+            restore(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV, self.ovs.take());
         }
     }
 
@@ -1169,6 +1282,7 @@ mod tests {
                 gateway: "10.9.0.1".into(),
                 routed: true,
                 segment_id: None,
+                binding: None,
             }],
             volumes: vec![],
             user_data: Some("do-not-log-user-data".into()),
@@ -1204,6 +1318,7 @@ mod tests {
             gateway: "10.90.0.1".into(),
             routed: true,
             segment_id: segment,
+            binding: None,
         }
     }
 
@@ -1682,5 +1797,196 @@ exec sleep 30"#
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert_eq!(std::fs::read_to_string(&log).unwrap(), ch_before);
         assert_eq!(std::fs::read_to_string(&ip_log).unwrap(), ip_before);
+    }
+
+    const IFACE: &str = "port-018f3a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5b";
+
+    fn ovs_nic() -> NicAttachment {
+        use std::collections::BTreeMap;
+        let mut nic = nic("10.90.0.10", "52:54:00:aa:bb:cc", None);
+        let mut details = BTreeMap::new();
+        details.insert("bridge".into(), "br-int".into());
+        details.insert("iface_id".into(), IFACE.into());
+        nic.binding = Some(crate::runtime::NicBinding {
+            vif_type: "ovs".into(),
+            vif_details: details,
+        });
+        nic
+    }
+
+    fn first_pos(log: &str, seq: &[&str]) -> Option<usize> {
+        positions(log, seq).into_iter().next()
+    }
+
+    fn positions(log: &str, seq: &[&str]) -> Vec<usize> {
+        let lines: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+        lines
+            .windows(seq.len())
+            .enumerate()
+            .filter(|(_, window)| *window == seq)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn old_net_state_without_ovs_stays_on_the_linux_bridge() {
+        let text = r#"{"mac":"52:54:00:aa:bb:cc","tap":"ct525400aabbcc","bridge":"pi01a102de3f33","id":"n525400aabbcc"}"#;
+        let net: SavedNet = serde_json::from_str(text).unwrap();
+        assert!(!net.ovs);
+        assert!(net.iface_id.is_empty());
+        let again = serde_json::to_string(&net).unwrap();
+        assert!(!again.contains("ovs"), "{again}");
+        assert!(!again.contains("iface_id"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn an_ovs_binding_plugs_the_tap_and_unplug_precedes_link_delete() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-cloud-ovs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state = tmp.join("state");
+        let _dir = DirGuard {
+            dir: tmp.clone(),
+            state: state.clone(),
+        };
+        let log = tmp.join("ch.log");
+        let bin = tmp.join("cloud-hypervisor");
+        write_script(&bin, &log, touch_socket_body());
+        let tool_log = tmp.join("tools.log");
+        let ip = tmp.join("ip");
+        write_script(&ip, &tool_log, "exit 0");
+        let ovs = tmp.join("ovs-vsctl");
+        // A missing port is success. Anything else must succeed so the tap
+        // can be deleted afterwards.
+        write_script(
+            &ovs,
+            &tool_log,
+            "if [ \"$1\" = \"--if-exists\" ]; then\n  echo \"ovs-vsctl: no port named $4\" >&2\n  exit 1\nfi\nexit 0",
+        );
+        let remote_log = tmp.join("remote.log");
+        let remote = tmp.join("ch-remote");
+        write_script(&remote, &remote_log, "exit 0");
+        let _env = EnvGuard::set(&bin, &state);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+        std::env::set_var(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV, &ovs);
+        std::env::set_var("PISTACK_CH_REMOTE", &remote);
+
+        let disk = tmp.join("disk.raw");
+        std::fs::write(&disk, b"not-empty").unwrap();
+        let rt = CloudRuntime;
+        let mut request = req("ovs", disk.to_str().unwrap());
+        request.nics = vec![ovs_nic()];
+        rt.start(&request).await.unwrap();
+
+        let text = std::fs::read_to_string(&tool_log).unwrap();
+        let plug = [
+            "--may-exist",
+            "add-port",
+            "br-int",
+            "ct525400aabbcc",
+            "--",
+            "set",
+            "Interface",
+            "ct525400aabbcc",
+            &format!("external_ids:iface-id={IFACE}"),
+            "external_ids:attached-mac=52:54:00:aa:bb:cc",
+            "external_ids:iface-status=active",
+        ];
+        let unplug = ["--if-exists", "del-port", "br-int", "ct525400aabbcc"];
+        let link_del = ["link", "del", "ct525400aabbcc"];
+        assert!(has_seq(&text, &plug), "{text}");
+        assert!(!text.contains("master"), "{text}");
+        let cleanup = first_pos(&text, &unplug).unwrap();
+        let deleted = first_pos(&text, &link_del).unwrap();
+        let added = first_pos(
+            &text,
+            &["tuntap", "add", "mode", "tap", "name", "ct525400aabbcc"],
+        )
+        .unwrap();
+        let plugged = first_pos(&text, &plug).unwrap();
+        let up = first_pos(&text, &["link", "set", "ct525400aabbcc", "up"]).unwrap();
+        assert!(
+            cleanup < deleted && deleted < added && added < plugged && plugged < up,
+            "{text}"
+        );
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join(request.id.to_string()).join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["nets"][0]["ovs"], true);
+        assert_eq!(saved["nets"][0]["bridge"], "br-int");
+        assert_eq!(saved["nets"][0]["iface_id"], IFACE);
+
+        let before = count_seq(&text, &plug);
+        let project = PortPlug {
+            machine: request.id.clone(),
+            nic: ovs_nic(),
+        };
+        plug_port(&project).await.unwrap();
+        let again = std::fs::read_to_string(&tool_log).unwrap();
+        assert_eq!(count_seq(&again, &plug), before, "{again}");
+        let remote_text = std::fs::read_to_string(&remote_log).unwrap_or_default();
+        assert_eq!(remote_text, "");
+
+        unplug_port(&project).await.unwrap();
+        let after = std::fs::read_to_string(&tool_log).unwrap();
+        let last_unplug = positions(&after, &unplug).pop().unwrap();
+        let last_del = positions(&after, &link_del).pop().unwrap();
+        assert!(last_unplug > plugged && last_unplug < last_del, "{after}");
+        let remote_text = std::fs::read_to_string(&remote_log).unwrap();
+        assert!(remote_text.contains("remove-device"), "{remote_text}");
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join(request.id.to_string()).join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved["nets"].as_array().unwrap().is_empty());
+
+        rt.delete(&request.id).await.unwrap();
+
+        let fail = tmp.join("cloud-fail");
+        let fail_log = tmp.join("fail.log");
+        write_script(&fail, &fail_log, "echo exploded >&2\nexit 1");
+        std::env::set_var("PISTACK_CLOUD_HYPERVISOR_BIN", &fail);
+        let before_fail = std::fs::read_to_string(&tool_log).unwrap();
+        let bad = req("bad-ovs", disk.to_str().unwrap());
+        let mut bad = bad;
+        bad.nics = vec![ovs_nic()];
+        let err = rt.start(&bad).await.unwrap_err();
+        assert!(err.message.contains("exploded"), "{err}");
+        assert!(!state.join(bad.id.to_string()).join("state.json").exists());
+        let failed = std::fs::read_to_string(&tool_log).unwrap();
+        let fresh = &failed[before_fail.len()..];
+        assert_eq!(count_seq(fresh, &unplug), 2, "{fresh}");
+        assert_eq!(count_seq(fresh, &link_del), 2, "{fresh}");
+        let unplugs = positions(fresh, &unplug);
+        let dels = positions(fresh, &link_del);
+        assert_eq!(unplugs.len(), 2, "{fresh}");
+        assert_eq!(dels.len(), 2, "{fresh}");
+        assert!(unplugs[0] < dels[0] && unplugs[1] < dels[1], "{fresh}");
+
+        // A hard del-port failure must not delete the tap.
+        let blocked = tmp.join("ovs-blocked");
+        write_script(
+            &blocked,
+            &tmp.join("blocked.log"),
+            "echo \"database connection failed\" >&2\nexit 1",
+        );
+        std::env::set_var(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV, &blocked);
+        std::env::set_var("PISTACK_CLOUD_HYPERVISOR_BIN", &bin);
+        let ip_before = std::fs::read_to_string(&tool_log).unwrap();
+        let held = req("held", disk.to_str().unwrap());
+        let mut held = held;
+        held.nics = vec![ovs_nic()];
+        let err = rt.start(&held).await.unwrap_err();
+        assert!(err.message.contains("database connection failed"), "{err}");
+        let ip_after = std::fs::read_to_string(&tool_log).unwrap();
+        assert_eq!(ip_after, ip_before, "{ip_after}");
     }
 }
