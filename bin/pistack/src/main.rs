@@ -119,6 +119,9 @@ enum StoreCmd {
         #[arg(long)]
         to: PathBuf,
     },
+    /// Rows and bytes per table, and how much of the store is replication log.
+    /// Stop the server first: the store file opens once.
+    Stats,
 }
 
 #[tokio::main]
@@ -162,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Store { cmd } => match cmd {
             StoreCmd::Dump => server::dump(cli.data_dir),
             StoreCmd::Backup { to } => server::backup(cli.data_dir, to),
+            StoreCmd::Stats => server::stats(cli.data_dir),
         },
         Cmd::Keep { cmd } => match cmd {
             KeepCmd::Status => keepcmd::status(&cli.data_dir),

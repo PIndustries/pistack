@@ -28,8 +28,9 @@ The first bootable set is `gate`, `core`, `forge`, `loom`, `anvil`, `fabric`,
 `slab`, `mold`, and `bench`. One `pistack server` plus `pistack agent` on
 the hosts is a cloud. That server is a one-voter cluster. Another server
 discovers it on the private prefix, or is pointed at it with `--join`, and
-replicates as a learner. A third server makes all three voters. Further
-servers replicate as learners until an operator promotes them. Writes go to
+replicates as a learner. Every joining server starts as a learner; with
+three members the leader promotes caught-up learners to three voters.
+Further servers replicate as learners. Writes go to
 the leader. This is not a requirement of the first demo, and a host agent
 adds capacity rather than a control-plane vote.
 

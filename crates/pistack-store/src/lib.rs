@@ -111,6 +111,28 @@ pub trait Backend: Send + Sync + 'static {
     fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>>;
     /// Current record flag. `apply_entries` turns recording off, then restores this.
     fn record_log(&self) -> bool;
+    /// Write a consistent copy of the whole store to `dst`. `src` is the
+    /// file this backend was opened from. The default copies the file; the
+    /// redb backend writes a fresh, compact database from one read
+    /// transaction instead, so writers are never blocked and the copy never
+    /// holds a half-written commit.
+    fn snapshot_to(&self, src: &Path, dst: &Path) -> Result<()> {
+        std::fs::copy(src, dst).map_err(|e| StoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+    /// Row counts and value bytes per table, for `pistack store stats`.
+    fn stats(&self) -> Result<Vec<TableStats>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Size of one table, or of the replication log inside `meta`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableStats {
+    pub table: String,
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -151,7 +173,7 @@ fn is_bookkeeping(op: &Op) -> bool {
             || key.starts_with("cluster_log/")
             || matches!(
                 key,
-                "cluster_term" | "cluster_voted_for" | "cluster_leader" | "node_id"
+                "cluster_term" | "cluster_voted_for" | "cluster_leader" | "node_id" | LOG_START_KEY
             ))
 }
 
@@ -172,6 +194,15 @@ fn allowed_when_fenced(op: &Op) -> bool {
 fn log_key(index: u64) -> String {
     format!("cluster_log/{index:020}")
 }
+
+/// First log row this store still keeps. Rows below it were trimmed by
+/// [`Store::compact_log`]; the state they produced is in the tables.
+const LOG_START_KEY: &str = "cluster_log_start";
+
+/// Rows per write transaction when copying a store or trimming its log, so
+/// neither holds one huge transaction in memory.
+const COPY_BATCH_ROWS: usize = 2_000;
+const COPY_BATCH_BYTES: usize = 8 << 20;
 
 fn log_op_from(op: &Op) -> LogOp {
     match op {
@@ -418,25 +449,147 @@ impl Backend for RedbBackend {
         self.applying.store(on, Ordering::Relaxed);
     }
 
+    /// Reads only the rows it returns: a range from `after + 1`, not a scan
+    /// of the whole log.
     fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        let start = log_key(after.saturating_add(1));
         let mut entries = Vec::new();
-        for (_key, raw) in self.scan("meta", "cluster_log/")? {
-            let entry: LogEntry = serde_json::from_slice(&raw)?;
-            if entry.index > after {
-                entries.push(entry);
+        for item in meta.range(start.as_str()..)? {
+            let (key, raw) = item?;
+            if !key.value().starts_with("cluster_log/") {
+                break;
+            }
+            entries.push(serde_json::from_slice::<LogEntry>(raw.value())?);
+            if entries.len() >= limit {
+                break;
             }
         }
-        entries.sort_by_key(|e| e.index);
-        entries.truncate(limit);
         Ok(entries)
     }
 
     fn record_log(&self) -> bool {
         self.record.load(Ordering::Acquire)
     }
+
+    fn snapshot_to(&self, _src: &Path, dst: &Path) -> Result<()> {
+        let read = self.db.begin_read()?;
+        let out = Database::create(dst)?;
+        {
+            let tx = out.begin_write()?;
+            tx.open_table(RESOURCES)?;
+            tx.open_table(NAMES)?;
+            tx.open_table(META)?;
+            tx.commit()?;
+        }
+        for def in [RESOURCES, META] {
+            let table = read.open_table(def)?;
+            let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut bytes = 0usize;
+            for item in table.iter()? {
+                let (key, value) = item?;
+                bytes += key.value().len() + value.value().len();
+                rows.push((key.value().to_owned(), value.value().to_vec()));
+                if rows.len() >= COPY_BATCH_ROWS || bytes >= COPY_BATCH_BYTES {
+                    write_rows(&out, def, &rows)?;
+                    rows.clear();
+                    bytes = 0;
+                }
+            }
+            write_rows(&out, def, &rows)?;
+        }
+        let names = read.open_table(NAMES)?;
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for item in names.iter()? {
+            let (key, value) = item?;
+            rows.push((key.value().to_owned(), value.value().to_owned()));
+            if rows.len() >= COPY_BATCH_ROWS {
+                write_names(&out, &rows)?;
+                rows.clear();
+            }
+        }
+        write_names(&out, &rows)?;
+        Ok(())
+    }
+
+    fn stats(&self) -> Result<Vec<TableStats>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        let mut log = TableStats {
+            table: "meta:cluster_log".into(),
+            ..TableStats::default()
+        };
+        for (name, def) in [("resources", RESOURCES), ("meta", META)] {
+            let mut stats = TableStats {
+                table: name.into(),
+                ..TableStats::default()
+            };
+            for item in tx.open_table(def)?.iter()? {
+                let (key, value) = item?;
+                let (k, v) = (key.value().len() as u64, value.value().len() as u64);
+                stats.rows += 1;
+                stats.key_bytes += k;
+                stats.value_bytes += v;
+                if key.value().starts_with("cluster_log/") {
+                    log.rows += 1;
+                    log.key_bytes += k;
+                    log.value_bytes += v;
+                }
+            }
+            out.push(stats);
+        }
+        let mut names = TableStats {
+            table: "names".into(),
+            ..TableStats::default()
+        };
+        for item in tx.open_table(NAMES)?.iter()? {
+            let (key, value) = item?;
+            names.rows += 1;
+            names.key_bytes += key.value().len() as u64;
+            names.value_bytes += value.value().len() as u64;
+        }
+        out.push(names);
+        out.push(log);
+        Ok(out)
+    }
+}
+
+fn write_rows(
+    db: &Database,
+    def: TableDefinition<&str, &[u8]>,
+    rows: &[(String, Vec<u8>)],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(def)?;
+        for (key, value) in rows {
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn write_names(db: &Database, rows: &[(String, String)]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(NAMES)?;
+        for (key, value) in rows {
+            table.insert(key.as_str(), value.as_str())?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// The store handle modules hold. Clone freely.
@@ -544,6 +697,52 @@ impl Store {
         Ok(self.get_meta::<u64>("cluster_commit")?.unwrap_or(0))
     }
 
+    /// First log row still kept. 1 until [`Self::compact_log`] trims.
+    pub fn log_start(&self) -> Result<u64> {
+        Ok(self.get_meta::<u64>(LOG_START_KEY)?.unwrap_or(1).max(1))
+    }
+
+    /// Trim log rows below `upto`, at most `max_rows` of them, and return how
+    /// many were removed. The commit row is never removed, so votes and
+    /// follower tip checks still see its term. The state those rows produced
+    /// stays in the tables and in every snapshot; a follower that still
+    /// needs a trimmed row is told to rejoin from a snapshot.
+    ///
+    /// Trimming is bookkeeping: it is never logged, and the write fence does
+    /// not refuse it.
+    pub fn compact_log(&self, upto: u64, max_rows: u64) -> Result<u64> {
+        let commit = self.commit_index()?;
+        let upto = upto.min(commit);
+        let start = self.log_start()?;
+        if upto <= start {
+            return Ok(0);
+        }
+        let end = upto.min(start.saturating_add(max_rows));
+        let mut at = start;
+        while at < end {
+            let stop = end.min(at + COPY_BATCH_ROWS as u64);
+            let mut ops: Vec<Op> = (at..stop)
+                .map(|index| Op::Delete {
+                    table: "meta".into(),
+                    key: log_key(index),
+                })
+                .collect();
+            ops.push(Op::Put {
+                table: "meta".into(),
+                key: LOG_START_KEY.into(),
+                value: serde_json::to_vec(&stop)?,
+            });
+            self.backend.batch(ops)?;
+            at = stop;
+        }
+        Ok(end - start)
+    }
+
+    /// Rows and bytes per table, and how much of `meta` is the log.
+    pub fn stats(&self) -> Result<Vec<TableStats>> {
+        self.backend.stats()
+    }
+
     /// Term of the log row at `index`, when this store holds that row.
     pub fn log_term_at(&self, index: u64) -> Result<Option<u64>> {
         if index == 0 {
@@ -594,7 +793,8 @@ impl Store {
         result
     }
 
-    /// Copy `src` while this process holds it open. Does not open `src`.
+    /// Copy the store while this process holds it open. Does not open `src`;
+    /// the backend writes a consistent copy (see [`Backend::snapshot_to`]).
     /// `dst` must not already exist. A copy that will not open is removed.
     pub fn snapshot_file(&self, src: &Path, dst: &Path) -> Result<()> {
         if dst.exists() {
@@ -608,9 +808,9 @@ impl Store {
                 std::fs::create_dir_all(parent).map_err(|e| StoreError::Storage(e.to_string()))?;
             }
         }
-        {
-            let _g = self.write_lock.write();
-            std::fs::copy(src, dst).map_err(|e| StoreError::Storage(e.to_string()))?;
+        if let Err(err) = self.backend.snapshot_to(src, dst) {
+            let _ = std::fs::remove_file(dst);
+            return Err(err);
         }
         let check = match Database::open(dst) {
             Ok(db) => db,
@@ -1169,6 +1369,95 @@ mod tests {
         );
         let err = store.snapshot_file(&src, &dst).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn compaction_trims_below_the_commit_row_and_reads_start_after_it() {
+        let store = Store::in_memory().unwrap();
+        store.set_log_term(2);
+        store.set_record_log(true);
+        for n in 0..100u64 {
+            store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        assert_eq!(store.commit_index().unwrap(), 100);
+        assert_eq!(store.log_start().unwrap(), 1);
+        // Never past the commit row, and at most `max_rows` per pass.
+        assert_eq!(store.compact_log(1_000, 30).unwrap(), 30);
+        assert_eq!(store.log_start().unwrap(), 31);
+        assert_eq!(store.compact_log(1_000, 1_000).unwrap(), 69);
+        assert_eq!(store.log_start().unwrap(), 100);
+        assert_eq!(store.log_term_at(100).unwrap(), Some(2));
+        assert_eq!(store.log_term_at(99).unwrap(), None);
+        assert_eq!(store.compact_log(1_000, 1_000).unwrap(), 0);
+        let rows = store.read_log(0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 100);
+        // Trimming is not a log entry, and the state stays.
+        assert_eq!(store.commit_index().unwrap(), 100);
+        assert_eq!(store.get_meta::<u64>("k0").unwrap(), Some(0));
+        // The fence does not refuse it either.
+        store.put_meta("k100", &100u64).unwrap();
+        store.set_write_fence(true);
+        store.set_record_log(false);
+        assert_eq!(store.compact_log(1_000, 1_000).unwrap(), 1);
+        assert_eq!(store.read_log(0, 10).unwrap()[0].index, 101);
+    }
+
+    #[test]
+    fn read_log_reads_a_range() {
+        let store = Store::in_memory().unwrap();
+        store.set_record_log(true);
+        for n in 0..10u64 {
+            store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        let page = store.read_log(3, 4).unwrap();
+        let indexes: Vec<u64> = page.iter().map(|entry| entry.index).collect();
+        assert_eq!(indexes, vec![4, 5, 6, 7]);
+        assert!(store.read_log(10, 4).unwrap().is_empty());
+        assert!(store.read_log(u64::MAX, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_is_a_fresh_compact_copy_with_every_row_and_stats_count_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("state.redb");
+        let (events, _) = broadcast::channel(8);
+        let store = Store::open(&src, events).unwrap();
+        store.set_record_log(true);
+        let col = store.collection::<Widget>();
+        for n in 0..50 {
+            col.create(widget(&format!("w{n}"), None)).unwrap();
+        }
+        let blob = "y".repeat(4096);
+        for n in 0..500 {
+            store.put_meta(&format!("blob/{n}"), &blob).unwrap();
+        }
+        for n in 0..500 {
+            store.delete_meta(&format!("blob/{n}")).unwrap();
+        }
+        store
+            .compact_log(store.commit_index().unwrap(), u64::MAX)
+            .unwrap();
+        let dst = dir.path().join("snap.redb");
+        store.snapshot_file(&src, &dst).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let copy = Store::open(&dst, events).unwrap();
+        assert_eq!(copy.collection::<Widget>().list(None).unwrap().len(), 50);
+        assert!(copy.collection::<Widget>().get_by_name(None, "w7").is_ok());
+        assert_eq!(copy.commit_index().unwrap(), store.commit_index().unwrap());
+        assert_eq!(copy.log_start().unwrap(), store.log_start().unwrap());
+        assert!(
+            std::fs::metadata(&dst).unwrap().len() < std::fs::metadata(&src).unwrap().len(),
+            "the copy kept free pages"
+        );
+        let stats = store.stats().unwrap();
+        let log = stats
+            .iter()
+            .find(|t| t.table == "meta:cluster_log")
+            .unwrap();
+        assert_eq!(log.rows, 1);
+        let res = stats.iter().find(|t| t.table == "resources").unwrap();
+        assert_eq!(res.rows, 50);
     }
 
     /// A write that reaches the store after stand-down is refused; the key is

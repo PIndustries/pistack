@@ -33,7 +33,7 @@ gauge.workspace = true
 bench.workspace = true
 
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tokio-rustls.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -50,5 +50,6 @@ uuid.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
