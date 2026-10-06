@@ -37,14 +37,56 @@ use tokio::sync::broadcast::error::RecvError;
 pub const TICK: Duration = Duration::from_secs(2);
 /// A host that has not reported for this long is `Error`.
 pub const HOST_STALE_AFTER: Duration = Duration::from_secs(30);
+/// A host whose last overlay apply failed gets the same plan again after
+/// this long, even when nothing in the plan changed.
+pub const OVERLAY_RETRY: Duration = Duration::from_secs(30);
+
+/// The overlay plan last sent to one host, and how that send went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverlaySent {
+    body: String,
+    /// The host's hello time when it was sent. A new hello means the agent
+    /// restarted, so the plan goes again.
+    hello: Option<chrono::DateTime<Utc>>,
+    /// Set when the agent answered with a failure or never answered.
+    failed: Option<std::time::Instant>,
+}
+
+/// Whether `node` needs this plan sent (again).
+fn overlay_due(
+    prev: Option<&OverlaySent>,
+    body: &str,
+    hello: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    match prev {
+        None => true,
+        Some(s) => {
+            s.body != body
+                || s.hello != hello
+                || s.failed.is_some_and(|t| t.elapsed() >= OVERLAY_RETRY)
+        }
+    }
+}
+
+type OverlaySentMap = Arc<parking_lot::Mutex<BTreeMap<String, OverlaySent>>>;
+
+/// Mark the send as failed, unless a newer plan was sent since.
+fn overlay_failed(sent: &OverlaySentMap, node: &str, body: &str) {
+    if let Some(s) = sent.lock().get_mut(node) {
+        if s.body == body {
+            s.failed = Some(std::time::Instant::now());
+        }
+    }
+}
 
 pub struct Reconciler {
     store: Store,
     drivers: Arc<DriverRegistry>,
     strategy: Strategy,
     queue: Option<CommandQueue>,
-    /// Last overlay document sent to each node. A changed plan is sent again.
-    overlay_sent: parking_lot::Mutex<BTreeMap<String, String>>,
+    /// Last overlay document sent to each node. A changed plan, a new agent
+    /// hello, or a failed apply sends it again.
+    overlay_sent: OverlaySentMap,
 }
 
 impl Reconciler {
@@ -54,7 +96,7 @@ impl Reconciler {
             drivers,
             strategy,
             queue: None,
-            overlay_sent: parking_lot::Mutex::new(BTreeMap::new()),
+            overlay_sent: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -200,9 +242,10 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Push a changed overlay plan to each host that has already said hello.
-    /// The send is not awaited: the agent applies it on its next poll, and a
-    /// later plan change is sent again.
+    /// Push the overlay plan to each host that has already said hello, when
+    /// the plan changed, the agent said hello again (it restarted), or the
+    /// last apply failed more than [`OVERLAY_RETRY`] ago. The send is not
+    /// awaited here: a background task records a failed answer.
     async fn sync_overlay(&self) {
         if !crate::overlay::enabled() {
             return;
@@ -217,11 +260,15 @@ impl Reconciler {
                 return;
             }
         };
-        let known: BTreeMap<String, ()> = queue.nodes().into_iter().map(|n| (n.name, ())).collect();
+        let known: BTreeMap<String, Option<chrono::DateTime<Utc>>> = queue
+            .nodes()
+            .into_iter()
+            .map(|n| (n.name, n.last_hello))
+            .collect();
         for (node, plan) in plans {
-            if !known.contains_key(&node) {
+            let Some(&hello) = known.get(&node) else {
                 continue;
-            }
+            };
             let body = match serde_json::to_string(&plan) {
                 Ok(body) => body,
                 Err(e) => {
@@ -229,13 +276,30 @@ impl Reconciler {
                     continue;
                 }
             };
-            if self.overlay_sent.lock().get(&node) == Some(&body) {
+            if !overlay_due(self.overlay_sent.lock().get(&node), &body, hello) {
                 continue;
             }
             let payload = serde_json::to_value(&plan).unwrap_or(serde_json::Value::Null);
             match queue.enqueue(&node, CommandKind::SyncOverlay, payload) {
-                Ok(_) => {
-                    self.overlay_sent.lock().insert(node, body);
+                Ok(ticket) => {
+                    self.overlay_sent.lock().insert(
+                        node.clone(),
+                        OverlaySent {
+                            body: body.clone(),
+                            hello,
+                            failed: None,
+                        },
+                    );
+                    let sent = self.overlay_sent.clone();
+                    tokio::spawn(async move {
+                        let why = match ticket.wait().await {
+                            Ok(r) if r.ok => return,
+                            Ok(r) => r.message,
+                            Err(e) => e.to_string(),
+                        };
+                        tracing::warn!(node, error = %why, "forge: overlay apply failed; will retry");
+                        overlay_failed(&sent, &node, &body);
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(node, error = %e, "forge: overlay plan was not queued");
@@ -712,5 +776,62 @@ mod pin_tests {
             .conditions
             .iter()
             .all(|c| c.kind != "Network"));
+    }
+}
+
+#[cfg(test)]
+mod overlay_retry_tests {
+    use super::{overlay_due, overlay_failed, OverlaySent, OVERLAY_RETRY};
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    fn a_plan_goes_again_on_change_new_hello_or_old_failure() {
+        let hello = Some(Utc::now());
+        assert!(overlay_due(None, "a", hello));
+        let sent = OverlaySent {
+            body: "a".into(),
+            hello,
+            failed: None,
+        };
+        // Same plan, same agent, no failure: nothing to do.
+        assert!(!overlay_due(Some(&sent), "a", hello));
+        // The plan changed.
+        assert!(overlay_due(Some(&sent), "b", hello));
+        // The agent restarted and said hello again.
+        let later = Some(Utc::now() + chrono::Duration::seconds(5));
+        assert!(overlay_due(Some(&sent), "a", later));
+        // A fresh failure waits; an old one goes again.
+        let fresh = OverlaySent {
+            failed: Some(Instant::now()),
+            ..sent.clone()
+        };
+        assert!(!overlay_due(Some(&fresh), "a", hello));
+        if let Some(old) = Instant::now().checked_sub(OVERLAY_RETRY) {
+            let old = OverlaySent {
+                failed: Some(old),
+                ..sent
+            };
+            assert!(overlay_due(Some(&old), "a", hello));
+        }
+    }
+
+    #[test]
+    fn a_failure_on_an_older_plan_does_not_mark_the_newer_one() {
+        let map = Arc::new(parking_lot::Mutex::new(BTreeMap::new()));
+        map.lock().insert(
+            "sim2".to_owned(),
+            OverlaySent {
+                body: "new".into(),
+                hello: None,
+                failed: None,
+            },
+        );
+        overlay_failed(&map, "sim2", "old");
+        assert!(map.lock()["sim2"].failed.is_none());
+        overlay_failed(&map, "sim2", "new");
+        assert!(map.lock()["sim2"].failed.is_some());
     }
 }
