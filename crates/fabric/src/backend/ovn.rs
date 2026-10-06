@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! OVN northbound backend. Networks, subnets and machine ports are written
-//! to OVN's northbound database; routers, security groups and floating IPs
-//! still return `not_implemented` and land in follow-ups. The doc comment
+//! OVN northbound backend. Networks, subnets, machine ports and security
+//! groups are written to OVN's northbound database; routers and floating
+//! IPs still return `not_implemented` and land in follow-ups. The doc comment
 //! on each of those is the contract for the real thing.
 //!
 //! The PiStack store stays the record. OVN holds a copy the leader writes:
@@ -20,9 +20,9 @@
 //!   on promotion rewrites anything that differs from the store.
 //! * Names: `Logical_Switch.name = ps-<net id>`, switch ports are named by
 //!   the port id, a provider network's uplink is `provnet-<net id>`.
-//!   Later: `Logical_Router.name = pr-<rtr id>`,
-//!   `Port_Group.name = pg_<sg uuid with '-' replaced by '_'>` (OVN names
-//!   must be valid identifiers), `Address_Set` likewise with `as_` prefix.
+//!   A security group is `Port_Group.name = pg_<sg uuid without dashes>`
+//!   (OVN names must be identifiers), and every port with port security
+//!   also joins `pg_pistack_drop`. Later: `Logical_Router.name = pr-<rtr id>`.
 //!
 //! On each host, OVS and `ovn-controller` realise the switches. The agent
 //! plugs a machine's tap or a pod's link into the integration bridge with
@@ -31,7 +31,10 @@
 
 use super::ovsdb::{self, eq, includes, map, set, uuid, Transport};
 use super::{FipView, NetBackend, RouterView};
-use crate::types::{Network, NetworkKind, Port, PortBinding, SecurityGroup, Subnet};
+use crate::types::{
+    Direction, EtherType, Network, NetworkKind, Port, PortBinding, Protocol, Remote, Rule,
+    SecurityGroup, Subnet,
+};
 use async_trait::async_trait;
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult, Id, Leadership};
@@ -194,6 +197,193 @@ impl OvnBackend {
             ))),
         }
     }
+
+    /// Insert ops for `acls` tagged with `group`; returns their named refs.
+    fn acl_inserts(&self, group: &str, acls: &[Acl], ops: &mut Vec<Value>) -> Vec<Value> {
+        let term = self.term().to_string();
+        acls.iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let name = format!("acl{i}");
+                let mut ext = vec![
+                    ("pistack:group".to_string(), group.to_string()),
+                    ("pistack:term".to_string(), term.clone()),
+                ];
+                if let Some(r) = &a.rule {
+                    ext.push(("pistack:rule".into(), r.clone()));
+                }
+                let row = json!({
+                    "direction": a.direction,
+                    "priority": a.priority,
+                    "match": a.matches,
+                    "action": a.action,
+                    "external_ids": map(ext),
+                });
+                ops.push(ovsdb::insert("ACL", row, &name));
+                ovsdb::named(&name)
+            })
+            .collect()
+    }
+
+    /// Make `Port_Group` `name` exist with `ext`. `acls` and `ports`, when
+    /// given, replace what the group has if it differs; `None` leaves them
+    /// alone (empty on a new group). Replaced ACLs are dropped by the
+    /// database once nothing refers to them.
+    async fn ensure_group(
+        &self,
+        name: &str,
+        ext: Vec<(String, String)>,
+        acls: Option<&[Acl]>,
+        ports: Option<Vec<String>>,
+    ) -> ApiResult<()> {
+        let found = self
+            .run(vec![
+                ovsdb::select("Port_Group", by_name(name)),
+                ovsdb::select(
+                    "ACL",
+                    vec![includes("external_ids", map([("pistack:group", name)]))],
+                ),
+            ])
+            .await?;
+        let groups = ovsdb::rows(&found[0]);
+        let have_acls = ovsdb::rows(&found[1]);
+        let mut ops = Vec::new();
+        match groups.as_slice() {
+            [] => {
+                ops.push(ovsdb::absent("Port_Group", by_name(name)));
+                let refs = acls
+                    .map(|a| self.acl_inserts(name, a, &mut ops))
+                    .unwrap_or_default();
+                let ports = ports.unwrap_or_default();
+                ops.push(ovsdb::insert(
+                    "Port_Group",
+                    json!({
+                        "name": name,
+                        "acls": set(refs),
+                        "ports": set(ports.iter().map(|u| uuid(u))),
+                        "external_ids": map(ext),
+                    }),
+                    "pg",
+                ));
+                self.run(ops).await?;
+                Ok(())
+            }
+            [one] => {
+                let u = ovsdb::row_uuid(one)
+                    .ok_or_else(|| ApiError::unavailable("ovn: Port_Group row: no uuid"))?;
+                let mut row = serde_json::Map::new();
+                if let Some(want) = acls {
+                    if !same_acls(&have_acls, want) {
+                        let refs = self.acl_inserts(name, want, &mut ops);
+                        row.insert("acls".into(), set(refs));
+                    }
+                }
+                if let Some(mut want) = ports {
+                    want.sort();
+                    want.dedup();
+                    if uuid_strings(one.get("ports")) != want {
+                        row.insert("ports".into(), set(want.iter().map(|u| uuid(u))));
+                    }
+                }
+                let ext = map(ext);
+                if !ovsdb::row_matches(one, &json!({ "external_ids": ext })) {
+                    row.insert("external_ids".into(), ext);
+                }
+                if !row.is_empty() {
+                    ops.push(ovsdb::update(
+                        "Port_Group",
+                        vec![eq("_uuid", uuid(&u))],
+                        Value::Object(row),
+                    ));
+                    self.run(ops).await?;
+                }
+                Ok(())
+            }
+            many => Err(ApiError::conflict(format!(
+                "ovn: {} Port_Group rows named {name}",
+                many.len()
+            ))),
+        }
+    }
+
+    /// The group for `sg` with its rules as ACLs. Groups its rules refer to
+    /// are created empty first, so the address sets OVN derives from them
+    /// exist before an ACL names them.
+    async fn ensure_sg_group(
+        &self,
+        sg: &SecurityGroup,
+        ports: Option<Vec<String>>,
+    ) -> ApiResult<()> {
+        for rule in &sg.spec.rules {
+            if let Remote::Group(g) = &rule.remote {
+                if g != &sg.meta.id {
+                    self.ensure_group(&group_name(g), self.tags(g, None), None, None)
+                        .await?;
+                }
+            }
+        }
+        let acls = group_acls(sg);
+        self.ensure_group(
+            &group_name(&sg.meta.id),
+            self.tags(&sg.meta.id, sg.meta.project.as_ref()),
+            Some(&acls),
+            ports,
+        )
+        .await
+    }
+
+    async fn ensure_drop_group(&self) -> ApiResult<()> {
+        let ext = vec![
+            ("pistack:id".to_string(), DROP_GROUP.to_string()),
+            ("pistack:term".to_string(), self.term().to_string()),
+        ];
+        self.ensure_group(DROP_GROUP, ext, Some(&drop_acls()), None)
+            .await
+    }
+
+    /// Put switch port `lsp` in exactly the PiStack groups named `want`.
+    /// Groups without `pistack:id` are never touched.
+    async fn set_membership(&self, lsp: &str, want: &[String]) -> ApiResult<()> {
+        let cur = self
+            .run(vec![ovsdb::select(
+                "Port_Group",
+                vec![includes("ports", uuid(lsp))],
+            )])
+            .await?;
+        let cur = ovsdb::rows(&cur[0]);
+        let name_of = |r: &Value| {
+            r.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let have: Vec<String> = cur.iter().map(name_of).collect();
+        let mut ops = Vec::new();
+        for w in want.iter().filter(|w| !have.contains(w)) {
+            ops.push(ovsdb::present("Port_Group", by_name(w)));
+            ops.push(ovsdb::mutate(
+                "Port_Group",
+                by_name(w),
+                vec![json!(["ports", "insert", set([uuid(lsp)])])],
+            ));
+        }
+        for r in cur
+            .iter()
+            .filter(|r| ext_has(r, "pistack:id") && !want.contains(&name_of(r)))
+        {
+            if let Some(u) = ovsdb::row_uuid(r) {
+                ops.push(ovsdb::mutate(
+                    "Port_Group",
+                    vec![eq("_uuid", uuid(&u))],
+                    vec![json!(["ports", "delete", set([uuid(lsp)])])],
+                ));
+            }
+        }
+        if !ops.is_empty() {
+            self.run(ops).await?;
+        }
+        Ok(())
+    }
 }
 
 fn switch_name(net: &Id) -> String {
@@ -293,6 +483,178 @@ fn pick_dhcp(rows: &[Value], ips: &[IpAddr], v4: bool) -> Vec<Value> {
         .take(1)
         .map(|u| uuid(&u))
         .collect()
+}
+
+/// Every port with port security joins this group. Its ACLs drop all IP
+/// traffic both ways at a lower priority than group rules, and let DHCP
+/// requests out.
+const DROP_GROUP: &str = "pg_pistack_drop";
+const DROP_PRIORITY: i64 = 1001;
+const RULE_PRIORITY: i64 = 1002;
+
+/// `pg_<sg uuid without dashes>`; OVN port group names must be identifiers.
+fn group_name(sg: &Id) -> String {
+    format!("pg_{}", sg.uuid.simple())
+}
+
+/// One ACL as fabric wants it. `rule` only feeds `external_ids`.
+#[derive(Clone, Debug)]
+struct Acl {
+    direction: &'static str,
+    priority: i64,
+    matches: String,
+    action: &'static str,
+    rule: Option<String>,
+}
+
+impl Acl {
+    fn key(&self) -> (String, i64, String, String) {
+        (
+            self.direction.to_string(),
+            self.priority,
+            self.matches.clone(),
+            self.action.to_string(),
+        )
+    }
+}
+
+fn acl_row_key(row: &Value) -> (String, i64, String, String) {
+    let s = |c: &str| row.get(c).and_then(Value::as_str).unwrap_or("").to_string();
+    (
+        s("direction"),
+        row.get("priority").and_then(Value::as_i64).unwrap_or(-1),
+        s("match"),
+        s("action"),
+    )
+}
+
+/// The ACL for one rule on group `group`, or `None` when the rule cannot
+/// match anything (a remote address of the other family).
+fn rule_acl(group: &str, rule: &Rule) -> Option<Acl> {
+    let fam = match rule.ethertype {
+        EtherType::IPv4 => "ip4",
+        EtherType::IPv6 => "ip6",
+    };
+    let (direction, port_side, addr_side) = match rule.direction {
+        Direction::Ingress => ("to-lport", "outport", "src"),
+        Direction::Egress => ("from-lport", "inport", "dst"),
+    };
+    let mut m = format!("{port_side} == @{group} && {fam}");
+    match &rule.remote {
+        Remote::Any => {}
+        Remote::Cidr(c) => {
+            if c.addr().is_ipv4() != (fam == "ip4") {
+                return None;
+            }
+            m.push_str(&format!(" && {fam}.{addr_side} == {}", c.trunc()));
+        }
+        Remote::Group(g) => {
+            m.push_str(&format!(
+                " && {fam}.{addr_side} == ${}_{fam}",
+                group_name(g)
+            ));
+        }
+    }
+    match rule.protocol {
+        Some(p @ (Protocol::Tcp | Protocol::Udp)) => {
+            let l4 = if p == Protocol::Tcp { "tcp" } else { "udp" };
+            m.push_str(&format!(" && {l4}"));
+            if let Some(r) = rule.port_range {
+                if r.min == r.max {
+                    m.push_str(&format!(" && {l4}.dst == {}", r.min));
+                } else {
+                    m.push_str(&format!(
+                        " && {l4}.dst >= {} && {l4}.dst <= {}",
+                        r.min, r.max
+                    ));
+                }
+            }
+        }
+        Some(Protocol::Icmp) => m.push_str(if fam == "ip4" {
+            " && icmp4"
+        } else {
+            " && icmp6"
+        }),
+        Some(Protocol::Any) | None => {}
+    }
+    Some(Acl {
+        direction,
+        priority: RULE_PRIORITY,
+        matches: m,
+        action: "allow-related",
+        rule: Some(rule.id.to_string()),
+    })
+}
+
+fn group_acls(sg: &SecurityGroup) -> Vec<Acl> {
+    let name = group_name(&sg.meta.id);
+    let mut out: Vec<Acl> = Vec::new();
+    for a in sg.spec.rules.iter().filter_map(|r| rule_acl(&name, r)) {
+        if !out.iter().any(|o| o.key() == a.key()) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn drop_acls() -> Vec<Acl> {
+    let g = DROP_GROUP;
+    let acl = |direction, priority, matches: String, action| Acl {
+        direction,
+        priority,
+        matches,
+        action,
+        rule: None,
+    };
+    vec![
+        acl(
+            "from-lport",
+            DROP_PRIORITY,
+            format!("inport == @{g} && ip"),
+            "drop",
+        ),
+        acl(
+            "to-lport",
+            DROP_PRIORITY,
+            format!("outport == @{g} && ip"),
+            "drop",
+        ),
+        acl(
+            "from-lport",
+            RULE_PRIORITY,
+            format!("inport == @{g} && udp && udp.src == 68 && udp.dst == 67"),
+            "allow",
+        ),
+        acl(
+            "from-lport",
+            RULE_PRIORITY,
+            format!("inport == @{g} && udp && udp.src == 546 && udp.dst == 547"),
+            "allow",
+        ),
+    ]
+}
+
+fn same_acls(have: &[Value], want: &[Acl]) -> bool {
+    let mut h: Vec<_> = have.iter().map(acl_row_key).collect();
+    let mut w: Vec<_> = want.iter().map(Acl::key).collect();
+    h.sort();
+    w.sort();
+    h == w
+}
+
+fn uuid_strings(v: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = ovsdb::elems(v)
+        .iter()
+        .filter_map(|e| e.get(1).and_then(Value::as_str).map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
+fn ext_has(row: &Value, key: &str) -> bool {
+    row["external_ids"][1]
+        .as_array()
+        .is_some_and(|ps| ps.iter().any(|p| p[0] == key))
 }
 
 #[async_trait]
@@ -424,9 +786,10 @@ impl NetBackend for OvnBackend {
     ///   row whose range holds one of the port's addresses.
     /// * `external_ids:pistack:id`, `pistack:device = <device id>`,
     ///   `pistack:project`, `pistack:term`.
-    /// * Security groups: not yet. A later change adds the port to each
-    ///   group's `Port_Group.ports`; when `port_security` is off the port
-    ///   joins no group and receives no ACLs (OVN default allow).
+    /// * Security groups: with `port_security` the port joins
+    ///   `pg_pistack_drop` and each of its groups' `Port_Group`, and leaves
+    ///   any other PiStack group; without it the port is in no group and
+    ///   gets no ACLs (OVN default allow).
     ///
     /// Binding: the agent sets `external_ids:iface-id = <port id>` on the
     /// OVS interface on the host. The returned `PortBinding` is
@@ -435,7 +798,7 @@ impl NetBackend for OvnBackend {
         &self,
         net: &Network,
         port: &Port,
-        _groups: &[SecurityGroup],
+        groups: &[SecurityGroup],
     ) -> ApiResult<PortBinding> {
         let id = &port.meta.id;
         if port.is_router_port() {
@@ -482,13 +845,24 @@ impl NetBackend for OvnBackend {
             "external_ids": map(ext),
         });
         let switch = switch_name(&net.meta.id);
-        self.ensure_row(
-            "Logical_Switch_Port",
-            by_name(&name),
-            row,
-            onto_switch(&switch),
-        )
-        .await?;
+        let lsp = self
+            .ensure_row(
+                "Logical_Switch_Port",
+                by_name(&name),
+                row,
+                onto_switch(&switch),
+            )
+            .await?;
+        let mut want = Vec::new();
+        if port.spec.port_security && !mac.is_empty() {
+            self.ensure_drop_group().await?;
+            want.push(DROP_GROUP.to_string());
+            for sg in groups {
+                self.ensure_sg_group(sg, None).await?;
+                want.push(group_name(&sg.meta.id));
+            }
+        }
+        self.set_membership(&lsp, &want).await?;
         Ok(PortBinding {
             vif_type: "ovs".into(),
             vif_details: [
@@ -501,7 +875,8 @@ impl NetBackend for OvnBackend {
     }
 
     /// Take the port off its switch and delete it. A second delete
-    /// succeeds. (Later: also remove it from every `Port_Group.ports`.)
+    /// succeeds. `Port_Group.ports` refers to switch ports weakly, so the
+    /// port leaves its groups with it.
     async fn delete_port(&self, id: &Id) -> ApiResult<()> {
         let name = id.to_string();
         let found = self
@@ -555,35 +930,55 @@ impl NetBackend for OvnBackend {
     }
 
     /// One `Port_Group` per security group:
-    /// * `name = pg_<sg uuid>`, `ports = {member LSPs}`,
-    ///   `external_ids:pistack:id = <sg id>`.
-    /// * OVN derives `Address_Set`s `pg_<uuid>_ip4` / `_ip6` from the
-    ///   group's ports automatically; those are what `Remote::Group` rules
-    ///   match on.
-    /// * Per rule an `ACL` in `Port_Group.acls`:
-    ///   `direction = to-lport` (ingress) or `from-lport` (egress),
-    ///   `priority = 1002`, `action = allow-related`,
-    ///   `match = "outport == @pg_<uuid> && ip4 && ip4.src == <cidr> && tcp && tcp.dst >= min && tcp.dst <= max"`
-    ///   (ingress; `inport`/`ip4.dst` for egress; `ip6` for IPv6;
-    ///   `Remote::Group(g)` → `ip4.src == $pg_<g uuid>_ip4`;
-    ///   `Remote::Any` omits the address term; `protocol=None|Any`
-    ///   omits the L4 term; `icmp` → `icmp4`/`icmp6`).
-    /// * Two implicit drop ACLs per group at `priority = 1001`:
-    ///   `to-lport outport == @pg && ip` and `from-lport inport == @pg && ip`,
-    ///   `action = drop`, so a port with groups is default-deny both ways
-    ///   except for what its rules allow.
-    /// * A cloud-wide `Port_Group` `pg_drop_all` (priority 1000 drop) and
-    ///   allow ACLs for DHCP (`udp.src == 68 && udp.dst == 67`) and
-    ///   IPv6 ND are installed once by the reconciler on first use.
-    /// * ACL `external_ids:pistack:rule = <rule uuid>` lets the reconciler
-    ///   diff rules without recreating the whole group.
-    async fn apply_security_group(&self, _sg: &SecurityGroup, _members: &[Port]) -> ApiResult<()> {
-        Err(self.todo("apply_security_group"))
+    /// * `name = pg_<sg uuid without dashes>`, `ports = {member switch
+    ///   ports with port security}`, `external_ids:pistack:id = <sg id>`.
+    /// * OVN derives address sets `pg_<uuid>_ip4` / `_ip6` from the
+    ///   group's ports; `Remote::Group` rules match on those. A group a
+    ///   rule names is created empty if it does not exist yet.
+    /// * Per rule an `ACL` in `Port_Group.acls`: `direction = to-lport`
+    ///   (ingress) or `from-lport` (egress), `priority = 1002`,
+    ///   `action = allow-related`, and a match such as
+    ///   `outport == @pg_<uuid> && ip4 && ip4.src == 10.0.0.0/8 && tcp && tcp.dst == 22`
+    ///   (`inport` and `ip4.dst` for egress, `ip6` for IPv6, `icmp4` /
+    ///   `icmp6` for ICMP; no address term for `Remote::Any`, no L4 term
+    ///   for any protocol). A rule whose remote address is of the other
+    ///   family matches nothing and gets no ACL.
+    /// * Default deny lives in one shared group, `pg_pistack_drop`, that
+    ///   every port with port security joins: drop all IP both ways at
+    ///   `priority = 1001`, allow DHCP and DHCPv6 requests out at 1002.
+    /// * ACLs carry `external_ids:pistack:group = <group name>` and
+    ///   `pistack:rule = <rule id>`. When the rules change, the group's
+    ///   ACL set is replaced in one transaction; unchanged rules write
+    ///   nothing.
+    async fn apply_security_group(&self, sg: &SecurityGroup, members: &[Port]) -> ApiResult<()> {
+        let names: Vec<String> = members
+            .iter()
+            .filter(|p| {
+                p.spec.port_security && !p.spec.mac.trim().is_empty() && !p.is_router_port()
+            })
+            .map(|p| p.meta.id.to_string())
+            .collect();
+        let ports = if names.is_empty() {
+            Vec::new()
+        } else {
+            let ops = names
+                .iter()
+                .map(|n| ovsdb::select("Logical_Switch_Port", by_name(n)))
+                .collect();
+            let out = self.run(ops).await?;
+            out.iter()
+                .flat_map(ovsdb::rows)
+                .filter_map(|r| ovsdb::row_uuid(&r))
+                .collect()
+        };
+        self.ensure_sg_group(sg, Some(ports)).await
     }
 
-    /// `pg-del pg_<sg uuid>`; OVN cascades its ACLs.
-    async fn delete_security_group(&self, _id: &Id) -> ApiResult<()> {
-        Err(self.todo("delete_security_group"))
+    /// Delete `pg_<sg uuid>`; the database drops its ACLs with it.
+    async fn delete_security_group(&self, id: &Id) -> ApiResult<()> {
+        self.run(vec![ovsdb::delete("Port_Group", by_name(&group_name(id)))])
+            .await?;
+        Ok(())
     }
 
     /// `NAT` row on the router that has an interface on the target port's
@@ -613,7 +1008,8 @@ mod tests {
     use super::*;
     use crate::backend::ovsdb::fake::FakeDb;
     use crate::types::{
-        HostRoute, NetworkSpec, NetworkStatus, PortSpec, PortStatus, SubnetSpec, SubnetStatus,
+        HostRoute, NetworkSpec, NetworkStatus, PortSpec, PortStatus, SecurityGroupSpec,
+        SecurityGroupStatus, SubnetSpec, SubnetStatus,
     };
     use pistack_types::{kind, Meta};
 
@@ -899,5 +1295,223 @@ mod tests {
         let (_db, b) = backend();
         let err = b.delete_router(&Id::new(kind::ROUTER)).await.unwrap_err();
         assert!(err.message.contains("not implemented"));
+    }
+    fn sg(rules: Vec<Rule>) -> SecurityGroup {
+        SecurityGroup {
+            meta: Meta::new(kind::SECGROUP, "sg", Some(Id::new(kind::PROJECT))),
+            spec: SecurityGroupSpec { rules },
+            status: SecurityGroupStatus::default(),
+        }
+    }
+
+    fn group(db: &FakeDb, name: &str) -> Option<Value> {
+        db.rows("Port_Group")
+            .into_iter()
+            .find(|r| r["name"] == name)
+    }
+
+    fn acl_matches(db: &FakeDb, group: &str) -> Vec<String> {
+        let mut m: Vec<String> = db
+            .rows("ACL")
+            .iter()
+            .filter(|r| ext(r, "pistack:group").as_deref() == Some(group))
+            .map(|r| {
+                format!(
+                    "{} {} {} {}",
+                    r["direction"].as_str().unwrap(),
+                    r["priority"],
+                    r["action"].as_str().unwrap(),
+                    r["match"].as_str().unwrap()
+                )
+            })
+            .collect();
+        m.sort();
+        m
+    }
+
+    async fn ready_port(b: &OvnBackend, groups: &[SecurityGroup]) -> (Network, Port) {
+        let n = net(NetworkKind::Overlay);
+        b.ensure_network(&n).await.unwrap();
+        let mut p = port(&n, "fa:16:3e:00:00:10", &["10.20.0.10"]);
+        p.spec.security_groups = groups.iter().map(|g| g.meta.id.clone()).collect();
+        b.ensure_port(&n, &p, groups).await.unwrap();
+        (n, p)
+    }
+
+    fn lsp_uuid(db: &FakeDb, p: &Port) -> Value {
+        db.rows("Logical_Switch_Port")
+            .into_iter()
+            .find(|r| r["name"] == json!(p.meta.id.to_string()))
+            .map(|r| r["_uuid"].clone())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rules_become_acls_on_the_groups_port_group() {
+        let (db, b) = backend();
+        let other = Id::new(kind::SECGROUP);
+        let mut g = sg(vec![]);
+        let me = g.meta.id.clone();
+        g.spec.rules = vec![
+            Rule::new(Direction::Ingress, EtherType::IPv4)
+                .protocol(Protocol::Tcp)
+                .ports(22, 22)
+                .remote(Remote::Cidr("10.0.0.0/8".parse().unwrap())),
+            Rule::new(Direction::Ingress, EtherType::IPv4)
+                .protocol(Protocol::Udp)
+                .ports(5000, 5100),
+            Rule::new(Direction::Ingress, EtherType::IPv4).remote(Remote::Group(me.clone())),
+            Rule::new(Direction::Ingress, EtherType::IPv6)
+                .protocol(Protocol::Icmp)
+                .remote(Remote::Group(other.clone())),
+            Rule::new(Direction::Egress, EtherType::IPv4),
+            Rule::new(Direction::Egress, EtherType::IPv6),
+            // A v4 remote on an IPv6 rule matches nothing.
+            Rule::new(Direction::Ingress, EtherType::IPv6)
+                .remote(Remote::Cidr("192.168.0.0/16".parse().unwrap())),
+        ];
+        b.apply_security_group(&g, &[]).await.unwrap();
+        let name = format!("pg_{}", me.uuid.simple());
+        let o = format!("pg_{}", other.uuid.simple());
+        let mut want = vec![
+            format!("from-lport 1002 allow-related inport == @{name} && ip4"),
+            format!("from-lport 1002 allow-related inport == @{name} && ip6"),
+            format!("to-lport 1002 allow-related outport == @{name} && ip4 && ip4.src == ${name}_ip4"),
+            format!("to-lport 1002 allow-related outport == @{name} && ip4 && ip4.src == 10.0.0.0/8 && tcp && tcp.dst == 22"),
+            format!("to-lport 1002 allow-related outport == @{name} && ip4 && udp && udp.dst >= 5000 && udp.dst <= 5100"),
+            format!("to-lport 1002 allow-related outport == @{name} && ip6 && ip6.src == ${o}_ip6 && icmp6"),
+        ];
+        want.sort();
+        assert_eq!(acl_matches(&db, &name), want);
+        let pg = group(&db, &name).unwrap();
+        assert_eq!(ext(&pg, "pistack:id"), Some(me.to_string()));
+        assert_eq!(ovsdb::elems(pg.get("acls")).len(), 6);
+        // The group the ICMP rule names exists, empty, so its address set does.
+        let og = group(&db, &o).unwrap();
+        assert!(ovsdb::elems(og.get("acls")).is_empty());
+        assert_eq!(ext(&og, "pistack:id"), Some(other.to_string()));
+
+        let writes = db.writes();
+        b.apply_security_group(&g, &[]).await.unwrap();
+        assert_eq!(db.writes(), writes, "a repeat must not write");
+
+        g.spec.rules.truncate(1);
+        b.apply_security_group(&g, &[]).await.unwrap();
+        assert_eq!(acl_matches(&db, &name).len(), 1);
+        assert_eq!(db.rows("ACL").len(), 1, "replaced ACLs are dropped");
+
+        b.delete_security_group(&me).await.unwrap();
+        b.delete_security_group(&me).await.unwrap();
+        assert!(group(&db, &name).is_none());
+        assert!(db.rows("ACL").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_port_with_security_joins_the_drop_group_and_its_groups() {
+        let (db, b) = backend();
+        let web = sg(vec![Rule::new(Direction::Egress, EtherType::IPv4)]);
+        let db_sg = sg(vec![Rule::new(Direction::Egress, EtherType::IPv4)]);
+        let (n, mut p) = ready_port(&b, std::slice::from_ref(&web)).await;
+        let u = lsp_uuid(&db, &p);
+        let web_name = format!("pg_{}", web.meta.id.uuid.simple());
+        let db_name = format!("pg_{}", db_sg.meta.id.uuid.simple());
+
+        let drop = group(&db, "pg_pistack_drop").unwrap();
+        assert_eq!(ovsdb::elems(drop.get("ports")), vec![u.clone()]);
+        let mut want = vec![
+            "from-lport 1001 drop inport == @pg_pistack_drop && ip".to_string(),
+            "to-lport 1001 drop outport == @pg_pistack_drop && ip".to_string(),
+            "from-lport 1002 allow inport == @pg_pistack_drop && udp && udp.src == 68 && udp.dst == 67".to_string(),
+            "from-lport 1002 allow inport == @pg_pistack_drop && udp && udp.src == 546 && udp.dst == 547".to_string(),
+        ];
+        want.sort();
+        assert_eq!(acl_matches(&db, "pg_pistack_drop"), want);
+        let wg = group(&db, &web_name).unwrap();
+        assert_eq!(ovsdb::elems(wg.get("ports")), vec![u.clone()]);
+        assert_eq!(acl_matches(&db, &web_name).len(), 1);
+
+        let writes = db.writes();
+        b.ensure_port(&n, &p, std::slice::from_ref(&web))
+            .await
+            .unwrap();
+        assert_eq!(db.writes(), writes, "a repeat must not write");
+
+        // Applying the group with its members agrees with the port.
+        b.apply_security_group(&web, std::slice::from_ref(&p))
+            .await
+            .unwrap();
+        assert_eq!(db.writes(), writes);
+
+        // Moving the port to another group takes it out of the first.
+        p.spec.security_groups = vec![db_sg.meta.id.clone()];
+        b.ensure_port(&n, &p, std::slice::from_ref(&db_sg))
+            .await
+            .unwrap();
+        assert!(ovsdb::elems(group(&db, &web_name).unwrap().get("ports")).is_empty());
+        assert_eq!(
+            ovsdb::elems(group(&db, &db_name).unwrap().get("ports")),
+            vec![u.clone()]
+        );
+
+        // Without port security it is in no group at all.
+        p.spec.port_security = false;
+        p.spec.security_groups.clear();
+        b.ensure_port(&n, &p, &[]).await.unwrap();
+        for g in db.rows("Port_Group") {
+            assert!(ovsdb::elems(g.get("ports")).is_empty(), "{g}");
+        }
+
+        // Deleting a port takes it out of its groups.
+        p.spec.port_security = true;
+        p.spec.security_groups = vec![db_sg.meta.id.clone()];
+        b.ensure_port(&n, &p, std::slice::from_ref(&db_sg))
+            .await
+            .unwrap();
+        b.delete_port(&p.meta.id).await.unwrap();
+        for g in db.rows("Port_Group") {
+            assert!(ovsdb::elems(g.get("ports")).is_empty(), "{g}");
+        }
+    }
+
+    #[tokio::test]
+    async fn applying_a_group_sets_its_members_from_their_switch_ports() {
+        let (db, b) = backend();
+        let g = sg(vec![Rule::new(Direction::Egress, EtherType::IPv4)]);
+        let n = net(NetworkKind::Overlay);
+        b.ensure_network(&n).await.unwrap();
+        let mut a = port(&n, "fa:16:3e:00:00:21", &["10.20.0.21"]);
+        a.spec.security_groups = vec![g.meta.id.clone()];
+        b.ensure_port(&n, &a, &[]).await.unwrap();
+        let mut c = port(&n, "fa:16:3e:00:00:22", &["10.20.0.22"]);
+        c.spec.security_groups = vec![g.meta.id.clone()];
+        // `c` has no switch port yet; it joins when it is ensured.
+        b.apply_security_group(&g, &[a.clone(), c.clone()])
+            .await
+            .unwrap();
+        let name = format!("pg_{}", g.meta.id.uuid.simple());
+        assert_eq!(
+            ovsdb::elems(group(&db, &name).unwrap().get("ports")),
+            vec![lsp_uuid(&db, &a)]
+        );
+        b.ensure_port(&n, &c, std::slice::from_ref(&g))
+            .await
+            .unwrap();
+        let mut have = ovsdb::elems(group(&db, &name).unwrap().get("ports"));
+        let mut want = vec![lsp_uuid(&db, &a), lsp_uuid(&db, &c)];
+        have.sort_by_key(|v| v.to_string());
+        want.sort_by_key(|v| v.to_string());
+        assert_eq!(have, want);
+    }
+
+    #[tokio::test]
+    async fn a_follower_writes_no_security_groups() {
+        let (db, b) = backend();
+        let store = Store::in_memory().unwrap();
+        let leadership = Leadership::new(false);
+        b.attach(&leadership, &store);
+        let g = sg(vec![Rule::new(Direction::Egress, EtherType::IPv4)]);
+        assert!(b.apply_security_group(&g, &[]).await.is_err());
+        assert!(b.delete_security_group(&g.meta.id).await.is_err());
+        assert_eq!(db.writes(), 0);
     }
 }
