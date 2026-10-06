@@ -1333,7 +1333,7 @@ pub fn report(m: RunningMachine) -> MachineReport {
     MachineReport {
         id: m.id,
         phase: Phase::Ready,
-        message: String::new(),
+        message: m.message,
         resources: None,
         addresses: m.addresses,
         power: Some(m.power),

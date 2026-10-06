@@ -61,6 +61,7 @@ impl MachineRuntime for MockRuntime {
             id: req.id.clone(),
             addresses: vec![format!("10.0.0.{n}")],
             power: PowerState::On,
+            message: String::new(),
         };
         st.machines.insert(req.id.clone(), rt.clone());
         Ok(rt)

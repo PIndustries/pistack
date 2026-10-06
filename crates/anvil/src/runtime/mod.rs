@@ -12,6 +12,7 @@ pub mod cloud;
 pub mod libvirt;
 mod metal;
 pub mod mock;
+mod podnet;
 pub(crate) mod rbdmap;
 pub(crate) mod volfs;
 pub mod youki;

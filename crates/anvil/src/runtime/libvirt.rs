@@ -83,6 +83,7 @@ impl MachineRuntime for LibvirtRuntime {
             id: req.id.clone(),
             addresses,
             power: PowerState::On,
+            message: String::new(),
         })
     }
 
@@ -234,6 +235,7 @@ impl MachineRuntime for LibvirtRuntime {
                 id,
                 addresses,
                 power,
+                message: String::new(),
             });
         }
         Ok(machines)
