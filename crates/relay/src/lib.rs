@@ -176,7 +176,9 @@ impl Module for Relay {
     }
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
-        let client = self.client(&ctx);
+        // Loom programs its own balancers on its own providers; binding
+        // them here as well fails with "address already in use".
+        let client = self.client(&ctx).leave_loom_managed();
         let provider_names = self.providers.names();
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
