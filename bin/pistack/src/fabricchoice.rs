@@ -7,8 +7,13 @@
 //! server started without it used to run the mock fabric, so a cluster where
 //! one server forgot the setting would stop wiring real networks the moment
 //! that server became leader. Now the choice is saved in the cluster store:
-//! a server with an explicit setting saves it, and a server without one
+//! a leader with an explicit setting saves it, and a server without one
 //! adopts the saved choice before any module reads the variable.
+//!
+//! Only a server that is leader at startup writes. A follower's store is a
+//! replica: a local write there is an entry the leader never had, and the
+//! follow loop rightly stops replicating into a store that has split off.
+//! A follower uses its own explicit setting and warns if it differs.
 
 use pistack_store::Store;
 
@@ -51,9 +56,11 @@ pub fn decide(env: Option<&str>, saved: Option<&str>) -> Choice {
 
 /// Settle this process's fabric backend against the cluster store. Call
 /// once membership is established and before modules are assembled.
-pub fn settle(store: &Store) -> anyhow::Result<Choice> {
+/// `leader` is whether this server leads right now; only then is an
+/// explicit choice saved.
+pub fn settle(store: &Store, leader: bool) -> anyhow::Result<Choice> {
     let raw = std::env::var(FABRIC_BACKEND_ENV).ok();
-    let choice = record(store, raw.as_deref())?;
+    let choice = record(store, raw.as_deref(), leader)?;
     match &choice {
         Choice::Explicit { backend, .. } | Choice::Adopt(backend) => {
             std::env::set_var(FABRIC_BACKEND_ENV, backend)
@@ -63,9 +70,10 @@ pub fn settle(store: &Store) -> anyhow::Result<Choice> {
     Ok(choice)
 }
 
-/// Decide against the store, save an explicit choice and log. Leaves the
-/// process environment alone so tests can run it in parallel.
-fn record(store: &Store, raw: Option<&str>) -> anyhow::Result<Choice> {
+/// Decide against the store, save an explicit choice when `leader`, and
+/// log. Never writes on a follower. Leaves the process environment alone
+/// so tests can run it in parallel.
+fn record(store: &Store, raw: Option<&str>, leader: bool) -> anyhow::Result<Choice> {
     if let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) {
         if !KNOWN.contains(&v) {
             tracing::error!(
@@ -79,15 +87,19 @@ fn record(store: &Store, raw: Option<&str>) -> anyhow::Result<Choice> {
     match &choice {
         Choice::Explicit { backend, replaces } => {
             if let Some(old) = replaces {
+                let action = if leader {
+                    "using and saving this server's setting"
+                } else {
+                    "using this server's setting; only the leader saves it"
+                };
                 tracing::warn!(
                     saved = %old,
                     set = %backend,
                     "fabric backend differs from the cluster's saved choice; \
-                     using and saving this server's setting. Set the same \
-                     {FABRIC_BACKEND_ENV} on every server"
+                     {action}. Set the same {FABRIC_BACKEND_ENV} on every server"
                 );
             }
-            if saved.as_deref() != Some(backend.as_str()) {
+            if leader && saved.as_deref() != Some(backend.as_str()) {
                 store.put_meta(META_KEY, backend)?;
             }
             tracing::info!(backend = %backend, "fabric: backend from this server's setting");
@@ -160,24 +172,45 @@ mod tests {
     #[test]
     fn record_saves_an_explicit_choice_and_adopts_it_later() {
         let store = Store::in_memory().unwrap();
-        assert_eq!(record(&store, None).unwrap(), Choice::Unset);
+        assert_eq!(record(&store, None, true).unwrap(), Choice::Unset);
         assert_eq!(store.get_meta::<String>(META_KEY).unwrap(), None);
 
-        record(&store, Some("overlay")).unwrap();
+        record(&store, Some("overlay"), true).unwrap();
         assert_eq!(
             store.get_meta::<String>(META_KEY).unwrap().as_deref(),
             Some("overlay")
         );
         assert_eq!(
-            record(&store, None).unwrap(),
+            record(&store, None, false).unwrap(),
             Choice::Adopt("overlay".into())
         );
         assert_eq!(
-            record(&store, Some("typo")).unwrap(),
+            record(&store, Some("typo"), false).unwrap(),
             Choice::Adopt("overlay".into())
         );
 
-        record(&store, Some("hostnat")).unwrap();
+        record(&store, Some("hostnat"), true).unwrap();
+        assert_eq!(
+            store.get_meta::<String>(META_KEY).unwrap().as_deref(),
+            Some("hostnat")
+        );
+    }
+
+    #[test]
+    fn a_follower_never_writes_its_replica() {
+        let store = Store::in_memory().unwrap();
+        // Nothing saved yet: the follower uses its setting but saves nothing.
+        assert_eq!(
+            record(&store, Some("overlay"), false).unwrap(),
+            Choice::Explicit {
+                backend: "overlay".into(),
+                replaces: None
+            }
+        );
+        assert_eq!(store.get_meta::<String>(META_KEY).unwrap(), None);
+        // A different saved choice: still no write, the saved one stays.
+        record(&store, Some("hostnat"), true).unwrap();
+        record(&store, Some("overlay"), false).unwrap();
         assert_eq!(
             store.get_meta::<String>(META_KEY).unwrap().as_deref(),
             Some("hostnat")
