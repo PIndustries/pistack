@@ -313,6 +313,28 @@ pub fn backup(data_dir: PathBuf, to: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn stats(data_dir: PathBuf) -> anyhow::Result<()> {
+    let path = data_dir.join("state.redb");
+    let file_bytes = std::fs::metadata(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    let (events, _) = broadcast::channel(1);
+    let store = Store::open(&path, events)?;
+    println!("file\t{file_bytes} bytes\t{}", path.display());
+    for table in store.stats()? {
+        println!(
+            "{}\t{} rows\t{} key bytes\t{} value bytes",
+            table.table, table.rows, table.key_bytes, table.value_bytes
+        );
+    }
+    println!(
+        "log\tentries {}..={}",
+        store.log_start()?,
+        store.commit_index()?
+    );
+    Ok(())
+}
+
 pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
     let (events, _) = broadcast::channel(1);
     let store = Store::open(data_dir.join("state.redb"), events)?;

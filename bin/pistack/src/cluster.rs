@@ -6,9 +6,13 @@
 //! A machine that already has a store stays that cluster and announces it.
 //! A machine with no store, on a private IPv4 listen address, sweeps its /24.
 //! One cluster means adopt it. None means found one. Two means wait for
-//! `--join`. The second member replicates as a learner. The third makes
-//! every member a voter. A learner does not become leader.
+//! `--join`. Every server that joins replicates as a learner: it never
+//! campaigns and never grants a vote. The leader promotes learners once
+//! they have caught up, until three servers are voters. A store copied from
+//! another server, or downloaded as a snapshot, is never trusted as this
+//! server's vote: it rejoins as a learner.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,15 +28,16 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use pistack_cluster::{
     accepts_writes, check_advertise, check_follower_tip, classify, consider_pre_vote,
-    consider_vote, election_seed, election_timeout, follow_candidate, in_leader_lease,
-    join_membership, lost_quorum, pick_leader, scan_targets, seed_membership, should_campaign,
-    sweep, Announce, Ballot, Formation, JoinRequest, Member, PeerView, Role, VoteRequest,
-    VoteResponse, DISCOVER_PORT,
+    consider_vote, election_seed, election_timeout, follow_candidate, in_leader_lease, is_voter,
+    join_membership, lost_quorum, pick_leader, plan_promotions, scan_targets, seed_membership,
+    should_campaign, sweep, Announce, Ballot, Formation, JoinRequest, Member, PeerView, Role,
+    VoteRequest, VoteResponse, DISCOVER_PORT,
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
 use pistack_types::{ApiError, Leadership};
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +47,31 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 /// A peer status probe is best effort. A dark peer must not stall a tick.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
+/// Entries one `/cluster/log` page carries.
+const LOG_PAGE: usize = 64;
+/// A learner is caught up when its last pull asked for entries no more than
+/// this far behind the leader's commit index.
+const PROMOTE_WINDOW: u64 = LOG_PAGE as u64;
+/// A learner's pull counts toward promotion only this soon after it.
+const PROGRESS_FRESH: Duration = Duration::from_secs(3);
+/// A follower that pulled this recently keeps the log rows it still needs.
+const PROGRESS_PIN: Duration = Duration::from_secs(600);
+/// Log rows every server keeps behind its commit index after compaction.
+const LOG_KEEP: u64 = 10_000;
+/// A slow follower never makes the leader keep more than this many rows.
+const LOG_KEEP_MAX: u64 = 200_000;
+/// How often a server trims its log, and how many rows one pass removes.
+const COMPACT_EVERY: Duration = Duration::from_secs(30);
+const COMPACT_MAX_ROWS: u64 = 50_000;
+/// Bytes per piece of a snapshot response.
+const SNAPSHOT_CHUNK: usize = 256 * 1024;
+/// A snapshot download fails when no bytes arrive for this long. There is
+/// no limit on the whole transfer: a slow link that keeps moving finishes.
+const SNAPSHOT_STALL: Duration = Duration::from_secs(30);
+/// Downloads that broke after bytes arrived are restarted this many times.
+const SNAPSHOT_RESTARTS: u32 = 3;
+/// How long to keep retrying a leader that is not answering yet.
+const SNAPSHOT_STARTUP: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct BootRequest<'a> {
@@ -102,6 +132,17 @@ pub struct ClusterHandle {
     pub ballot: Mutex<()>,
     /// Last replication error, so a stuck follower logs it once per change.
     pub pull_error: Mutex<Option<String>>,
+    /// True while a background pull from the leader runs. The follow loop
+    /// keeps checking the leader every tick meanwhile, so a slow pull never
+    /// looks like a silent leader, and it does not campaign until the pull
+    /// is done.
+    pub pulling: AtomicBool,
+    /// On the leader: each follower's last pull, as (index it asked after, when).
+    pub progress: Mutex<HashMap<String, (u64, Instant)>>,
+    /// Last log compaction pass.
+    pub last_compact: Mutex<Instant>,
+    /// Rows kept behind the commit index; [`LOG_KEEP`] outside tests.
+    pub log_keep: AtomicU64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -127,6 +168,9 @@ struct LogQuery {
     /// The follower's term at `after`, 0 when it has no row there.
     #[serde(default)]
     term: u64,
+    /// The puller's node id, so the leader can tell when a learner caught up.
+    #[serde(default)]
+    node: String,
 }
 
 /// Private unicast from `host:port`. `0.0.0.0`, public addresses, and names
@@ -242,6 +286,21 @@ pub fn establish_local(
 ) -> anyhow::Result<LocalRole> {
     store.set_record_log(false);
     let members: Vec<Member> = store.get_meta("members")?.unwrap_or_default();
+    let owner: Option<String> = store.get_meta("node_id")?;
+    if let Some(owner) = owner.filter(|owner| owner != node_id) {
+        // This store was written by another server: a snapshot download or
+        // an offline copy. Its term is the cluster's and may stay, but its
+        // vote and leadership were that server's. Forget the vote and rejoin
+        // as a learner, so this server cannot campaign or vote on a log it
+        // never checked with the leader.
+        tracing::warn!(
+            store_owner = %owner,
+            node_id,
+            "state.redb was written by another server; rejoining as a learner"
+        );
+        forget_copied_vote(store)?;
+        return Ok(LocalRole::NeedJoin);
+    }
     if members.is_empty() {
         if !allow_seed {
             return Ok(LocalRole::NeedJoin);
@@ -306,6 +365,14 @@ pub fn establish_local(
     }))
 }
 
+/// Clear the node-local parts of a store that came from another server: its
+/// vote. The term stays (it is the cluster's, and keeping it means the
+/// joiner never raises it), and the leader id stays as a hint for the join.
+fn forget_copied_vote(store: &Store) -> anyhow::Result<()> {
+    store.put_meta("cluster_voted_for", &None::<String>)?;
+    Ok(())
+}
+
 pub fn leader_hint(store: &Store, self_id: &str) -> anyhow::Result<Option<String>> {
     let members: Vec<Member> = store.get_meta("members")?.unwrap_or_default();
     let leader_id: Option<String> = store.get_meta("cluster_leader_id")?;
@@ -354,6 +421,7 @@ pub async fn adopt(
         .await
         .with_context(|| format!("joining {url}"))?;
     store.set_record_log(false);
+    forget_copied_vote(store)?;
     store.put_meta("members", &status.members)?;
     store.put_meta("node_id", &node_id)?;
     if !status.leader_id.is_empty() {
@@ -420,6 +488,10 @@ pub fn handle_from(
         leader_contact: Mutex::new(None),
         ballot: Mutex::new(()),
         pull_error: Mutex::new(None),
+        pulling: AtomicBool::new(false),
+        progress: Mutex::new(HashMap::new()),
+        last_compact: Mutex::new(Instant::now()),
+        log_keep: AtomicU64::new(LOG_KEEP),
     }
 }
 
@@ -528,9 +600,14 @@ async fn join(
     if node_id.is_empty() || api.is_empty() {
         return Err(ApiError::bad_request("node_id and api are required"));
     }
+    if node_id == handle.node_id {
+        return Err(ApiError::conflict("a server cannot join itself"));
+    }
     let current = members_of(&handle.store)?;
     let next = join_membership(&current, node_id, api);
     handle.store.put_meta("members", &next).map_err(store_err)?;
+    guard(&handle.progress).remove(node_id);
+    tracing::info!(node = %node_id, api = %api, "server joined as a learner");
     if let Some(me) = next.iter().find(|member| member.id == handle.node_id) {
         *guard(&handle.role) = me.role;
     }
@@ -548,16 +625,32 @@ async fn snapshot(
     let dest = handle
         .db_path
         .with_file_name(format!("snapshot-{}.redb", uuid::Uuid::now_v7()));
-    let _remove = RemoveFile(dest.clone());
-    handle
-        .store
-        .snapshot_file(&handle.db_path, &dest)
+    let remove = RemoveFile(dest.clone());
+    let store = handle.store.clone();
+    let src = handle.db_path.clone();
+    let target = dest.clone();
+    tokio::task::spawn_blocking(move || store.snapshot_file(&src, &target))
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?
         .map_err(store_err)?;
-    let bytes = std::fs::read(&dest).map_err(|err| ApiError::internal(err.to_string()))?;
+    let file = tokio::fs::File::open(&dest)
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))?
+        .len();
+    // The open file keeps its bytes; the name goes now so nothing is left
+    // behind however the transfer ends.
+    drop(remove);
+    tracing::info!(bytes = len, "sending a snapshot");
+    let stream = tokio_util::io::ReaderStream::with_capacity(file, SNAPSHOT_CHUNK);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, len)
+        .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
@@ -573,7 +666,21 @@ async fn log(
         check_follower_tip(query.after, query.term, commit, ours)
             .map_err(|err| ApiError::conflict(err.to_string()))?;
     }
-    let entries = handle.store.read_log(query.after, 64).map_err(store_err)?;
+    let start = handle.store.log_start().map_err(store_err)?;
+    if query.after.saturating_add(1) < start {
+        return Err(ApiError::conflict(format!(
+            "compacted: this server needs entries after {}, the leader keeps entries from {start}",
+            query.after
+        )));
+    }
+    let node = query.node.trim();
+    if !node.is_empty() {
+        guard(&handle.progress).insert(node.to_owned(), (query.after, Instant::now()));
+    }
+    let entries = handle
+        .store
+        .read_log(query.after, LOG_PAGE)
+        .map_err(store_err)?;
     Ok(Json(entries))
 }
 
@@ -594,6 +701,18 @@ async fn vote(
         })
     };
     if *guard(&handle.role) == Role::Learner {
+        return Ok(refuse(&handle));
+    }
+    // A server that is not a voter in its own membership (a copied or
+    // half-joined store) never votes, and nobody votes for a server that is
+    // not a voter here.
+    let members = members_of(&handle.store)?;
+    if !is_voter(&members, &handle.node_id) || !is_voter(&members, &req.candidate_id) {
+        tracing::debug!(
+            candidate = %req.candidate_id,
+            term = req.term,
+            "vote refused: not between voters"
+        );
         return Ok(refuse(&handle));
     }
     if in_leader_lease(since_contact(&handle)) {
@@ -632,11 +751,17 @@ async fn vote(
 
 /// Pull entries after our commit index. The leader checks our term at that
 /// index first and answers 409 when our log forked from its own.
+#[cfg(test)]
 pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
+    pull_page(leader, store, "").await.map(|_| ())
+}
+
+/// One page of entries after our commit index. Returns how many were applied.
+async fn pull_page(leader: &str, store: &Store, node: &str) -> anyhow::Result<usize> {
     let after = store.commit_index()?;
     let term = store.log_term_at(after)?.unwrap_or(0);
     let url = format!(
-        "{}/cluster/log?after={after}&term={term}",
+        "{}/cluster/log?after={after}&term={term}&node={node}",
         leader.trim_end_matches('/')
     );
     let response = with_join(rpc_client().get(&url))
@@ -649,10 +774,36 @@ pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
     }
     let entries: Vec<LogEntry> = response.error_for_status()?.json().await?;
     if entries.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     store.apply_entries(&entries)?;
-    Ok(())
+    Ok(entries.len())
+}
+
+/// Pull from `leader` in the background until a page comes back short. Only
+/// one runs at a time. The follow loop keeps checking the leader each tick
+/// while it runs, so the election timer and the lease track the leader, not
+/// how long replication takes.
+fn start_pull(handle: &std::sync::Arc<ClusterHandle>, leader: &str) {
+    if handle.pulling.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let handle = handle.clone();
+    let leader = leader.to_owned();
+    tokio::spawn(async move {
+        let pulled = loop {
+            if handle.leader.load(Ordering::Acquire) {
+                break Ok(());
+            }
+            match pull_page(&leader, &handle.store, &handle.node_id).await {
+                Ok(n) if n >= LOG_PAGE => continue,
+                Ok(_) => break Ok(()),
+                Err(err) => break Err(err),
+            }
+        };
+        note_pull(&handle, &leader, pulled);
+        handle.pulling.store(false, Ordering::Release);
+    });
 }
 
 /// One loop per node.
@@ -670,6 +821,7 @@ pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
 /// Elections run a pre-vote first, so a failed attempt does not raise terms.
 async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationToken) {
     loop {
+        maybe_compact(&handle);
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(FOLLOW_TICK) => {}
@@ -710,7 +862,9 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
         }
         let silent = guard(&handle.last_heard).elapsed();
         let timeout = *guard(&handle.election_timeout);
-        if should_campaign(silent, timeout) {
+        // A pull still running means the leader answered moments ago; let it
+        // finish (it is bounded by the RPC timeout) before deciding.
+        if should_campaign(silent, timeout) && !handle.pulling.load(Ordering::Acquire) {
             if let Err(err) = campaign(&handle).await {
                 tracing::info!(error = %err, "election did not complete");
             }
@@ -726,6 +880,7 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
 
 async fn lead(handle: &ClusterHandle) {
     *guard(&handle.last_heard) = Instant::now();
+    promote_caught_up(handle);
     let voters = members_of(&handle.store)
         .map(|members| {
             members
@@ -767,6 +922,96 @@ async fn lead(handle: &ClusterHandle) {
     if lost_quorum(since) {
         stand_down(handle, "no voter majority answered");
     }
+}
+
+/// Promote learners whose last pull was within [`PROMOTE_WINDOW`] of our
+/// commit index, as [`plan_promotions`] allows. The membership change is an
+/// ordinary logged write, so every server copies it.
+fn promote_caught_up(handle: &ClusterHandle) {
+    let Ok(members) = members_of(&handle.store) else {
+        return;
+    };
+    if !members.iter().any(|member| member.role == Role::Learner) {
+        return;
+    }
+    let Ok(commit) = handle.store.commit_index() else {
+        return;
+    };
+    let progress = guard(&handle.progress).clone();
+    let caught_up = |id: &str| {
+        progress.get(id).is_some_and(|(after, at)| {
+            at.elapsed() < PROGRESS_FRESH && commit.saturating_sub(*after) <= PROMOTE_WINDOW
+        })
+    };
+    let Some(next) = plan_promotions(&members, caught_up) else {
+        return;
+    };
+    if !handle.leader.load(Ordering::Acquire) {
+        return;
+    }
+    match handle.store.put_meta("members", &next) {
+        Ok(()) => {
+            for member in next
+                .iter()
+                .filter(|member| member.role == Role::Voter && !is_voter(&members, &member.id))
+            {
+                tracing::info!(node = %member.id, api = %member.api, "learner caught up; now a voter");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "could not promote caught-up learners"),
+    }
+}
+
+/// Trim log rows every [`COMPACT_EVERY`]. Every server keeps the last
+/// `log_keep` rows. The leader also keeps what a follower that pulled in the
+/// last [`PROGRESS_PIN`] still needs, up to [`LOG_KEEP_MAX`] rows. Runs on a
+/// blocking thread; one pass removes at most [`COMPACT_MAX_ROWS`].
+fn maybe_compact(handle: &std::sync::Arc<ClusterHandle>) {
+    {
+        let mut last = guard(&handle.last_compact);
+        if last.elapsed() < COMPACT_EVERY {
+            return;
+        }
+        *last = Instant::now();
+    }
+    let handle = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = compact_now(&handle) {
+            tracing::warn!(error = %err, "log compaction failed");
+        }
+    });
+}
+
+/// One compaction pass. Returns the rows removed.
+fn compact_now(handle: &ClusterHandle) -> anyhow::Result<u64> {
+    let commit = handle.store.commit_index()?;
+    let keep = handle.log_keep.load(Ordering::Relaxed).max(1);
+    let mut upto = commit.saturating_sub(keep);
+    if handle.leader.load(Ordering::Acquire) {
+        let members = members_of(&handle.store).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let floor = commit.saturating_sub(LOG_KEEP_MAX.max(keep));
+        let progress = guard(&handle.progress).clone();
+        if let Some(slowest) = members
+            .iter()
+            .filter(|member| member.id != handle.node_id)
+            .filter_map(|member| progress.get(&member.id))
+            .filter(|(_, at)| at.elapsed() < PROGRESS_PIN)
+            .map(|(after, _)| *after)
+            .min()
+        {
+            upto = upto.min(slowest.max(floor));
+        }
+    }
+    let removed = handle.store.compact_log(upto, COMPACT_MAX_ROWS)?;
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            log_start = handle.store.log_start()?,
+            commit,
+            "trimmed replication log"
+        );
+    }
+    Ok(removed)
 }
 
 /// The newest leader any voter claims to be, at our term or newer.
@@ -812,7 +1057,7 @@ async fn probe_voters(handle: &ClusterHandle) -> Vec<ClusterStatus> {
 /// Follow `leader` when it leads a term at least as new as ours. That proof
 /// renews the lease and the election timer; a failed pull after it does not
 /// undo either.
-async fn refresh(handle: &ClusterHandle, leader: &str) -> anyhow::Result<()> {
+async fn refresh(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow::Result<()> {
     let url = format!("{}/cluster", leader.trim_end_matches('/'));
     let status: ClusterStatus = rpc_get_json(&url).await?;
     if !status.leader {
@@ -851,8 +1096,7 @@ async fn refresh(handle: &ClusterHandle, leader: &str) -> anyhow::Result<()> {
         handle.store.put_meta("members", &status.members)?;
     }
     publish(handle);
-    let pulled = pull_log(leader, &handle.store).await;
-    note_pull(handle, leader, pulled);
+    start_pull(handle, leader);
     Ok(())
 }
 
@@ -868,6 +1112,12 @@ fn note_pull(handle: &ClusterHandle, leader: &str, pulled: anyhow::Result<()>) {
             let text = format!("{err:#}");
             if last.as_deref() == Some(text.as_str()) {
                 tracing::debug!(leader = %leader, error = %text, "replication pull failed");
+            } else if text.contains("compacted") {
+                tracing::warn!(
+                    leader = %leader,
+                    error = %text,
+                    "replication stopped: the leader no longer keeps the entries this store needs. Stop this node, move state.redb aside (keep node.id), and start it with --join <leader api>"
+                );
             } else if text.contains("diverged") {
                 tracing::warn!(
                     leader = %leader,
@@ -941,11 +1191,22 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
         return Ok(());
     }
     let members = members_of(&handle.store).map_err(|err| anyhow::anyhow!("{err}"))?;
+    // Only a voter in this store's own membership campaigns. A store with no
+    // membership, or one that lists this server as a learner or not at all,
+    // has nothing to campaign for.
+    if !is_voter(&members, &handle.node_id) {
+        tracing::info!(
+            node = %handle.node_id,
+            "not a voter in this store's membership; not campaigning"
+        );
+        return Ok(());
+    }
     let voters: Vec<&Member> = members
         .iter()
         .filter(|member| member.role == Role::Voter)
         .collect();
-    if voters.len() <= 1 {
+    if voters.len() == 1 {
+        // The only voter is this server: a one-voter cluster leads itself.
         let term = handle.term.load(Ordering::Relaxed).max(1);
         become_leader(handle, term)?;
         return Ok(());
@@ -1324,45 +1585,194 @@ where
     Err(last.unwrap_or_else(|| anyhow::anyhow!("{url} failed")))
 }
 
+/// Limits for one snapshot download. [`Default`] is what `--join` uses.
+#[derive(Debug, Clone)]
+pub struct SnapshotFetch {
+    /// Fail when no bytes arrive for this long.
+    pub stall: Duration,
+    /// Restarts after a transfer that broke part way.
+    pub restarts: u32,
+    /// How long to retry a leader that refuses connections or answers 5xx
+    /// before sending anything.
+    pub startup: Duration,
+    /// Pause between attempts.
+    pub retry_wait: Duration,
+}
+
+impl Default for SnapshotFetch {
+    fn default() -> Self {
+        Self {
+            stall: SNAPSHOT_STALL,
+            restarts: SNAPSHOT_RESTARTS,
+            startup: SNAPSHOT_STARTUP,
+            retry_wait: Duration::from_millis(500),
+        }
+    }
+}
+
+/// What one download moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Downloaded {
+    pub bytes: u64,
+    /// The largest piece held in memory at once.
+    pub largest_chunk: usize,
+}
+
+enum Attempt {
+    /// Nothing usable arrived (refused, 5xx, stalled before the body).
+    NotStarted(anyhow::Error),
+    /// The body started and then broke.
+    Broken(anyhow::Error),
+    /// The leader said no (4xx). Retrying will not help.
+    Refused(anyhow::Error),
+}
+
 async fn fetch_snapshot(api: &str, dest: &Path) -> anyhow::Result<()> {
+    fetch_snapshot_with(api, dest, &SnapshotFetch::default())
+        .await
+        .map(|_| ())
+}
+
+/// Download the leader's snapshot to `dest`. The body is written to
+/// `dest.partial` piece by piece as it arrives, so memory stays at one piece
+/// whatever the store size. There is no limit on the whole transfer, only on
+/// a stall. A broken transfer starts again from the beginning on a truncated
+/// partial file. The file is synced, opened once to check it, and only then
+/// renamed to `dest`, so `dest` is either absent or complete.
+pub async fn fetch_snapshot_with(
+    api: &str,
+    dest: &Path,
+    limits: &SnapshotFetch,
+) -> anyhow::Result<Downloaded> {
     if dest.exists() {
         anyhow::bail!("{} already exists", dest.display());
     }
     let url = format!("{}/cluster/snapshot", api.trim_end_matches('/'));
     let partial = dest.with_extension("partial");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut last = None;
-    while tokio::time::Instant::now() < deadline {
-        match with_join(http_client().get(&url)).send().await {
-            Ok(response) if response.status().is_success() => {
-                let bytes = response.bytes().await?;
-                std::fs::write(&partial, &bytes)?;
-                match verify_db(&partial) {
-                    Ok(()) => {
-                        std::fs::rename(&partial, dest)?;
-                        return Ok(());
+    let started = tokio::time::Instant::now();
+    let mut restarts = 0u32;
+    let result = loop {
+        let _ = tokio::fs::remove_file(&partial).await;
+        match download_once(&url, &partial, limits.stall).await {
+            Ok(done) => match check_and_install(&partial, dest).await {
+                Ok(()) => break Ok(done),
+                Err(err) => {
+                    if restarts >= limits.restarts {
+                        break Err(err);
                     }
-                    Err(err) => {
-                        let _ = std::fs::remove_file(&partial);
-                        last = Some(err);
-                    }
+                    restarts += 1;
+                    tracing::warn!(error = %err, restarts, "snapshot did not open; downloading again");
                 }
+            },
+            Err(Attempt::Refused(err)) => break Err(err),
+            Err(Attempt::NotStarted(err)) => {
+                if started.elapsed() >= limits.startup {
+                    break Err(err);
+                }
+                tracing::debug!(error = %err, "snapshot not available yet");
             }
-            Ok(response) if response.status().is_client_error() => {
-                anyhow::bail!("snapshot {url} returned {}", response.status());
+            Err(Attempt::Broken(err)) => {
+                if restarts >= limits.restarts {
+                    break Err(err);
+                }
+                restarts += 1;
+                tracing::warn!(error = %err, restarts, "snapshot transfer broke; starting it again");
             }
-            Ok(response) => {
-                last = Some(anyhow::anyhow!(
-                    "snapshot {url} returned {}",
-                    response.status()
-                ));
-            }
-            Err(err) => last = Some(err.into()),
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(limits.retry_wait).await;
+    };
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
     }
-    let _ = std::fs::remove_file(&partial);
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("snapshot {url} failed")))
+    result
+}
+
+async fn download_once(url: &str, partial: &Path, stall: Duration) -> Result<Downloaded, Attempt> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    // The leader writes its copy before the first byte, so the wait for
+    // headers is a stall too.
+    let response = match tokio::time::timeout(stall, with_join(client.get(url)).send()).await {
+        Err(_) => {
+            return Err(Attempt::NotStarted(anyhow::anyhow!(
+                "snapshot {url}: no answer for {stall:?}"
+            )))
+        }
+        Ok(Err(err)) => return Err(Attempt::NotStarted(err.into())),
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status();
+    if status.is_client_error() {
+        return Err(Attempt::Refused(anyhow::anyhow!(
+            "snapshot {url} returned {status}"
+        )));
+    }
+    if !status.is_success() {
+        return Err(Attempt::NotStarted(anyhow::anyhow!(
+            "snapshot {url} returned {status}"
+        )));
+    }
+    let expected = response.content_length();
+    let mut response = response;
+    let broken = |err: anyhow::Error| Attempt::Broken(err);
+    let mut file = tokio::fs::File::create(partial)
+        .await
+        .map_err(|err| broken(err.into()))?;
+    let mut done = Downloaded::default();
+    let mut next_note = 256u64 << 20;
+    loop {
+        let chunk = match tokio::time::timeout(stall, response.chunk()).await {
+            Err(_) => {
+                return Err(broken(anyhow::anyhow!(
+                    "snapshot transfer stalled: no data for {stall:?} after {} bytes",
+                    done.bytes
+                )))
+            }
+            Ok(Err(err)) => return Err(broken(err.into())),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => chunk,
+        };
+        done.largest_chunk = done.largest_chunk.max(chunk.len());
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| broken(err.into()))?;
+        done.bytes += chunk.len() as u64;
+        if done.bytes >= next_note {
+            tracing::info!(bytes = done.bytes, total = ?expected, "snapshot download progress");
+            next_note += 256 << 20;
+        }
+    }
+    file.flush().await.map_err(|err| broken(err.into()))?;
+    file.sync_all().await.map_err(|err| broken(err.into()))?;
+    if let Some(expected) = expected {
+        if expected != done.bytes {
+            return Err(broken(anyhow::anyhow!(
+                "snapshot ended after {} of {expected} bytes",
+                done.bytes
+            )));
+        }
+    }
+    Ok(done)
+}
+
+/// Open the downloaded copy once, then rename it into place and sync the
+/// directory so the rename survives a crash.
+async fn check_and_install(partial: &Path, dest: &Path) -> anyhow::Result<()> {
+    let partial = partial.to_owned();
+    let dest = dest.to_owned();
+    tokio::task::spawn_blocking(move || {
+        verify_db(&partial)?;
+        std::fs::rename(&partial, &dest)?;
+        if let Some(dir) = dest.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            if let Ok(dir) = std::fs::File::open(dir) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })
+    .await?
 }
 
 fn verify_db(path: &Path) -> anyhow::Result<()> {
@@ -1554,11 +1964,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.members.len(), 3);
-        assert!(third
-            .members
+        assert!(third.members.iter().any(|member| member.id == "node-b"));
+        let c = third.members.iter().find(|m| m.id == "node-c").unwrap();
+        assert_eq!(c.role, Role::Learner, "a join never adds a voter");
+
+        // Both learners pulled up to the leader's commit: promoted together.
+        promote_caught_up(&handle);
+        assert_eq!(
+            members_of(&store).unwrap()[1].role,
+            Role::Learner,
+            "no promotion before the learners pulled"
+        );
+        let commit = store.commit_index().unwrap();
+        for id in ["node-b", "node-c"] {
+            guard(&handle.progress).insert(id.into(), (commit, Instant::now()));
+        }
+        promote_caught_up(&handle);
+        assert!(members_of(&store)
+            .unwrap()
             .iter()
             .all(|member| member.role == Role::Voter));
-        assert!(third.members.iter().any(|member| member.id == "node-b"));
     }
 
     struct LiveVoter {
@@ -1646,6 +2071,20 @@ mod tests {
         ready: &Established,
         leadership: Leadership,
     ) -> LiveVoter {
+        start_voter_opts(id, listener, store, dir, ready, leadership, None)
+    }
+
+    /// `log_delay` holds every `/cluster/log` answer that long: a leader
+    /// whose pulls are slow (a big log, a busy disk) but that is alive.
+    fn start_voter_opts(
+        id: &str,
+        listener: tokio::net::TcpListener,
+        store: Store,
+        dir: tempfile::TempDir,
+        ready: &Established,
+        leadership: Leadership,
+        log_delay: Option<Duration>,
+    ) -> LiveVoter {
         let addr = listener.local_addr().unwrap();
         let api = format!("http://{addr}");
         let path = dir.path().join("state.redb");
@@ -1665,6 +2104,16 @@ mod tests {
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
                 reject_follower_writes,
+            ))
+            .layer(middleware::from_fn(
+                move |req: axum::extract::Request, next: Next| async move {
+                    if let Some(delay) = log_delay {
+                        if req.uri().path() == "/cluster/log" {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    next.run(req).await
+                },
             ));
         let stop = serve_stop.clone();
         tokio::spawn(async move {
@@ -2312,18 +2761,22 @@ mod tests {
 
     #[test]
     fn a_voter_in_a_three_voter_cluster_starts_as_a_follower() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open_store(dir.path());
         let members = vec![
             Member::voter("sim", "http://sim"),
             Member::voter("sim2", "http://sim2"),
             Member::voter("sim3", "http://sim3"),
         ];
-        store.put_meta("members", &members).unwrap();
-        store
-            .put_meta("cluster_leader_id", &"sim".to_string())
-            .unwrap();
-        store.put_meta("cluster_term", &6u64).unwrap();
+        let seeded = || {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_store(dir.path());
+            store.put_meta("members", &members).unwrap();
+            store
+                .put_meta("cluster_leader_id", &"sim".to_string())
+                .unwrap();
+            store.put_meta("cluster_term", &6u64).unwrap();
+            (dir, store)
+        };
+        let (_dir, store) = seeded();
         let LocalRole::Ready(old) = establish_local(&store, "sim", "http://sim", true).unwrap()
         else {
             panic!("member had to join");
@@ -2331,6 +2784,7 @@ mod tests {
         assert!(!old.leader);
         assert_eq!(old.leader_api, "");
         assert_eq!(old.term, 6);
+        let (_dir2, store) = seeded();
         let LocalRole::Ready(peer) = establish_local(&store, "sim2", "http://sim2", true).unwrap()
         else {
             panic!("member had to join");
@@ -2437,5 +2891,559 @@ mod tests {
                 .uses,
             1
         );
+    }
+
+    async fn status_of_api(api: &str) -> ClusterStatus {
+        http_client()
+            .get(format!("{api}/cluster"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn ask_vote(api: &str, candidate: &str, term: u64, pre: bool) -> VoteResponse {
+        http_client()
+            .post(format!("{api}/cluster/vote"))
+            .json(&VoteRequest {
+                term,
+                candidate_id: candidate.into(),
+                last_index: 1_000_000,
+                last_term: 1_000,
+                pre,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    /// A learner whose leader went silent waits: election timeouts pass, it
+    /// never campaigns, never moves its term, and refuses every vote. The
+    /// same holds when its in-memory role says voter but its own store does
+    /// not, and for a server whose store has no membership at all.
+    #[tokio::test]
+    async fn a_learner_never_campaigns_or_votes_even_when_the_leader_is_silent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", "http://127.0.0.1:9"),
+            Member::voter("sim2", "http://127.0.0.1:9"),
+            Member::learner("joiner", &api),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        seed_voter(&store, "joiner", &members, 6);
+        let ready = Established {
+            role: Role::Learner,
+            leader: false,
+            leader_api: "http://127.0.0.1:9".into(),
+            term: 6,
+            members: members.clone(),
+        };
+        let joiner = start_voter("joiner", listener, store, dir, &ready);
+        *guard(&joiner.handle.election_timeout) = Duration::from_millis(50);
+        run(&joiner);
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(!joiner.leads(), "a learner took leadership");
+        }
+        assert_eq!(joiner.term(), 6, "a learner moved the term");
+        for pre in [true, false] {
+            let reply = ask_vote(&joiner.api, "sim2", 9, pre).await;
+            assert!(!reply.granted, "a learner granted a vote");
+            assert_eq!(reply.term, 6);
+        }
+
+        // In-memory role out of step with the store: the store wins.
+        *guard(&joiner.handle.role) = Role::Voter;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(!joiner.leads());
+        }
+        assert_eq!(joiner.term(), 6);
+        assert!(!ask_vote(&joiner.api, "sim2", 9, true).await.granted);
+        joiner.kill();
+
+        // No membership in the store: never a lone voter.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.put_meta("cluster_term", &6u64).unwrap();
+        let ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: String::new(),
+            term: 6,
+            members: Vec::new(),
+        };
+        let bare = start_voter("bare", listener, store, dir, &ready);
+        *guard(&bare.handle.election_timeout) = Duration::from_millis(50);
+        run(&bare);
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(!bare.leads(), "a server with no membership elected itself");
+        }
+        assert_eq!(bare.term(), 6);
+        bare.kill();
+    }
+
+    /// The lab failure. The leader's own store is copied, offline, onto a
+    /// voter that keeps its node id; the leader comes back and writes on.
+    /// The copy carries the leader's id, term, vote and a membership naming
+    /// the copy's server a voter. It must rejoin as a learner, never lead or
+    /// move the term, catch up, and only then become a voter: one leader the
+    /// whole time and no fork.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copied_leader_store_rejoins_as_a_learner_and_is_promoted_without_a_fork() {
+        let term = 6u64;
+        let (sim, sim2, sim3) = three_voters(term).await;
+        for n in 0..20 {
+            sim.handle.store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        wait_for("followers copy", Duration::from_secs(5), || {
+            sim3.handle.store.get_meta::<i32>("k19").unwrap() == Some(19)
+                && sim2.handle.store.get_meta::<i32>("k19").unwrap() == Some(19)
+        })
+        .await;
+
+        // Stop sim3 and copy the leader's store over it.
+        sim3.kill();
+        let LiveVoter {
+            addr: sim3_addr,
+            dir: sim3_dir,
+            api: sim3_api,
+            ..
+        } = sim3;
+        let copy_path = sim3_dir.path().join("state.redb.reseed");
+        sim.handle
+            .store
+            .snapshot_file(&sim.handle.db_path, &copy_path)
+            .unwrap();
+        // The leader keeps writing past the copy, as it did in the lab.
+        for n in 20..200 {
+            sim.handle.store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+
+        let copy = {
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            Store::open(&copy_path, events).unwrap()
+        };
+        let owner: Option<String> = copy.get_meta("node_id").unwrap();
+        assert_eq!(
+            owner.as_deref(),
+            Some("sim"),
+            "the copy carries the leader's id"
+        );
+        let voted: Option<String> = copy.get_meta("cluster_voted_for").unwrap_or(None);
+        assert_eq!(voted.as_deref(), Some("sim"));
+        assert!(is_voter(&members_of(&copy).unwrap(), "sim3"));
+
+        // Boot as the server does with an existing store (Keep).
+        let established = match establish_local(&copy, "sim3", &sim3_api, true).unwrap() {
+            LocalRole::NeedJoin => adopt(&copy, &sim.api, "sim3", &sim3_api).await.unwrap(),
+            LocalRole::Ready(_) => panic!("a copied store was trusted as this server's own"),
+        };
+        assert_eq!(established.role, Role::Learner);
+        assert!(!established.leader);
+        let voted: Option<String> = copy.get_meta("cluster_voted_for").unwrap_or(None);
+        assert!(voted.is_none(), "the copied vote was kept");
+        let owner: Option<String> = copy.get_meta("node_id").unwrap();
+        assert_eq!(owner.as_deref(), Some("sim3"));
+        let leader_view = members_of(&sim.handle.store).unwrap();
+        assert!(
+            !is_voter(&leader_view, "sim3"),
+            "the rejoiner stayed a voter"
+        );
+
+        let listener = loop {
+            match tokio::net::TcpListener::bind(sim3_addr).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let back = start_voter("sim3", listener, copy.clone(), sim3_dir, &established);
+        *guard(&back.handle.election_timeout) = Duration::from_millis(50);
+        run(&back);
+
+        let mut promoted = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let leaders = [&sim, &sim2, &back].iter().filter(|v| v.leads()).count();
+            assert_eq!(leaders, 1, "exactly one node may claim leadership");
+            assert!(sim.leads(), "the healthy leader lost leadership");
+            assert!(!back.leads(), "the reseeded server led");
+            assert_eq!(sim.term(), term, "the term moved");
+            assert_eq!(back.term(), term, "the reseeded server moved its term");
+            if is_voter(&members_of(&sim.handle.store).unwrap(), "sim3")
+                && *guard(&back.handle.role) == Role::Voter
+            {
+                promoted = true;
+                break;
+            }
+        }
+        assert!(promoted, "the caught-up learner was not promoted");
+        // Promoted within one page of the leader; the rest follows.
+        wait_for(
+            "the learner copies the writes made after the copy",
+            Duration::from_secs(3),
+            || copy.get_meta::<i32>("k199").unwrap() == Some(199),
+        )
+        .await;
+        sim.handle.store.put_meta("after", &"yes").unwrap();
+        wait_for(
+            "the promoted voter copies on",
+            Duration::from_secs(3),
+            || marker(&copy, "after").as_deref() == Some("yes"),
+        )
+        .await;
+        let tip = copy.commit_index().unwrap();
+        assert_eq!(tip, sim.handle.store.commit_index().unwrap());
+        assert_eq!(
+            copy.log_term_at(tip).unwrap(),
+            sim.handle.store.log_term_at(tip).unwrap()
+        );
+        assert!(guard(&back.handle.pull_error).is_none());
+        assert_eq!(status_of_api(&sim.api).await.term, term);
+        sim.kill();
+        sim2.kill();
+        back.kill();
+    }
+
+    /// The other half of the lab failure. Pulls from a live leader are slow
+    /// (a large log): a follower that just heard the leader must not count
+    /// the time its pull takes as silence, start an election, or let its
+    /// lease lapse and hand a vote to a candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_pull_from_a_live_leader_neither_starts_an_election_nor_opens_the_lease() {
+        let term = 6u64;
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let third = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sim_api = format!("http://{}", first.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &sim_api),
+            Member::voter("sim2", &format!("http://{}", second.local_addr().unwrap())),
+            Member::voter("sim3", &format!("http://{}", third.local_addr().unwrap())),
+        ];
+        let mut voters = Vec::new();
+        for (id, listener) in [("sim", first), ("sim2", second), ("sim3", third)] {
+            let leader = id == "sim";
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_store(dir.path());
+            seed_voter(&store, id, &members, term);
+            store.set_log_term(term);
+            if leader {
+                store.set_record_log(true);
+            }
+            let ready = Established {
+                role: Role::Voter,
+                leader,
+                leader_api: sim_api.clone(),
+                term,
+                members: members.clone(),
+            };
+            let delay = leader.then_some(Duration::from_millis(1_500));
+            voters.push(start_voter_opts(
+                id,
+                listener,
+                store,
+                dir,
+                &ready,
+                Leadership::new(leader),
+                delay,
+            ));
+        }
+        let (sim, sim2, sim3) = (&voters[0], &voters[1], &voters[2]);
+        *guard(&sim2.handle.election_timeout) = Duration::from_millis(300);
+        *guard(&sim3.handle.election_timeout) = Duration::from_millis(300);
+        for voter in &voters {
+            run(voter);
+        }
+        sim.handle.store.put_meta("slow", &"yes").unwrap();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(4) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(sim.leads(), "a slow pull deposed a live leader");
+            assert!(!sim2.leads() && !sim3.leads());
+            assert_eq!(sim2.term(), term, "a follower started an election");
+            assert_eq!(sim3.term(), term, "a follower started an election");
+            if started.elapsed() > Duration::from_millis(500) {
+                let reply = ask_vote(&sim2.api, "sim3", term + 1, true).await;
+                assert!(
+                    !reply.granted,
+                    "a follower with a live leader granted a pre-vote"
+                );
+            }
+        }
+        assert_eq!(marker(&sim2.handle.store, "slow").as_deref(), Some("yes"));
+        assert_eq!(marker(&sim3.handle.store, "slow").as_deref(), Some("yes"));
+        for voter in &voters {
+            voter.kill();
+        }
+    }
+
+    /// A store of several megabytes, written as a real redb file.
+    fn big_store(dir: &Path, rows: usize, size: usize) -> (PathBuf, Store) {
+        let path = dir.join("state.redb");
+        let store = open_store(dir);
+        store.put_meta("cluster_id", &"c1".to_string()).unwrap();
+        store.set_log_term(3);
+        store.set_record_log(true);
+        let blob = "x".repeat(size);
+        for n in 0..rows {
+            store.put_meta(&format!("blob/{n:06}"), &blob).unwrap();
+        }
+        store.set_record_log(false);
+        (path, store)
+    }
+
+    /// Serve `bytes` as `/cluster/snapshot` in `piece`-byte pieces with a
+    /// pause between them. `break_first` cuts the first answer off half way;
+    /// `hang` stops sending half way and never finishes.
+    async fn slow_snapshot_server(
+        bytes: Arc<Vec<u8>>,
+        piece: usize,
+        pause: Duration,
+        break_first: bool,
+        hang: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = Router::new().route(
+            "/cluster/snapshot",
+            axum::routing::get(move || {
+                let bytes = bytes.clone();
+                let call = seen.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let total = bytes.len();
+                    let cut = (break_first && call == 0) || hang;
+                    let stream = futures::stream::unfold(0usize, move |at| {
+                        let bytes = bytes.clone();
+                        async move {
+                            if at >= total {
+                                return None;
+                            }
+                            if cut && at >= total / 2 {
+                                if hang {
+                                    std::future::pending::<()>().await;
+                                }
+                                return Some((Err(std::io::Error::other("link dropped")), total));
+                            }
+                            tokio::time::sleep(pause).await;
+                            let end = (at + piece).min(total);
+                            Some((
+                                Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(
+                                    &bytes[at..end],
+                                )),
+                                end,
+                            ))
+                        }
+                    });
+                    Response::builder()
+                        .header(header::CONTENT_LENGTH, total)
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    /// Many megabytes in small pieces over a slow link: the download holds
+    /// one piece at a time, takes far longer than the stall limit, and still
+    /// finishes because only a stall fails it. The result opens and is the
+    /// leader's data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_snapshot_streams_in_small_pieces_and_a_slow_link_finishes() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let (path, store) = big_store(src_dir.path(), 600, 8 * 1024);
+        drop(store);
+        let bytes = Arc::new(std::fs::read(&path).unwrap());
+        assert!(bytes.len() > 4 << 20, "{}", bytes.len());
+        let piece = 32 * 1024;
+        let (api, _) =
+            slow_snapshot_server(bytes.clone(), piece, Duration::from_millis(8), false, false)
+                .await;
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("state.redb");
+        let limits = SnapshotFetch {
+            stall: Duration::from_millis(400),
+            restarts: 0,
+            startup: Duration::from_secs(2),
+            retry_wait: Duration::from_millis(50),
+        };
+        let started = Instant::now();
+        let done = fetch_snapshot_with(&api, &dest, &limits).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(done.bytes, bytes.len() as u64);
+        assert!(done.largest_chunk <= 4 * piece, "{}", done.largest_chunk);
+        assert!(took > limits.stall * 3, "the link was not slow: {took:?}");
+        assert!(!dest.with_extension("partial").exists());
+        let copy = open_store(dest_dir.path());
+        assert_eq!(
+            copy.get_meta::<String>("blob/000599")
+                .unwrap()
+                .unwrap()
+                .len(),
+            8 * 1024
+        );
+    }
+
+    /// A transfer cut off half way starts again cleanly and installs once.
+    /// A transfer that stops moving fails on the stall limit and leaves
+    /// neither the store nor a partial file behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_broken_snapshot_restarts_cleanly_and_a_stalled_one_fails() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let (path, store) = big_store(src_dir.path(), 100, 8 * 1024);
+        drop(store);
+        let bytes = Arc::new(std::fs::read(&path).unwrap());
+        let limits = SnapshotFetch {
+            stall: Duration::from_millis(300),
+            restarts: 2,
+            startup: Duration::from_secs(2),
+            retry_wait: Duration::from_millis(20),
+        };
+
+        let (api, calls) =
+            slow_snapshot_server(bytes.clone(), 16 * 1024, Duration::ZERO, true, false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state.redb");
+        let done = fetch_snapshot_with(&api, &dest, &limits).await.unwrap();
+        assert_eq!(done.bytes, bytes.len() as u64);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one restart");
+        assert!(dest.exists());
+        assert!(!dest.with_extension("partial").exists());
+
+        let (api, _) =
+            slow_snapshot_server(bytes.clone(), 16 * 1024, Duration::ZERO, false, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state.redb");
+        let limits = SnapshotFetch {
+            restarts: 0,
+            ..limits
+        };
+        let err = fetch_snapshot_with(&api, &dest, &limits).await.unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err:#}");
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("partial").exists());
+    }
+
+    /// The real `/cluster/snapshot` route streams a consistent copy of a
+    /// leader's multi-megabyte store; the joiner gets every row, the same
+    /// commit index, and the leader leaves no temporary file behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_snapshot_route_streams_a_consistent_copy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, store) = big_store(dir.path(), 700, 8 * 1024);
+        let members = vec![Member::voter("sim", "http://sim")];
+        seed_voter(&store, "sim", &members, 3);
+        let ready = Established {
+            role: Role::Voter,
+            leader: true,
+            leader_api: String::new(),
+            term: 3,
+            members,
+        };
+        let leader = start_voter("sim", listener, store.clone(), dir, &ready);
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("state.redb");
+        let done = fetch_snapshot_with(&leader.api, &dest, &SnapshotFetch::default())
+            .await
+            .unwrap();
+        assert!(done.bytes > 4 << 20, "{}", done.bytes);
+        assert!(
+            done.largest_chunk <= 4 * SNAPSHOT_CHUNK,
+            "{}",
+            done.largest_chunk
+        );
+        let copy = open_store(dest_dir.path());
+        assert_eq!(copy.commit_index().unwrap(), store.commit_index().unwrap());
+        assert!(copy.get_meta::<String>("blob/000699").unwrap().is_some());
+        let leftovers: Vec<_> = std::fs::read_dir(leader.dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("snapshot-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary snapshot files left behind");
+        leader.kill();
+    }
+
+    /// Compaction trims what every follower already has, keeps what a
+    /// slightly-behind follower still needs, and replication goes on. A
+    /// server that needs trimmed rows is told to rejoin, not fed a gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compaction_trims_the_log_and_followers_keep_working() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let members = vec![
+            Member::voter("sim", "http://sim"),
+            Member::voter("a", "http://a"),
+            Member::voter("b", "http://b"),
+        ];
+        let leader = serve_voter("sim", listener, &members, true, 6, "").await;
+        let store = leader.handle.store.clone();
+        for n in 0..300 {
+            store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        let commit = store.commit_index().unwrap();
+        let (_a_dir, a) = {
+            let dir = tempfile::tempdir().unwrap();
+            let s = open_store(dir.path());
+            (dir, s)
+        };
+        let (_b_dir, b) = {
+            let dir = tempfile::tempdir().unwrap();
+            let s = open_store(dir.path());
+            (dir, s)
+        };
+        while pull_page(&leader.api, &a, "a").await.unwrap() > 0 {}
+        assert_eq!(a.commit_index().unwrap(), commit);
+        // Two pages: the leader saw b ask after the first one.
+        pull_page(&leader.api, &b, "b").await.unwrap();
+        pull_page(&leader.api, &b, "b").await.unwrap();
+        let b_at = b.commit_index().unwrap();
+        assert!(b_at < commit);
+
+        leader.handle.log_keep.store(50, Ordering::Relaxed);
+        let removed = compact_now(&leader.handle).unwrap();
+        assert!(removed > 0);
+        let start = store.log_start().unwrap();
+        assert!(start <= b_at, "trimmed rows the slow follower still needs");
+        assert!(store.log_term_at(commit).unwrap().is_some());
+        // The slightly-behind follower carries on.
+        while pull_page(&leader.api, &b, "b").await.unwrap() > 0 {}
+        assert_eq!(b.commit_index().unwrap(), commit);
+
+        // Everyone is current: trim down to the kept tail.
+        compact_now(&leader.handle).unwrap();
+        assert_eq!(store.log_start().unwrap(), commit - 50);
+        assert_eq!(store.read_log(0, 1).unwrap()[0].index, commit - 50);
+        for n in 300..320 {
+            store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        while pull_page(&leader.api, &a, "a").await.unwrap() > 0 {}
+        while pull_page(&leader.api, &b, "b").await.unwrap() > 0 {}
+        assert_eq!(a.get_meta::<i32>("k319").unwrap(), Some(319));
+        assert_eq!(b.get_meta::<i32>("k319").unwrap(), Some(319));
+
+        // A server that needs trimmed rows is sent back to --join.
+        let fresh = Store::in_memory().unwrap();
+        let err = pull_page(&leader.api, &fresh, "c").await.unwrap_err();
+        assert!(err.to_string().contains("compacted"), "{err:#}");
+        assert_eq!(fresh.commit_index().unwrap(), 0);
+        leader.kill();
     }
 }
