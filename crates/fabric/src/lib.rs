@@ -51,6 +51,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// The module. `Default` uses the mock backend so a single-node server is
 /// functional end to end. [`Fabric::hostnat`] is the single-host datapath.
 /// [`Fabric::overlay`] accepts overlay networks; the agent applies the plan.
+/// [`Fabric::ovn`] writes OVN's northbound database.
 pub struct Fabric {
     backend: Arc<dyn NetBackend>,
 }
@@ -76,6 +77,14 @@ impl Fabric {
     /// per router. The agent applies [`overlay::OverlayPlan`].
     pub fn overlay() -> Self {
         Self::with_backend(Arc::new(OverlayBackend::new()))
+    }
+
+    /// OVN: the leader writes OVN's northbound database at
+    /// `PISTACK_OVN_NB` (default [`backend::ovn::DEFAULT_NB`]); OVS and
+    /// `ovn-controller` on each host do the rest.
+    /// Selected when `PISTACK_FABRIC_BACKEND=ovn`.
+    pub fn ovn() -> Self {
+        Self::with_backend(Arc::new(OvnBackend::from_env()))
     }
 
     /// A `Client` over the context's store and this module's backend.
@@ -109,6 +118,7 @@ impl Module for Fabric {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client(&ctx);
+        self.backend.attach(&ctx.leadership, &ctx.store::<Store>());
         let backend_name = self.backend.name();
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();

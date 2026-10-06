@@ -11,16 +11,19 @@
 //!
 //! [`MockBackend`] records calls for tests. [`HostNat`] is the single-host
 //! datapath. [`OverlayBackend`] accepts one VXLAN segment per network and
-//! does not configure the host. [`OvnBackend`] is a stub.
+//! does not configure the host. [`OvnBackend`] writes OVN's northbound
+//! database (networks, subnets and ports so far).
 
 use crate::types::{FloatingIp, Network, Port, PortBinding, Router, SecurityGroup, Subnet};
 use async_trait::async_trait;
-use pistack_types::{ApiResult, Id};
+use pistack_store::Store;
+use pistack_types::{ApiResult, Id, Leadership};
 
 pub mod hostnat;
 pub mod mock;
 pub mod overlay;
 pub mod ovn;
+pub mod ovsdb;
 
 pub use hostnat::HostNat;
 pub use mock::{Call, MockBackend};
@@ -52,6 +55,11 @@ pub struct FipView {
 pub trait NetBackend: Send + Sync + 'static {
     /// Human name, for logs and `GET /network/`.
     fn name(&self) -> &'static str;
+
+    /// Called once when the module starts, before any ensure. A backend
+    /// that writes shared state outside the store uses this to check
+    /// leadership before each write.
+    fn attach(&self, _leadership: &Leadership, _store: &Store) {}
 
     async fn ensure_network(&self, net: &Network) -> ApiResult<()>;
     async fn delete_network(&self, id: &Id) -> ApiResult<()>;
