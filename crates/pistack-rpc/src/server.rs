@@ -128,7 +128,7 @@ pub fn router_with_auth(queue: CommandQueue, store: Store, auth: RpcAuth) -> Rou
     let enroll = Router::new()
         .route("/agents/enroll", post(enroll))
         .with_state(store.clone());
-    let app = enroll.merge(routes(queue));
+    let app = enroll.merge(routes(queue).layer(axum::Extension(store.clone())));
     if !auth.require_join && !auth.require_client_cert {
         return app;
     }
@@ -298,11 +298,35 @@ async fn hello(
 async fn heartbeat(
     State(q): State<CommandQueue>,
     ext: axum::http::Extensions,
+    store: Option<axum::Extension<Store>>,
     Json(hb): Json<Heartbeat>,
 ) -> ApiResult<Json<HeartbeatAck>> {
     check_node_name(&hb.node_name)?;
     check_peer_node(&ext, &hb.node_name)?;
-    Ok(Json(q.heartbeat(&hb)))
+    let mut ack = q.heartbeat(&hb);
+    if let Some(axum::Extension(store)) = store {
+        ack.servers = cluster_servers(&store);
+    }
+    Ok(Json(ack))
+}
+
+/// Only the field we need from a cluster member record.
+#[derive(Deserialize)]
+struct MemberAddress {
+    api: String,
+}
+
+/// API addresses of the cluster's servers, from the replicated member list.
+fn cluster_servers(store: &Store) -> Vec<String> {
+    store
+        .get_meta::<Vec<MemberAddress>>("members")
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.api.trim().to_owned())
+        .filter(|api| !api.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -660,6 +684,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_lists_the_cluster_servers() {
+        let store = Store::in_memory().unwrap();
+        let auth = RpcAuth {
+            require_join: false,
+            require_client_cert: false,
+        };
+        let (base, server) = serve_auth(store.clone(), auth, None).await;
+        let http = reqwest::Client::new();
+        let beat = Heartbeat {
+            node_name: "n1".into(),
+            resources_free: Resources::default(),
+            machines: vec![],
+            at: Utc::now(),
+        };
+        let ack: HeartbeatAck = http
+            .post(format!("{base}/agents/heartbeat"))
+            .json(&beat)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(ack.servers.is_empty(), "a single server lists no peers");
+
+        store
+            .put_meta(
+                "members",
+                &serde_json::json!([
+                    {"id": "a", "api": "https://10.0.0.10:8443", "role": "voter"},
+                    {"id": "b", "api": "https://10.0.0.11:8443", "role": "voter"},
+                    {"id": "c", "api": " ", "role": "learner"},
+                ]),
+            )
+            .unwrap();
+        let ack: HeartbeatAck = http
+            .post(format!("{base}/agents/heartbeat"))
+            .json(&beat)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            ack.servers,
+            vec!["https://10.0.0.10:8443", "https://10.0.0.11:8443"]
+        );
         server.abort();
     }
 

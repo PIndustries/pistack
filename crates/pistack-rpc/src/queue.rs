@@ -273,6 +273,7 @@ impl CommandQueue {
             server_time: now,
             commands_waiting,
             known,
+            servers: Vec::new(),
         }
     }
 
