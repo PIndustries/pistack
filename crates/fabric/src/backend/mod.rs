@@ -36,6 +36,8 @@ pub struct RouterView {
     pub router: Router,
     /// External network and the router's gateway port on it.
     pub gateway: Option<(Network, Port)>,
+    /// The external subnet the gateway port's address is on, when known.
+    pub gateway_subnet: Option<Subnet>,
     /// One entry per `spec.interfaces` subnet: the subnet and the router's
     /// interface port on it (holding the subnet gateway address).
     pub interfaces: Vec<(Subnet, Port)>,

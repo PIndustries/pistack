@@ -510,6 +510,34 @@ pub(crate) mod fake {
         if let Some(rows) = st.tables.get_mut("ACL") {
             rows.retain(|r| r.get("_uuid").is_some_and(|u| acls.contains(u)));
         }
+        // Router rows are not root tables either: what no router holds
+        // goes, and then gateway chassis no router port holds.
+        for (table, col) in [
+            ("Logical_Router_Port", "ports"),
+            ("NAT", "nat"),
+            ("Logical_Router_Static_Route", "static_routes"),
+        ] {
+            let held: Vec<Value> = st
+                .tables
+                .get("Logical_Router")
+                .map(|rs| rs.iter().flat_map(|r| elems(r.get(col))).collect())
+                .unwrap_or_default();
+            if let Some(rows) = st.tables.get_mut(table) {
+                rows.retain(|r| r.get("_uuid").is_some_and(|u| held.contains(u)));
+            }
+        }
+        let held: Vec<Value> = st
+            .tables
+            .get("Logical_Router_Port")
+            .map(|rs| {
+                rs.iter()
+                    .flat_map(|r| elems(r.get("gateway_chassis")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(rows) = st.tables.get_mut("Gateway_Chassis") {
+            rows.retain(|r| r.get("_uuid").is_some_and(|u| held.contains(u)));
+        }
     }
 
     #[async_trait]

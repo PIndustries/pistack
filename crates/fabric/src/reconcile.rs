@@ -427,6 +427,13 @@ impl Client {
                 }
                 None => None,
             };
+            let gateway_subnet = match &gateway {
+                Some((_, port)) => match &port.spec.subnet {
+                    Some(sid) => Some(self.subnets().get(sid).map_err(api)?),
+                    None => None,
+                },
+                None => None,
+            };
             let mut interfaces = Vec::new();
             for sid in &router.spec.interfaces {
                 let sub = self.subnets().get(sid).map_err(api)?;
@@ -442,6 +449,7 @@ impl Client {
             let view = RouterView {
                 router: router.clone(),
                 gateway,
+                gateway_subnet,
                 interfaces,
             };
             self.backend().ensure_router(&view).await
