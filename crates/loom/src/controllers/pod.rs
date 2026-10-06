@@ -85,13 +85,13 @@ pub struct PodSandbox {
     /// [`Self::config_maps`]. Payloads are not part of the pod spec.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: BTreeMap<String, ProjectedFiles>,
-    /// Slab volume id to the absolute host path recorded at attach.
+    /// Slab volume id to the mounted directory recorded at attach.
     /// Empty until the volume is attached. The youki runtime bind-mounts
-    /// these paths when it creates the containers.
+    /// this directory. It does not bind the volume's backing file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub volume_paths: BTreeMap<String, String>,
-    /// Slab volume id to a device name, when the volume has no host path
-    /// (an RBD image is mapped to a device after the bundle exists).
+    /// Slab volume id to a device name, when the volume has no mounted
+    /// directory yet. The runtime does not bind that device.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub volume_devices: BTreeMap<String, String>,
 }

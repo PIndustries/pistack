@@ -464,16 +464,45 @@ pub async fn reject_follower_writes(
     let read = method == axum::http::Method::GET
         || method == axum::http::Method::HEAD
         || method == axum::http::Method::OPTIONS;
-    if read || path == "/healthz" || path == "/" || path.starts_with("/cluster") {
+    // Agents must reach the leader for every call, reads included: a
+    // follower's command queue never receives anything, so a long-poll
+    // there would wait forever. They follow the leader address below.
+    let rpc = path == "/rpc" || path.starts_with("/rpc/");
+    if (read && !rpc) || path == "/healthz" || path == "/" || path.starts_with("/cluster") {
         return next.run(req).await;
     }
     if handle.leader.load(Ordering::Relaxed) {
         return next.run(req).await;
     }
+    if rpc {
+        // Agents act on the address, so only name a leader this follower
+        // heard from within an election window. During an election there
+        // is none yet; the agent retries shortly.
+        return match fresh_leader(&handle) {
+            Some(leader) => ApiError::conflict("not the leader")
+                .with_detail("leader", leader)
+                .into_response(),
+            None => ApiError::unavailable("no leader yet, retry soon").into_response(),
+        };
+    }
     let leader = locked(&handle.leader_api);
     ApiError::conflict("not the leader")
         .with_detail("leader", leader)
         .into_response()
+}
+
+/// The leader this follower tracks, if it heard from it within the current
+/// election timeout. Reads the follow loop's state; changes nothing.
+fn fresh_leader(handle: &ClusterHandle) -> Option<String> {
+    let leader = locked(&handle.leader_api);
+    if leader.is_empty() || leader == handle.self_api {
+        return None;
+    }
+    let window = *guard(&handle.election_timeout);
+    match since_contact(handle) {
+        Some(quiet) if quiet < window => Some(leader),
+        _ => None,
+    }
 }
 
 async fn show(
@@ -1427,6 +1456,28 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         let body = refused.text().await.unwrap();
         assert!(body.contains("not the leader"));
+        // Agents' command polls are reads, but a follower's queue never
+        // fills, so they are sent to the leader too.
+        let poll = client
+            .get(format!("{base}/rpc/agents/n1/commands"))
+            .send()
+            .await
+            .unwrap();
+        // Not heard from the leader yet: no address, just "retry soon".
+        assert_eq!(poll.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = poll.text().await.unwrap();
+        assert!(body.contains("no leader yet"), "{body}");
+        *guard(&handle.leader_contact) = Some(Instant::now());
+        let poll = client
+            .get(format!("{base}/rpc/agents/n1/commands"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = poll.json().await.unwrap();
+        assert_eq!(body["error"]["details"]["leader"], base.as_str());
+        let read = client.get(format!("{base}/cluster")).send().await.unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
         handle.leader.store(true, Ordering::Relaxed);
         let allowed = client.post(format!("{base}/mutate")).send().await.unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);

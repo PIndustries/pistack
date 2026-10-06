@@ -4,6 +4,7 @@
 //! The agent side of the protocol: what `anvil` uses to talk to the control
 //! plane.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pistack_types::ApiError;
@@ -21,10 +22,47 @@ use crate::proto::{
 /// the full wait is not cut off by the client.
 const POLL_GRACE: Duration = Duration::from_secs(10);
 
+/// How long to wait for a server to accept a connection. Short, so a
+/// powered-off server (whose packets vanish rather than being refused) is
+/// skipped quickly in favour of the next known one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Where the agent routes are mounted under a server's API address.
+pub const RPC_PATH: &str = "/rpc";
+
+/// Most "not the leader" answers one call follows before giving up.
+const MAX_LEADER_HOPS: usize = 3;
+
+/// Append [`RPC_PATH`] to a server's API address unless it is already there.
+pub fn rpc_base(api: &str) -> String {
+    let a = api.trim().trim_end_matches('/');
+    if a.ends_with(RPC_PATH) {
+        a.to_owned()
+    } else {
+        format!("{a}{RPC_PATH}")
+    }
+}
+
+/// The server this client talks to now, plus every server it has heard of.
+/// Shared by clones so the whole agent moves together.
+#[derive(Debug)]
+struct Servers {
+    current: String,
+    known: Vec<String>,
+}
+
+impl Servers {
+    fn learn(&mut self, base: String) {
+        if !self.known.contains(&base) {
+            self.known.push(base);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentClient {
     http: reqwest::Client,
-    base: String,
+    servers: Arc<Mutex<Servers>>,
     node_name: String,
     token: Option<String>,
 }
@@ -32,7 +70,7 @@ pub struct AgentClient {
 impl std::fmt::Debug for AgentClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentClient")
-            .field("base", &self.base)
+            .field("base", &self.base_url())
             .field("node_name", &self.node_name)
             .field("token", &self.token.as_ref().map(|_| "<set>"))
             .finish()
@@ -47,7 +85,7 @@ impl AgentClient {
         node_name: impl Into<String>,
     ) -> Result<Self, RpcError> {
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Self::with_http(http, base_url, node_name)
@@ -66,7 +104,10 @@ impl AgentClient {
         reqwest::Url::parse(&base).map_err(|e| RpcError::InvalidUrl(format!("{base}: {e}")))?;
         Ok(Self {
             http,
-            base,
+            servers: Arc::new(Mutex::new(Servers {
+                current: base.clone(),
+                known: vec![base],
+            })),
             node_name: node_name.into(),
             token: None,
         })
@@ -103,26 +144,122 @@ impl AgentClient {
 
     /// Spend the join token once and receive a CA-signed client certificate.
     pub async fn enroll(&self, node_name: &str) -> Result<EnrollResponse, RpcError> {
-        let rb = self
-            .http
-            .post(self.url("/agents/enroll"))
-            .json(&EnrollRequest {
-                node_name: node_name.to_owned(),
-            })
-            .timeout(Duration::from_secs(30));
-        decode(self.prepare(rb).send().await?).await
+        let body = EnrollRequest {
+            node_name: node_name.to_owned(),
+        };
+        self.send(|base| {
+            self.http
+                .post(format!("{base}/agents/enroll"))
+                .json(&body)
+                .timeout(Duration::from_secs(30))
+        })
+        .await
     }
 
     pub fn node_name(&self) -> &str {
         &self.node_name
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base
+    /// The server this client talks to now. It changes when a server
+    /// answers "not the leader" or the current one stops answering.
+    pub fn base_url(&self) -> String {
+        self.lock().current.clone()
     }
 
+    /// Every server this client has heard of, current one included.
+    pub fn known_servers(&self) -> Vec<String> {
+        self.lock().known.clone()
+    }
+
+    /// Remember more servers (API addresses or `/rpc` bases) to try when the
+    /// current one stops answering.
+    pub fn learn_servers<I, S>(&self, servers: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut s = self.lock();
+        for api in servers {
+            let api = api.as_ref();
+            if api.trim().is_empty() || reqwest::Url::parse(api.trim()).is_err() {
+                continue;
+            }
+            s.learn(rpc_base(api));
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Servers> {
+        self.servers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base)
+        format!("{}{path}", self.base_url())
+    }
+
+    /// Switch to `next` if we are still on `from`.
+    fn switch(&self, from: &str, next: String) {
+        let mut s = self.lock();
+        if s.current == from {
+            tracing::info!(from, to = %next, "agent rpc: switching server");
+            s.current = next.clone();
+        }
+        s.learn(next);
+    }
+
+    /// Move on to the next known server after `from` stopped answering.
+    fn rotate(&self, from: &str) {
+        let mut s = self.lock();
+        if s.current != from || s.known.len() < 2 {
+            return;
+        }
+        let at = s.known.iter().position(|k| k == from).unwrap_or(0);
+        let next = s.known[(at + 1) % s.known.len()].clone();
+        tracing::warn!(from, to = %next, "agent rpc: server not answering, trying the next one");
+        s.current = next;
+    }
+
+    /// Send one call, following "not the leader" answers to the leader.
+    /// A refused or timed-out connection, a timed-out call, or a "no leader
+    /// yet" answer moves the client to the next known server and returns
+    /// the error, so the caller's retry lands somewhere new. A follower cut
+    /// off from the majority keeps saying "no leader yet"; another server
+    /// may already know the winner.
+    async fn send<T: DeserializeOwned>(
+        &self,
+        build: impl Fn(&str) -> RequestBuilder,
+    ) -> Result<T, RpcError> {
+        let mut hops = 0;
+        loop {
+            let base = self.base_url();
+            let result = match self.prepare(build(&base)).send().await {
+                Ok(resp) => decode(resp).await,
+                Err(e) => {
+                    if e.is_connect() || e.is_timeout() {
+                        self.rotate(&base);
+                    }
+                    return Err(RpcError::Http(e));
+                }
+            };
+            if let Err(RpcError::Api { status: 503, error }) = &result {
+                if leader_hint(error).is_none() {
+                    self.rotate(&base);
+                    return result;
+                }
+            }
+            if hops < MAX_LEADER_HOPS {
+                if let Err(RpcError::Api { error, .. }) = &result {
+                    if let Some(next) = leader_hint(error) {
+                        if next != base {
+                            self.switch(&base, next);
+                            hops += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            return result;
+        }
     }
 
     fn prepare(&self, rb: RequestBuilder) -> RequestBuilder {
@@ -133,21 +270,26 @@ impl AgentClient {
     }
 
     pub async fn hello(&self, hello: &AgentHello) -> Result<HelloAck, RpcError> {
-        let rb = self
-            .http
-            .post(self.url("/agents/hello"))
-            .json(hello)
-            .timeout(Duration::from_secs(30));
-        decode(self.prepare(rb).send().await?).await
+        self.send(|base| {
+            self.http
+                .post(format!("{base}/agents/hello"))
+                .json(hello)
+                .timeout(Duration::from_secs(30))
+        })
+        .await
     }
 
     pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<HeartbeatAck, RpcError> {
-        let rb = self
-            .http
-            .post(self.url("/agents/heartbeat"))
-            .json(hb)
-            .timeout(Duration::from_secs(30));
-        decode(self.prepare(rb).send().await?).await
+        let ack: HeartbeatAck = self
+            .send(|base| {
+                self.http
+                    .post(format!("{base}/agents/heartbeat"))
+                    .json(hb)
+                    .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        self.learn_servers(&ack.servers);
+        Ok(ack)
     }
 
     /// Long-poll for commands, waiting up to `wait` (capped at
@@ -163,22 +305,25 @@ impl AgentClient {
         max: usize,
     ) -> Result<Vec<Command>, RpcError> {
         let wait_secs = wait.as_secs().min(MAX_LONG_POLL_SECS);
-        let rb = self
-            .http
-            .get(self.url(&format!("/agents/{}/commands", self.node_name)))
-            .query(&[("wait", wait_secs.to_string()), ("max", max.to_string())])
-            .timeout(Duration::from_secs(wait_secs) + POLL_GRACE);
-        decode(self.prepare(rb).send().await?).await
+        let query = [("wait", wait_secs.to_string()), ("max", max.to_string())];
+        self.send(|base| {
+            self.http
+                .get(format!("{base}/agents/{}/commands", self.node_name))
+                .query(&query)
+                .timeout(Duration::from_secs(wait_secs) + POLL_GRACE)
+        })
+        .await
     }
 
     /// Report results for commands this node received.
     pub async fn report(&self, results: &[CommandResult]) -> Result<ReportAck, RpcError> {
-        let rb = self
-            .http
-            .post(self.url(&format!("/agents/{}/results", self.node_name)))
-            .json(results)
-            .timeout(Duration::from_secs(30));
-        decode(self.prepare(rb).send().await?).await
+        self.send(|base| {
+            self.http
+                .post(format!("{base}/agents/{}/results", self.node_name))
+                .json(results)
+                .timeout(Duration::from_secs(30))
+        })
+        .await
     }
 
     /// Report one result.
@@ -196,13 +341,22 @@ fn mtls_http_client(ca_pem: &str, client: &keep::Pki) -> Result<reqwest::Client,
     identity.push_str(&client.key_pem);
     let identity = reqwest::Identity::from_pem(identity.as_bytes()).map_err(RpcError::Http)?;
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
         .identity(identity);
     for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).map_err(RpcError::Http)? {
         builder = builder.add_root_certificate(cert);
     }
     Ok(builder.build()?)
+}
+
+/// The leader's `/rpc` base from a "not the leader" answer, if it names one.
+fn leader_hint(error: &ApiError) -> Option<String> {
+    let leader = error.details.get("leader")?.as_str()?.trim();
+    if leader.is_empty() || reqwest::Url::parse(leader).is_err() {
+        return None;
+    }
+    Some(rpc_base(leader))
 }
 
 #[derive(Deserialize)]
@@ -246,6 +400,173 @@ fn synthesize(status: StatusCode, body: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+
+    /// A server that answers every call "not the leader" and names `leader`.
+    async fn follower(leader: String) -> String {
+        let app = axum::Router::new().fallback(move || {
+            let leader = leader.clone();
+            async move {
+                ApiError::conflict("not the leader")
+                    .with_detail("leader", leader)
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A leader whose `/rpc` answers polls with nothing and heartbeats with
+    /// `servers`.
+    async fn leader(servers: Vec<String>) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/rpc/agents/{node}/commands",
+                axum::routing::get(|| async { axum::Json(Vec::<Command>::new()) }),
+            )
+            .route(
+                "/rpc/agents/heartbeat",
+                axum::routing::post(move || {
+                    let servers = servers.clone();
+                    async move {
+                        axum::Json(HeartbeatAck {
+                            server_time: chrono::Utc::now(),
+                            commands_waiting: 0,
+                            known: true,
+                            servers,
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn beat() -> Heartbeat {
+        Heartbeat {
+            node_name: "n1".into(),
+            resources_free: Default::default(),
+            machines: vec![],
+            at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_client_follows_a_follower_to_the_leader() {
+        let lead = leader(vec!["http://10.0.0.12:8443".into()]).await;
+        let follow = follower(lead.clone()).await;
+        let c = AgentClient::new(rpc_base(&follow), "n1").unwrap();
+        let got = c.next_commands(Duration::from_secs(0)).await.unwrap();
+        assert!(got.is_empty());
+        assert_eq!(c.base_url(), rpc_base(&lead));
+        // Clones share where they talk to.
+        let clone = c.clone();
+        clone.heartbeat(&beat()).await.unwrap();
+        assert_eq!(
+            c.known_servers(),
+            vec![
+                rpc_base(&follow),
+                rpc_base(&lead),
+                "http://10.0.0.12:8443/rpc".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follower_that_names_itself_is_not_followed_forever() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let me = format!("http://{addr}");
+        let named = me.clone();
+        let app = axum::Router::new().fallback(move || {
+            let named = named.clone();
+            async move {
+                ApiError::conflict("not the leader")
+                    .with_detail("leader", named)
+                    .into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = AgentClient::new(rpc_base(&me), "n1").unwrap();
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Api { status: 409, .. }), "{err}");
+        assert_eq!(c.base_url(), rpc_base(&me));
+    }
+
+    #[tokio::test]
+    async fn a_dead_server_moves_the_client_to_the_next_known_one() {
+        let lead = leader(vec![]).await;
+        // Bind and drop to get a port nothing listens on.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let c = AgentClient::new(rpc_base(&dead), "n1").unwrap();
+        c.learn_servers([lead.as_str(), "not a url", ""]);
+        assert_eq!(c.known_servers().len(), 2);
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Http(_)), "{err}");
+        assert_eq!(c.base_url(), rpc_base(&lead));
+        assert!(c
+            .next_commands(Duration::from_secs(0))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_leader_yet_moves_the_client_to_the_next_known_server() {
+        let lead = leader(vec![]).await;
+        let app = axum::Router::new().fallback(|| async {
+            ApiError::unavailable("no leader yet, retry soon").into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cut_off = format!("http://{addr}");
+        let c = AgentClient::new(rpc_base(&cut_off), "n1").unwrap();
+        c.learn_servers([lead.as_str()]);
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Api { status: 503, .. }), "{err}");
+        assert_eq!(c.base_url(), rpc_base(&lead));
+        assert!(c
+            .next_commands(Duration::from_secs(0))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_moves_the_client_on() {
+        let lead = leader(vec![]).await;
+        // Accepts connections but never replies, like a wedged host.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let silent = format!("http://{addr}");
+        let c = AgentClient::new(rpc_base(&silent), "n1").unwrap();
+        c.learn_servers([lead.as_str()]);
+        // A zero-second poll times out after the grace period.
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(&err, RpcError::Http(e) if e.is_timeout()), "{err}");
+        assert_eq!(c.base_url(), rpc_base(&lead));
+    }
+
+    #[test]
+    fn rpc_base_adds_the_path_once() {
+        assert_eq!(rpc_base("http://a:1"), "http://a:1/rpc");
+        assert_eq!(rpc_base("http://a:1/ "), "http://a:1/rpc");
+        assert_eq!(rpc_base("http://a:1/rpc/"), "http://a:1/rpc");
+    }
 
     #[test]
     fn url_normalisation_and_validation() {

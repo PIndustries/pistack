@@ -225,7 +225,11 @@ async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<Agen
                 };
                 save_agent_pki(&cert_dir, &pki)?;
                 tracing::info!("enrolled agent client certificate");
-                return Ok(AgentClient::with_mtls(&base, node, &pki.ca_pem, &pki)?);
+                // Keep talking to whichever server enrolled us (the leader,
+                // if the join address pointed at a follower).
+                let client = AgentClient::with_mtls(bootstrap.base_url(), node, &pki.ca_pem, &pki)?;
+                client.learn_servers(bootstrap.known_servers());
+                return Ok(client);
             }
             Err(err) => {
                 tracing::warn!(
@@ -402,7 +406,7 @@ impl Agent {
             resources: self.facts.resources,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             labels: Default::default(),
-            underlay_ip: discover_underlay(self.client.base_url()),
+            underlay_ip: discover_underlay(&self.client.base_url()),
         }
     }
 
