@@ -217,8 +217,16 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     // Before any module reads the fabric setting. Only a leader saves it
     // (its writes are logged and replicate); a follower never writes its
     // replica, which would split it off from the leader.
-    crate::fabricchoice::settle(&store, established.leader).context("fabric backend")?;
+    let fabric_choice =
+        crate::fabricchoice::settle(&store, established.leader).context("fabric backend")?;
     leadership.set(established.leader);
+    // A follower promoted later saves its setting then.
+    crate::fabricchoice::save_on_promotion(
+        store.clone(),
+        leadership.clone(),
+        shutdown.clone(),
+        &fabric_choice,
+    );
     let cluster = std::sync::Arc::new(crate::cluster::handle_from(
         node_id,
         public_url.clone(),
