@@ -214,9 +214,10 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         members = established.members.len(),
         "control plane membership"
     );
-    // Before any module reads the fabric setting, and before the follow
-    // loop starts replicating: a leader's save reaches every server.
-    crate::fabricchoice::settle(&store).context("fabric backend")?;
+    // Before any module reads the fabric setting. Only a leader saves it
+    // (its writes are logged and replicate); a follower never writes its
+    // replica, which would split it off from the leader.
+    crate::fabricchoice::settle(&store, established.leader).context("fabric backend")?;
     leadership.set(established.leader);
     let cluster = std::sync::Arc::new(crate::cluster::handle_from(
         node_id,
