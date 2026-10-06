@@ -1,5 +1,7 @@
 /target
 /data
+# Runtime data a module writes under ./data when PISTACK_DATA_DIR is unset.
+/crates/*/data/
 *.redb
 .DS_Store
 __pycache__/
