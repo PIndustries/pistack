@@ -10,7 +10,8 @@
 //! a leader with an explicit setting saves it, and a server without one
 //! adopts the saved choice before any module reads the variable.
 //!
-//! Only a server that is leader at startup writes. A follower's store is a
+//! Only the leader writes: at startup if it leads then, otherwise when it
+//! is promoted. A follower's store is a
 //! replica: a local write there is an entry the leader never had, and the
 //! follow loop rightly stops replicating into a store that has split off.
 //! A follower uses its own explicit setting and warns if it differs.
@@ -68,6 +69,55 @@ pub fn settle(store: &Store, leader: bool) -> anyhow::Result<Choice> {
         Choice::Unset => std::env::remove_var(FABRIC_BACKEND_ENV),
     }
     Ok(choice)
+}
+
+/// Save this server's explicit choice each time it becomes leader. A
+/// promoted leader logs its writes before the leadership signal goes up,
+/// so the save reaches every follower. Runs until `shutdown`.
+pub fn save_on_promotion(
+    store: Store,
+    leadership: pistack_types::Leadership,
+    shutdown: pistack_types::CancellationToken,
+    choice: &Choice,
+) {
+    let Choice::Explicit { backend, .. } = choice else {
+        return;
+    };
+    let backend = backend.clone();
+    let watch = leadership.clone();
+    tokio::spawn(async move {
+        watch
+            .run_while_leader(shutdown, move |_active| {
+                let store = store.clone();
+                let backend = backend.clone();
+                let leadership = leadership.clone();
+                async move {
+                    if !leadership.is_leader() {
+                        return;
+                    }
+                    if let Err(e) = save_as_leader(&store, &backend) {
+                        tracing::warn!(error = %e, "fabric: saving backend on promotion");
+                    }
+                }
+            })
+            .await;
+    });
+}
+
+/// Save `backend` unless it is already the saved choice. Only call on the
+/// leader. Returns whether it wrote.
+fn save_as_leader(store: &Store, backend: &str) -> anyhow::Result<bool> {
+    let saved: Option<String> = store.get_meta(META_KEY)?;
+    if saved.as_deref() == Some(backend) {
+        return Ok(false);
+    }
+    tracing::info!(
+        backend,
+        replaces = ?saved,
+        "fabric: became leader; saving this server's backend"
+    );
+    store.put_meta(META_KEY, &backend)?;
+    Ok(true)
 }
 
 /// Decide against the store, save an explicit choice when `leader`, and
@@ -194,6 +244,18 @@ mod tests {
             store.get_meta::<String>(META_KEY).unwrap().as_deref(),
             Some("hostnat")
         );
+    }
+
+    #[test]
+    fn a_promoted_leader_saves_its_setting_once() {
+        let store = Store::in_memory().unwrap();
+        record(&store, Some("hostnat"), true).unwrap();
+        assert!(save_as_leader(&store, "overlay").unwrap());
+        assert_eq!(
+            store.get_meta::<String>(META_KEY).unwrap().as_deref(),
+            Some("overlay")
+        );
+        assert!(!save_as_leader(&store, "overlay").unwrap());
     }
 
     #[test]
