@@ -91,11 +91,15 @@
 //!
 //! Before `youki create`, each slab volume a container mounts must name the
 //! host path recorded at attach. That path is the directory where the agent
-//! mounted the volume. The path must exist and be a directory, and the
-//! container bind-mounts that directory. A missing path fails the create.
-//! A raw file or block device is refused, including the backing file or
-//! mapped device kept for detach. A volume that only names a device, with
-//! no mounted directory yet, is left unbound. Rewriting `config.json` after
+//! mounted the volume. It must exist, be a directory, and be a mount point.
+//! The container bind-mounts that directory. A missing path fails the
+//! create. An empty directory left after a reboot or an unmount fails the
+//! create too, so the pod does not write onto the host disk. The check
+//! looks that path up in `/proc/self/mountinfo`. When that file cannot be
+//! read, the folder's device number is compared with its parent's. A raw
+//! file or block device is refused, including the backing file or mapped
+//! device kept for detach. A volume that only names a device, with no
+//! mounted directory yet, is left unbound. Rewriting `config.json` after
 //! attach does not change this check.
 //!
 //! When the agent is not root and sudo mode is off, the sandbox creates a
@@ -3295,13 +3299,14 @@ fn prepared_volume(
         }
         // The bind is the mounted folder. A raw file or device in
         // `disks.json` is not a source. Attach rewrites this config before
-        // the folder is recorded, so a missing or non-directory path is
-        // left unbound instead of failing the attach.
+        // the folder is recorded, so a missing path, a non-directory, or a
+        // directory that is not a mount point is left unbound instead of
+        // failing the attach.
         VolumeSrc::Volume(id) => {
             let disk = disks.iter().find(|d| &d.volume == id)?;
             let path = slab_paths.get(id).filter(|path| !path.is_empty())?;
             let host_path = PathBuf::from(path);
-            if !host_path.is_dir() {
+            if !host_path.is_dir() || !matches!(folder_is_mount_point(path), Ok(true)) {
                 return None;
             }
             Some(PreparedVolume {
@@ -3359,8 +3364,8 @@ fn oci_binds(
 }
 
 /// Binds for one container at create time. A slab volume fails when its
-/// mounted directory is missing or is not a directory. Other volumes keep
-/// the lenient mount plan.
+/// folder is missing, is not a directory, or is not a mount point. Other
+/// volumes keep the lenient mount plan.
 fn pod_binds(
     pod: &Path,
     plan: &PodPlan,
@@ -3475,9 +3480,116 @@ enum SlabSource {
 /// The mounted folder, or an error that names the volume.
 fn require_mounted_dir(label: &str, path: &str) -> ApiResult<PathBuf> {
     match classify_slab_path(path) {
-        Ok(SlabSource::Dir) => Ok(PathBuf::from(path)),
+        Ok(SlabSource::Dir) => match folder_is_mount_point(path) {
+            Ok(true) => Ok(PathBuf::from(path)),
+            Ok(false) => Err(not_mounted_error(label, path)),
+            Err(err) => Err(slab_source_io(label, path, err)),
+        },
         Ok(kind) => Err(slab_source_error(label, path, kind)),
         Err(err) => Err(slab_source_io(label, path, err)),
+    }
+}
+
+fn not_mounted_error(label: &str, path: &str) -> ApiError {
+    ApiError::unavailable(format!(
+        "youki runtime: slab volume {label} is not mounted at {path}"
+    ))
+}
+
+/// `$PISTACK_YOUKI_MOUNTINFO` replaces `/proc/self/mountinfo` for tests.
+/// An empty value is ignored.
+const MOUNTINFO_ENV: &str = "PISTACK_YOUKI_MOUNTINFO";
+
+fn mountinfo_file() -> PathBuf {
+    match std::env::var_os(MOUNTINFO_ENV) {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => PathBuf::from("/proc/self/mountinfo"),
+    }
+}
+
+/// Whether `path` is a mount point.
+///
+/// The mount table is preferred. The path has to appear as a mount point,
+/// after octal escapes such as `\040` are turned back into characters. A
+/// bind on the same disk does not change the device number, so the table
+/// is what catches that. When the table cannot be read, the folder's
+/// device number is compared with its parent's.
+fn folder_is_mount_point(path: &str) -> std::io::Result<bool> {
+    match std::fs::read_to_string(mountinfo_file()) {
+        Ok(text) => Ok(mountinfo_lists(&text, path)),
+        Err(_) => mounted_by_device(Path::new(path)),
+    }
+}
+
+fn mountinfo_lists(text: &str, path: &str) -> bool {
+    let want = mount_key(path);
+    text.lines()
+        .any(|line| mountinfo_point(line).is_some_and(|point| mount_key(&point) == want))
+}
+
+/// Field 5 of a mountinfo line is the mount point. Optional fields sit
+/// after the mount options, so the point stays the fifth word.
+fn mountinfo_point(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    line.split_whitespace().nth(4).map(unescape_mount)
+}
+
+fn mount_key(path: &str) -> &str {
+    if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    }
+}
+
+/// Mountinfo escapes space, tab, newline, and backslash as three octal digits.
+fn unescape_mount(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            let oct = &bytes[i + 1..i + 4];
+            if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                if let Ok(text) = std::str::from_utf8(oct) {
+                    if let Ok(v) = u8::from_str_radix(text, 8) {
+                        out.push(v);
+                        i += 4;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn mounted_by_device(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let child = std::fs::metadata(path)?;
+        let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Ok(true);
+        };
+        let parent = std::fs::metadata(parent)?;
+        Ok(child.dev() != parent.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mount check needs a unix device number",
+        ))
     }
 }
 
@@ -3713,8 +3825,9 @@ async fn start_pod(
     plan: &PodPlan,
     prior: bool,
 ) -> ApiResult<RunningMachine> {
-    // Fail before youki create. A missing bind would otherwise land in
-    // config.json and stay invisible to the live mount namespace.
+    // Fail before youki create. A missing path, or a directory that is not
+    // a mount point, would otherwise land in config.json and the pod would
+    // write onto the host disk.
     let disks = read_disks(bundle)?;
     ensure_slab_sources(plan, &disks)?;
     if prior {
@@ -5730,6 +5843,7 @@ fi
         std::fs::write(image_b.join("marker"), "b").unwrap();
         let mounted = tmp.join("slab-mount");
         std::fs::create_dir_all(&mounted).unwrap();
+        let _mounts = inject_mountinfo(&tmp, &[mounted.as_path()]);
         let raw = tmp.join("slab-file");
         std::fs::write(&raw, "block").unwrap();
         let vol_id = "vol-11111111-1111-1111-1111-111111111111";
@@ -6099,6 +6213,21 @@ fi
         }
     }
 
+    /// Mount table the slab checks read instead of `/proc/self/mountinfo`.
+    fn inject_mountinfo(dir: &Path, mounts: &[&Path]) -> EnvSlot {
+        let file = dir.join("mountinfo");
+        let mut text = String::new();
+        for (index, mount) in mounts.iter().enumerate() {
+            let id = index + 11;
+            let point = mount.to_string_lossy().replace(' ', "\\040");
+            text.push_str(&format!(
+                "{id} 1 8:{id} / {point} rw - ext4 /dev/slab{id} rw\n"
+            ));
+        }
+        std::fs::write(&file, text).unwrap();
+        EnvSlot::set(MOUNTINFO_ENV, file.to_str().expect("utf8"))
+    }
+
     fn attached_raw(vol_id: &str, path: &str, read_only: bool) -> AttachedDisk {
         AttachedDisk {
             volume: vol_id.into(),
@@ -6120,6 +6249,7 @@ fi
         std::fs::write(image.join("marker"), "a").unwrap();
         let folder = tmp.join("mounted");
         std::fs::create_dir_all(&folder).unwrap();
+        let _mounts = inject_mountinfo(&tmp, &[folder.as_path()]);
         let raw = tmp.join("disk.raw");
         std::fs::write(&raw, b"block").unwrap();
         let vol_id = "vol-33333333-3333-3333-3333-333333333333";
@@ -6231,6 +6361,7 @@ fi
         std::fs::write(image.join("marker"), "a").unwrap();
         let folder = tmp.join("mounted");
         std::fs::create_dir_all(&folder).unwrap();
+        let _mounts = inject_mountinfo(&tmp, &[folder.as_path()]);
         let raw = tmp.join("disk.raw");
         std::fs::write(&raw, b"block").unwrap();
         let vol_id = "vol-44444444-4444-4444-4444-444444444444";
@@ -6300,6 +6431,133 @@ fi
             data["options"],
             serde_json::json!(["rbind", "rprivate", "rw"])
         );
+    }
+
+    #[test]
+    fn mountinfo_matches_the_exact_path_and_unescapes_spaces() {
+        let text = "\
+36 35 98:0 / /mnt/data rw,noatime master:1 - ext4 /dev/root rw\n\
+37 35 98:0 / /mnt/my\\040vol rw - ext4 /dev/sda1 rw\n\
+38 35 98:0 / /mnt/data-extra rw - ext4 /dev/sdb1 rw\n\
+50 1 8:3 / /mnt/elsewhere rw - ext4 /var/lib/pistack/vol rw\n";
+        assert!(mountinfo_lists(text, "/mnt/data"));
+        assert!(mountinfo_lists(text, "/mnt/data/"));
+        assert!(mountinfo_lists(text, "/mnt/my vol"));
+        assert!(!mountinfo_lists(text, "/mnt"));
+        assert!(!mountinfo_lists(text, "/mnt/data-extra/child"));
+        assert!(!mountinfo_lists(text, "/mnt/missing"));
+        // The device column is not a mount point.
+        assert!(!mountinfo_lists(text, "/var/lib/pistack/vol"));
+        assert_eq!(unescape_mount("my\\040vol"), "my vol");
+        assert_eq!(unescape_mount("line\\012break"), "line\nbreak");
+    }
+
+    #[tokio::test]
+    async fn mounted_slab_folder_is_accepted() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("slab-mounted");
+        let _dir = scopeguard_dir(&tmp);
+        let image = tmp.join("image");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("marker"), "a").unwrap();
+        let folder = tmp.join("my vol");
+        std::fs::create_dir_all(&folder).unwrap();
+        let _mounts = inject_mountinfo(&tmp, &[folder.as_path()]);
+        let vol_id = "vol-55555555-5555-5555-5555-555555555555";
+        let folder_s = folder.to_string_lossy().into_owned();
+        let image_s = image.to_string_lossy().into_owned();
+        let plan = slab_plan(&image_s, vol_id, Some(&folder_s), None);
+        ensure_slab_sources(&plan, &[]).unwrap();
+        let bundle = tmp.join("pod");
+        let binds = pod_binds(&bundle, &plan, &plan.containers[0].volume_mounts, &[]).unwrap();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].source, folder_s);
+        assert!(binds[0].directory);
+        let limits = Limits {
+            vcpus: 1,
+            memory_mib: 64,
+        };
+        RunMode::privileged()
+            .stage_pod_bundles(&bundle, "web", &limits, &plan, &image_s, 7)
+            .unwrap();
+        let web: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("containers").join("0").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let data = mount_at(&web, "/data");
+        assert_eq!(data["source"], folder_s);
+        assert_eq!(
+            data["options"],
+            serde_json::json!(["rbind", "rprivate", "rw"])
+        );
+    }
+
+    #[tokio::test]
+    async fn unmounted_slab_folder_is_refused() {
+        let _guard = env_lock().lock().await;
+        let tmp = temp_dir("slab-unmounted");
+        let _dir = scopeguard_dir(&tmp);
+        let image = tmp.join("image");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("marker"), "a").unwrap();
+        let empty = tmp.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let table = tmp.join("mountinfo");
+        let parent = empty
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .replace(' ', "\\040");
+        std::fs::write(
+            &table,
+            format!("41 1 8:1 / {parent} rw - ext4 /dev/disk rw\n"),
+        )
+        .unwrap();
+        let _mounts = EnvSlot::set(MOUNTINFO_ENV, table.to_str().expect("utf8"));
+        let vol_id = "vol-66666666-6666-6666-6666-666666666666";
+        let empty_s = empty.to_string_lossy().into_owned();
+        let image_s = image.to_string_lossy().into_owned();
+        let plan = slab_plan(&image_s, vol_id, Some(&empty_s), None);
+        let expected = format!("slab volume disk is not mounted at {empty_s}");
+        let err = ensure_slab_sources(&plan, &[]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(err.message.contains(&expected), "{err}");
+        let bundle = tmp.join("pod");
+        let limits = Limits {
+            vcpus: 1,
+            memory_mib: 64,
+        };
+        let err = RunMode::privileged()
+            .stage_pod_bundles(&bundle, "web", &limits, &plan, &image_s, 7)
+            .unwrap_err();
+        assert!(err.message.contains(&expected), "{err}");
+        assert!(!bundle.join("config.json").exists());
+        assert!(!bundle.join("containers").exists());
+
+        let disks = vec![attached_raw(vol_id, &empty_s, false)];
+        assert!(oci_binds(
+            &bundle,
+            &plan.volumes,
+            &plan.containers[0].volume_mounts,
+            &disks,
+            &plan.volume_paths,
+        )
+        .is_empty());
+
+        // The mount table cannot be read, so the device-number fallback
+        // still refuses a folder that shares its parent's device.
+        let missing = tmp.join("no-such-mountinfo");
+        let _fallback = EnvSlot::set(MOUNTINFO_ENV, missing.to_str().expect("utf8"));
+        let err = match pod_binds(&bundle, &plan, &plan.containers[0].volume_mounts, &[]) {
+            Err(err) => err,
+            Ok(_) => panic!("an unmounted folder was bound"),
+        };
+        assert!(err.message.contains(&expected), "{err}");
+        let late = slab_plan(&image_s, vol_id, Some(&empty_s), None);
+        let err = RunMode::privileged()
+            .stage_pod_bundles(&bundle, "web", &limits, &late, &image_s, 7)
+            .unwrap_err();
+        assert!(err.message.contains(&expected), "{err}");
     }
 
     #[tokio::test]
