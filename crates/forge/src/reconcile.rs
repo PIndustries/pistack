@@ -120,6 +120,10 @@ impl Reconciler {
     }
 
     pub(crate) async fn run_loop(&self, active: pistack_types::CancellationToken) {
+        // A new term starts from nothing: every host gets the current plan
+        // once, so a failed apply remembered by an earlier term (here or on
+        // another server) is not forgotten.
+        self.overlay_sent.lock().clear();
         let mut rx = self.store.events().subscribe();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -816,6 +820,25 @@ mod overlay_retry_tests {
             };
             assert!(overlay_due(Some(&old), "a", hello));
         }
+    }
+
+    #[tokio::test]
+    async fn taking_the_lead_forgets_what_was_sent() {
+        let store = pistack_store::Store::in_memory().unwrap();
+        let drivers = Arc::new(crate::driver::DriverRegistry::new());
+        let r = super::Reconciler::new(store, drivers, crate::scheduler::Strategy::default());
+        r.overlay_sent.lock().insert(
+            "sim2".to_owned(),
+            OverlaySent {
+                body: "a".into(),
+                hello: None,
+                failed: None,
+            },
+        );
+        let active = pistack_types::CancellationToken::new();
+        active.cancel();
+        r.run_loop(active).await;
+        assert!(r.overlay_sent.lock().is_empty());
     }
 
     #[test]
