@@ -5,7 +5,7 @@
 //! the host. An empty `spec.networks` leaves the shared bridge alone.
 
 use fabric::{Client, HostNat, MockBackend, NetBackend, Port, Router, Subnet};
-use pistack_rpc::proto::NicAttachment;
+use pistack_rpc::proto::{NicAttachment, NicBinding};
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::net::Ipv4Addr;
@@ -99,6 +99,7 @@ fn fabric_client(store: &Store) -> Client {
     {
         Some("hostnat") => Arc::new(HostNat::new()),
         Some("overlay") => Arc::new(fabric::OverlayBackend::new()),
+        Some("ovn") => Arc::new(fabric::OvnBackend::from_env()),
         _ => Arc::new(MockBackend::new()),
     };
     Client::new(store.clone(), backend)
@@ -162,6 +163,10 @@ fn nic_from(client: &Client, port: &Port) -> ApiResult<NicAttachment> {
         gateway,
         routed: is_routed(client, &subnet_id),
         segment_id: crate::overlay::segment_for_nic(&net, &address)?,
+        binding: port.status.binding.as_ref().map(|b| NicBinding {
+            vif_type: b.vif_type.clone(),
+            vif_details: b.vif_details.clone(),
+        }),
     })
 }
 
@@ -305,5 +310,61 @@ mod tests {
         let quiet = new_machine("demo", None, MachineSpec::default());
         ensure_ports(&store, &quiet).await.unwrap();
         assert!(attachments(&store, &quiet).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_ovs_binding_is_copied_onto_the_nic() {
+        let store = Store::in_memory().unwrap();
+        let client = fabric_client(&store);
+        let project = Id::new(kind::PROJECT);
+        let net = client
+            .create_network(
+                Meta::new(kind::NETWORK, "app", Some(project.clone())),
+                NetworkSpec::default(),
+            )
+            .unwrap();
+        client
+            .create_subnet(
+                Meta::new(kind::SUBNET, "app-net", Some(project.clone())),
+                SubnetSpec {
+                    network: net.meta.id.clone(),
+                    cidr: "10.90.0.0/24".parse().unwrap(),
+                    gateway: Some("10.90.0.1".parse().unwrap()),
+                    allocation_pools: vec![],
+                    dns_nameservers: vec![],
+                    enable_dhcp: true,
+                    host_routes: vec![],
+                },
+            )
+            .unwrap();
+        let machine = new_machine("box", Some(project), spec_net("app"));
+        ensure_ports(&store, &machine).await.unwrap();
+        let port = client
+            .ports_of_device(&machine.meta.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let iface = port.meta.id.to_string();
+        client
+            .ports()
+            .modify(&port.meta.id, |p| {
+                p.status.binding = Some(fabric::PortBinding {
+                    vif_type: "ovs".into(),
+                    vif_details: [
+                        ("bridge".into(), "br-int".into()),
+                        ("iface_id".into(), iface.clone()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let nics = attachments(&store, &machine).unwrap();
+        let binding = nics[0].binding.as_ref().unwrap();
+        assert_eq!(binding.vif_type, "ovs");
+        assert_eq!(binding.vif_details["bridge"], "br-int");
+        assert_eq!(binding.vif_details["iface_id"], iface);
     }
 }

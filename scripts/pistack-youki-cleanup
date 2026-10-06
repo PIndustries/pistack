@@ -29,7 +29,7 @@ Install for the agent user `ubuntu`:
     install -m 0755 scripts/pistack-youki-cleanup /usr/local/sbin/pistack-youki-cleanup
 
     # /etc/sudoers.d/pistack-youki
-    ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup
+    ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip, /usr/bin/ovs-vsctl
 
 Replace `ubuntu` and `/usr/bin/youki` with the agent user and the youki
 path on the host. Leave sudo's environment reset (the default). The

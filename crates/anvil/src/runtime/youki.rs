@@ -62,11 +62,12 @@
 //! As root it only removes paths under `/var/lib/pistack/youki`, the default
 //! state directory. sudo resets the environment, so a custom
 //! `PISTACK_YOUKI_STATE` cannot widen that directory. `sudo -n` fails closed
-//! without a rule. Allow only the youki binary, that helper, and `ip`:
+//! without a rule. Allow only the youki binary, that helper, `ip`, and
+//! `ovs-vsctl`:
 //!
 //! ```text
 //! # /etc/sudoers.d/pistack-youki
-//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip
+//! ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip, /usr/bin/ovs-vsctl
 //! ```
 //!
 //! Replace `ubuntu` and the paths with the agent user and the binaries on
@@ -115,16 +116,19 @@
 //!
 //! A pod whose ports name a network is placed in a named network namespace
 //! before `youki create`. The host end of a veth is set master of the same
-//! bridge a virtual machine tap would use. The other end is `eth0` (then
-//! `eth1`, ...) inside that namespace, with the recorded MAC, address, and,
-//! when a gateway is recorded, a default route. A root agent runs `ip`
-//! directly. In sudo mode those commands are `sudo -n <ip>`. A rootless
-//! agent cannot do this: it keeps the sandbox network namespace and reports
-//! that the pod has no network. A pod with no port attachment keeps the
-//! sandbox network namespace. Stop, delete, and a failed create remove the
-//! veth and the namespace. The next start creates the sandbox again so it
-//! joins the new namespace. Names left by a crashed create are removed
-//! before the next create.
+//! bridge a virtual machine tap would use. When the port binding `vif_type`
+//! is `ovs`, that end is added to the binding's OVS bridge with `ovs-vsctl`
+//! instead, and `del-port` runs before the link is deleted. The other end
+//! is `eth0` (then `eth1`, ...) inside that namespace, with the recorded
+//! MAC, address, and, when a gateway is recorded, a default route. A root
+//! agent runs `ip` and `ovs-vsctl` directly. In sudo mode those commands
+//! are `sudo -n <ip>` and `sudo -n <ovs-vsctl>`. A rootless agent cannot do
+//! this: it keeps the sandbox network namespace and reports that the pod
+//! has no network. A pod with no port attachment keeps the sandbox network
+//! namespace. Stop, delete, and a failed create remove the veth and the
+//! namespace. The next start creates the sandbox again so it joins the new
+//! namespace. Names left by a crashed create are removed before the next
+//! create.
 
 use super::podnet::{self, PodNetwork};
 use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
@@ -186,6 +190,9 @@ struct Saved {
     /// Host ends of the veth pairs. Empty when `netns` is empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     veths: Vec<String>,
+    /// OVS ports removed before those veths. Empty on a Linux bridge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ovs: Vec<podnet::OvsLink>,
     /// Set when a rootless agent could not attach the recorded address.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     network_message: String,
@@ -315,6 +322,7 @@ impl MachineRuntime for YoukiRuntime {
                 probes: Vec::new(),
                 netns: observed.netns.clone(),
                 veths: observed.veths.clone(),
+                ovs: observed.ovs.clone(),
                 network_message: observed.message.clone(),
             },
         )
@@ -351,6 +359,7 @@ impl MachineRuntime for YoukiRuntime {
         saved.power = PowerState::Off;
         saved.netns.clear();
         saved.veths.clear();
+        saved.ovs.clear();
         saved.network_message.clear();
         write_state(&bundle, &saved).await
     }
@@ -367,8 +376,14 @@ impl MachineRuntime for YoukiRuntime {
         let had_state = saved.is_some();
         if let Some(saved) = saved.as_ref() {
             release_recorded(&mode, saved, &bundle).await?;
-        } else if let Some((netns, veths)) = podnet::read_record(&bundle) {
-            podnet::release(&ip_privilege(&mode), &netns, &veths).await?;
+        } else if let Some(recorded) = podnet::read_record(&bundle) {
+            podnet::release(
+                &ip_privilege(&mode),
+                &recorded.netns,
+                &recorded.veths,
+                &recorded.ovs,
+            )
+            .await?;
         }
         let mut order: Vec<String> = saved
             .map(|s| s.containers)
@@ -743,7 +758,7 @@ const NETNS_ENV: &str = "PISTACK_YOUKI_NETNS";
 
 /// Sample sudoers rule. Operators replace the user and the paths.
 const SUDOERS_SAMPLE: &str =
-    "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip";
+    "ubuntu ALL=(root) NOPASSWD: /usr/bin/youki, /usr/local/sbin/pistack-youki-cleanup, /usr/sbin/ip, /usr/bin/ovs-vsctl";
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -772,7 +787,7 @@ fn resolve_privilege() -> ApiResult<Privilege> {
         return match sudo_bin() {
             Some(sudo) => Ok(Privilege::Sudo { sudo }),
             None if unprivileged_userns_available() => Err(ApiError::unavailable(format!(
-                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary, the cleanup helper, and ip (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
+                "youki runtime: {SUDO_ENV} is set but sudo is not available. Install sudo and a NOPASSWD sudoers rule for the youki binary, the cleanup helper, ip, and ovs-vsctl (`{SUDOERS_SAMPLE}`), or unset {SUDO_ENV} to use a rootless user namespace"
             ))),
             None => Err(privilege_unavailable()),
         };
@@ -785,7 +800,7 @@ fn resolve_privilege() -> ApiResult<Privilege> {
 
 fn privilege_unavailable() -> ApiError {
     ApiError::unavailable(format!(
-        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary, the cleanup helper, and ip (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
+        "youki runtime: the agent is not root, so youki needs {SUDO_ENV}=1 with a NOPASSWD sudoers rule for the youki binary, the cleanup helper, ip, and ovs-vsctl (`{SUDOERS_SAMPLE}`) or an unprivileged user namespace for a single-id map (no newuidmap). Run the agent as root, set {SUDO_ENV}=1, or enable unprivileged user namespaces"
     ))
 }
 
@@ -971,6 +986,7 @@ struct ObservedNet {
     message: String,
     netns: String,
     veths: Vec<String>,
+    ovs: Vec<podnet::OvsLink>,
 }
 
 fn observe(req: &MachineRequest, net: &PodNetwork) -> ObservedNet {
@@ -980,18 +996,21 @@ fn observe(req: &MachineRequest, net: &PodNetwork) -> ObservedNet {
             message: String::new(),
             netns: link.netns.clone(),
             veths: link.veths.clone(),
+            ovs: link.ovs.clone(),
         },
         PodNetwork::Refused(message) => ObservedNet {
             addresses: Vec::new(),
             message: message.clone(),
             netns: String::new(),
             veths: Vec::new(),
+            ovs: Vec::new(),
         },
         PodNetwork::None => ObservedNet {
             addresses: nic_addresses(req),
             message: String::new(),
             netns: String::new(),
             veths: Vec::new(),
+            ovs: Vec::new(),
         },
     }
 }
@@ -1025,7 +1044,9 @@ fn joins_new_net(net: &PodNetwork) -> bool {
 
 async fn drop_link(mode: &RunMode, net: &PodNetwork) {
     if let PodNetwork::Linked(link) = net {
-        if let Err(err) = podnet::release(&ip_privilege(mode), &link.netns, &link.veths).await {
+        if let Err(err) =
+            podnet::release(&ip_privilege(mode), &link.netns, &link.veths, &link.ovs).await
+        {
             tracing::warn!(
                 netns = %link.netns,
                 error = %err,
@@ -1037,15 +1058,25 @@ async fn drop_link(mode: &RunMode, net: &PodNetwork) {
 
 /// Remove a recorded namespace. Empty names do not run `ip`.
 async fn release_recorded(mode: &RunMode, saved: &Saved, bundle: &Path) -> ApiResult<()> {
-    let recorded = if !saved.netns.is_empty() || !saved.veths.is_empty() {
-        Some((saved.netns.clone(), saved.veths.clone()))
+    let recorded = if !saved.netns.is_empty() || !saved.veths.is_empty() || !saved.ovs.is_empty() {
+        Some(podnet::RecordedNet {
+            netns: saved.netns.clone(),
+            veths: saved.veths.clone(),
+            ovs: saved.ovs.clone(),
+        })
     } else {
         podnet::read_record(bundle)
     };
-    let Some((netns, veths)) = recorded else {
+    let Some(recorded) = recorded else {
         return Ok(());
     };
-    podnet::release(&ip_privilege(mode), &netns, &veths).await
+    podnet::release(
+        &ip_privilege(mode),
+        &recorded.netns,
+        &recorded.veths,
+        &recorded.ovs,
+    )
+    .await
 }
 
 fn parse_id(s: &str) -> ApiResult<Id> {
@@ -4184,6 +4215,7 @@ async fn start_pod(
             probes: crate::probe::probes_in_user_data(req.user_data.as_deref()),
             netns: observed.netns.clone(),
             veths: observed.veths.clone(),
+            ovs: observed.ovs.clone(),
             network_message: observed.message.clone(),
         },
     )
@@ -8483,6 +8515,7 @@ exit 0
                 gateway: "10.90.0.1".into(),
                 routed: true,
                 segment_id: None,
+                binding: None,
             },
             crate::runtime::NicAttachment {
                 network_id: "net-01a102de-3f33-73bf-86f7-57fe3b47f1ea".into(),
@@ -8492,6 +8525,7 @@ exit 0
                 gateway: String::new(),
                 routed: false,
                 segment_id: Some(4),
+                binding: None,
             },
         ];
         request.user_data = Some(sandbox_doc(image));
@@ -8507,6 +8541,7 @@ exit 0
         assert!(SUDOERS_SAMPLE.contains("/usr/bin/youki"));
         assert!(SUDOERS_SAMPLE.contains("/usr/local/sbin/pistack-youki-cleanup"));
         assert!(SUDOERS_SAMPLE.contains("/usr/sbin/ip"));
+        assert!(SUDOERS_SAMPLE.contains("/usr/bin/ovs-vsctl"));
         assert!(!SUDOERS_SAMPLE.contains("ip link"));
     }
 

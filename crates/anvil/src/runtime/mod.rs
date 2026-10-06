@@ -12,6 +12,7 @@ pub mod cloud;
 pub mod libvirt;
 mod metal;
 pub mod mock;
+mod ovsplug;
 mod podnet;
 pub(crate) mod rbdmap;
 pub(crate) mod volfs;
@@ -33,7 +34,7 @@ pub use youki::YoukiRuntime;
 /// The request/result shapes are the wire types from `pistack-rpc`, so a
 /// `Command` payload deserialises straight into what a runtime executes.
 pub use pistack_rpc::proto::{
-    MachineKind, MachineRef, MachineRequest, NicAttachment, PowerState, RunningMachine,
+    MachineKind, MachineRef, MachineRequest, NicAttachment, NicBinding, PowerState, RunningMachine,
     VolumeAttach, VolumeDetach,
 };
 

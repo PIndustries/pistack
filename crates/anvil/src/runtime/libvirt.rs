@@ -1895,6 +1895,7 @@ mod tests {
             gateway: "10.90.0.1".into(),
             routed,
             segment_id: None,
+            binding: None,
         }
     }
 
