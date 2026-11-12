@@ -78,6 +78,7 @@ fn queue() -> CommandQueue {
         command_timeout: Duration::from_secs(2),
         capacity: 8,
         heartbeat_interval: Duration::from_secs(30),
+        ovn: None,
     })
 }
 

@@ -26,6 +26,7 @@ pub mod http;
 mod metadata;
 mod nic;
 mod overlay;
+mod ovn;
 pub mod reconcile;
 pub mod scheduler;
 pub mod types;
@@ -40,7 +41,7 @@ pub use overlay::{
     ServiceEndpointView, ServicePortView, ServiceRecord, ServiceStatusView, ServiceView,
 };
 pub use reconcile::Reconciler;
-pub use scheduler::{place, place_on_segment, Allocations, Strategy};
+pub use scheduler::{place, place_on_ovn, place_on_segment, Allocations, Strategy};
 pub use types::*;
 
 use async_trait::async_trait;

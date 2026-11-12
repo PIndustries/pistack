@@ -44,7 +44,14 @@ pub struct Assembly {
 pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly {
     let gate_m = Arc::new(gate::Gate::default());
     let registry = Arc::new(forge::DriverRegistry::new());
-    let queue = CommandQueue::new(QueueConfig::default());
+    let queue = CommandQueue::new(QueueConfig {
+        ovn: ovn_host_config(
+            std::env::var("PISTACK_FABRIC_BACKEND").ok().as_deref(),
+            std::env::var(OVN_SB_ENV).ok().as_deref(),
+            std::env::var(OVN_ENCAP_TYPE_ENV).ok().as_deref(),
+        ),
+        ..QueueConfig::default()
+    });
     // Agents that join through `/rpc` become forge hosts via its registrar;
     // dev mode additionally keeps the in-process mock `local` host.
     let forge_m = Arc::new(
@@ -86,6 +93,37 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
         queue,
         images,
     }
+}
+
+/// Southbound database every agent should point its `ovn-controller` at,
+/// e.g. `tcp:10.0.0.11:6642`. Read only when the fabric backend is `ovn`.
+const OVN_SB_ENV: &str = "PISTACK_OVN_SB";
+/// Tunnel type handed to agents with [`OVN_SB_ENV`]: `geneve` (the default)
+/// or `vxlan`.
+const OVN_ENCAP_TYPE_ENV: &str = "PISTACK_OVN_ENCAP_TYPE";
+
+/// What agents are told about OVN in the hello answer. `None` unless the
+/// backend is `ovn` and a southbound address is set: without one, hosts
+/// keep whatever the operator configured and the agent only reports on it.
+fn ovn_host_config(
+    backend: Option<&str>,
+    sb: Option<&str>,
+    encap: Option<&str>,
+) -> Option<pistack_rpc::OvnHostConfig> {
+    if backend != Some("ovn") {
+        return None;
+    }
+    let Some(sb) = sb.map(str::trim).filter(|v| !v.is_empty()) else {
+        tracing::warn!(
+            "fabric: {OVN_SB_ENV} is not set, so agents are not told where the OVN southbound database is and each host must be set up by hand"
+        );
+        return None;
+    };
+    let encap = encap.map(str::trim).filter(|v| !v.is_empty());
+    Some(pistack_rpc::OvnHostConfig {
+        sb_remote: sb.to_owned(),
+        encap_type: encap.unwrap_or("geneve").to_owned(),
+    })
 }
 
 /// `PISTACK_FABRIC_BACKEND=hostnat` is the single-host NAT datapath.
@@ -345,4 +383,31 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
         println!("{k}\t{}", String::from_utf8_lossy(&v));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ovn_host_config;
+
+    #[test]
+    fn agents_are_told_about_ovn_only_when_the_backend_is_ovn_and_has_an_address() {
+        let got = ovn_host_config(Some("ovn"), Some(" tcp:10.0.0.11:6642 "), None).unwrap();
+        assert_eq!(got.sb_remote, "tcp:10.0.0.11:6642");
+        assert_eq!(got.encap_type, "geneve");
+        let got = ovn_host_config(Some("ovn"), Some("tcp:10.0.0.11:6642"), Some("vxlan")).unwrap();
+        assert_eq!(got.encap_type, "vxlan");
+        assert_eq!(ovn_host_config(Some("ovn"), None, None), None);
+        assert_eq!(
+            ovn_host_config(Some("ovn"), Some("  "), Some("geneve")),
+            None
+        );
+        assert_eq!(
+            ovn_host_config(Some("overlay"), Some("tcp:10.0.0.11:6642"), None),
+            None
+        );
+        assert_eq!(
+            ovn_host_config(None, Some("tcp:10.0.0.11:6642"), None),
+            None
+        );
+    }
 }

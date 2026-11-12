@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use pistack_types::node::{self, NodeIdentity, NODE_NAME_ENV};
 
 use crate::facts::{self, HostFacts};
+use crate::ovnhost::OvnHost;
 use crate::probe::{self, ProbeBook, ProbeTarget};
 use crate::runtime::{select_runtimes, RunningMachine, Runtimes};
 
@@ -351,12 +352,30 @@ pub async fn run_agent_with_facts(
     facts: HostFacts,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    let ovn = Arc::new(OvnHost::system());
+    run_agent_on(client, runtimes, facts, ovn, None, shutdown).await
+}
+
+async fn run_agent_on(
+    client: AgentClient,
+    runtimes: Runtimes,
+    facts: HostFacts,
+    ovn: Arc<OvnHost>,
+    underlay: Option<String>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let ovn_watch = Arc::new(AtomicBool::new(
+        facts.capabilities.iter().any(|c| c == "ovs"),
+    ));
     let agent = Agent {
         client,
         runtimes,
         facts,
         probes: Arc::new(ProbeBook::new()),
         images: ImageCache::new(&data_dir()),
+        ovn,
+        ovn_watch,
+        underlay,
     };
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -393,6 +412,12 @@ struct Agent {
     facts: HostFacts,
     probes: Arc<ProbeBook>,
     images: ImageCache,
+    ovn: Arc<OvnHost>,
+    /// Report OVN in heartbeats. Turned on by a hello answer that carries
+    /// OVN settings, and from the start on a host that has Open vSwitch.
+    ovn_watch: Arc<AtomicBool>,
+    /// Underlay address to announce instead of looking one up.
+    underlay: Option<String>,
 }
 
 /// The agent's data directory: `PISTACK_DATA_DIR`, which `pistack agent`
@@ -418,16 +443,36 @@ impl Agent {
             resources: self.facts.resources,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             labels: Default::default(),
-            underlay_ip: discover_underlay(&self.client.base_url()),
+            underlay_ip: self
+                .underlay
+                .clone()
+                .or_else(|| discover_underlay(&self.client.base_url())),
         }
     }
 
     /// One hello followed by heartbeats and polls until something breaks.
     async fn session(&self, shutdown: &CancellationToken) -> SessionEnd {
-        let ack = match self.client.hello(&self.hello()).await {
+        let hello = self.hello();
+        let ack = match self.client.hello(&hello).await {
             Ok(a) => a,
             Err(e) => return SessionEnd::Error(e),
         };
+        if let Some(cfg) = &ack.ovn {
+            self.ovn_watch.store(true, Ordering::Relaxed);
+            let mappings = crate::ovnhost::bridge_mappings_from_env();
+            if let Err(e) = self
+                .ovn
+                .configure(
+                    cfg,
+                    hello.underlay_ip.as_deref(),
+                    &self.facts.node_name,
+                    mappings.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(error = %e.message, "anvil: this host is not set up for OVN");
+            }
+        }
         let interval = Duration::from_secs(ack.heartbeat_interval_secs.max(1));
         tracing::info!(
             node = %ack.node_name,
@@ -472,6 +517,8 @@ impl Agent {
             runtimes: self.runtimes.clone(),
             resources: self.facts.resources,
             probes: self.probes.clone(),
+            ovn: self.ovn.clone(),
+            ovn_watch: self.ovn_watch.clone(),
         }
     }
 
@@ -532,6 +579,9 @@ impl Agent {
             CommandKind::StartMachine => {
                 let mut req: MachineRequest = payload(c.payload)?;
                 tracing::info!(machine = %req.id, name = %req.name, kind = ?req.kind, "anvil: start");
+                if req.nics.iter().any(on_ovn) {
+                    self.ovn.require_ready().await?;
+                }
                 self.localize_image(&mut req).await?;
                 let rt = self.runtimes.start(&req).await?;
                 self.probes.install(
@@ -571,6 +621,9 @@ impl Agent {
             CommandKind::PlugPort => {
                 let req: PortPlug = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, "anvil: plug port");
+                if on_ovn(&req.nic) {
+                    self.ovn.require_ready().await?;
+                }
                 attach_port(&self.runtimes, &req).await?;
                 Ok(serde_json::Value::Null)
             }
@@ -816,6 +869,11 @@ fn cloud_vm(runtimes: &Runtimes) -> bool {
     runtimes
         .get(MachineKind::Vm)
         .is_some_and(|rt| rt.name() == "cloud-hypervisor")
+}
+
+/// True when fabric bound this NIC to the OVN integration bridge.
+fn on_ovn(nic: &pistack_rpc::proto::NicAttachment) -> bool {
+    nic.binding.as_ref().is_some_and(|b| b.vif_type == "ovs")
 }
 
 async fn attach_port(runtimes: &Runtimes, req: &PortPlug) -> Result<(), ApiError> {
@@ -1130,6 +1188,8 @@ struct HeartbeatTask {
     runtimes: Runtimes,
     resources: Resources,
     probes: Arc<ProbeBook>,
+    ovn: Arc<OvnHost>,
+    ovn_watch: Arc<AtomicBool>,
 }
 
 /// Runs due probes about once a second. An exec probe asks the runtime that
@@ -1263,6 +1323,11 @@ impl HeartbeatTask {
                 resources_free: self.resources,
                 machines: rows,
                 at: Utc::now(),
+                ovn: if self.ovn_watch.load(Ordering::Relaxed) {
+                    Some(self.ovn.check().await)
+                } else {
+                    None
+                },
             };
             match self.client.heartbeat(&hb).await {
                 Ok(ack) if !ack.known => {
@@ -1621,6 +1686,7 @@ mod tests {
                 resources_free: Resources::default(),
                 machines: vec![],
                 at: Utc::now(),
+                ovn: None,
             })
             .await;
 
@@ -1767,6 +1833,9 @@ still here
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
             images: ImageCache::new(std::path::Path::new("/nonexistent")),
+            ovn: Arc::new(OvnHost::system()),
+            ovn_watch: Arc::new(AtomicBool::new(false)),
+            underlay: None,
         };
         let bad = agent
             .execute(Command {
@@ -1933,11 +2002,15 @@ still here
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
             images: ImageCache::new(std::path::Path::new("/nonexistent")),
+            ovn: Arc::new(OvnHost::system()),
+            ovn_watch: Arc::new(AtomicBool::new(false)),
+            underlay: None,
         };
         let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
             command_timeout: Duration::from_secs(5),
             capacity: 4,
             heartbeat_interval: Duration::from_secs(30),
+            ovn: None,
         });
 
         let ran = queue_exec(
@@ -1979,6 +2052,115 @@ still here
         .unwrap_err();
         assert_eq!(missing.code, pistack_types::error::ErrorCode::NotFound);
         assert!(missing.message.contains("missing"), "{missing}");
+    }
+
+    fn ovn_start(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": Id::new(pistack_types::kind::MACHINE).to_string(),
+            "name": name,
+            "image": "ubuntu-24.04",
+            "nics": [{
+                "network_id": "net-01a102de-3f33-73bf-86f7-57fe3b47f1ea",
+                "mac": "52:54:00:aa:bb:cc",
+                "address": "10.90.0.10",
+                "prefix": 24,
+                "gateway": "10.90.0.1",
+                "routed": true,
+                "binding": {
+                    "vif_type": "ovs",
+                    "vif_details": {"bridge": "br-int", "iface_id": "port-1"}
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn the_hello_answer_sets_up_ovn_and_heartbeats_report_the_chassis() {
+        use crate::ovnhost::tests::{cfg, tools, FakeSwitch};
+        use pistack_rpc::proto::AgentEvent;
+
+        let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
+            command_timeout: Duration::from_secs(10),
+            capacity: 8,
+            heartbeat_interval: Duration::from_secs(1),
+            ovn: Some(cfg()),
+        });
+        let mut events = queue.subscribe_agent_events();
+        let app = axum::Router::new().nest("/rpc", pistack_rpc::router(queue.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/rpc", listener.local_addr().unwrap());
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        });
+
+        let switch = FakeSwitch::new();
+        switch.controller(Some("connected"));
+        let ovn = Arc::new(OvnHost::with(switch.clone(), tools(false)));
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::new());
+        let facts = HostFacts {
+            node_name: "node-a".into(),
+            resources: Resources::default(),
+            capabilities: vec![],
+        };
+        let agent = tokio::spawn(run_agent_on(
+            AgentClient::new(base, "node-a").unwrap(),
+            Runtimes::all(rt),
+            facts,
+            ovn,
+            Some("10.66.66.5".into()),
+            shutdown.clone(),
+        ));
+
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(AgentEvent::Heartbeat(hb)) = events.recv().await {
+                    if let Some(report) = hb.ovn {
+                        return report;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a heartbeat with an ovn report");
+        assert!(report.ready, "{}", report.message);
+        assert_eq!(report.chassis, "node-a");
+        assert_eq!(
+            switch.get("ovn-remote").as_deref(),
+            Some("tcp:10.66.66.1:6642")
+        );
+        assert_eq!(switch.get("ovn-encap-ip").as_deref(), Some("10.66.66.5"));
+        assert!(switch.has_bridge("br-int"));
+
+        let started = queue
+            .enqueue("node-a", CommandKind::StartMachine, ovn_start("up"))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert!(started.ok, "{}", started.message);
+
+        // ovn-controller dies: the next machine is refused, not plugged
+        // into a bridge nothing programs.
+        switch.controller(None);
+        let refused = queue
+            .enqueue("node-a", CommandKind::StartMachine, ovn_start("down"))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .into_api_result()
+            .unwrap_err();
+        assert_eq!(refused.code, pistack_types::error::ErrorCode::Unavailable);
+        assert!(refused.message.contains("not ready for OVN"), "{refused}");
+        assert!(refused.message.contains("ovn-controller"), "{refused}");
+
+        shutdown.cancel();
+        agent.await.unwrap().unwrap();
     }
 
     async fn queue_exec(
@@ -2312,6 +2494,9 @@ still here
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
             images: ImageCache::new(dir.path()),
+            ovn: Arc::new(OvnHost::system()),
+            ovn_watch: Arc::new(AtomicBool::new(false)),
+            underlay: None,
         };
         let request = |image: &str, source: Option<pistack_rpc::ImageSource>| MachineRequest {
             id: Id::new(pistack_types::kind::MACHINE),

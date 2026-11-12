@@ -24,9 +24,13 @@
 //!   also joins `pg_pistack_drop`. A router is `Logical_Router.name =
 //!   pr-<rtr id>` and each of its ports is `lrp-<port id>`.
 //! * Router gateway ports are scheduled on the chassis listed in
-//!   `PISTACK_OVN_GATEWAY_CHASSIS`. With none listed the gateway port has
-//!   no chassis, so outbound NAT and floating IPs do not leave the
-//!   cluster.
+//!   `PISTACK_OVN_GATEWAY_CHASSIS`. With none listed, the chassis are the
+//!   hosts whose agent reports a connected `ovn-controller` and a bridge
+//!   mapping, by chassis name, at most [`MAX_GATEWAY_CHASSIS`]. The list
+//!   is read again on the reconciler's timer, so a host that joins or
+//!   drops out moves the gateway ports. With no such host the gateway
+//!   port has no chassis, outbound NAT and floating IPs do not leave the
+//!   cluster, and a warning says so.
 //!
 //! On each host, OVS and `ovn-controller` realise the switches. The agent
 //! plugs a machine's tap or a pod's link into the integration bridge with
@@ -41,7 +45,8 @@ use crate::types::{
 };
 use async_trait::async_trait;
 use pistack_store::Store;
-use pistack_types::{ApiError, ApiResult, Id, Leadership};
+use pistack_types::{kind, ApiError, ApiResult, Id, Leadership, Phase, Resource, Spec};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -58,6 +63,11 @@ pub const INTEGRATION_BRIDGE: &str = "br-int";
 /// Environment variable listing the chassis that may host router gateway
 /// ports, highest priority first, comma separated.
 pub const GATEWAY_CHASSIS_ENV: &str = "PISTACK_OVN_GATEWAY_CHASSIS";
+/// Most chassis one gateway port is scheduled on. OVN keeps a BFD session
+/// between every pair, so the list is kept short.
+pub const MAX_GATEWAY_CHASSIS: usize = 5;
+/// `external_ids` key marking a router port as the router's gateway.
+const GATEWAY_TAG: &str = "pistack:gateway";
 /// The cluster term, as the cluster saves it in the store.
 const TERM_KEY: &str = "cluster_term";
 
@@ -95,7 +105,77 @@ impl Transport for BadEndpoint {
     }
 }
 
+/// The parts of a compute host record that say whether it can carry a
+/// router's gateway port. The compute module owns the record; this view
+/// only reads it and must never be written back, since it drops every
+/// other field.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HostView {
+    #[serde(default)]
+    pub node_name: String,
+}
+
+impl Spec for HostView {
+    const KIND: &'static str = kind::HOST;
+}
+
+/// Host state the gateway choice reads. See [`HostView`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HostStatusView {
+    #[serde(default)]
+    pub phase: Phase,
+    #[serde(default)]
+    pub ovn: Option<ChassisView>,
+}
+
+/// OVN on a host as its agent last reported it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ChassisView {
+    #[serde(default)]
+    pub chassis: String,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub bridge_mappings: String,
+}
+
+/// Read-only host record. See [`HostView`].
+pub type HostRecord = Resource<HostView, HostStatusView>;
+
+/// Chassis that can host a gateway port, highest priority first: ready
+/// hosts whose `ovn-controller` is connected and that have a bridge
+/// mapping, ordered by chassis name so every pass gives the same answer.
+pub fn gateway_candidates(store: &Store) -> ApiResult<Vec<String>> {
+    let hosts = store
+        .collection::<HostRecord>()
+        .list(None)
+        .map_err(|e| ApiError::unavailable(format!("ovn: listing hosts: {e}")))?;
+    let mut chassis: Vec<String> = hosts
+        .into_iter()
+        .filter(|h| h.status.phase == Phase::Ready)
+        .filter_map(|h| h.status.ovn)
+        .filter(|o| o.ready && !o.chassis.is_empty() && !o.bridge_mappings.trim().is_empty())
+        .map(|o| o.chassis)
+        .collect();
+    chassis.sort();
+    chassis.dedup();
+    chassis.truncate(MAX_GATEWAY_CHASSIS);
+    Ok(chassis)
+}
+
 impl OvnBackend {
+    /// Chassis for gateway ports: the configured list when there is one,
+    /// else the hosts that report they can carry one.
+    fn gateway_chassis(&self) -> ApiResult<Vec<String>> {
+        if !self.gateway_chassis.is_empty() {
+            return Ok(self.gateway_chassis.clone());
+        }
+        match self.attached.get() {
+            Some(a) => gateway_candidates(&a.store),
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn new(nb_endpoint: impl Into<String>) -> Self {
         let nb_endpoint = nb_endpoint.into();
         let nb: Arc<dyn Transport> = match ovsdb::Endpoint::parse(&nb_endpoint) {
@@ -433,6 +513,9 @@ impl OvnBackend {
         let lrp = lrp_name(&port.meta.id);
         let mut ext = self.tags(rtr, port.meta.project.as_ref());
         ext.push(("pistack:port".into(), port.meta.id.to_string()));
+        if want.gateway {
+            ext.push((GATEWAY_TAG.into(), "true".into()));
+        }
         let row = json!({
             "name": lrp,
             "mac": mac,
@@ -448,7 +531,8 @@ impl OvnBackend {
             )
             .await?;
         if want.gateway {
-            self.set_gateway_chassis(rtr, &lrp, &lrp_uuid).await?;
+            self.set_gateway_chassis(&rtr.to_string(), &lrp, &lrp_uuid)
+                .await?;
         }
         let name = port.meta.id.to_string();
         let mut ext = self.tags(&port.meta.id, port.meta.project.as_ref());
@@ -472,10 +556,17 @@ impl OvnBackend {
 
     /// Point the gateway port at one `Gateway_Chassis` row per configured
     /// chassis. Rewrites the rows only when the chassis or priorities differ.
-    async fn set_gateway_chassis(&self, rtr: &Id, lrp: &str, lrp_uuid: &str) -> ApiResult<()> {
-        let n = self.gateway_chassis.len();
-        let mut want: Vec<(String, i64)> = self
-            .gateway_chassis
+    async fn set_gateway_chassis(&self, rtr: &str, lrp: &str, lrp_uuid: &str) -> ApiResult<()> {
+        let chassis = self.gateway_chassis()?;
+        if chassis.is_empty() {
+            tracing::warn!(
+                router = rtr,
+                "ovn: no chassis can host the gateway port, so the router has no way out. Set {GATEWAY_CHASSIS_ENV}, or {} on an agent whose host has the uplink",
+                "PISTACK_OVN_BRIDGE_MAPPINGS"
+            );
+        }
+        let n = chassis.len();
+        let mut want: Vec<(String, i64)> = chassis
             .iter()
             .enumerate()
             .map(|(i, c)| (c.clone(), (n - i) as i64))
@@ -524,7 +615,10 @@ impl OvnBackend {
                     "name": format!("{lrp}_{chassis}"),
                     "chassis_name": chassis,
                     "priority": priority,
-                    "external_ids": map(self.tags(rtr, None)),
+                    "external_ids": map([
+                        ("pistack:id".to_string(), rtr.to_string()),
+                        ("pistack:term".to_string(), self.term().to_string()),
+                    ]),
                 }),
                 &n,
             ));
@@ -970,6 +1064,31 @@ fn ext_has(row: &Value, key: &str) -> bool {
 impl NetBackend for OvnBackend {
     fn name(&self) -> &'static str {
         "ovn"
+    }
+
+    /// Schedule every gateway port again from the current chassis list.
+    /// Nothing is written for a port whose chassis are already right.
+    async fn refresh(&self) -> ApiResult<()> {
+        if !self.gateway_chassis.is_empty() {
+            return Ok(());
+        }
+        let found = self
+            .run(vec![ovsdb::select(
+                "Logical_Router_Port",
+                vec![includes("external_ids", map([(GATEWAY_TAG, "true")]))],
+            )])
+            .await?;
+        for row in ovsdb::rows(&found[0]) {
+            let (Some(u), Some(rtr), Some(name)) = (
+                ovsdb::row_uuid(&row),
+                ext_value(&row, "pistack:id"),
+                row["name"].as_str(),
+            ) else {
+                continue;
+            };
+            self.set_gateway_chassis(&rtr, name, &u).await?;
+        }
+        Ok(())
     }
 
     fn attach(&self, leadership: &Leadership, store: &Store) {
@@ -1794,6 +1913,10 @@ mod tests {
     async fn routed() -> (Arc<FakeDb>, OvnBackend, RouterView) {
         let (db, b) = backend();
         let b = b.with_gateway_chassis(vec!["gw-a".into(), "gw-b".into()]);
+        routed_on(db, b).await
+    }
+
+    async fn routed_on(db: Arc<FakeDb>, b: OvnBackend) -> (Arc<FakeDb>, OvnBackend, RouterView) {
         let mut outside = net(NetworkKind::Overlay);
         outside.spec.external = true;
         let esub = subnet(&outside, "203.0.113.0/24", "203.0.113.1");
@@ -1834,6 +1957,157 @@ mod tests {
             interfaces: vec![(tsub, iface)],
         };
         (db, b, view)
+    }
+
+    fn host_record(chassis: &str, phase: Phase, ovn: Option<(bool, &str)>) -> HostRecord {
+        Resource {
+            meta: Meta::new(kind::HOST, chassis, None),
+            spec: HostView {
+                node_name: chassis.into(),
+            },
+            status: HostStatusView {
+                phase,
+                ovn: ovn.map(|(ready, mappings)| ChassisView {
+                    chassis: chassis.into(),
+                    ready,
+                    bridge_mappings: mappings.into(),
+                }),
+            },
+        }
+    }
+
+    fn scheduled_on(db: &FakeDb) -> Vec<(String, i64)> {
+        let mut out: Vec<(String, i64)> = db
+            .rows("Gateway_Chassis")
+            .iter()
+            .map(|r| {
+                (
+                    r["chassis_name"].as_str().unwrap().to_string(),
+                    r["priority"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn gateway_ports_follow_the_hosts_that_report_an_uplink() {
+        let (db, b) = backend();
+        let store = Store::in_memory().unwrap();
+        b.attach(&Leadership::always(), &store);
+        let hosts = store.collection::<HostRecord>();
+        let uplink = Some((true, "physnet1:br-ex"));
+        let a = hosts
+            .create(host_record("node-a", Phase::Ready, uplink))
+            .unwrap();
+        hosts
+            .create(host_record("node-c", Phase::Ready, uplink))
+            .unwrap();
+        // None of these can carry a gateway: no uplink, ovn-controller not
+        // connected, the host itself stale, and no report at all.
+        hosts
+            .create(host_record("node-b", Phase::Ready, Some((true, ""))))
+            .unwrap();
+        hosts
+            .create(host_record(
+                "node-d",
+                Phase::Ready,
+                Some((false, "physnet1:br-ex")),
+            ))
+            .unwrap();
+        hosts
+            .create(host_record("node-e", Phase::Error, uplink))
+            .unwrap();
+        hosts
+            .create(host_record("node-f", Phase::Ready, None))
+            .unwrap();
+        assert_eq!(
+            gateway_candidates(&store).unwrap(),
+            vec!["node-a".to_string(), "node-c".to_string()]
+        );
+
+        let (db, b, view) = routed_on(db, b).await;
+        b.ensure_router(&view).await.unwrap();
+        assert_eq!(
+            scheduled_on(&db),
+            vec![("node-a".into(), 2), ("node-c".into(), 1)]
+        );
+        let writes = db.writes();
+        b.refresh().await.unwrap();
+        b.ensure_router(&view).await.unwrap();
+        assert_eq!(db.writes(), writes, "nothing changed, nothing written");
+
+        // node-a loses its southbound connection.
+        hosts
+            .modify(&a.meta.id, |h| {
+                h.status.ovn.as_mut().unwrap().ready = false;
+                Ok(())
+            })
+            .unwrap();
+        b.refresh().await.unwrap();
+        assert_eq!(scheduled_on(&db), vec![("node-c".into(), 1)]);
+
+        // No host left: the port keeps no chassis, and gets them back on
+        // the first pass after a host returns.
+        for h in hosts.list(None).unwrap() {
+            hosts.delete(&h.meta.id).unwrap();
+        }
+        b.refresh().await.unwrap();
+        assert!(db.rows("Gateway_Chassis").is_empty());
+        let gw = db
+            .rows("Logical_Router_Port")
+            .into_iter()
+            .find(|r| ext(r, "pistack:gateway").is_some())
+            .unwrap();
+        assert!(ovsdb::elems(gw.get("gateway_chassis")).is_empty());
+        hosts
+            .create(host_record("node-g", Phase::Ready, uplink))
+            .unwrap();
+        b.refresh().await.unwrap();
+        assert_eq!(scheduled_on(&db), vec![("node-g".into(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn the_configured_chassis_list_wins_over_the_hosts() {
+        let (db, b) = backend();
+        let store = Store::in_memory().unwrap();
+        b.attach(&Leadership::always(), &store);
+        store
+            .collection::<HostRecord>()
+            .create(host_record(
+                "node-a",
+                Phase::Ready,
+                Some((true, "physnet1:br-ex")),
+            ))
+            .unwrap();
+        let b = b.with_gateway_chassis(vec!["gw-a".into(), "gw-b".into()]);
+        let (db, b, view) = routed_on(db, b).await;
+        b.ensure_router(&view).await.unwrap();
+        b.refresh().await.unwrap();
+        assert_eq!(
+            scheduled_on(&db),
+            vec![("gw-a".into(), 2), ("gw-b".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn at_most_five_chassis_carry_a_gateway() {
+        let store = Store::in_memory().unwrap();
+        let hosts = store.collection::<HostRecord>();
+        for i in (0..8).rev() {
+            hosts
+                .create(host_record(
+                    &format!("node-{i}"),
+                    Phase::Ready,
+                    Some((true, "physnet1:br-ex")),
+                ))
+                .unwrap();
+        }
+        let got = gateway_candidates(&store).unwrap();
+        assert_eq!(got.len(), MAX_GATEWAY_CHASSIS);
+        assert_eq!(got[0], "node-0");
+        assert_eq!(got[4], "node-4");
     }
 
     fn named(db: &FakeDb, table: &str, name: &str) -> Option<Value> {

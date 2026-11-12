@@ -111,6 +111,48 @@ pub struct HostStatus {
     pub message: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+    /// OVN on this host, from the agent's last heartbeat. None when the
+    /// agent sent no report. The scheduler places a machine on an OVN
+    /// network only where this says ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ovn: Option<pistack_rpc::OvnReport>,
+}
+
+impl HostStatus {
+    /// Keep the agent's OVN report and mirror it as the `OvnReady`
+    /// condition. No report removes both.
+    pub fn set_ovn(&mut self, report: Option<&pistack_rpc::OvnReport>) {
+        if self.ovn.as_ref() == report {
+            return;
+        }
+        self.ovn = report.cloned();
+        let Some(report) = report else {
+            self.conditions.retain(|c| c.kind != "OvnReady");
+            return;
+        };
+        let reason = if report.ready {
+            "ChassisConnected"
+        } else {
+            "ChassisNotReady"
+        };
+        match self.conditions.iter_mut().find(|c| c.kind == "OvnReady") {
+            Some(c) => {
+                if c.status != report.ready {
+                    c.last_transition = Utc::now();
+                }
+                c.status = report.ready;
+                c.reason = reason.to_owned();
+                c.message = report.message.clone();
+            }
+            None => self.conditions.push(Condition {
+                kind: "OvnReady".to_owned(),
+                status: report.ready,
+                reason: reason.to_owned(),
+                message: report.message.clone(),
+                last_transition: Utc::now(),
+            }),
+        }
+    }
 }
 
 resource_kind!(

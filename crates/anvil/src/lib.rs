@@ -9,6 +9,8 @@
 //!   drives KVM through `virsh`. youki runs pods as OCI bundles.
 //! * [`Anvil`] — the module mounted at `/host` on a control-plane node,
 //!   serving this node's facts.
+//! * `ovnhost` — points Open vSwitch at the cluster's OVN and reports
+//!   whether this host is a working chassis.
 //! * [`agent`] — [`run_agent`], the entry point for `pistack agent`: hello,
 //!   heartbeats and the command loop over `pistack-rpc`.
 
@@ -16,6 +18,7 @@ pub mod agent;
 pub mod facts;
 pub mod images;
 mod overlay;
+mod ovnhost;
 mod probe;
 pub mod runtime;
 

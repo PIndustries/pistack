@@ -12,6 +12,7 @@
 //! wins under `Strategy::Pack`), then free vcpus, then host id for a
 //! deterministic tie-break.
 
+use crate::ovn::Refusal;
 use crate::types::{usable_underlay, Host, MachineSpec};
 use pistack_types::{ApiError, ApiResult, Id, Phase, Resources};
 use std::collections::BTreeMap;
@@ -179,6 +180,41 @@ pub fn place_on_segment(
         )));
     }
     place(spec, size, &on_segment, allocations, strategy)
+}
+
+/// Place a machine that named a network when the networks are OVN.
+///
+/// A host qualifies when it reported a usable underlay address and its last
+/// heartbeat said it is a working OVN chassis. When none qualify, the error
+/// says how many hosts lacked each. Otherwise this is [`place`] on the hosts
+/// that remain, including that function's resource and driver errors.
+pub fn place_on_ovn(
+    spec: &MachineSpec,
+    size: &Resources,
+    hosts: &[Host],
+    allocations: &Allocations,
+    strategy: Strategy,
+) -> ApiResult<Id> {
+    let mut no_underlay = 0u64;
+    let mut not_ready = 0u64;
+    let mut usable = Vec::new();
+    for h in hosts {
+        match crate::ovn::not_usable(h) {
+            None => usable.push(h.clone()),
+            Some(Refusal::NoUnderlay) => no_underlay += 1,
+            Some(Refusal::NotReady) => not_ready += 1,
+        }
+    }
+    if usable.is_empty() {
+        return Err(ApiError::unavailable(format!(
+            "no host is ready for an OVN network: {} hosts, {no_underlay} lacked an underlay, {not_ready} are not a connected OVN chassis",
+            hosts.len()
+        ))
+        .with_detail("hosts", hosts.len() as u64)
+        .with_detail("no_underlay", no_underlay)
+        .with_detail("ovn_not_ready", not_ready));
+    }
+    place(spec, size, &usable, allocations, strategy)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -530,6 +566,76 @@ mod tests {
             .unwrap_err();
             assert!(err.message.contains("segment"), "{ip}: {}", err.message);
         }
+    }
+
+    fn chassis(ready: bool, message: &str) -> pistack_rpc::OvnReport {
+        pistack_rpc::OvnReport {
+            chassis: "a".into(),
+            ready,
+            message: message.into(),
+            bridge_mappings: String::new(),
+        }
+    }
+
+    #[test]
+    fn place_on_ovn_takes_only_a_connected_chassis_with_an_underlay() {
+        let place_one = |hosts: &[Host]| {
+            place_on_ovn(
+                &spec(MachineKind::Vm),
+                &SIZE,
+                hosts,
+                &Allocations::new(),
+                Strategy::Spread,
+            )
+        };
+        // No report at all, a report that says not ready, and a ready
+        // chassis with no tunnel endpoint.
+        let mut silent = host("silent", 32768, &["kvm"]);
+        silent.spec.underlay_ip = Some("10.1.0.2".into());
+        let mut down = host("down", 32768, &["kvm"]);
+        down.spec.underlay_ip = Some("10.1.0.3".into());
+        down.status
+            .set_ovn(Some(&chassis(false, "ovn-controller did not answer")));
+        let mut bare = host("bare", 32768, &["kvm"]);
+        bare.status.set_ovn(Some(&chassis(true, "")));
+
+        let err = place_one(&[silent.clone(), down.clone(), bare.clone()]).unwrap_err();
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable);
+        assert!(err.message.contains("OVN"), "{}", err.message);
+        assert_eq!(err.details.get("hosts").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            err.details.get("no_underlay").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            err.details.get("ovn_not_ready").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+
+        // The one ready host wins although it has the least memory.
+        let mut ready = host("ready", 8192, &["kvm"]);
+        ready.spec.underlay_ip = Some("10.1.0.4".into());
+        ready.status.set_ovn(Some(&chassis(true, "")));
+        let got = place_one(&[silent, down.clone(), bare, ready.clone()]).unwrap();
+        assert_eq!(got, ready.meta.id);
+
+        // A chassis that comes back is usable again.
+        down.status.set_ovn(Some(&chassis(true, "")));
+        assert_eq!(
+            place_one(std::slice::from_ref(&down)).unwrap(),
+            down.meta.id
+        );
+
+        // Hosts that qualify still go through the ordinary filters.
+        let mut pods_only = host("pods", 32768, &["youki"]);
+        pods_only.spec.underlay_ip = Some("10.1.0.5".into());
+        pods_only.status.set_ovn(Some(&chassis(true, "")));
+        let err = place_one(&[pods_only]).unwrap_err();
+        assert!(!err.message.contains("OVN"), "{}", err.message);
+        assert_eq!(
+            err.details.get("no_driver").and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 
     #[test]
