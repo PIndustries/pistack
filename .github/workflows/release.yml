@@ -1,0 +1,229 @@
+# Builds what people download: release tarballs for Linux x86_64 and aarch64,
+# and the server and agent container images. Runs when a version tag is pushed
+# and when someone starts it by hand, never on a pull request, and nothing in
+# ci.yml waits for it. Do not make it a required check.
+#
+# A run on a v* tag publishes a GitHub Release and pushes the images. A run
+# started by hand on a branch is a rehearsal: it builds and checks everything
+# and publishes nothing. docs/RELEASING.md has the steps.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/pindustries/pistack
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: version
+        id: plan
+        run: |
+          set -euo pipefail
+          cargo_version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "pistack") | .version')
+          if [ "$GITHUB_REF_TYPE" = tag ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$cargo_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $cargo_version in Cargo.toml"
+              exit 1
+            fi
+            publish=true
+          else
+            version="$cargo_version-dev.$(git rev-parse --short HEAD)"
+            publish=false
+          fi
+          # 1.2.3-rc.1 is a pre-release: no "latest" tag, marked as such on GitHub.
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, publish $publish, prerelease $prerelease" >> "$GITHUB_STEP_SUMMARY"
+
+  # The runner image sets the oldest glibc the binaries run on (22.04: 2.35).
+  tarball:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No build cache on purpose: a release is built from clean.
+      - name: build
+        run: cargo build --release --locked -p pistack -p bench
+      - name: pack
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$ARCH"
+          packaging/make-tarball.sh target/release "$VERSION" "$ARCH" dist
+      - name: install from the tarball
+        run: |
+          set -euo pipefail
+          name="pistack-$VERSION-linux-$ARCH"
+          (cd dist && sha256sum -c "$name.tar.gz.sha256")
+          tar -xzf "dist/$name.tar.gz" -C "$RUNNER_TEMP"
+          sudo "$RUNNER_TEMP/$name/install.sh"
+          pistack --version
+          pi --version
+          for h in pistack-overlay pistack-fip pistack-shelf-helper pistack-youki-cleanup; do
+            test -x "/usr/local/sbin/$h"
+          done
+          systemd-analyze verify /etc/systemd/system/pistack-server.service \
+            /etc/systemd/system/pistack-agent.service
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Each architecture builds on its own runner, so nothing compiles under
+  # emulation. On a tag the images are pushed by digest and joined below.
+  image:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: builder
+        run: docker buildx create --use --name release
+      - name: build and try
+        run: |
+          set -euo pipefail
+          for target in server agent; do
+            docker buildx build --target "$target" --load -t "pistack:$target" .
+            docker run --rm "pistack:$target" --version
+          done
+          test "$(docker run --rm --entrypoint id pistack:agent -u)" = 0
+          test "$(docker image inspect -f '{{.Config.User}}' pistack:server)" = 65532:65532
+      - name: push by digest
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          mkdir -p digests
+          for target in server agent; do
+            docker buildx build --target "$target" \
+              --label "org.opencontainers.image.version=$VERSION" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "meta-$target.json" .
+            jq -r '."containerimage.digest"' "meta-$target.json" > "digests/$target-$ARCH"
+          done
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  manifest:
+    needs: [plan, tarball, image]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: digests
+          merge-multiple: true
+      - name: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # server: VERSION and latest. agent: VERSION-agent and latest-agent.
+          for target in server agent; do
+            suffix=""
+            [ "$target" = agent ] && suffix="-agent"
+            tags=(-t "$IMAGE:$VERSION$suffix")
+            [ "$PRERELEASE" = false ] && tags+=(-t "$IMAGE:latest$suffix")
+            docker buildx imagetools create "${tags[@]}" \
+              "$IMAGE@$(cat "digests/$target-x86_64")" \
+              "$IMAGE@$(cat "digests/$target-aarch64")"
+            docker buildx imagetools inspect "$IMAGE:$VERSION$suffix"
+          done
+
+  github-release:
+    needs: [plan, tarball, manifest]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          rm ./*.tar.gz.sha256
+          sha256sum -c SHA256SUMS
+      - name: publish
+        run: |
+          set -euo pipefail
+          # A re-run for the same tag replaces the files and keeps the notes.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            flags=(--verify-tag --generate-notes --title "PiStack $GITHUB_REF_NAME")
+            [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+            gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*
+          fi

@@ -1,0 +1,9 @@
+/target
+/data
+/.git
+/.github
+/.claude
+/docs
+/crates/*/data/
+*.redb
+.DS_Store
