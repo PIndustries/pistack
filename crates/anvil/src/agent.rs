@@ -556,8 +556,10 @@ impl Agent {
 
     /// Point `req.image` at a file on this host. The server sends the path
     /// the image has there; when that file is not here and the request says
-    /// which catalog image it is, download it. A runtime that boots nothing
-    /// from the file (mock, metal) is left alone.
+    /// which catalog image it is, download it. A file that is here but not
+    /// named for its format (the server's blob, on a host that runs both)
+    /// is linked into the cache under such a name. A runtime that boots
+    /// nothing from the file (mock, metal) is left alone.
     async fn localize_image(&self, req: &mut MachineRequest) -> ApiResult<()> {
         let Some(source) = &req.image_source else {
             return Ok(());
@@ -566,10 +568,21 @@ impl Agent {
             .runtimes
             .get(req.kind)
             .is_some_and(|rt| !matches!(rt.name(), "mock" | "metal"));
-        if !reads_file || std::path::Path::new(&req.image).is_file() {
+        if !reads_file {
             return Ok(());
         }
-        let path = self.images.ensure(&self.client, source).await?;
+        let local = std::path::Path::new(&req.image);
+        let path = if local.is_file() {
+            let named = local
+                .extension()
+                .is_some_and(|ext| ext == source.format.as_str());
+            if named {
+                return Ok(());
+            }
+            self.images.adopt(local, source).await?
+        } else {
+            self.images.ensure(&self.client, source).await?
+        };
         req.image = path.to_string_lossy().into_owned();
         Ok(())
     }
@@ -2523,6 +2536,17 @@ still here
         let mut req = request(&here, Some(source.clone()));
         agent(libvirt()).localize_image(&mut req).await.unwrap();
         assert_eq!(req.image, here);
+
+        // The server's own blob has no extension: the guest gets a name
+        // the hypervisor's confinement accepts.
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"disk").unwrap();
+        let mut req = request(&blob.to_string_lossy(), Some(source.clone()));
+        agent(libvirt()).localize_image(&mut req).await.unwrap();
+        let adopted = dir.path().join("images").join(format!("{digest}.qcow2"));
+        assert_eq!(req.image, adopted.to_string_lossy());
+        assert_eq!(std::fs::read(&adopted).unwrap(), b"disk");
+        std::fs::remove_file(&adopted).unwrap();
 
         // No catalog image named: the runtime resolves the name as before.
         let mut req = request("ubuntu-24.04", None);
