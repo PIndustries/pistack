@@ -13,8 +13,8 @@
 
 use anyhow::Context;
 use axum::extract::connect_info::Connected;
-use axum::extract::ConnectInfo;
 use axum::extract::Request;
+use axum::extract::{ConnectInfo, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::serve::{IncomingStream, Listener};
@@ -29,7 +29,18 @@ use tokio_util::sync::CancellationToken;
 
 /// Local wrapper so we can implement axum `Connected` (orphan rules).
 #[derive(Clone, Debug)]
-struct GatewayPeer(PeerIdentity);
+struct GatewayPeer {
+    peer: PeerIdentity,
+    /// The client's leaf certificate, when it offered one that chained to
+    /// the cloud CA. Kept so each request can check it is not revoked.
+    leaf: Option<Arc<Vec<u8>>>,
+}
+
+impl GatewayPeer {
+    fn plain(peer: PeerIdentity) -> Self {
+        GatewayPeer { peer, leaf: None }
+    }
+}
 
 /// HTTPS bind plus the store whose CA signs a missing certificate.
 pub struct TlsListen {
@@ -42,6 +53,8 @@ pub struct BoundListeners {
     pub http: SocketAddr,
     pub tls: Option<SocketAddr>,
     app: axum::Router,
+    /// The store the revocation list is read from; set with TLS.
+    store: Option<Store>,
     http_listener: TcpListener,
     tls_listener: Option<TlsListener>,
 }
@@ -67,8 +80,13 @@ impl Listener for TlsListener {
             };
             match self.acceptor.accept(sock).await {
                 Ok(tls) => {
-                    let peer = PeerIdentity::from_tls(addr, tls.get_ref().1);
-                    return (tls, GatewayPeer(peer));
+                    let conn = tls.get_ref().1;
+                    let peer = PeerIdentity::from_tls(addr, conn);
+                    let leaf = conn
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .map(|c| Arc::new(c.as_ref().to_vec()));
+                    return (tls, GatewayPeer { peer, leaf });
                 }
                 Err(e) => {
                     tracing::debug!(%addr, error = %e, "tls handshake failed");
@@ -78,7 +96,7 @@ impl Listener for TlsListener {
     }
 
     fn local_addr(&self) -> std::io::Result<GatewayPeer> {
-        Ok(GatewayPeer(PeerIdentity {
+        Ok(GatewayPeer::plain(PeerIdentity {
             addr: Some(self.tcp.local_addr()?),
             common_name: None,
         }))
@@ -93,17 +111,37 @@ impl Connected<IncomingStream<'_, TlsListener>> for GatewayPeer {
 
 impl Connected<IncomingStream<'_, TcpListener>> for GatewayPeer {
     fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        GatewayPeer(PeerIdentity::plain(*stream.remote_addr()))
+        GatewayPeer::plain(PeerIdentity::plain(*stream.remote_addr()))
     }
 }
 
 /// Copy [`PeerIdentity`] into request extensions for `/rpc` middleware.
+///
+/// A client certificate is checked against the revocation list on every
+/// request, not once per connection, so revoking one cuts off an agent that
+/// is already connected. A revoked certificate, or a list that cannot be
+/// read, leaves the request with no peer name, which `/rpc` refuses.
 async fn publish_peer(
-    ConnectInfo(peer): ConnectInfo<GatewayPeer>,
+    State(store): State<Option<Store>>,
+    ConnectInfo(conn): ConnectInfo<GatewayPeer>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    req.extensions_mut().insert(peer.0);
+    let mut peer = conn.peer;
+    if let (Some(store), Some(leaf)) = (&store, &conn.leaf) {
+        match keep::ca::is_revoked(store, leaf) {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(peer = ?peer.common_name, "revoked client certificate refused");
+                peer.common_name = None;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot read the revocation list");
+                peer.common_name = None;
+            }
+        }
+    }
+    req.extensions_mut().insert(peer);
     next.run(req).await
 }
 
@@ -123,7 +161,7 @@ pub async fn bind_listeners(
         .with_context(|| format!("binding {http_listen}"))?;
     let http = http_listener.local_addr()?;
 
-    let (tls_listener, tls_bound) = if let (Some(spec), Some(addr)) = (tls, tls_addr) {
+    let (tls_listener, tls_bound, store) = if let (Some(spec), Some(addr)) = (tls, tls_addr) {
         let pki = load_or_issue(&spec.data_dir, &spec.store, addr.ip())?;
         let cfg = keep::tls::server_config_http(&pki).context("building rustls server config")?;
         let acceptor = TlsAcceptor::from(Arc::new(cfg));
@@ -132,15 +170,20 @@ pub async fn bind_listeners(
             .with_context(|| format!("binding tls listener {addr}"))?;
         let bound = tcp.local_addr()?;
         tracing::info!(tls_listen = %bound, "tls listener");
-        (Some(TlsListener { tcp, acceptor }), Some(bound))
+        (
+            Some(TlsListener { tcp, acceptor }),
+            Some(bound),
+            Some(spec.store),
+        )
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     Ok(BoundListeners {
         http,
         tls: tls_bound,
         app,
+        store,
         http_listener,
         tls_listener,
     })
@@ -149,7 +192,9 @@ pub async fn bind_listeners(
 impl BoundListeners {
     /// Serve until `shutdown` is cancelled. Both listeners watch that token.
     pub async fn serve(self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        let app = self.app.layer(middleware::from_fn(publish_peer));
+        let app = self
+            .app
+            .layer(middleware::from_fn_with_state(self.store, publish_peer));
         let http_sd = shutdown.clone();
         let http_svc = app
             .clone()
@@ -387,6 +432,20 @@ mod tests {
         assert!(body.contains("agent-who"), "{body}");
 
         let (status, body) = https_get_with_client(tls, &ca, None, "/whoami").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("none"), "{body}");
+
+        // Revoked: the handshake still completes, the name is gone.
+        let certs = store
+            .collection::<keep::Certificate>()
+            .list(None)
+            .expect("certificates");
+        let cert = certs
+            .iter()
+            .find(|c| c.spec.common_name == "agent-who")
+            .expect("the agent's certificate record");
+        keep.revoke_certificate(&cert.meta.id).expect("revoke");
+        let (status, body) = https_get_with_client(tls, &ca, Some(&client_pki), "/whoami").await;
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("none"), "{body}");
 
