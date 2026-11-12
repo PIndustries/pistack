@@ -586,8 +586,8 @@ async fn apply(privilege: &IpPrivilege, plan: &Plan) -> ApiResult<()> {
                             return Err(err);
                         }
                     }
-                } else if let Err(err) = result {
-                    return Err(err);
+                } else {
+                    result?;
                 }
             }
             Step::Plug {

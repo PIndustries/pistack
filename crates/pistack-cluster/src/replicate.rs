@@ -86,7 +86,7 @@ pub fn plan_promotions(
         .map(|(index, _)| index)
         .collect();
     let mut take = (target - voters).min(ready.len());
-    if take > 0 && voters + take != target && (voters + take) % 2 == 0 {
+    if take > 0 && voters + take != target && (voters + take).is_multiple_of(2) {
         take -= 1;
     }
     if take == 0 {
