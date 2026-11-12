@@ -27,6 +27,7 @@ use pistack_store::Store;
 use pistack_types::{
     kind, ApiError, Id, Kind, ListQuery, Meta, Module, ModuleContext, ModuleInfo, Page,
 };
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub use policy::authorize;
@@ -55,12 +56,25 @@ impl FromRef<AppState> for Verifier {
     }
 }
 
+/// File in the data directory that holds a generated admin password.
+pub const ADMIN_PASSWORD_FILE: &str = "admin-password";
+
 #[derive(Default)]
 pub struct Gate {
     state: OnceLock<AppState>,
+    password_file: Option<PathBuf>,
 }
 
 impl Gate {
+    /// A gate that writes a generated admin password to `path` (mode 0600)
+    /// and keeps it out of the log.
+    pub fn with_password_file(path: impl Into<PathBuf>) -> Gate {
+        Gate {
+            state: OnceLock::new(),
+            password_file: Some(path.into()),
+        }
+    }
+
     /// Build (once) the shared state from the context's store.
     fn state(&self, ctx: &ModuleContext) -> anyhow::Result<AppState> {
         if let Some(s) = self.state.get() {
@@ -110,13 +124,20 @@ impl Module for Gate {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let state = self.state(&ctx)?;
-        bootstrap(&state.store)
+        bootstrap_with(&state.store, self.password_file.as_deref())
     }
 }
 
 /// First-run setup: built-in roles, the `admin` project and principal, and a
 /// system-scoped admin binding. Idempotent.
 pub fn bootstrap(store: &Store) -> anyhow::Result<()> {
+    bootstrap_with(store, None)
+}
+
+/// [`bootstrap`], writing a generated admin password to `password_file`.
+/// With no file the password goes to the log, which is all a caller with no
+/// data directory can do.
+pub fn bootstrap_with(store: &Store, password_file: Option<&Path>) -> anyhow::Result<()> {
     let roles = store.collection::<Role>();
     for (name, description) in BUILTIN_ROLES {
         if roles.try_get_by_name(name)?.is_none() {
@@ -192,6 +213,13 @@ pub fn bootstrap(store: &Store) -> anyhow::Result<()> {
             principal = ADMIN_NAME,
             "bootstrapped admin with password from {ADMIN_PASSWORD_ENV}"
         );
+    } else if let Some(path) = password_file {
+        write_password(path, &password)?;
+        tracing::warn!(
+            principal = ADMIN_NAME,
+            file = %path.display(),
+            "bootstrapped admin with a generated password; read it from the file, change it, delete the file"
+        );
     } else {
         tracing::warn!(
             principal = ADMIN_NAME,
@@ -199,6 +227,21 @@ pub fn bootstrap(store: &Store) -> anyhow::Result<()> {
             "bootstrapped admin with a generated password; this is logged once, change it"
         );
     }
+    Ok(())
+}
+
+/// Write the password and a newline to a new file only its owner can read.
+fn write_password(path: &Path, password: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    writeln!(file, "{password}")?;
     Ok(())
 }
 
@@ -323,6 +366,17 @@ mod tests {
             },
         );
         assert_eq!(one.total, 1);
+    }
+
+    #[test]
+    fn a_generated_password_goes_to_a_file_only_its_owner_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ADMIN_PASSWORD_FILE);
+        write_password(&path, "s3cret").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cret\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

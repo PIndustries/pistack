@@ -8,7 +8,7 @@ A control plane is one or more `pistack server` processes that share a replicate
 pistack --data-dir /var/lib/pistack server --init --listen 10.0.0.11:8443
 ```
 
-`--init` founds a new cluster. The server creates `state.redb` in the data directory, becomes the only voter and the leader, and creates the `admin` project and principal. The admin password is taken from `PISTACK_ADMIN_PASSWORD` if set. Otherwise one is generated and written to the log once.
+`--init` founds a new cluster. The server creates `state.redb` in the data directory, becomes the only voter and the leader, and creates the `admin` project and principal. The admin password is taken from `PISTACK_ADMIN_PASSWORD` if set. Otherwise one is generated and written to `admin-password` in the data directory, mode 0600.
 
 After the first start, `--init` is no longer needed. A server that finds an existing `state.redb` stays in that cluster whatever flags it is given.
 

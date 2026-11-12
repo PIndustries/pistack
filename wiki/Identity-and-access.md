@@ -22,7 +22,7 @@ The first time a server starts on an empty store it creates:
 - a principal named `admin`, whose default project is `admin`,
 - a system-wide binding of `admin` to the `admin` role.
 
-The password comes from `PISTACK_ADMIN_PASSWORD` if it is set. Otherwise the server generates one and writes it to the log once, at warning level. Change it, or at least take it out of the log.
+The password comes from `PISTACK_ADMIN_PASSWORD` if it is set. Otherwise the server generates one and writes it to `<data_dir>/admin-password` with mode 0600; the log names the file and does not hold the password. Change the password and delete the file.
 
 ## Principals
 
