@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 P. Industries LLC and PiStack contributors
+
+[Unit]
+Description=PiStack host agent
+Documentation=https://github.com/PIndustries/pistack
+After=network-online.target libvirtd.service openvswitch-switch.service pistack-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# PISTACK_JOIN in this file names the control plane. The agent has nothing
+# to do without it.
+EnvironmentFile=/etc/pistack/agent.env
+ExecStart=/usr/local/bin/pistack agent --join ${PISTACK_JOIN}
+Restart=on-failure
+RestartSec=5
+# Stopping the agent must not take the machines and containers it started
+# down with it.
+KillMode=process
+LimitNOFILE=1048576
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

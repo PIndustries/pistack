@@ -3,7 +3,7 @@
 
 [Unit]
 Description=Restore PiStack floating IPs, security groups, and metadata doors
-After=network-online.target libvirtd.service wg-quick@wg-fleet.service pistack.service
+After=network-online.target libvirtd.service wg-quick@wg-fleet.service pistack.service pistack-server.service
 Wants=network-online.target
 
 [Service]

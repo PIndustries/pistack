@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 P. Industries LLC and PiStack contributors
+
+[Unit]
+Description=PiStack control plane
+Documentation=https://github.com/PIndustries/pistack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/pistack/server.env
+# PISTACK_SERVER_ARGS carries the flags that have no variable of their own:
+# --init on the first node, --join URL on the others. Unquoted on purpose so
+# systemd splits it into words.
+ExecStart=/usr/local/bin/pistack server $PISTACK_SERVER_ARGS
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
