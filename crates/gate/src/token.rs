@@ -9,6 +9,7 @@
 //! Verifying one needs the key and nothing else: no store lookup, so the
 //! gateway can do it on every request with a cheap, cloneable `Verifier`.
 
+use crate::types::{ApiKey, Principal};
 use axum::{
     extract::{FromRef, FromRequestParts, Request, State},
     http::{header, request::Parts, HeaderMap},
@@ -45,6 +46,9 @@ pub struct Claims {
     pub roles: Vec<String>,
     #[serde(default)]
     pub system: bool,
+    /// API key the login used, when it used one. The token dies with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<Id>,
     pub iat: i64,
     pub exp: i64,
     pub jti: String,
@@ -106,8 +110,18 @@ impl Keys {
 
     /// Sign a token for `caller` valid for `ttl` from now.
     pub fn sign(&self, caller: &Caller, ttl: Duration) -> ApiResult<(String, Claims)> {
+        self.sign_for_key(caller, None, ttl)
+    }
+
+    /// As [`Keys::sign`], for a login made with API key `key`.
+    pub fn sign_for_key(
+        &self,
+        caller: &Caller,
+        key: Option<Id>,
+        ttl: Duration,
+    ) -> ApiResult<(String, Claims)> {
         let now = Utc::now();
-        self.sign_at(caller, now, now + ttl)
+        self.sign_claims(caller, key, now, now + ttl)
     }
 
     /// Sign with explicit timestamps (tests use this to make expired tokens).
@@ -117,12 +131,23 @@ impl Keys {
         issued: DateTime<Utc>,
         expires: DateTime<Utc>,
     ) -> ApiResult<(String, Claims)> {
+        self.sign_claims(caller, None, issued, expires)
+    }
+
+    fn sign_claims(
+        &self,
+        caller: &Caller,
+        key: Option<Id>,
+        issued: DateTime<Utc>,
+        expires: DateTime<Utc>,
+    ) -> ApiResult<(String, Claims)> {
         let claims = Claims {
             sub: caller.principal.clone(),
             name: caller.principal_name.clone(),
             project: caller.project.clone(),
             roles: caller.roles.clone(),
             system: caller.system,
+            key,
             iat: issued.timestamp(),
             exp: expires.timestamp(),
             jti: uuid::Uuid::now_v7().to_string(),
@@ -134,11 +159,19 @@ impl Keys {
 }
 
 /// Verifies tokens. Cheap to clone; the gateway holds one and checks every
-/// request with it. No store access.
+/// request with it.
+///
+/// One built with [`Verifier::from_store`] also reads the store on every
+/// check: the principal must still exist and be enabled, the API key the
+/// login used must still exist and be unexpired, and the roles are the ones
+/// bound now, not the ones bound at login. So disabling a user, deleting a
+/// key or removing a binding takes effect on the next request. One built
+/// from a bare secret checks the signature and expiry only.
 #[derive(Clone)]
 pub struct Verifier {
     decoding: Arc<DecodingKey>,
     validation: Arc<Validation>,
+    store: Option<Store>,
 }
 
 impl Verifier {
@@ -150,17 +183,28 @@ impl Verifier {
         Verifier {
             decoding: Arc::new(DecodingKey::from_secret(secret)),
             validation: Arc::new(validation),
+            store: None,
         }
     }
 
     /// Load from the store (the gateway does this once at boot). Fails if
     /// `gate` has not generated a key yet.
     pub fn from_store(store: &Store) -> anyhow::Result<Verifier> {
-        Ok(Keys::load_or_create(store)?.verifier())
+        Ok(Keys::load_or_create(store)?.verifier().with_store(store))
+    }
+
+    /// Also check each token against `store`.
+    pub fn with_store(mut self, store: &Store) -> Verifier {
+        self.store = Some(store.clone());
+        self
     }
 
     pub fn verify(&self, token: &str) -> ApiResult<Caller> {
-        Ok(self.claims(token)?.caller())
+        let claims = self.claims(token)?;
+        match &self.store {
+            Some(store) => live_caller(store, &claims),
+            None => Ok(claims.caller()),
+        }
     }
 
     pub fn claims(&self, token: &str) -> ApiResult<Claims> {
@@ -183,6 +227,28 @@ impl Verifier {
         let token = bearer(parts)?;
         self.verify(token)
     }
+}
+
+/// The caller a token stands for as the store has it now. Any reason the
+/// token no longer holds is the same 401, so a probe learns nothing.
+fn live_caller(store: &Store, claims: &Claims) -> ApiResult<Caller> {
+    let revoked = || ApiError::unauthorized("token revoked");
+    let internal = |e: pistack_store::StoreError| ApiError::internal(e.to_string());
+    let principal = store
+        .collection::<Principal>()
+        .try_get(&claims.sub)
+        .map_err(internal)?
+        .filter(|p| p.spec.enabled)
+        .ok_or_else(revoked)?;
+    if let Some(key) = &claims.key {
+        store
+            .collection::<ApiKey>()
+            .try_get(key)
+            .map_err(internal)?
+            .filter(|k| k.spec.principal == principal.meta.id && !k.is_expired(Utc::now()))
+            .ok_or_else(revoked)?;
+    }
+    crate::api::caller_for(store, &principal, claims.project.clone()).map_err(|_| revoked())
 }
 
 /// `pub fn verify(token)` convenience when a `Verifier` is in hand.

@@ -51,7 +51,7 @@ pub struct AppState {
 
 impl FromRef<AppState> for Verifier {
     fn from_ref(s: &AppState) -> Verifier {
-        s.keys.verifier()
+        s.keys.verifier().with_store(&s.store)
     }
 }
 
@@ -79,7 +79,9 @@ impl Gate {
 
     /// The token verifier, once `router` or `start` has run.
     pub fn verifier(&self) -> Option<Verifier> {
-        self.state.get().map(|s| s.keys.verifier())
+        self.state
+            .get()
+            .map(|s| s.keys.verifier().with_store(&s.store))
     }
 }
 
