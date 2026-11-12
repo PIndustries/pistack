@@ -229,6 +229,14 @@ impl BlockBackend for LocalFileBackend {
         Ok(BackendRef::new(to.to_string_lossy().into_owned()))
     }
 
+    async fn clone_volume(&self, src: &Volume, into: &Volume) -> ApiResult<BackendRef> {
+        self.ensure_dirs().await?;
+        let from = self.vol_ref_path(src);
+        let to = self.volume_path(into);
+        Self::copy_and_size(&from, &to, gib_to_bytes(into.spec.size_gib)).await?;
+        Ok(BackendRef::new(to.to_string_lossy().into_owned()))
+    }
+
     async fn extend(&self, vol: &Volume, new_size_gib: u64) -> ApiResult<()> {
         let path = self.vol_ref_path(vol);
         let f = fs::OpenOptions::new()

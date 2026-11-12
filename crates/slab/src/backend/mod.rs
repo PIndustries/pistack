@@ -139,7 +139,9 @@ pub trait BlockBackend: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Create blank storage for `vol` at `spec.size_gib`. Image bytes are
-    /// written afterwards by [`BlockBackend::write_image`].
+    /// written afterwards by [`BlockBackend::write_image`]. A volume whose
+    /// source is a snapshot or another volume is made by
+    /// [`BlockBackend::restore`] or [`BlockBackend::clone_volume`].
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef>;
 
     /// Copy the disk image at `src` onto `vol` as raw bytes. `format` is
@@ -157,8 +159,12 @@ pub trait BlockBackend: Send + Sync + 'static {
     /// Delete a snapshot. Must be idempotent.
     async fn delete_snapshot(&self, snap: &Snapshot) -> ApiResult<()>;
 
-    /// Materialise `snap` as the new volume `into`.
+    /// Materialise `snap` as the new volume `into`, at `into.spec.size_gib`.
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef>;
+
+    /// Copy the volume `src` into the new volume `into`, at
+    /// `into.spec.size_gib`.
+    async fn clone_volume(&self, src: &Volume, into: &Volume) -> ApiResult<BackendRef>;
 
     /// Grow `vol` to `new_size_gib`. Shrinking is never allowed.
     async fn extend(&self, vol: &Volume, new_size_gib: u64) -> ApiResult<()>;

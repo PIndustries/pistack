@@ -13,7 +13,8 @@
 //! | delete          | `rbd rm {pool}/{vol_id}` |
 //! | snapshot        | `rbd snap create {pool}/{vol_id}@{snap_id}` then `rbd snap protect {pool}/{vol_id}@{snap_id}` |
 //! | delete_snapshot | `rbd snap unprotect {pool}/{vol_id}@{snap_id}` then `rbd snap rm {pool}/{vol_id}@{snap_id}` |
-//! | restore         | `rbd clone {pool}/{vol_id}@{snap_id} {pool}/{new_vol_id}` |
+//! | restore         | `rbd clone {pool}/{vol_id}@{snap_id} {pool}/{new_vol_id}` and, when the new volume is larger, `rbd resize --size {size_gib}G {pool}/{new_vol_id}` |
+//! | clone           | `rbd cp --image-feature layering,exclusive-lock {pool}/{src_vol_id} {pool}/{new_vol_id}`, then `rbd resize` as for restore |
 //! | extend          | `rbd resize --size {new_size_gib}G {pool}/{vol_id}` |
 //! | attach_info     | `Rbd { pool, image: vol_id, monitors, user }` |
 //! | image           | `qemu-img convert -O raw -f <fmt> -n <src> rbd:{pool}/{vol_id}` |
@@ -130,6 +131,25 @@ impl RbdBackend {
         }
     }
 
+    /// A clone or a copy has its source's size. Grow it when `into` asks
+    /// for more than `source_gib`.
+    async fn grow(&self, image: &str, source_gib: u64, into: &Volume) -> ApiResult<()> {
+        if into.spec.size_gib <= source_gib {
+            return Ok(());
+        }
+        run(
+            &super::configured_bin(ENV_BIN, "rbd"),
+            &[
+                "resize".into(),
+                "--size".into(),
+                format!("{}G", into.spec.size_gib),
+                image.to_owned(),
+            ],
+            false,
+        )
+        .await
+    }
+
     /// `qemu-img convert -O raw -f <format> -n <src> rbd:{pool}/{id}`.
     fn image_convert_args(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<Vec<String>> {
         let pool = self.pool()?;
@@ -149,6 +169,7 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef> {
+        blank_only(vol)?;
         self.require_available().await?;
         let pool = self.pool()?;
         let id = vol_id(vol)?;
@@ -239,6 +260,28 @@ impl BlockBackend for RbdBackend {
             false,
         )
         .await?;
+        self.grow(&image, snap.status.size_gib, into).await?;
+        Ok(BackendRef::new(image))
+    }
+
+    async fn clone_volume(&self, src: &Volume, into: &Volume) -> ApiResult<BackendRef> {
+        self.require_available().await?;
+        let pool = self.pool()?;
+        let src_id = vol_id(src)?;
+        let id = vol_id(into)?;
+        let image = format!("{pool}/{id}");
+        run_copy(
+            &super::configured_bin(ENV_BIN, "rbd"),
+            &[
+                "cp".into(),
+                "--image-feature".into(),
+                "layering,exclusive-lock".into(),
+                format!("{pool}/{src_id}"),
+                image.clone(),
+            ],
+        )
+        .await?;
+        self.grow(&image, src.spec.size_gib, into).await?;
         Ok(BackendRef::new(image))
     }
 
@@ -303,6 +346,17 @@ fn vol_id(vol: &Volume) -> ApiResult<String> {
     Ok(id)
 }
 
+/// `create` makes a blank image. Refuse a source it would drop.
+fn blank_only(vol: &Volume) -> ApiResult<()> {
+    use crate::types::VolumeSource;
+    match vol.spec.source {
+        VolumeSource::None | VolumeSource::Image(_) => Ok(()),
+        VolumeSource::Snapshot(_) | VolumeSource::Volume(_) => Err(ApiError::internal(
+            "rbd create makes a blank image; a snapshot or volume source is restored or cloned",
+        )),
+    }
+}
+
 fn snap_id(snap: &Snapshot) -> ApiResult<String> {
     let id = snap.meta.id.to_string();
     ident("snapshot id", &id)?;
@@ -364,6 +418,39 @@ fn object_absent(text: &str) -> bool {
         || s.contains("not protected")
         || s.contains("already unprotected")
         || (s.contains("not found") && (s.contains("image") || s.contains("snap")))
+}
+
+/// `rbd cp` reads and writes every allocated block of the source, so it
+/// gets the limit an image copy has instead of the 30s one.
+const COPY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+async fn run_copy(bin: &str, args: &[String]) -> ApiResult<()> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let finished = tokio::time::timeout(COPY_TIMEOUT, cmd.output()).await;
+    let output = match finished {
+        Err(_) => {
+            return Err(ApiError::unavailable(format!(
+                "{bin} cp timed out after {}s",
+                COPY_TIMEOUT.as_secs()
+            )))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::unavailable(format!("{bin} is not available")))
+        }
+        Ok(Err(e)) => return Err(ApiError::internal(format!("{bin}: {e}"))),
+        Ok(Ok(output)) => output,
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = format!("{}{}", clip(&output.stderr), clip(&output.stdout));
+    let code = output.status.code().unwrap_or(-1);
+    Err(ApiError::internal(format!("{bin} exited {code}: {detail}")))
 }
 
 #[cfg(test)]
@@ -483,6 +570,90 @@ mod tests {
         assert!(err.message.contains("not available"), "{err}");
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.lines().any(|line| line == "create"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn restore_and_clone_carry_the_source() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("rbd");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{quoted}'\nexit 0\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+        // One line per command, without the `rbd pool stats` probe.
+        let issued = || -> Vec<String> {
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            logged
+                .lines()
+                .filter(|line| !line.starts_with("pool stats"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let src = volume(4);
+        let src_id = src.meta.id.to_string();
+        let snap = Snapshot {
+            meta: Meta::new(kind::SNAPSHOT, "snap", None),
+            spec: crate::types::SnapshotSpec {
+                volume: src.meta.id.clone(),
+            },
+            status: crate::types::SnapshotStatus {
+                size_gib: 4,
+                ..Default::default()
+            },
+        };
+        let snap_id = snap.meta.id.to_string();
+
+        // Larger than the snapshot: cloned, then grown to the requested size.
+        let mut restored = volume(6);
+        restored.spec.source = crate::types::VolumeSource::Snapshot(snap.meta.id.clone());
+        let id = restored.meta.id.to_string();
+        let made = backend.restore(&snap, &restored).await.unwrap();
+        assert_eq!(made.as_str(), format!("volumes/{id}"));
+        assert_eq!(
+            issued(),
+            vec![
+                format!("clone volumes/{src_id}@{snap_id} volumes/{id}"),
+                format!("resize --size 6G volumes/{id}"),
+            ]
+        );
+
+        // Same size as the source volume: copied, not resized.
+        let mut cloned = volume(4);
+        cloned.spec.source = crate::types::VolumeSource::Volume(src.meta.id.clone());
+        let id = cloned.meta.id.to_string();
+        let made = backend.clone_volume(&src, &cloned).await.unwrap();
+        assert_eq!(made.as_str(), format!("volumes/{id}"));
+        assert_eq!(
+            issued(),
+            vec![format!(
+                "cp --image-feature layering,exclusive-lock volumes/{src_id} volumes/{id}"
+            )]
+        );
+
+        // `create` would drop the source, so it refuses and runs nothing.
+        for vol in [&restored, &cloned] {
+            let err = backend.create(vol).await.unwrap_err();
+            assert_eq!(err.code, pistack_types::error::ErrorCode::Internal);
+            assert!(err.message.contains("blank"), "{err}");
+        }
+        assert!(issued().is_empty());
     }
 
     #[tokio::test]
