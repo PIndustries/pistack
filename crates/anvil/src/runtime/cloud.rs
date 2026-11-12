@@ -9,6 +9,14 @@
 //! `cloud-hypervisor` on `PATH`. State lives under `$PISTACK_CLOUD_STATE`
 //! (default `/var/lib/pistack/cloud`). A missing binary is unavailable.
 //! `user_data` and ssh keys are not logged and are not placed on the argv.
+//!
+//! Each machine boots its own disk, `disk.raw` in its state directory: a
+//! raw copy of the image made with `qemu-img convert` on the first start and
+//! grown to the size's disk. The image file itself is never opened by a
+//! guest. A NoCloud seed built with `cloud-localds`, the same one the
+//! libvirt runtime builds, is the second disk and is read-only.
+//! `$PISTACK_QEMU_IMG` and `$PISTACK_CLOUD_LOCALDS` override those tools.
+//! Delete removes the directory and both files with it.
 //! The process is recorded only after it is still running.
 //!
 //! Each port is a tap. On a Linux bridge the tap is
@@ -23,6 +31,7 @@
 //! override those helpers. This runtime does not create bridges. Virtual
 //! machines run `ovs-vsctl` directly.
 
+use super::libvirt;
 use super::ovsplug;
 use super::{MachineRequest, MachineRuntime, NicAttachment, PowerState, RunningMachine};
 use async_trait::async_trait;
@@ -136,7 +145,7 @@ impl MachineRuntime for CloudRuntime {
                 "cloud-hypervisor runtime: machine resources are not set",
             ));
         }
-        let disk = validate_disk(&req.image)?;
+        let image = validate_disk(&req.image)?;
         let ports = plan_ports(&req.nics)?;
         if let Some(plan) = &req.overlay {
             crate::overlay::apply_plan(plan).await?;
@@ -150,11 +159,23 @@ impl MachineRuntime for CloudRuntime {
             ))
         })?;
 
+        let (disk, seed) = match provision(&dir, &image, req).await {
+            Ok(files) => files,
+            Err(e) => {
+                if prior.is_none() {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                }
+                return Err(e);
+            }
+        };
+
         let mut args: Vec<String> = Vec::new();
         args.push("--api-socket".into());
         args.push(socket.to_string_lossy().into_owned());
+        // One `--disk` takes every disk. The first is the boot disk.
         args.push("--disk".into());
         args.push(format!("path={}", disk.display()));
+        args.push(format!("path={},readonly=on", seed.display()));
         args.push("--cpus".into());
         args.push(format!("boot={}", req.resources.vcpus));
         args.push("--memory".into());
@@ -1012,6 +1033,76 @@ fn validate_disk(image: &str) -> ApiResult<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// The machine's own disk and its seed, both under `dir`.
+///
+/// The disk is made once and kept across stop and start. It is a full raw
+/// copy of the image, not a qcow2 overlay on it: cloud-hypervisor reads raw
+/// without a format driver, and a copy does not depend on the image file
+/// staying in the cache. The copy is sparse. It is written beside its final
+/// name and renamed, so a start that died part way does not leave a short
+/// disk to boot. The seed is rewritten on every start.
+async fn provision(
+    dir: &Path,
+    image: &Path,
+    req: &MachineRequest,
+) -> ApiResult<(PathBuf, PathBuf)> {
+    let disk = dir.join("disk.raw");
+    if !disk.exists() {
+        let part = dir.join("disk.raw.part");
+        if let Err(e) = copy_image(image, &part, req.resources.disk_gib).await {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&part, &disk)
+            .await
+            .map_err(|e| disk_error(&disk, &e))?;
+    }
+    let seed = libvirt::write_seed(dir, &req.id.to_string(), req).await?;
+    Ok((disk, seed))
+}
+
+/// Convert `image` to raw at `dest` and grow it to `gib` (10 when the size
+/// names no disk). An image larger than that keeps its own size.
+async fn copy_image(image: &Path, dest: &Path, gib: u64) -> ApiResult<()> {
+    let format = libvirt::image_format(image).await?;
+    libvirt::run(
+        &libvirt::qemu_img_bin(),
+        [
+            "convert",
+            "-f",
+            &format,
+            "-O",
+            "raw",
+            &image.to_string_lossy(),
+            &dest.to_string_lossy(),
+        ],
+    )
+    .await?;
+    let want = (if gib == 0 { 10 } else { gib }) << 30;
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(dest)
+        .await
+        .map_err(|e| disk_error(dest, &e))?;
+    let have = file
+        .metadata()
+        .await
+        .map_err(|e| disk_error(dest, &e))?
+        .len();
+    if have < want {
+        // A raw disk is as large as its file. The new space is a hole.
+        file.set_len(want).await.map_err(|e| disk_error(dest, &e))?;
+    }
+    Ok(())
+}
+
+fn disk_error(path: &Path, e: &std::io::Error) -> ApiError {
+    ApiError::unavailable(format!(
+        "cloud-hypervisor runtime: preparing {}: {e}",
+        path.display()
+    ))
+}
+
 fn has_parent_dir(path: &Path) -> bool {
     path.components().any(|c| matches!(c, Component::ParentDir))
         || path.to_string_lossy().split('/').any(|p| p == "..")
@@ -1180,6 +1271,8 @@ mod tests {
         ip: Option<std::ffi::OsString>,
         remote: Option<std::ffi::OsString>,
         ovs: Option<std::ffi::OsString>,
+        qemu_img: Option<std::ffi::OsString>,
+        localds: Option<std::ffi::OsString>,
     }
 
     impl EnvGuard {
@@ -1192,7 +1285,10 @@ mod tests {
                 ip: std::env::var_os("PISTACK_IP_BIN"),
                 remote: std::env::var_os("PISTACK_CH_REMOTE"),
                 ovs: std::env::var_os(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV),
+                qemu_img: std::env::var_os("PISTACK_QEMU_IMG"),
+                localds: std::env::var_os("PISTACK_CLOUD_LOCALDS"),
             };
+            fake_disk_tools(bin.parent().unwrap());
             std::env::set_var("PISTACK_CLOUD_HYPERVISOR_BIN", bin);
             std::env::set_var("PISTACK_CLOUD_STATE", state);
             std::env::remove_var("PISTACK_CLOUD_KERNEL");
@@ -1212,7 +1308,34 @@ mod tests {
             restore("PISTACK_IP_BIN", self.ip.take());
             restore("PISTACK_CH_REMOTE", self.remote.take());
             restore(crate::runtime::ovsplug::OVS_VSCTL_BIN_ENV, self.ovs.take());
+            restore("PISTACK_QEMU_IMG", self.qemu_img.take());
+            restore("PISTACK_CLOUD_LOCALDS", self.localds.take());
         }
+    }
+
+    /// Stand-ins for `qemu-img` and `cloud-localds` in `dir`, each with a
+    /// log of its arguments. `convert` copies the image. The seed is the
+    /// user data followed by the meta data, so a test can read it back.
+    fn fake_disk_tools(dir: &Path) {
+        let qemu_img = dir.join("qemu-img");
+        write_script(
+            &qemu_img,
+            &dir.join("qemu-img.log"),
+            r#"case "$1" in
+  info) echo '{"format": "raw"}' ;;
+  convert) for a in "$@"; do src=$dst; dst=$a; done; cp "$src" "$dst" ;;
+  *) exit 1 ;;
+esac"#,
+        );
+        let localds = dir.join("cloud-localds");
+        write_script(
+            &localds,
+            &dir.join("cloud-localds.log"),
+            r#"if [ "$1" = "--network-config" ]; then shift 2; fi
+cat "$2" "$3" > "$1""#,
+        );
+        std::env::set_var("PISTACK_QEMU_IMG", &qemu_img);
+        std::env::set_var("PISTACK_CLOUD_LOCALDS", &localds);
     }
 
     fn restore(key: &str, prev: Option<std::ffi::OsString>) {
@@ -1435,9 +1558,39 @@ mod tests {
         assert!(sock_name.ends_with(".sock"), "{sock_name}");
         assert!(!sock_name.starts_with("pi"), "{sock_name}");
         assert!(sock_path.starts_with(std::env::temp_dir()) || sock_path.starts_with("/tmp"));
-        assert!(lines
-            .windows(2)
-            .any(|w| w[0] == "--disk" && w[1] == format!("path={}", disk.display())));
+        // The guest boots its own copy of the image, with the seed second.
+        let own = state.join(request.id.to_string());
+        assert!(lines.windows(3).any(|w| {
+            w[0] == "--disk"
+                && w[1] == format!("path={}", own.join("disk.raw").display())
+                && w[2] == format!("path={},readonly=on", own.join("seed.iso").display())
+        }));
+        assert!(!text.contains(&disk.display().to_string()), "{text}");
+        assert_eq!(
+            std::fs::metadata(own.join("disk.raw")).unwrap().len(),
+            1 << 30
+        );
+        let seed = std::fs::read_to_string(own.join("seed.iso")).unwrap();
+        assert!(seed.contains("do-not-log-user-data"), "{seed}");
+        assert!(
+            seed.contains(&format!("instance-id: {}", request.id)),
+            "{seed}"
+        );
+        assert!(seed.contains("local-hostname: web"), "{seed}");
+        let tools = std::fs::read_to_string(tmp.join("qemu-img.log")).unwrap()
+            + &std::fs::read_to_string(tmp.join("cloud-localds.log")).unwrap();
+        assert!(!tools.contains("do-not-log-user-data"));
+        assert!(!tools.contains("do-not-log-ssh-key"));
+        assert!(
+            has_seq(
+                &tools,
+                &[
+                    "--network-config",
+                    own.join("network-config").to_str().unwrap()
+                ]
+            ),
+            "{tools}"
+        );
         assert!(lines
             .windows(2)
             .any(|w| w[0] == "--cpus" && w[1] == "boot=1"));
@@ -1535,7 +1688,9 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
         }
         std::env::set_var("PISTACK_CLOUD_HYPERVISOR_BIN", &bin);
+        assert!(own.join("disk.raw").exists());
         rt.delete(&request.id).await.unwrap();
+        assert!(!own.exists());
         rt.delete(&request.id).await.unwrap();
         assert_eq!(
             rt.stop(&request.id).await.unwrap_err().code,
@@ -1568,6 +1723,106 @@ mod tests {
             before_fail + 2,
             "{failed}"
         );
+    }
+
+    #[tokio::test]
+    async fn each_machine_gets_its_own_disk_and_a_seed_with_its_keys() {
+        let _guard = env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "pistack-cloud-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state = tmp.join("state");
+        let _dir = DirGuard {
+            dir: tmp.clone(),
+            state: state.clone(),
+        };
+        let log = tmp.join("ch.log");
+        let bin = tmp.join("cloud-hypervisor");
+        write_script(&bin, &log, "exec sleep 30");
+        let ip = tmp.join("ip");
+        write_script(&ip, &tmp.join("ip.log"), "exit 0");
+        let _env = EnvGuard::set(&bin, &state);
+        std::env::set_var("PISTACK_IP_BIN", &ip);
+
+        let image = tmp.join("image.raw");
+        std::fs::write(&image, b"image-bytes").unwrap();
+        let mut one = req("one", image.to_str().unwrap());
+        one.user_data = None;
+        one.ssh_keys = vec!["ssh-ed25519 AAAAkey one".into()];
+        // No disk in the size is ten gigabytes, as it is under libvirt.
+        one.resources.disk_gib = 0;
+        let mut two = req("two", image.to_str().unwrap());
+        two.nics.clear();
+
+        let rt = CloudRuntime;
+        rt.start(&one).await.unwrap();
+        rt.start(&two).await.unwrap();
+        let dir_one = state.join(one.id.to_string());
+        let dir_two = state.join(two.id.to_string());
+        let disk_one = dir_one.join("disk.raw");
+        let disk_two = dir_two.join("disk.raw");
+        let text = std::fs::read_to_string(&log).unwrap();
+        for disk in [&disk_one, &disk_two] {
+            assert!(
+                lines_of(&text).contains(&format!("path={}", disk.display())),
+                "{text}"
+            );
+            assert!(std::fs::read(disk).unwrap().starts_with(b"image-bytes"));
+            assert!(!dir_one.join("disk.raw.part").exists());
+        }
+        assert!(!text.contains(&image.display().to_string()), "{text}");
+        assert_eq!(std::fs::metadata(&disk_one).unwrap().len(), 10 << 30);
+        assert_eq!(std::fs::metadata(&disk_two).unwrap().len(), 1 << 30);
+
+        // Without user data the seed carries the hostname and the keys.
+        let seed = std::fs::read_to_string(dir_one.join("seed.iso")).unwrap();
+        assert!(seed.starts_with("#cloud-config\nhostname: one\n"), "{seed}");
+        assert!(seed.contains("  - ssh-ed25519 AAAAkey one\n"), "{seed}");
+        // No ports, no network config.
+        assert!(dir_one.join("network-config").exists());
+        assert!(!dir_two.join("network-config").exists());
+
+        // What one guest writes stays on its disk, and the disk outlives a
+        // stop: the next start boots it and does not copy the image again.
+        std::fs::write(&disk_one, b"written-by-the-guest").unwrap();
+        let copies = |log: &Path| count_seq(&std::fs::read_to_string(log).unwrap(), &["convert"]);
+        assert_eq!(copies(&tmp.join("qemu-img.log")), 2);
+        rt.stop(&one.id).await.unwrap();
+        rt.start(&one).await.unwrap();
+        assert_eq!(copies(&tmp.join("qemu-img.log")), 2);
+        assert_eq!(std::fs::read(&disk_one).unwrap(), b"written-by-the-guest");
+        assert_eq!(std::fs::read(&image).unwrap(), b"image-bytes");
+        assert!(std::fs::read(&disk_two)
+            .unwrap()
+            .starts_with(b"image-bytes"));
+
+        rt.delete(&one.id).await.unwrap();
+        assert!(!dir_one.exists());
+        assert!(disk_two.exists());
+        assert!(image.exists());
+
+        // A copy that fails leaves nothing behind and starts no guest.
+        let broken = tmp.join("qemu-img-broken");
+        write_script(
+            &broken,
+            &tmp.join("broken.log"),
+            "echo no space >&2\nexit 1",
+        );
+        std::env::set_var("PISTACK_QEMU_IMG", &broken);
+        let before = std::fs::read_to_string(&log).unwrap();
+        let three = req("three", image.to_str().unwrap());
+        let err = rt.start(&three).await.unwrap_err();
+        assert!(err.message.contains("no space"), "{}", err.message);
+        assert!(!state.join(three.id.to_string()).exists());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+        rt.delete(&two.id).await.unwrap();
+        assert!(!dir_two.exists());
     }
 
     fn touch_socket_body() -> &'static str {

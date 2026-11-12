@@ -260,7 +260,7 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
         let format = image_format(&base).await?;
         let size = format!("{gib}G");
         run(
-            "qemu-img",
+            &qemu_img_bin(),
             [
                 "create",
                 "-f",
@@ -281,6 +281,32 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
     for nic in &req.nics {
         prepare_nic(nic).await?;
     }
+    let seed = write_seed(&vm, domain, req).await?;
+    let vcpus = req.resources.vcpus.max(1);
+    let memory = if req.resources.memory_mib == 0 {
+        1024
+    } else {
+        req.resources.memory_mib
+    };
+    let xml = domain_xml(domain, memory, vcpus, &disk, &seed, &req.nics)?;
+    let xml_path = vm.join("domain.xml");
+    tokio::fs::write(&xml_path, xml)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    virsh(["define", &xml_path.to_string_lossy()])
+        .await
+        .map(|_| ())
+}
+
+/// Build the NoCloud seed for `req` in `vm` and return its path. The user
+/// data is the request's, or a cloud-config with the hostname and ssh keys.
+/// Ports become a static network config matched by MAC. `instance` is the
+/// instance id the guest sees. Shared with the cloud-hypervisor runtime.
+pub(super) async fn write_seed(
+    vm: &Path,
+    instance: &str,
+    req: &MachineRequest,
+) -> ApiResult<PathBuf> {
     let user_data = match &req.user_data {
         Some(raw) => raw.clone(),
         None => cloud_config(&req.name, &req.ssh_keys)?,
@@ -294,7 +320,7 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
     tokio::fs::write(
         &meta_path,
         format!(
-            "instance-id: {domain}\nlocal-hostname: {}\n",
+            "instance-id: {instance}\nlocal-hostname: {}\n",
             hostname(&req.name)
         ),
     )
@@ -313,21 +339,12 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
     seed_args.push(seed.to_string_lossy().into_owned());
     seed_args.push(user_path.to_string_lossy().into_owned());
     seed_args.push(meta_path.to_string_lossy().into_owned());
-    run("cloud-localds", seed_args.iter().map(String::as_str)).await?;
-    let vcpus = req.resources.vcpus.max(1);
-    let memory = if req.resources.memory_mib == 0 {
-        1024
-    } else {
-        req.resources.memory_mib
-    };
-    let xml = domain_xml(domain, memory, vcpus, &disk, &seed, &req.nics)?;
-    let xml_path = vm.join("domain.xml");
-    tokio::fs::write(&xml_path, xml)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    virsh(["define", &xml_path.to_string_lossy()])
-        .await
-        .map(|_| ())
+    run(
+        &tool_bin("PISTACK_CLOUD_LOCALDS", "cloud-localds"),
+        seed_args.iter().map(String::as_str),
+    )
+    .await?;
+    Ok(seed)
 }
 
 async fn ensure_network() -> ApiResult<()> {
@@ -403,9 +420,9 @@ fn image_name_ok(name: &str) -> bool {
         && !name.contains("..")
 }
 
-async fn image_format(path: &Path) -> ApiResult<String> {
+pub(super) async fn image_format(path: &Path) -> ApiResult<String> {
     let out = run(
-        "qemu-img",
+        &qemu_img_bin(),
         ["info", "--output=json", &path.to_string_lossy()],
     )
     .await?;
@@ -447,9 +464,19 @@ async fn dom_state(domain: &str) -> ApiResult<String> {
 
 /// `PISTACK_VIRSH`, when set and non-empty, replaces the `virsh` binary.
 fn virsh_bin() -> String {
-    match std::env::var("PISTACK_VIRSH") {
+    tool_bin("PISTACK_VIRSH", "virsh")
+}
+
+/// `PISTACK_QEMU_IMG`, when set and non-empty, replaces `qemu-img`.
+/// `PISTACK_CLOUD_LOCALDS` does the same for `cloud-localds`.
+pub(super) fn qemu_img_bin() -> String {
+    tool_bin("PISTACK_QEMU_IMG", "qemu-img")
+}
+
+fn tool_bin(var: &str, default: &str) -> String {
+    match std::env::var(var) {
         Ok(v) if !v.trim().is_empty() && !v.contains('\0') => v,
-        _ => "virsh".to_owned(),
+        _ => default.to_owned(),
     }
 }
 
@@ -463,7 +490,7 @@ where
     run(&virsh_bin(), full.iter().map(String::as_str)).await
 }
 
-async fn run<I, S>(bin: &str, args: I) -> ApiResult<String>
+pub(super) async fn run<I, S>(bin: &str, args: I) -> ApiResult<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
