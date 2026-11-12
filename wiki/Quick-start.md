@@ -27,13 +27,13 @@ What the parts do:
 - `--insecure-http` says you know this listener is plain HTTP.
 - `PISTACK_DNS_LISTEN` moves the built-in DNS server off port 5353. On macOS and on Linux machines that run avahi, 5353 is taken by mDNS and the server will not start without this.
 
-The server logs a generated admin password once, on first start:
+On first start the server generates an admin password and writes it to `admin-password` in the data directory, readable only by the user the server runs as:
 
 ```text
-WARN gate: bootstrapped admin with a generated password; this is logged once, change it principal="admin" password=...
+WARN gate: bootstrapped admin with a generated password; read it from the file, change it, delete the file principal="admin" file=/var/lib/pistack/admin-password
 ```
 
-Keep it if you want to log in later. To choose the password yourself, set `PISTACK_ADMIN_PASSWORD` before the first start.
+The password is not in the log. To choose it yourself, set `PISTACK_ADMIN_PASSWORD` before the first start; then no file is written.
 
 ## Look around
 
