@@ -108,8 +108,8 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PISTACK_RPC_INSECURE` | off | `1` stops `/rpc` from requiring a client certificate. Needed for agents today; see [Agents and hosts](Agents-and-hosts). |
-| `PISTACK_REQUIRE_JOIN` | off | `1` makes every `/rpc` and `/cluster` call carry a valid join token. |
-| `PISTACK_JOIN_TOKEN` | none | The join token a joining server sends when the cluster requires one. Also `pistack agent --token`. |
+| `PISTACK_REQUIRE_JOIN` | unset | `/cluster` always needs a member or a join token unless this is `0`, which opens it. `1` also makes every `/rpc` call carry a valid join token. |
+| `PISTACK_JOIN_TOKEN` | none | The join token a new server sends on its first start. Also `pistack agent --token`. |
 
 Both switches accept only the exact value `1`.
 
