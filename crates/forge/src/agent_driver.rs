@@ -77,13 +77,14 @@ impl RpcDriver {
     /// Build the wire request for `m`.
     ///
     /// A bare image name is replaced when the store has a ready `img` of
-    /// that name whose `file_path` or `backing_ref` is an absolute file
+    /// that name the machine's project may use, whose `file_path` or `backing_ref` is an absolute file
     /// that exists. Anything else, including `ubuntu-24.04` and a
     /// `sha256:` blob id, is sent unchanged so anvil can still resolve
     /// `bases/<name>.qcow2`. A catalog image with a digest also sets
     /// `image_source`, so a host without the file can download it.
     pub fn request_for(&self, m: &Machine) -> MachineRequest {
-        let (image, image_source) = resolve_boot_image(self.store.as_ref(), &m.spec.image);
+        let (image, image_source) =
+            resolve_boot_image(self.store.as_ref(), m.meta.project.as_ref(), &m.spec.image);
         MachineRequest {
             id: m.meta.id.clone(),
             name: m.meta.name.clone(),
@@ -206,6 +207,9 @@ impl HostDriver for RpcDriver {
 struct CatalogImage {
     id: String,
     name: String,
+    /// The owning project. `None` is a cloud-wide image.
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     spec: CatalogSpec,
     #[serde(default)]
@@ -216,6 +220,21 @@ struct CatalogImage {
 struct CatalogSpec {
     #[serde(default)]
     format: String,
+    /// `private` (the default), `project` or `public`.
+    #[serde(default)]
+    visibility: String,
+}
+
+/// An image member row: `project` may use `image`.
+#[derive(serde::Deserialize)]
+struct CatalogMember {
+    spec: CatalogMemberSpec,
+}
+
+#[derive(serde::Deserialize)]
+struct CatalogMemberSpec {
+    image: String,
+    project: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -233,6 +252,27 @@ struct CatalogStatus {
 }
 
 impl CatalogImage {
+    /// May a machine in `project` boot this image? This is mold's
+    /// `Client::can_see` for a caller in that project, read off the stored
+    /// rows: a public image, one the project owns, or one shared with the
+    /// project by a member row. A machine with no project is the cloud
+    /// admin's and may use any image.
+    fn usable_by(&self, store: &Store, project: Option<&Id>) -> bool {
+        let Some(project) = project.map(Id::to_string) else {
+            return true;
+        };
+        if self.spec.visibility == "public" || self.project.as_deref() == Some(&project) {
+            return true;
+        }
+        self.spec.visibility == "project"
+            && store
+                .raw_scan("resources", "imgmem/")
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|(_, bytes)| serde_json::from_slice::<CatalogMember>(bytes).ok())
+                .any(|m| m.spec.image == self.id && m.spec.project == project)
+    }
+
     /// The image's file on this server, when it has one that exists.
     fn local_file(&self) -> Option<String> {
         let path = self
@@ -272,14 +312,20 @@ impl CatalogImage {
 /// The image string for the wire, and where an agent can fetch it.
 ///
 /// An absolute path is sent as it is. A bare name that matches a ready
-/// catalog image becomes that image's file on this server when there is
-/// one, and carries the image's id and digest so a host that does not have
-/// the file downloads it. Anything else is sent unchanged.
-fn resolve_boot_image(store: Option<&Store>, image: &str) -> (String, Option<ImageSource>) {
+/// catalog image the machine's project may use becomes that image's file
+/// on this server when there is one, and carries the image's id and digest
+/// so a host that does not have the file downloads it. Anything else is
+/// sent unchanged, so an image the project cannot see fails on the host
+/// the same way a name that is not in the catalog does.
+fn resolve_boot_image(
+    store: Option<&Store>,
+    project: Option<&Id>,
+    image: &str,
+) -> (String, Option<ImageSource>) {
     if Path::new(image).is_absolute() {
         return (image.to_owned(), None);
     }
-    let Some(found) = store.and_then(|store| catalog_image(store, image)) else {
+    let Some(found) = store.and_then(|store| catalog_image(store, project, image)) else {
         return (image.to_owned(), None);
     };
     let source = found.source();
@@ -289,11 +335,14 @@ fn resolve_boot_image(store: Option<&Store>, image: &str) -> (String, Option<Ima
     )
 }
 
-/// The ready catalog image called `name`. One whose file is on this server
-/// wins over one that only has a digest.
-fn catalog_image(store: &Store, name: &str) -> Option<CatalogImage> {
+/// The ready catalog image called `name` that a machine in `project` may
+/// boot. The project's own image wins over one shared with it or public.
+/// Among those, one whose file is on this server wins over one that only
+/// has a digest.
+fn catalog_image(store: &Store, project: Option<&Id>, name: &str) -> Option<CatalogImage> {
     let rows = store.raw_scan("resources", "img/").ok()?;
-    let mut fetchable = None;
+    let own = project.map(Id::to_string);
+    let mut best: Option<(u8, CatalogImage)> = None;
     for (_, bytes) in rows {
         let Ok(view) = serde_json::from_slice::<CatalogImage>(&bytes) else {
             continue;
@@ -301,14 +350,20 @@ fn catalog_image(store: &Store, name: &str) -> Option<CatalogImage> {
         if view.name != name || view.status.phase != "ready" {
             continue;
         }
-        if view.local_file().is_some() {
-            return Some(view);
+        let has_file = view.local_file().is_some();
+        if !has_file && view.source().is_none() {
+            continue;
         }
-        if fetchable.is_none() && view.source().is_some() {
-            fetchable = Some(view);
+        if !view.usable_by(store, project) {
+            continue;
+        }
+        let foreign = own.is_some() && view.project != own;
+        let rank = u8::from(foreign) * 2 + u8::from(!has_file);
+        if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+            best = Some((rank, view));
         }
     }
-    fetchable
+    best.map(|(_, view)| view)
 }
 
 pub fn kind_to_wire(k: MachineKind) -> pistack_rpc::proto::MachineKind {
@@ -1179,6 +1234,158 @@ mod tests {
         // A path the user gave is theirs to stage.
         m.spec.image = "/var/lib/images/mine.qcow2".into();
         assert_eq!(driver.request_for(&m).image_source, None);
+    }
+
+    /// A ready image with a file on this server, owned by `project`.
+    fn put_image_for(
+        store: &Store,
+        name: &str,
+        project: Option<&Id>,
+        visibility: &str,
+        file: &str,
+    ) -> Id {
+        let meta = Meta::new(pistack_types::kind::IMAGE, name, project.cloned());
+        let id = meta.id.clone();
+        store
+            .collection::<ImgRow>()
+            .create(ImgRow {
+                meta,
+                spec: serde_json::json!({ "format": "qcow2", "visibility": visibility }),
+                status: serde_json::json!({ "phase": "ready", "file_path": file }),
+            })
+            .unwrap();
+        id
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct MemberRow {
+        #[serde(flatten)]
+        meta: Meta,
+        spec: serde_json::Value,
+    }
+
+    impl Kind for MemberRow {
+        const KIND: &'static str = "imgmem";
+        fn meta(&self) -> &Meta {
+            &self.meta
+        }
+        fn meta_mut(&mut self) -> &mut Meta {
+            &mut self.meta
+        }
+    }
+
+    fn image_file(tag: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "pistack-boot-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(&path, b"disk").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn machine_in(project: Option<&Id>, image: &str) -> Machine {
+        let mut m = machine("web");
+        m.meta.project = project.cloned();
+        m.spec.image = image.into();
+        m
+    }
+
+    #[test]
+    fn a_machine_boots_only_an_image_its_project_may_use() {
+        let store = Store::in_memory().unwrap();
+        let ours = Id::new("proj");
+        let theirs = Id::new("proj");
+        let file = image_file("visible");
+
+        put_image_for(&store, "private", Some(&theirs), "private", &file);
+        put_image_for(&store, "unshared", Some(&theirs), "project", &file);
+        let shared = put_image_for(&store, "shared", Some(&theirs), "project", &file);
+        put_image_for(&store, "public", Some(&theirs), "public", &file);
+        put_image_for(&store, "cloud-private", None, "private", &file);
+        put_image_for(&store, "cloud-public", None, "public", &file);
+        // A member row on an image that is no longer shared grants nothing.
+        let unshared_again = put_image_for(&store, "was-shared", Some(&theirs), "private", &file);
+        for image in [&shared, &unshared_again] {
+            store
+                .collection::<MemberRow>()
+                .create(MemberRow {
+                    meta: Meta::new("imgmem", format!("{image}:{ours}"), Some(theirs.clone())),
+                    spec: serde_json::json!({ "image": image, "project": ours }),
+                })
+                .unwrap();
+        }
+
+        let driver = RpcDriver::for_node(CommandQueue::default(), "h1").with_store(store);
+        let boots = |project: Option<&Id>, image: &str| {
+            let req = driver.request_for(&machine_in(project, image));
+            if req.image == file {
+                true
+            } else {
+                // Sent as an unknown name, with nothing to download.
+                assert_eq!(req.image, image);
+                assert_eq!(req.image_source, None);
+                false
+            }
+        };
+        for (image, usable) in [
+            ("private", false),
+            ("unshared", false),
+            ("shared", true),
+            ("public", true),
+            ("cloud-private", false),
+            ("cloud-public", true),
+            ("was-shared", false),
+        ] {
+            assert_eq!(boots(Some(&ours), image), usable, "{image}");
+            // The owner, and a machine with no project, may use them all.
+            assert!(boots(None, image), "{image}");
+        }
+        for image in ["private", "unshared", "shared", "public", "was-shared"] {
+            assert!(boots(Some(&theirs), image), "{image}");
+        }
+        // A third project is not the member.
+        assert!(!boots(Some(&Id::new("proj")), "shared"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_projects_own_image_wins_over_another_of_the_same_name() {
+        let store = Store::in_memory().unwrap();
+        let ours = Id::new("proj");
+        let theirs = Id::new("proj");
+        let our_file = image_file("ours");
+        let their_file = image_file("theirs");
+        let public_file = image_file("public");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        put_image_for(&store, "base", Some(&theirs), "private", &their_file);
+        put_image_for(&store, "base", None, "public", &public_file);
+        put_image_for(&store, "base", Some(&ours), "private", &our_file);
+        // Ours has only a digest here; the public one has its file.
+        put_image_for(&store, "remote", None, "public", &public_file);
+        let meta = Meta::new(pistack_types::kind::IMAGE, "remote", Some(ours.clone()));
+        let remote = meta.id.to_string();
+        store
+            .collection::<ImgRow>()
+            .create(ImgRow {
+                meta,
+                spec: serde_json::json!({ "format": "qcow2" }),
+                status: serde_json::json!({ "phase": "ready", "sha256": digest }),
+            })
+            .unwrap();
+
+        let driver = RpcDriver::for_node(CommandQueue::default(), "h1").with_store(store);
+        let image = |project: &Id, name: &str| driver.request_for(&machine_in(Some(project), name));
+        assert_eq!(image(&ours, "base").image, our_file);
+        assert_eq!(image(&theirs, "base").image, their_file);
+        assert_eq!(image(&Id::new("proj"), "base").image, public_file);
+        let req = image(&ours, "remote");
+        assert_eq!(req.image, "remote");
+        assert_eq!(req.image_source.unwrap().id, remote);
+        for file in [our_file, their_file, public_file] {
+            let _ = std::fs::remove_file(file);
+        }
     }
 
     #[test]
