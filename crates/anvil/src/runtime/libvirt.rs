@@ -2069,10 +2069,13 @@ mod tests {
         let mut port = nic("10.90.0.10", false);
         port.binding = Some(pistack_rpc::proto::NicBinding {
             vif_type: "ovs".into(),
-            vif_details: [("bridge", "br-int"), ("iface_id", "port-0195c0de")]
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
+            vif_details: [
+                ("bridge", "br-int"),
+                ("iface_id", "0195c0de-3f33-73bf-86f7-57fe3b47f1ea"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
         });
         port
     }
@@ -2087,7 +2090,7 @@ mod tests {
             assert!(xml.contains("<source bridge='br-int'/>"), "{xml}");
             assert!(xml.contains("<virtualport type='openvswitch'>"), "{xml}");
             assert!(
-                xml.contains("<parameters interfaceid='port-0195c0de'/>"),
+                xml.contains("<parameters interfaceid='0195c0de-3f33-73bf-86f7-57fe3b47f1ea'/>"),
                 "{xml}"
             );
             assert!(xml.contains("<mac address='52:54:00:aa:bb:cc'/>"), "{xml}");

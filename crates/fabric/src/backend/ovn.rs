@@ -34,7 +34,7 @@
 //!
 //! On each host, OVS and `ovn-controller` realise the switches. The agent
 //! plugs a machine's tap or a pod's link into the integration bridge with
-//! `external_ids:iface-id=<port id>`; the port binding below tells it which
+//! `external_ids:iface-id=<port uuid>`; the port binding below tells it which
 //! bridge and id to use.
 
 use super::ovsdb::{self, eq, includes, map, set, uuid, Transport};
@@ -730,6 +730,13 @@ fn lrp_name(port: &Id) -> String {
     format!("lrp-{port}")
 }
 
+/// Name of the switch port a guest or pod plugs into: the port id without
+/// its `port-` prefix. The host sets it as `iface-id`, and libvirt takes
+/// nothing but a UUID there.
+fn lsp_name(port: &Id) -> String {
+    port.uuid.to_string()
+}
+
 /// `<address>/<prefix>` for a router port on `subnet`: the port's address
 /// inside the subnet, else the subnet gateway.
 fn port_network(port: &Port, subnet: &Subnet) -> ApiResult<String> {
@@ -1203,7 +1210,7 @@ impl NetBackend for OvnBackend {
     }
 
     /// `Logical_Switch_Port` on `ps-<net id>`:
-    /// * `name = <port id>`, `type = ""` (VIF) for machine ports. Router
+    /// * `name = <port uuid>`, `type = ""` (VIF) for machine ports. Router
     ///   ports are written with their router (see [`Self::ensure_router`]);
     ///   here they only get a binding.
     /// * `addresses = ["<mac> <ip1> <ip2>..."]`, or `["unknown"]` before a
@@ -1219,9 +1226,9 @@ impl NetBackend for OvnBackend {
     ///   any other PiStack group; without it the port is in no group and
     ///   gets no ACLs (OVN default allow).
     ///
-    /// Binding: the agent sets `external_ids:iface-id = <port id>` on the
+    /// Binding: the agent sets `external_ids:iface-id = <port uuid>` on the
     /// OVS interface on the host. The returned `PortBinding` is
-    /// `{vif_type: "ovs", vif_details: {bridge: "br-int", iface_id: <port id>}}`.
+    /// `{vif_type: "ovs", vif_details: {bridge: "br-int", iface_id: <port uuid>}}`.
     async fn ensure_port(
         &self,
         net: &Network,
@@ -1263,7 +1270,9 @@ impl NetBackend for OvnBackend {
         if let Some(d) = &port.spec.device {
             ext.push(("pistack:device".into(), d.to_string()));
         }
-        let name = id.to_string();
+        let name = lsp_name(id);
+        // A port written before the name lost its prefix.
+        self.drop_switch_ports(by_name(&id.to_string())).await?;
         let row = json!({
             "name": name,
             "addresses": addresses,
@@ -1306,7 +1315,7 @@ impl NetBackend for OvnBackend {
     /// succeeds. `Port_Group.ports` refers to switch ports weakly, so the
     /// port leaves its groups with it.
     async fn delete_port(&self, id: &Id) -> ApiResult<()> {
-        self.drop_switch_ports(by_name(&id.to_string())).await
+        self.drop_switch_ports(tagged("pistack:id", id)).await
     }
 
     /// `Logical_Router`:
@@ -1510,7 +1519,7 @@ impl NetBackend for OvnBackend {
             .filter(|p| {
                 p.spec.port_security && !p.spec.mac.trim().is_empty() && !p.is_router_port()
             })
-            .map(|p| p.meta.id.to_string())
+            .map(|p| lsp_name(&p.meta.id))
             .collect();
         let ports = if names.is_empty() {
             Vec::new()
@@ -1538,7 +1547,7 @@ impl NetBackend for OvnBackend {
     /// `NAT` row on the router that has an interface on the target port's
     /// subnet (`view.router`):
     /// * `type = dnat_and_snat`, `external_ip = <fip address>`,
-    ///   `logical_ip = <target fixed ip>`, `logical_port = <port id>`,
+    ///   `logical_ip = <target fixed ip>`, `logical_port = <port uuid>`,
     ///   `external_mac = <target port mac>` (distributed: the chassis
     ///   hosting the machine answers ARP and forwards directly; a port
     ///   without a mac yet gets neither column and goes through the
@@ -1573,7 +1582,7 @@ impl NetBackend for OvnBackend {
         let (logical_port, external_mac) = if mac.is_empty() {
             (set([]), set([]))
         } else {
-            (set([json!(port.meta.id.to_string())]), set([json!(mac)]))
+            (set([json!(lsp_name(&port.meta.id))]), set([json!(mac)]))
         };
         let row = json!({
             "type": "dnat_and_snat",
@@ -1806,12 +1815,13 @@ mod tests {
         let binding = b.ensure_port(&n, &p, &[]).await.unwrap();
         assert_eq!(binding.vif_type, "ovs");
         assert_eq!(binding.vif_details["bridge"], "br-int");
-        assert_eq!(binding.vif_details["iface_id"], p.meta.id.to_string());
+        assert_eq!(binding.vif_details["iface_id"], p.meta.id.uuid.to_string());
 
         let lsp = db.rows("Logical_Switch_Port");
         assert_eq!(lsp.len(), 1);
         let want = "fa:16:3e:00:00:01 10.20.0.5 fd00:20::5";
-        assert_eq!(lsp[0]["name"], json!(p.meta.id.to_string()));
+        // Bare UUID: libvirt refuses any other iface-id.
+        assert_eq!(lsp[0]["name"], json!(p.meta.id.uuid.to_string()));
         assert_eq!(ovsdb::canon(&lsp[0]["addresses"]), json!(want));
         assert_eq!(ovsdb::canon(&lsp[0]["port_security"]), json!(want));
         assert_eq!(
@@ -2284,7 +2294,7 @@ mod tests {
         assert_eq!(dnat[0]["logical_ip"], "10.0.0.5");
         assert_eq!(
             ovsdb::canon(&dnat[0]["logical_port"]),
-            json!(vm.meta.id.to_string())
+            json!(vm.meta.id.uuid.to_string())
         );
         assert_eq!(
             ovsdb::canon(&dnat[0]["external_mac"]),
@@ -2374,7 +2384,7 @@ mod tests {
     fn lsp_uuid(db: &FakeDb, p: &Port) -> Value {
         db.rows("Logical_Switch_Port")
             .into_iter()
-            .find(|r| r["name"] == json!(p.meta.id.to_string()))
+            .find(|r| r["name"] == json!(p.meta.id.uuid.to_string()))
             .map(|r| r["_uuid"].clone())
             .unwrap()
     }
