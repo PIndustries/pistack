@@ -529,12 +529,23 @@ impl Reconciler {
                 })
                 .await?;
             }
-            Err(e) if e.code == ErrorCode::Unavailable && e.message.contains("no segment") => {
+            Err(e) if waits_for(&e) == Some("Segment") => {
                 tracing::info!(machine = %m.meta.id, error = %e, "forge: waiting for the network segment");
                 let msg = e.message.clone();
                 self.patch(&m.meta.id, |s| {
                     s.message = msg.clone();
                     s.set_condition("Scheduled", true, "Segment", &msg);
+                })
+                .await?;
+            }
+            Err(e) if waits_for(&e) == Some("PortBinding") => {
+                // Fabric writes the port to OVN on its own pass. The machine
+                // stays in creating and the next pass starts it.
+                tracing::info!(machine = %m.meta.id, error = %e, "forge: waiting for the port binding");
+                let msg = e.message.clone();
+                self.patch(&m.meta.id, |s| {
+                    s.message = msg.clone();
+                    s.set_condition("Scheduled", true, "PortBinding", &msg);
                 })
                 .await?;
             }
@@ -720,9 +731,41 @@ fn copy_network(dest: &mut MachineStatus, src: &MachineStatus) {
     }
 }
 
+/// A start error that only means fabric has not caught up: the machine
+/// stays in creating and is started again on the next pass. The value is
+/// the reason recorded on the `Scheduled` condition.
+fn waits_for(e: &ApiError) -> Option<&'static str> {
+    if e.code != ErrorCode::Unavailable {
+        return None;
+    }
+    if e.message.contains("no segment") {
+        Some("Segment")
+    } else if e.message.contains("not bound in OVN") {
+        Some("PortBinding")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod pin_tests {
-    use super::{pinned_hosts, volume_wait};
+    use super::{pinned_hosts, volume_wait, waits_for};
+    use pistack_types::ApiError;
+
+    #[test]
+    fn a_start_that_is_ahead_of_fabric_waits_and_any_other_failure_does_not() {
+        let unbound =
+            ApiError::unavailable("machine mach-1 has a port that is not bound in OVN yet");
+        assert_eq!(waits_for(&unbound), Some("PortBinding"));
+        let segment = ApiError::unavailable("overlay network net-1 has no segment");
+        assert_eq!(waits_for(&segment), Some("Segment"));
+        assert_eq!(waits_for(&ApiError::unavailable("host is not ready")), None);
+        assert_eq!(
+            waits_for(&ApiError::internal("port is not bound in OVN yet")),
+            None
+        );
+    }
+
     use crate::types::{
         new_host, new_machine, MachineSpec, NODE_PIN_ANNOTATION, WAIT_VOLUME_ANNOTATION,
     };
