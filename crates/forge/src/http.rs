@@ -304,6 +304,20 @@ fn resolve_size(s: &AppState, name_or_id: &str) -> ApiResult<Size> {
         .map_err(|_| ApiError::unprocessable(format!("size '{name_or_id}' not found")))
 }
 
+/// No host reads `spec.volumes`: a machine that named volumes started
+/// without them. Until a start can attach them, say so instead of taking
+/// the request. Attaching to a running machine goes through the volume API.
+fn refuse_volumes(volumes: &[String]) -> ApiResult<()> {
+    if volumes.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::unprocessable(
+        "spec.volumes is not supported: a machine does not attach volumes when it starts. \
+         Create the machine without them, then attach each one with \
+         `pi volume attach <volume> --machine <machine>`",
+    ))
+}
+
 async fn list_machines(
     State(s): State<AppState>,
     scope: Scope,
@@ -325,6 +339,7 @@ async fn create_machine(
     if body.spec.size.trim().is_empty() {
         return Err(ApiError::bad_request("spec.size is required"));
     }
+    refuse_volumes(&body.spec.volumes)?;
     let size = resolve_size(&s, &body.spec.size)?;
     let mut spec = body.spec;
     // Store the canonical size name so renames of the request form do not
@@ -370,6 +385,10 @@ async fn update_machine(
             return Err(ApiError::unprocessable(
                 "kind, image and size can only change while the machine is pending",
             ));
+        }
+        // A machine stored with volumes before they were refused keeps them.
+        if spec.volumes != m.spec.volumes {
+            refuse_volumes(&spec.volumes)?;
         }
         let size = resolve_size(&s, &spec.size)?;
         spec.size = size.meta.name.clone();

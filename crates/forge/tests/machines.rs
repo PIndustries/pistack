@@ -284,6 +284,52 @@ async fn validation_and_sizes() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
+    // Volumes named at create are refused, for every kind, and nothing is
+    // stored. An empty list is the same as leaving the field out.
+    for kind in ["vm", "container", "metal"] {
+        let (st, bytes) = raw(
+            app,
+            "POST",
+            "/machines",
+            Some(serde_json::json!({
+                "name": "with-disk",
+                "spec": {"kind": kind, "size": "m.2x4", "image": "i", "volumes": ["data"]},
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{kind}");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("spec.volumes"), "{text}");
+        assert!(text.contains("pi volume attach"), "{text}");
+    }
+    let (st, list) = call::<Page<Machine>>(app, "GET", "/machines", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list.total, 0);
+    let (st, m) = call::<Machine>(
+        app,
+        "POST",
+        "/machines",
+        Some(serde_json::json!({
+            "name": "no-disk",
+            "spec": {"size": "m.2x4", "image": "i", "volumes": []},
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    // Nor can an update add them.
+    let mut spec = serde_json::to_value(&m.spec).unwrap();
+    spec["volumes"] = serde_json::json!(["data"]);
+    let (st, _) = raw(
+        app,
+        "PUT",
+        &format!("/machines/{}", m.meta.id),
+        Some(serde_json::json!({ "spec": spec })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, _) = raw(app, "DELETE", &format!("/machines/{}", m.meta.id), None).await;
+    assert!(st.is_success(), "{st}");
+
     // Size CRUD with a stale revision conflict.
     let (st, sz) = call::<Size>(
         app,
