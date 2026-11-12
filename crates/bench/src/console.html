@@ -7,45 +7,78 @@
 <style>
   :root {
     --bg: #04060a;
-    --panel: rgba(14, 30, 18, .92);
-    --panel-solid: #0c1610;
-    --line: rgba(75, 222, 128, .22);
+    --side: #070b10;
+    --panel: #0c1218;
+    --panel-2: #101821;
+    --line: rgba(160, 190, 175, .16);
+    --line-strong: rgba(160, 190, 175, .28);
     --text: #eafaef;
     --muted: #7e9b86;
     --accent: #34c759;
     --ok: #8df06a;
     --press: #159a3c;
     --ink: #04140a;
-    --bad: #e07a6a;
-    --wait: #c5d6a8;
-    --field: #07140c;
+    --bad: #f0806e;
+    --bad-bg: rgba(240, 128, 110, .12);
+    --wait: #e6c35c;
+    --field: #080d12;
+    --hover: rgba(52, 199, 89, .08);
+    --active: rgba(52, 199, 89, .16);
+    --shadow: 0 8px 30px rgba(0, 0, 0, .35);
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f7f6;
+    --side: #ffffff;
+    --panel: #ffffff;
+    --panel-2: #f0f3f1;
+    --line: rgba(20, 40, 30, .12);
+    --line-strong: rgba(20, 40, 30, .22);
+    --text: #10201a;
+    --muted: #5d6f66;
+    --accent: #1f9d45;
+    --ok: #17803a;
+    --press: #17803a;
+    --ink: #ffffff;
+    --bad: #c2412d;
+    --bad-bg: rgba(194, 65, 45, .08);
+    --wait: #946a00;
+    --field: #ffffff;
+    --hover: rgba(31, 157, 69, .07);
+    --active: rgba(31, 157, 69, .13);
+    --shadow: 0 8px 30px rgba(20, 40, 30, .12);
   }
   * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  html[data-theme="light"] { color-scheme: light; }
   body {
     margin: 0;
-    background:
-      radial-gradient(1200px 520px at 50% -12%, rgba(52, 199, 89, .09), transparent 58%),
-      var(--bg);
+    background: var(--bg);
     color: var(--text);
-    font: 15px/1.45 ui-sans-serif, system-ui, sans-serif;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
   button, input, select, textarea {
     font: inherit;
     color: inherit;
     background: var(--field);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    padding: 0.42rem 0.7rem;
   }
-  button { cursor: pointer; background: var(--panel-solid); }
+  button { cursor: pointer; background: var(--panel-2); transition: background .12s, border-color .12s; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
   button.primary { background: var(--accent); color: var(--ink); border-color: transparent; font-weight: 650; }
   button.primary:active { background: var(--press); }
   button.danger { color: var(--bad); }
+  button.danger:hover:not(:disabled) { border-color: var(--bad); background: var(--bad-bg); }
+  button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  button.ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); border-color: transparent; }
   canvas.screen {
     width: 100%;
     height: auto;
     background: #000;
     border: 1px solid var(--line);
+    border-radius: 10px;
     display: block;
     margin-top: 0.8rem;
   }
@@ -57,6 +90,7 @@
     font-weight: 650;
     text-align: left;
   }
+  button.linkish:hover:not(:disabled) { text-decoration: underline; border-color: transparent; }
   button:disabled { opacity: 0.5; cursor: default; }
   button:focus-visible, input:focus, select:focus, textarea:focus {
     outline: 2px solid rgba(52, 199, 89, .55);
@@ -71,77 +105,159 @@
     display: grid;
     place-items: center;
     padding: 1.5rem;
+    background: radial-gradient(900px 480px at 50% -10%, rgba(52, 199, 89, .10), transparent 60%);
   }
-  #login h1::after {
-    content: "";
+  .mark {
     display: inline-block;
-    width: 0.48rem;
-    height: 0.48rem;
-    margin-left: 0.4rem;
+    width: 0.55rem;
+    height: 0.55rem;
     border-radius: 50%;
     background: var(--ok);
-    vertical-align: 0.12em;
+    box-shadow: 0 0 0 4px rgba(141, 240, 106, .15);
   }
-  #login form, .card, form.create, .detail, .once {
+  #login h1 { display: flex; align-items: center; gap: 0.55rem; }
+  #login form, .card, form.create, .detail, .once, .tile, .panel {
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 12px;
     padding: 1.25rem;
   }
-  #login form, .card { width: min(420px, 100%); }
-  h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+  #login form { box-shadow: var(--shadow); }
+  #login form, .card { width: min(400px, 100%); }
+  #login button.primary { width: 100%; margin-top: 1rem; padding: 0.55rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }
   h2, h3 { font-weight: 650; }
-  h2 { font-size: 1.15rem; margin: 0; }
-  h3 { font-size: 0.95rem; margin: 1rem 0 0.35rem; }
+  h2 { font-size: 1.2rem; margin: 0; letter-spacing: -0.01em; }
+  h3 { font-size: 0.82rem; margin: 1.4rem 0 0.5rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
   .sub { color: var(--muted); margin: 0 0 1rem; }
-  label { display: block; margin: 0.7rem 0 0.25rem; color: var(--muted); font-size: 0.85rem; }
+  label { display: block; margin: 0.7rem 0 0.25rem; color: var(--muted); font-size: 0.8rem; }
   input, select, textarea { width: 100%; }
-  textarea { min-height: 4.5rem; resize: vertical; }
-  .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; }
+  textarea { min-height: 4.5rem; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+  .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: end; }
   .row > * { flex: 1; min-width: 8rem; }
-  #shell:not([hidden]) { display: grid; grid-template-columns: 200px 1fr; min-height: 100vh; }
-  #shell:not([hidden]) > div { min-width: 0; }
-  nav { border-right: 1px solid var(--line); padding: 1rem 0.6rem; background: var(--field); }
-  nav button { display: block; width: 100%; text-align: left; margin: 0.15rem 0; background: transparent; border-color: transparent; }
-  nav button[aria-current="page"], nav button:active { background: var(--press); color: var(--ink); border-color: transparent; font-weight: 650; }
-  header {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 0.8rem 1.1rem; border-bottom: 1px solid var(--line);
+
+  #shell:not([hidden]) { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; }
+  #side {
+    background: var(--side);
+    border-right: 1px solid var(--line);
+    padding: 0.9rem 0.6rem 1.5rem;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
   }
-  main { padding: 1rem 1.1rem 2rem; min-width: 0; overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 0.45rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--muted); font-weight: 600; font-size: 0.78rem; letter-spacing: 0.03em; }
-  .phase { text-transform: lowercase; }
+  .brand { display: flex; align-items: center; gap: 0.6rem; padding: 0.2rem 0.55rem 0.9rem; font-size: 1.02rem; }
+  #nav-filter { margin-bottom: 0.7rem; font-size: 0.86rem; }
+  nav button {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    text-align: left;
+    margin: 1px 0;
+    padding: 0.36rem 0.55rem;
+    background: transparent;
+    border-color: transparent;
+    border-radius: 7px;
+    color: var(--muted);
+  }
+  nav button:hover:not(:disabled) { background: var(--hover); color: var(--text); border-color: transparent; }
+  nav button[data-view][aria-current="page"] { background: var(--active); color: var(--text); font-weight: 600; box-shadow: inset 2px 0 0 var(--accent); }
+  nav button[hidden] { display: none; }
+  nav .count { font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  nav .group { margin-top: 0.55rem; }
+  nav .group-head { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 650; padding: 0.3rem 0.55rem; }
+  nav .group-head::after { content: "▾"; font-size: 0.7rem; transition: transform .12s; }
+  nav .group-head[aria-expanded="false"]::after { transform: rotate(-90deg); }
+  nav .group-items[hidden] { display: none; }
+
+  #shell:not([hidden]) > div { min-width: 0; }
+  header {
+    display: flex; gap: 0.8rem; justify-content: space-between; align-items: center;
+    padding: 0.6rem 1.4rem; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .crumbs { display: flex; align-items: center; gap: 0.45rem; flex-shrink: 0; white-space: nowrap; }
+  .crumbs span { color: var(--muted); }
+  .crumbs span:not(:empty)::after { content: "/"; margin-left: 0.45rem; opacity: 0.6; }
+  .head-tools { display: flex; align-items: center; gap: 0.5rem; }
+  #filter { width: 13rem; font-size: 0.86rem; }
+  .live { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; font-size: 0.8rem; white-space: nowrap; cursor: pointer; }
+  .live input { width: auto; accent-color: var(--accent); }
+  #who { color: var(--muted); font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16rem; }
+  #menu { display: none; }
+  header button { white-space: nowrap; }
+  main { padding: 1.3rem 1.4rem 3rem; min-width: 0; overflow-x: auto; }
+
+  table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; padding: 0.55rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--hover); }
+  th { color: var(--muted); font-weight: 600; font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; background: var(--panel-2); white-space: nowrap; }
+  td button { padding: 0.22rem 0.55rem; font-size: 0.82rem; }
+  td.empty { color: var(--muted); text-align: center; padding: 2rem 1rem; }
+  .phase { text-transform: lowercase; white-space: nowrap; }
+  .phase:not(:empty)::before { content: ""; display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: currentColor; margin-right: 0.45rem; vertical-align: 0.05em; opacity: 0.9; }
   .phase.ready, .phase.on, .phase.running, .phase.succeeded, .phase.ok, .phase.accepted { color: var(--ok); }
   .phase.error, .phase.off, .phase.failed, .phase.firing { color: var(--bad); }
   .phase.pending, .phase.creating, .phase.deleting, .phase.unknown { color: var(--wait); }
-  .rules { margin: 0.25rem 0 0; padding-left: 1.1rem; }
-  .detail { width: min(760px, 100%); }
-  .detail p { margin: 0.22rem 0; }
+  .rules { margin: 0.25rem 0 0; padding-left: 1.1rem; color: var(--muted); }
+  .detail { width: min(820px, 100%); }
+  .detail p { margin: 0.3rem 0; }
   .detail .k { color: var(--muted); display: inline-block; min-width: 9.5rem; }
-  .once { color: var(--ok); border-radius: 8px; padding: 0.6rem 0.75rem; margin: 0 0 0.8rem; word-break: break-all; }
-  #err, #note, #login-err:not(:empty) {
-    border-radius: 8px; padding: 0.6rem 0.75rem; margin: 0 0 0.8rem;
-  }
-  #err { background: #3a2222; color: #ffd0c8; display: none; }
-  #login-err:not(:empty) { background: #3a2222; color: #ffd0c8; }
-  #note { background: var(--panel); color: var(--muted); border: 1px solid var(--line); }
+  .once { color: var(--ok); border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 1rem; word-break: break-all; }
+  #err, #note, #login-err:not(:empty) { border-radius: 10px; padding: 0.6rem 0.9rem; margin: 0 0 1rem; }
+  #err { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad); display: none; }
+  #login-err:not(:empty) { background: var(--bad-bg); color: var(--bad); }
+  #note { color: var(--muted); border-left: 3px solid var(--line-strong); border-radius: 0; padding: 0.1rem 0 0.1rem 0.8rem; max-width: 70ch; }
   #note:empty { display: none; }
-  .tools { display: flex; gap: 0.5rem; align-items: center; margin: 0 0 0.8rem; flex-wrap: wrap; }
-  form.create { border-radius: 10px; padding: 0.8rem; margin: 0 0 1rem; width: auto; }
-  @media (max-width: 800px) {
+  .tools { display: flex; gap: 0.5rem; align-items: center; margin: 0 0 1rem; flex-wrap: wrap; }
+  .tools .grow { flex: 1; }
+  .chip { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 999px; padding: 0.05rem 0.55rem; font-variant-numeric: tabular-nums; }
+  .chip:empty { display: none; }
+  form.create { margin: 0 0 1.2rem; width: auto; }
+  form.create p { color: var(--muted); font-size: 0.85rem; max-width: 80ch; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.8rem; }
+  button.tile { display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; text-align: left; padding: 0.95rem 1rem; background: var(--panel); border-color: var(--line); min-height: 6.6rem; }
+  button.tile:hover:not(:disabled) { background: var(--panel-2); }
+  .tile .label { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tile .value { font-size: 1.7rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.25; font-variant-numeric: tabular-nums; }
+  .tile .value small { font-size: 0.85rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .tile .hint { color: var(--muted); font-size: 0.8rem; }
+  .tile .hint.bad { color: var(--bad); }
+  .meter { height: 6px; border-radius: 999px; background: var(--panel-2); overflow: hidden; margin: 0.45rem 0 0.3rem; border: 1px solid var(--line); }
+  .meter i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .meter.high i { background: var(--wait); }
+  .meter.full i { background: var(--bad); }
+  td .meter { width: 5rem; display: inline-block; vertical-align: middle; margin: 0 0.5rem 0 0; }
+  .panel td { white-space: nowrap; }
+  .panel table.wrap td:last-child { white-space: normal; }
+  .panel { padding: 0; overflow-x: auto; }
+  .panel > p { margin: 0; padding: 1.4rem; color: var(--muted); text-align: center; }
+  .panel table { border: 0; border-radius: 0; }
+  .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 0 1.2rem; }
+
+  @media (max-width: 860px) {
     #login:not([hidden]) { padding: 1rem; }
-    #shell:not([hidden]) { grid-template-columns: 1fr; }
-    nav { display: flex; gap: 0.25rem; overflow: auto; border-right: 0; border-bottom: 1px solid var(--line); }
-    nav button { width: auto; white-space: nowrap; }
+    #shell:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+    #side { position: fixed; z-index: 20; width: 260px; transform: translateX(-100%); transition: transform .16s; box-shadow: var(--shadow); }
+    #shell.nav-open #side { transform: none; }
+    #menu { display: inline-block; }
+    header { padding: 0.55rem 0.8rem; }
+    main { padding: 1rem 0.8rem 3rem; }
+    #filter { width: 100%; min-width: 4rem; }
+    .head-tools { min-width: 0; }
+    #who, .live span { display: none; }
   }
 </style>
 </head>
 <body>
 <section id="login">
   <form id="login-form" autocomplete="off" onsubmit="event.preventDefault()">
-    <h1>PiStack</h1>
+    <h1><span class="mark"></span>PiStack</h1>
     <p class="sub">Sign in to this cloud. The token stays in this tab.</p>
     <label for="user">Name</label>
     <input id="user" name="name" autocomplete="username" value="admin" required>
@@ -152,54 +268,99 @@
   </form>
 </section>
 <div id="shell" hidden>
-  <nav>
-    <button type="button" data-view="machines" aria-current="page">Machines</button>
-    <button type="button" data-view="hosts">Hosts</button>
-    <button type="button" data-view="networks">Networks</button>
-    <button type="button" data-view="subnets">Subnets</button>
-    <button type="button" data-view="ports">Ports</button>
-    <button type="button" data-view="routers">Routers</button>
-    <button type="button" data-view="security">Security groups</button>
-    <button type="button" data-view="fips">Floating IPs</button>
-    <button type="button" data-view="volumes">Volumes</button>
-    <button type="button" data-view="images">Images</button>
-    <button type="button" data-view="buckets">Buckets</button>
-    <button type="button" data-view="projects">Projects</button>
-    <button type="button" data-view="users">Users</button>
-    <button type="button" data-view="keys">Keys</button>
-    <button type="button" data-view="secrets">Secrets</button>
-    <button type="button" data-view="dns">DNS</button>
-    <button type="button" data-view="balancers">Load balancers</button>
-    <button type="button" data-view="pods">Pods</button>
-    <button type="button" data-view="deployments">Deployments</button>
-    <button type="button" data-view="statefulsets">StatefulSets</button>
-    <button type="button" data-view="daemonsets">DaemonSets</button>
-    <button type="button" data-view="autoscalers">Autoscalers</button>
-    <button type="button" data-view="services">Services</button>
-    <button type="button" data-view="jobs">Jobs</button>
-    <button type="button" data-view="ingresses">Ingresses</button>
-    <button type="button" data-view="stacks">Stacks</button>
-    <button type="button" data-view="shares">Shares</button>
-    <button type="button" data-view="alarms">Alarms</button>
-  </nav>
+  <aside id="side">
+    <div class="brand"><span class="mark"></span><strong>PiStack</strong></div>
+    <input id="nav-filter" type="search" placeholder="Jump to…  ( / )" aria-label="Filter the navigation" autocomplete="off">
+    <nav>
+      <button type="button" data-view="overview" aria-current="page">Overview</button>
+      <div class="group" data-group="Compute">
+        <button type="button" class="group-head" aria-expanded="true">Compute</button>
+        <div class="group-items">
+          <button type="button" data-view="machines">Machines</button>
+          <button type="button" data-view="hosts">Hosts</button>
+          <button type="button" data-view="images">Images</button>
+        </div>
+      </div>
+      <div class="group" data-group="Network">
+        <button type="button" class="group-head" aria-expanded="true">Network</button>
+        <div class="group-items">
+          <button type="button" data-view="networks">Networks</button>
+          <button type="button" data-view="subnets">Subnets</button>
+          <button type="button" data-view="ports">Ports</button>
+          <button type="button" data-view="routers">Routers</button>
+          <button type="button" data-view="security">Security groups</button>
+          <button type="button" data-view="fips">Floating IPs</button>
+          <button type="button" data-view="balancers">Load balancers</button>
+          <button type="button" data-view="dns">DNS</button>
+        </div>
+      </div>
+      <div class="group" data-group="Storage">
+        <button type="button" class="group-head" aria-expanded="true">Storage</button>
+        <div class="group-items">
+          <button type="button" data-view="volumes">Volumes</button>
+          <button type="button" data-view="buckets">Buckets</button>
+          <button type="button" data-view="shares">Shares</button>
+        </div>
+      </div>
+      <div class="group" data-group="Workloads">
+        <button type="button" class="group-head" aria-expanded="true">Workloads</button>
+        <div class="group-items">
+          <button type="button" data-view="pods">Pods</button>
+          <button type="button" data-view="deployments">Deployments</button>
+          <button type="button" data-view="statefulsets">StatefulSets</button>
+          <button type="button" data-view="daemonsets">DaemonSets</button>
+          <button type="button" data-view="autoscalers">Autoscalers</button>
+          <button type="button" data-view="services">Services</button>
+          <button type="button" data-view="jobs">Jobs</button>
+          <button type="button" data-view="ingresses">Ingresses</button>
+          <button type="button" data-view="stacks">Stacks</button>
+        </div>
+      </div>
+      <div class="group" data-group="Access">
+        <button type="button" class="group-head" aria-expanded="true">Access</button>
+        <div class="group-items">
+          <button type="button" data-view="projects">Projects</button>
+          <button type="button" data-view="users">Users</button>
+          <button type="button" data-view="keys">Keys</button>
+          <button type="button" data-view="secrets">Secrets</button>
+        </div>
+      </div>
+      <div class="group" data-group="Monitoring">
+        <button type="button" class="group-head" aria-expanded="true">Monitoring</button>
+        <div class="group-items">
+          <button type="button" data-view="alarms">Alarms</button>
+        </div>
+      </div>
+    </nav>
+  </aside>
   <div>
     <header>
-      <strong id="who">PiStack</strong>
-      <button type="button" id="logout">Sign out</button>
+      <div class="crumbs">
+        <button type="button" id="menu" class="ghost" aria-label="Open navigation">☰</button>
+        <span id="crumb-group"></span>
+        <strong id="crumb-title">Overview</strong>
+      </div>
+      <div class="head-tools">
+        <input id="filter" type="search" placeholder="Filter rows" aria-label="Filter the rows on this page" autocomplete="off">
+        <label class="live" title="Reload this page every few seconds"><input type="checkbox" id="live" checked><span>Live</span></label>
+        <button type="button" id="theme" class="ghost" aria-label="Switch between light and dark">◐</button>
+        <span id="who">PiStack</span>
+        <button type="button" id="logout">Sign out</button>
+      </div>
     </header>
     <main>
-      <p id="note"></p>
-      <div id="err"></div>
+      <div id="err" role="alert"></div>
       <div id="view"></div>
     </main>
   </div>
 </div>
 <script>
 const VIEWS = {
+  overview: { title: "Overview" },
   machines: {
     title: "Machines",
     path: "/compute/machines",
-    note: "Guests boot on the host NAT network 10.88.0.0/24. SSH from the fleet host as ubuntu@the address. Attach a volume from Volumes and it shows up in the guest as a virtio disk.",
+    note: "Open a machine for its console, addresses and volumes. A volume attached from Volumes shows up in the guest as a virtio disk.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
@@ -280,7 +441,7 @@ const VIEWS = {
   fips: {
     title: "Floating IPs",
     path: "/network/floating-ips",
-    note: "A floating IP is an address on the fleet tunnel, drawn from 10.66.66.80/28. Associate it with a machine and that address reaches the guest. Traffic is accepted only from 10.66.66.0/24.",
+    note: "A floating IP is an address on the external network. Associate it with a machine and that address reaches the guest.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
@@ -524,8 +685,14 @@ const VIEWS = {
   },
 };
 
-let current = "machines";
+let current = "overview";
 let timer = 0;
+// Row counts shown next to each navigation entry, by view name.
+const counts = {};
+// Which create forms are open, by view name.
+const formOpen = {};
+let lastErr = "";
+let readOnly = false;
 let renderGen = 0;
 let openMachine = null;
 let machineFips = [];
@@ -554,6 +721,8 @@ async function api(method, path, body, auth) {
   }
   if (res.status === 401 && auth !== false) { showLogin(); throw new Error("session ended"); }
   if (!res.ok) throw new Error((data && data.error && data.error.message) || res.statusText);
+  // A change went through: the create form has done its job.
+  if (method !== "GET") formOpen[current] = false;
   return data;
 }
 
@@ -570,6 +739,7 @@ function showApp() {
 }
 function setErr(msg) {
   const n = document.getElementById("err");
+  lastErr = msg || "";
   n.style.display = msg ? "block" : "none";
   n.textContent = msg || "";
 }
@@ -701,10 +871,10 @@ document.getElementById("login-form").addEventListener("submit", async (ev) => {
     }, false);
     setToken(data.token);
     document.getElementById("pass").value = "";
-    const who = data.caller || {};
-    document.getElementById("who").textContent = (who.principal_name || "admin") + (who.project ? " · " + who.project : "");
+    setWho(data.caller || {}, "admin");
     showApp();
-    await render();
+    go(hashView(), true);
+    loadCounts();
   } catch (e) {
     err.textContent = e.message === "invalid credentials"
       ? "Password was not accepted. Clear the box and paste it again. A password manager may have replaced it."
@@ -712,14 +882,173 @@ document.getElementById("login-form").addEventListener("submit", async (ev) => {
   }
 });
 document.getElementById("logout").addEventListener("click", () => { showLogin(); });
-document.querySelector("nav").addEventListener("click", (ev) => {
-  const b = ev.target.closest("button[data-view]");
-  if (!b) return;
-  current = b.dataset.view;
+function setWho(who, fallback) {
+  const roles = who.roles || [];
+  readOnly = roles.length > 0 && !roles.includes("admin") && !roles.includes("member");
+  const node = document.getElementById("who");
+  node.textContent = (who.principal_name || fallback) + (readOnly ? " · read-only" : "");
+  node.title = who.project ? "Project " + who.project : "";
+}
+
+// ---- navigation -----------------------------------------------------------
+
+function navButton(view) {
+  return document.querySelector('nav button[data-view="' + view + '"]');
+}
+function go(view, fromHash) {
+  if (!VIEWS[view]) view = "overview";
+  current = view;
   openMachine = null;
-  for (const n of document.querySelectorAll("nav button")) n.removeAttribute("aria-current");
-  b.setAttribute("aria-current", "page");
+  for (const n of document.querySelectorAll("nav button[data-view]")) n.removeAttribute("aria-current");
+  const b = navButton(view);
+  let group = "";
+  if (b) {
+    b.setAttribute("aria-current", "page");
+    const g = b.closest(".group");
+    if (g) { group = g.dataset.group; setGroup(g, true); }
+  }
+  document.getElementById("crumb-group").textContent = group;
+  document.getElementById("crumb-title").textContent = VIEWS[view].title;
+  document.title = VIEWS[view].title + " · PiStack";
+  document.getElementById("filter").value = "";
+  document.getElementById("shell").classList.remove("nav-open");
+  if (!fromHash && location.hash !== "#/" + view) history.pushState(null, "", "#/" + view);
   render();
+}
+function hashView() {
+  const v = location.hash.replace(/^#\/?/, "");
+  return VIEWS[v] ? v : "overview";
+}
+window.addEventListener("popstate", () => { if (token()) go(hashView(), true); });
+
+function storedGroups() {
+  try { return JSON.parse(localStorage.getItem("pistack.nav") || "{}") || {}; } catch (e) { return {}; }
+}
+function setGroup(g, open, remember) {
+  g.querySelector(".group-head").setAttribute("aria-expanded", String(open));
+  g.querySelector(".group-items").hidden = !open;
+  if (!remember) return;
+  const all = storedGroups();
+  all[g.dataset.group] = open;
+  try { localStorage.setItem("pistack.nav", JSON.stringify(all)); } catch (e) { /* private window */ }
+}
+(function restoreGroups() {
+  const all = storedGroups();
+  for (const g of document.querySelectorAll("nav .group")) {
+    const open = g.dataset.group in all ? all[g.dataset.group] : g.dataset.group === "Compute";
+    if (!open) setGroup(g, false);
+  }
+})();
+document.querySelector("nav").addEventListener("click", (ev) => {
+  const head = ev.target.closest(".group-head");
+  if (head) {
+    setGroup(head.parentNode, head.getAttribute("aria-expanded") !== "true", true);
+    return;
+  }
+  const b = ev.target.closest("button[data-view]");
+  if (b) go(b.dataset.view);
+});
+document.getElementById("menu").addEventListener("click", () => {
+  document.getElementById("shell").classList.toggle("nav-open");
+});
+
+// Typing in the box above the navigation narrows it. Enter opens the first
+// match, and "/" anywhere outside a field puts the cursor there.
+const navFilter = document.getElementById("nav-filter");
+function filterNav() {
+  const q = navFilter.value.trim().toLowerCase();
+  const stored = storedGroups();
+  for (const g of document.querySelectorAll("nav .group")) {
+    let any = false;
+    for (const b of g.querySelectorAll("button[data-view]")) {
+      const hit = !q || b.firstChild.textContent.toLowerCase().includes(q) || g.dataset.group.toLowerCase().includes(q);
+      b.hidden = !hit;
+      any = any || hit;
+    }
+    g.hidden = !any;
+    setGroup(g, q ? any : (g.dataset.group in stored ? stored[g.dataset.group] : g.dataset.group === "Compute"));
+  }
+  const cur = navButton(current);
+  if (!q && cur && cur.closest(".group")) setGroup(cur.closest(".group"), true);
+}
+navFilter.addEventListener("input", filterNav);
+navFilter.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { navFilter.value = ""; filterNav(); navFilter.blur(); return; }
+  if (ev.key !== "Enter") return;
+  const first = [...document.querySelectorAll("nav .group button[data-view]")].find(b => !b.hidden);
+  if (!first || !navFilter.value.trim()) return;
+  navFilter.value = "";
+  filterNav();
+  go(first.dataset.view);
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "/" || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
+  if (document.getElementById("shell").hidden) return;
+  ev.preventDefault();
+  navFilter.focus();
+});
+
+function setCount(view, n) {
+  counts[view] = n;
+  const b = navButton(view);
+  if (!b) return;
+  let c = b.querySelector(".count");
+  if (!c) { c = el("span", null, "count"); b.append(c); }
+  c.textContent = n ? String(n) : "";
+}
+// One pass over every list after sign-in, a few at a time, so the
+// navigation shows what the cloud holds without opening each page.
+async function loadCounts() {
+  const names = Object.keys(VIEWS).filter(v => VIEWS[v].path);
+  const next = async () => {
+    while (names.length) {
+      const v = names.shift();
+      try { setCount(v, itemsOf(await api("GET", VIEWS[v].path)).length); }
+      catch (e) { /* a module that is off, or a list this role cannot read */ }
+      if (!token()) return;
+    }
+  };
+  await Promise.all([next(), next(), next(), next()]);
+}
+
+// ---- row filter, live reload, theme ---------------------------------------
+
+function applyFilter() {
+  const q = document.getElementById("filter").value.trim().toLowerCase();
+  for (const tr of document.querySelectorAll("#view tbody tr")) {
+    if (tr.querySelector("td.empty")) continue;
+    tr.hidden = !!q && !tr.textContent.toLowerCase().includes(q);
+  }
+}
+document.getElementById("filter").addEventListener("input", applyFilter);
+
+const liveBox = document.getElementById("live");
+try { liveBox.checked = localStorage.getItem("pistack.live") !== "off"; } catch (e) { /* private window */ }
+liveBox.addEventListener("change", () => {
+  try { localStorage.setItem("pistack.live", liveBox.checked ? "on" : "off"); } catch (e) { /* private window */ }
+});
+// A reload must not take anything out from under the user: not a form
+// they are filling in, a one-time secret, or a machine's console.
+setInterval(() => {
+  if (!liveBox.checked || document.hidden || !token()) return;
+  if (document.getElementById("shell").hidden) return;
+  if (openMachine || formOpen[current]) return;
+  const view = document.getElementById("view");
+  if (view.contains(document.activeElement) || view.querySelector(".once")) return;
+  render(true);
+}, 5000);
+
+function setTheme(name) {
+  if (name === "light") document.documentElement.dataset.theme = "light";
+  else delete document.documentElement.dataset.theme;
+}
+try { setTheme(localStorage.getItem("pistack.theme")); } catch (e) { /* private window */ }
+document.getElementById("theme").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  setTheme(next);
+  try { localStorage.setItem("pistack.theme", next); } catch (e) { /* private window */ }
 });
 
 function field(label, node) {
@@ -1536,7 +1865,7 @@ function simpleTable(cols, items) {
   }
   if (!items.length) {
     const tr = el("tr");
-    const td = el("td", "Nothing here yet.");
+    const td = el("td", "Nothing here yet.", "empty");
     td.colSpan = cols.length;
     tr.append(td);
     body.append(tr);
@@ -2004,30 +2333,205 @@ async function renderBalancers(root, gen) {
   ], pools));
 }
 
-async function render() {
-  const gen = ++renderGen;
-  clearInterval(timer);
-  const view = VIEWS[current];
-  const root = document.getElementById("view");
-  root.replaceChildren();
-  document.getElementById("note").textContent = view.note || "";
-  setErr("");
-  if (current === "machines" && openMachine) {
-    await renderMachine(openMachine, gen);
-    return;
-  }
-  const tools = el("div"); tools.className = "tools";
-  tools.append(el("h2", view.title));
+// ---- overview -------------------------------------------------------------
+
+function phaseOf(i) { return String((i.status && i.status.phase) || "").toLowerCase(); }
+function meter(used, total) {
+  const m = el("div", null, "meter");
+  const pct = total > 0 ? Math.min(100, Math.round(used * 100 / total)) : 0;
+  if (pct >= 95) m.classList.add("full"); else if (pct >= 80) m.classList.add("high");
+  const bar = el("i");
+  bar.style.width = pct + "%";
+  m.append(bar);
+  m.title = pct + "% in use";
+  return m;
+}
+function tile(view, label, value, unit, hint, bar, bad) {
+  const t = el("button", null, "tile");
+  t.type = "button";
+  t.append(el("div", label, "label"));
+  const v = el("div", String(value), "value");
+  if (unit) { v.append(" "); v.append(el("small", unit)); }
+  t.append(v);
+  if (bar) t.append(bar);
+  if (hint) t.append(el("div", hint, bad ? "hint bad" : "hint"));
+  t.addEventListener("click", () => go(view));
+  return t;
+}
+function gib(mib) { return Math.round(mib / 102.4) / 10; }
+
+async function renderOverview(root, gen) {
+  const wanted = ["hosts", "machines", "pods", "networks", "fips", "volumes", "images", "alarms"];
+  const got = {};
+  const failed = [];
+  await Promise.all(wanted.map(async (v) => {
+    try { got[v] = itemsOf(await api("GET", VIEWS[v].path)); }
+    catch (e) { got[v] = []; failed.push(VIEWS[v].title); }
+  }));
+  if (gen !== renderGen) return;
+  for (const v of wanted) if (!failed.includes(VIEWS[v].title)) setCount(v, got[v].length);
+  if (failed.length === wanted.length) { setErr("The server did not answer. Is it still running?"); return; }
+
+  const tools = el("div", null, "tools");
+  tools.append(el("h2", "Overview"), el("span", null, "grow"));
   const refresh = el("button", "Refresh"); refresh.type = "button";
   refresh.addEventListener("click", () => render());
   tools.append(refresh);
   root.append(tools);
+
+  const hosts = got.hosts;
+  const ready = hosts.filter(h => phaseOf(h) === "ready");
+  let cpuAll = 0, cpuFree = 0, memAll = 0, memFree = 0;
+  for (const h of ready) {
+    const cap = (h.spec && h.spec.capacity) || {};
+    const free = (h.status && h.status.free) || {};
+    cpuAll += cap.vcpus || 0; cpuFree += free.vcpus || 0;
+    memAll += cap.memory_mib || 0; memFree += free.memory_mib || 0;
+  }
+  const machines = got.machines;
+  const on = machines.filter(m => phaseOf(m) === "ready" && String(m.status.power || "").toLowerCase() === "on");
+  const firing = got.alarms.filter(a => phaseOf(a) === "firing" || String((a.status && a.status.state) || "").toLowerCase() === "firing");
+  const volGib = got.volumes.reduce((n, v) => n + ((v.spec && v.spec.size_gib) || 0), 0);
+
+  const tiles = el("div", null, "tiles");
+  tiles.append(
+    tile("machines", "Machines", on.length, "of " + machines.length + " running"),
+    tile("hosts", "Hosts", ready.length, "of " + hosts.length + " ready",
+      hosts.length > ready.length ? (hosts.length - ready.length) + " not ready" : "", null, true),
+    tile("hosts", "vCPU in use", cpuAll - cpuFree, "of " + cpuAll, cpuFree + " free", meter(cpuAll - cpuFree, cpuAll)),
+    tile("hosts", "Memory in use", gib(memAll - memFree), "of " + gib(memAll) + " GiB", gib(memFree) + " GiB free", meter(memAll - memFree, memAll)),
+    tile("pods", "Pods", got.pods.length),
+    tile("networks", "Networks", got.networks.length, "", got.fips.length + " floating IPs"),
+    tile("volumes", "Volumes", got.volumes.length, "", volGib + " GiB provisioned"),
+    tile("alarms", "Alarms firing", firing.length, "of " + got.alarms.length, "", null, firing.length > 0),
+  );
+  root.append(tiles);
+
+  // Anything that is not healthy, across what was fetched.
+  const trouble = [];
+  for (const v of wanted) {
+    for (const i of got[v]) {
+      const ph = phaseOf(i);
+      if (["error", "failed", "firing"].includes(ph)) trouble.push({ view: v, item: i });
+    }
+  }
+  const split = el("div", null, "split");
+  const left = el("div");
+  left.append(el("h3", "Needs attention"));
+  const panel = el("div", null, "panel");
+  if (!trouble.length) {
+    panel.append(el("p", "Nothing is in an error state."));
+  } else {
+    const t = simpleTable([
+      ["Kind", r => VIEWS[r.view].title],
+      ["Name", r => r.item.name],
+      ["Phase", r => r.item.status && r.item.status.phase],
+      ["Message", r => String((r.item.status && r.item.status.message) || "").slice(0, 160)],
+    ], trouble.slice(0, 12));
+    t.className = "wrap";
+    [...t.querySelectorAll("tbody tr")].forEach((tr, idx) => {
+      const r = trouble[idx];
+      const cell = tr.children[1];
+      const b = el("button", r.item.name || "—", "linkish"); b.type = "button";
+      b.addEventListener("click", () => {
+        go(r.view);
+        if (r.view === "machines") { openMachine = r.item.id; render(); }
+      });
+      cell.replaceChildren(b);
+    });
+    panel.append(t);
+  }
+  left.append(panel);
+
+  const right = el("div");
+  right.append(el("h3", "Hosts"));
+  const hp = el("div", null, "panel");
+  if (!hosts.length) {
+    hp.append(el("p", "No host has joined yet. Start an agent with pistack agent --join."));
+  } else {
+    const t = simpleTable([
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["vCPU", () => ""],
+      ["Memory", () => ""],
+    ], hosts.slice(0, 12));
+    [...t.querySelectorAll("tbody tr")].forEach((tr, idx) => {
+      const h = hosts[idx];
+      const cap = (h.spec && h.spec.capacity) || {};
+      const free = (h.status && h.status.free) || {};
+      const cpu = (cap.vcpus || 0) - (free.vcpus || 0);
+      const mem = (cap.memory_mib || 0) - (free.memory_mib || 0);
+      tr.children[2].replaceChildren(meter(cpu, cap.vcpus || 0), cpu + " / " + (cap.vcpus || 0));
+      tr.children[3].replaceChildren(meter(mem, cap.memory_mib || 0), gib(mem) + " / " + gib(cap.memory_mib || 0) + " GiB");
+    });
+    hp.append(t);
+  }
+  right.append(hp);
+  split.append(left, right);
+  root.append(split);
+  if (failed.length) setErr("Could not read: " + failed.join(", ") + ".");
+}
+
+// `soft` is a background reload: the page is built off-screen and swapped
+// in when it is complete, so nothing flickers, and a failed reload leaves
+// what was on screen.
+async function render(soft) {
+  const gen = ++renderGen;
+  clearInterval(timer);
+  const view = VIEWS[current];
+  const live = document.getElementById("view");
+  if (current === "machines" && openMachine) {
+    setErr("");
+    await renderMachine(openMachine, gen);
+    return;
+  }
+  const root = soft ? el("div") : live;
+  if (!soft) live.replaceChildren();
+  setErr("");
+  await renderInto(root, view, gen);
+  if (gen !== renderGen) return;
+  if (soft) {
+    if (lastErr) return;
+    live.replaceChildren(...root.childNodes);
+  }
+  applyFilter();
+}
+
+async function renderInto(root, view, gen) {
+  if (current === "overview") { await renderOverview(root, gen); return; }
+  const form = readOnly ? null : createForm();
+  const tools = el("div"); tools.className = "tools";
+  tools.append(el("h2", view.title));
+  const chip = el("span", null, "chip");
+  tools.append(chip, el("span", null, "grow"));
+  if (form) {
+    const open = !!formOpen[current];
+    form.hidden = !open;
+    const toggle = el("button", open ? "Close" : "Create", open ? "" : "primary");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => {
+      formOpen[current] = form.hidden;
+      form.hidden = !form.hidden;
+      toggle.textContent = form.hidden ? "Create" : "Close";
+      toggle.className = form.hidden ? "primary" : "";
+      if (!form.hidden) { const first = form.querySelector("input, select, textarea"); if (first) first.focus(); }
+    });
+    tools.append(toggle);
+  }
+  const refresh = el("button", "Refresh"); refresh.type = "button";
+  refresh.addEventListener("click", () => render());
+  tools.append(refresh);
+  root.append(tools);
+  if (view.note) {
+    const note = el("p", view.note);
+    note.id = "note";
+    root.append(note);
+  }
   if (current === "keys" && keyOnce) {
     const shown = keyOnce;
     keyOnce = null;
     root.append(el("p", "Copy this key secret now. It is not shown again. " + shown, "once"));
   }
-  const form = createForm();
   if (form) root.append(form);
   if (view.multi === "dns") { await renderDns(root, gen); return; }
   if (view.multi === "balancers") { await renderBalancers(root, gen); return; }
@@ -2051,6 +2555,8 @@ async function render() {
     }
   }
   const items = itemsOf(page);
+  setCount(current, items.length);
+  chip.textContent = String(items.length);
   root.append(simpleTable(view.cols, items));
   const table = root.lastElementChild;
   const body = table.querySelector("tbody");
@@ -2163,20 +2669,14 @@ async function render() {
       setErr(e.message);
     }
   }
-  if (current === "machines" && items.some(i => ["pending", "creating", "deleting"].includes(i.status && i.status.phase))) {
-    timer = setInterval(() => {
-      const viewEl = document.getElementById("view");
-      if (viewEl.contains(document.activeElement)) return;
-      render();
-    }, 3000);
-  }
 }
 
 if (token()) {
   api("GET", "/identity/tokens/self").then((who) => {
-    document.getElementById("who").textContent = (who.principal_name || "signed in") + (who.project ? " · " + who.project : "");
+    setWho(who || {}, "signed in");
     showApp();
-    render();
+    go(hashView(), true);
+    loadCounts();
   }).catch(() => showLogin());
 }
 </script>
