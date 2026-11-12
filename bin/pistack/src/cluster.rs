@@ -11,6 +11,16 @@
 //! they have caught up, until three servers are voters. A store copied from
 //! another server, or downloaded as a snapshot, is never trusted as this
 //! server's vote: it rejoins as a learner.
+//!
+//! A write is confirmed before it is answered. The leader applies and logs
+//! it, then holds the response until a majority of voters has the entry
+//! ([`confirm_write`]). A follower's pull names the index it has applied,
+//! which is its acknowledgement, and the pull waits briefly on the leader
+//! when there is nothing new, so an acknowledgement follows a write in
+//! milliseconds. A candidate needs a log at least as current as a majority's
+//! to win, so the next leader holds every confirmed write. A write that is
+//! not confirmed in time is answered 503: it is in the leader's log and may
+//! still take effect, but nothing was promised.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,6 +57,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 /// A peer status probe is best effort. A dark peer must not stall a tick.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
+/// How long a write waits for a voter majority to hold it.
+const CONFIRM_WAIT: Duration = Duration::from_secs(5);
+/// How long an empty `/cluster/log` pull waits on the leader for a new
+/// entry. Shorter than [`FOLLOW_TICK`], so a follower's next tick starts a
+/// fresh pull, and far shorter than [`RPC_TIMEOUT`].
+const LOG_WAIT: Duration = Duration::from_millis(150);
 /// Entries one `/cluster/log` page carries.
 const LOG_PAGE: usize = 64;
 /// A learner is caught up when its last pull asked for entries no more than
@@ -143,6 +159,12 @@ pub struct ClusterHandle {
     pub last_compact: Mutex<Instant>,
     /// Rows kept behind the commit index; [`LOG_KEEP`] outside tests.
     pub log_keep: AtomicU64,
+    /// Woken when a follower's pull acknowledges entries.
+    pub acks: tokio::sync::Notify,
+    /// Woken when an API write lands, so a waiting pull answers at once.
+    pub log_grew: tokio::sync::Notify,
+    /// How long a write waits for a majority; [`CONFIRM_WAIT`] outside tests.
+    pub confirm_wait: Mutex<Duration>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -168,9 +190,19 @@ struct LogQuery {
     /// The follower's term at `after`, 0 when it has no row there.
     #[serde(default)]
     term: u64,
-    /// The puller's node id, so the leader can tell when a learner caught up.
+    /// The puller's node id, so the leader can tell when a learner caught up
+    /// and which voters hold a write.
     #[serde(default)]
     node: String,
+    /// The puller's current term, 0 when it does not say. A puller in a
+    /// newer term has voted this leader out: its pull is not an
+    /// acknowledgement.
+    #[serde(default)]
+    fterm: u64,
+    /// Milliseconds to wait for a new entry when there is none, capped at
+    /// [`LOG_WAIT`].
+    #[serde(default)]
+    wait: u64,
 }
 
 /// Private unicast from `host:port`. `0.0.0.0`, public addresses, and names
@@ -492,6 +524,9 @@ pub fn handle_from(
         progress: Mutex::new(HashMap::new()),
         last_compact: Mutex::new(Instant::now()),
         log_keep: AtomicU64::new(LOG_KEEP),
+        acks: tokio::sync::Notify::new(),
+        log_grew: tokio::sync::Notify::new(),
+        confirm_wait: Mutex::new(CONFIRM_WAIT),
     }
 }
 
@@ -544,7 +579,24 @@ pub async fn reject_follower_writes(
         return next.run(req).await;
     }
     if handle.leader.load(Ordering::Acquire) {
-        return next.run(req).await;
+        if read {
+            return next.run(req).await;
+        }
+        let term = handle.term.load(Ordering::Relaxed);
+        let before = handle.store.commit_index().ok();
+        let response = next.run(req).await;
+        let after = match handle.store.commit_index() {
+            Ok(after) => after,
+            Err(err) => return store_err(err).into_response(),
+        };
+        if before == Some(after) {
+            // Nothing was logged while this request ran.
+            return response;
+        }
+        return match confirm_write(&handle, after, term).await {
+            Ok(()) => response,
+            Err(err) => err.into_response(),
+        };
     }
     if rpc {
         // Agents act on the address, so only name a leader this follower
@@ -561,6 +613,65 @@ pub async fn reject_follower_writes(
     ApiError::conflict("not the leader")
         .with_detail("leader", leader)
         .into_response()
+}
+
+/// Wait until a majority of voters holds the log through `index`, written in
+/// `term`. This server counts as one. A follower holds it once a pull of its
+/// asked for entries after `index` or later.
+///
+/// Fails when this server stops leading, the term moves, or no majority
+/// confirms within `confirm_wait`. The entry stays in this server's log
+/// either way: the caller is told nothing was promised, not that nothing
+/// happened.
+async fn confirm_write(handle: &ClusterHandle, index: u64, term: u64) -> Result<(), ApiError> {
+    handle.log_grew.notify_waiters();
+    let deadline = Instant::now() + *guard(&handle.confirm_wait);
+    loop {
+        let acked = handle.acks.notified();
+        tokio::pin!(acked);
+        // Register before counting, so an acknowledgement between the count
+        // and the wait is not missed.
+        acked.as_mut().enable();
+        if !handle.leader.load(Ordering::Acquire) || handle.term.load(Ordering::Relaxed) != term {
+            return Err(ApiError::unavailable(
+                "this server stopped leading before a majority of voters confirmed the write; it may or may not take effect",
+            )
+            .with_detail("index", index));
+        }
+        let members = members_of(&handle.store)?;
+        let voters: Vec<&Member> = members
+            .iter()
+            .filter(|member| member.role == Role::Voter)
+            .collect();
+        let have = {
+            let progress = guard(&handle.progress);
+            voters
+                .iter()
+                .filter(|voter| {
+                    voter.id == handle.node_id
+                        || progress
+                            .get(&voter.id)
+                            .is_some_and(|(after, _)| *after >= index)
+                })
+                .count()
+        };
+        // A store with no voter listed is a single server.
+        if voters.len() <= 1 || have >= majority(voters.len()) {
+            return Ok(());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ApiError::unavailable(
+                "a majority of voters did not confirm the write in time; it may or may not take effect",
+            )
+            .with_detail("index", index)
+            .with_detail("confirmed_by", have)
+            .with_detail("voters", voters.len()));
+        }
+        // Wake on an acknowledgement, and look again every so often for a
+        // stand-down or a membership change.
+        let _ = tokio::time::timeout(left.min(Duration::from_millis(100)), acked).await;
+    }
 }
 
 /// The leader this follower tracks, if it heard from it within the current
@@ -660,6 +771,19 @@ async fn log(
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<LogEntry>>, ApiError> {
     enforce_join(&handle.store, &headers)?;
+    let term = handle.term.load(Ordering::Relaxed);
+    if query.fterm > term {
+        // The puller has voted in a newer term. Its pull must not count as
+        // an acknowledgement for a leader that term replaced.
+        if let Err(err) = adopt_term(&handle, query.fterm) {
+            tracing::warn!(error = %err, "could not store the newer term");
+        }
+        stand_down(&handle, "a follower reports a newer term");
+        return Err(ApiError::conflict(format!(
+            "stale term: the puller is at term {}, this server at term {term}",
+            query.fterm
+        )));
+    }
     if query.after > 0 {
         let commit = handle.store.commit_index().map_err(store_err)?;
         let ours = handle.store.log_term_at(query.after).map_err(store_err)?;
@@ -676,11 +800,26 @@ async fn log(
     let node = query.node.trim();
     if !node.is_empty() {
         guard(&handle.progress).insert(node.to_owned(), (query.after, Instant::now()));
+        handle.acks.notify_waiters();
     }
-    let entries = handle
+    let grew = handle.log_grew.notified();
+    tokio::pin!(grew);
+    // Register before reading, so a write between the read and the wait is
+    // not missed.
+    grew.as_mut().enable();
+    let mut entries = handle
         .store
         .read_log(query.after, LOG_PAGE)
         .map_err(store_err)?;
+    if entries.is_empty() && query.wait > 0 {
+        let wait = Duration::from_millis(query.wait).min(LOG_WAIT);
+        if tokio::time::timeout(wait, grew).await.is_ok() {
+            entries = handle
+                .store
+                .read_log(query.after, LOG_PAGE)
+                .map_err(store_err)?;
+        }
+    }
     Ok(Json(entries))
 }
 
@@ -753,16 +892,28 @@ async fn vote(
 /// index first and answers 409 when our log forked from its own.
 #[cfg(test)]
 pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
-    pull_page(leader, store, "").await.map(|_| ())
+    pull_page(leader, store, "", 0, Duration::ZERO)
+        .await
+        .map(|_| ())
 }
 
 /// One page of entries after our commit index. Returns how many were applied.
-async fn pull_page(leader: &str, store: &Store, node: &str) -> anyhow::Result<usize> {
+/// Naming that index tells the leader we hold everything through it.
+/// `current_term` is this server's term (0 leaves it unsaid), and `wait` is
+/// how long the leader may hold an empty answer for a new entry.
+async fn pull_page(
+    leader: &str,
+    store: &Store,
+    node: &str,
+    current_term: u64,
+    wait: Duration,
+) -> anyhow::Result<usize> {
     let after = store.commit_index()?;
     let term = store.log_term_at(after)?.unwrap_or(0);
     let url = format!(
-        "{}/cluster/log?after={after}&term={term}&node={node}",
-        leader.trim_end_matches('/')
+        "{}/cluster/log?after={after}&term={term}&node={node}&fterm={current_term}&wait={}",
+        leader.trim_end_matches('/'),
+        wait.as_millis()
     );
     let response = with_join(rpc_client().get(&url))
         .timeout(RPC_TIMEOUT)
@@ -780,8 +931,9 @@ async fn pull_page(leader: &str, store: &Store, node: &str) -> anyhow::Result<us
     Ok(entries.len())
 }
 
-/// Pull from `leader` in the background until a page comes back short. Only
-/// one runs at a time. The follow loop keeps checking the leader each tick
+/// Pull from `leader` in the background until a page comes back empty. Only
+/// one runs at a time. A page that brought entries is followed by another
+/// pull straight away: that pull is what tells the leader we hold them. The follow loop keeps checking the leader each tick
 /// while it runs, so the election timer and the lease track the leader, not
 /// how long replication takes.
 fn start_pull(handle: &std::sync::Arc<ClusterHandle>, leader: &str) {
@@ -795,8 +947,9 @@ fn start_pull(handle: &std::sync::Arc<ClusterHandle>, leader: &str) {
             if handle.leader.load(Ordering::Acquire) {
                 break Ok(());
             }
-            match pull_page(&leader, &handle.store, &handle.node_id).await {
-                Ok(n) if n >= LOG_PAGE => continue,
+            let term = handle.term.load(Ordering::Relaxed);
+            match pull_page(&leader, &handle.store, &handle.node_id, term, LOG_WAIT).await {
+                Ok(n) if n > 0 => continue,
                 Ok(_) => break Ok(()),
                 Err(err) => break Err(err),
             }
@@ -1341,6 +1494,9 @@ fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     *guard(&handle.last_heard) = Instant::now();
     *guard(&handle.leader_contact) = Some(Instant::now());
     *guard(&handle.pull_error) = None;
+    // Acknowledgements from an earlier time leading say nothing about what
+    // followers hold now.
+    guard(&handle.progress).clear();
     *guard(&handle.role) = Role::Voter;
     handle
         .store
@@ -2101,6 +2257,18 @@ mod tests {
         let serve_stop = CancellationToken::new();
         let app = router(handle.clone())
             .route("/mutate", axum::routing::post(|| async { "ok" }))
+            .route(
+                "/write/{key}",
+                axum::routing::post({
+                    let store = handle.store.clone();
+                    move |axum::extract::Path(key): axum::extract::Path<String>| async move {
+                        match store.put_meta(&key, &"yes".to_string()) {
+                            Ok(()) => StatusCode::OK,
+                            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                        }
+                    }
+                }),
+            )
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
                 reject_follower_writes,
@@ -3409,11 +3577,19 @@ mod tests {
             let s = open_store(dir.path());
             (dir, s)
         };
-        while pull_page(&leader.api, &a, "a").await.unwrap() > 0 {}
+        while pull_page(&leader.api, &a, "a", 0, Duration::ZERO)
+            .await
+            .unwrap()
+            > 0
+        {}
         assert_eq!(a.commit_index().unwrap(), commit);
         // Two pages: the leader saw b ask after the first one.
-        pull_page(&leader.api, &b, "b").await.unwrap();
-        pull_page(&leader.api, &b, "b").await.unwrap();
+        pull_page(&leader.api, &b, "b", 0, Duration::ZERO)
+            .await
+            .unwrap();
+        pull_page(&leader.api, &b, "b", 0, Duration::ZERO)
+            .await
+            .unwrap();
         let b_at = b.commit_index().unwrap();
         assert!(b_at < commit);
 
@@ -3424,7 +3600,11 @@ mod tests {
         assert!(start <= b_at, "trimmed rows the slow follower still needs");
         assert!(store.log_term_at(commit).unwrap().is_some());
         // The slightly-behind follower carries on.
-        while pull_page(&leader.api, &b, "b").await.unwrap() > 0 {}
+        while pull_page(&leader.api, &b, "b", 0, Duration::ZERO)
+            .await
+            .unwrap()
+            > 0
+        {}
         assert_eq!(b.commit_index().unwrap(), commit);
 
         // Everyone is current: trim down to the kept tail.
@@ -3434,16 +3614,140 @@ mod tests {
         for n in 300..320 {
             store.put_meta(&format!("k{n}"), &n).unwrap();
         }
-        while pull_page(&leader.api, &a, "a").await.unwrap() > 0 {}
-        while pull_page(&leader.api, &b, "b").await.unwrap() > 0 {}
+        while pull_page(&leader.api, &a, "a", 0, Duration::ZERO)
+            .await
+            .unwrap()
+            > 0
+        {}
+        while pull_page(&leader.api, &b, "b", 0, Duration::ZERO)
+            .await
+            .unwrap()
+            > 0
+        {}
         assert_eq!(a.get_meta::<i32>("k319").unwrap(), Some(319));
         assert_eq!(b.get_meta::<i32>("k319").unwrap(), Some(319));
 
         // A server that needs trimmed rows is sent back to --join.
         let fresh = Store::in_memory().unwrap();
-        let err = pull_page(&leader.api, &fresh, "c").await.unwrap_err();
+        let err = pull_page(&leader.api, &fresh, "c", 0, Duration::ZERO)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("compacted"), "{err:#}");
         assert_eq!(fresh.commit_index().unwrap(), 0);
         leader.kill();
+    }
+
+    async fn post_write(api: &str, key: &str) -> u16 {
+        reqwest::Client::new()
+            .post(format!("{api}/write/{key}"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn a_write_is_answered_only_once_a_voter_majority_holds_it() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        for n in 0..5 {
+            let key = format!("confirmed-{n}");
+            assert_eq!(post_write(&sim.api, &key).await, 200);
+            // No waiting here: the answer itself means a follower has it.
+            let holders = [&sim2, &sim3]
+                .iter()
+                .filter(|voter| marker(&voter.handle.store, &key).is_some())
+                .count();
+            assert!(
+                holders >= 1,
+                "{key} was answered before any follower held it"
+            );
+        }
+        sim.kill();
+        sim2.kill();
+        sim3.kill();
+    }
+
+    #[tokio::test]
+    async fn a_write_no_majority_holds_is_not_confirmed() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        assert_eq!(post_write(&sim.api, "while-healthy").await, 200);
+        // Both followers go dark. The leader still leads until it notices.
+        sim2.kill();
+        sim3.kill();
+        *guard(&sim.handle.confirm_wait) = Duration::from_millis(400);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(post_write(&sim.api, "alone").await, 503);
+        assert!(marker(&sim2.handle.store, "alone").is_none());
+        assert!(marker(&sim3.handle.store, "alone").is_none());
+        sim.kill();
+    }
+
+    #[tokio::test]
+    async fn one_follower_is_enough_for_a_majority_of_three() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        assert_eq!(post_write(&sim.api, "warm-up").await, 200);
+        sim3.kill();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(post_write(&sim.api, "two-of-three").await, 200);
+        assert!(marker(&sim2.handle.store, "two-of-three").is_some());
+        sim.kill();
+        sim2.kill();
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_write_survives_losing_the_leader() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        for n in 0..3 {
+            assert_eq!(post_write(&sim.api, &format!("kept-{n}")).await, 200);
+        }
+        sim.kill();
+        wait_for("a follower takes over", Duration::from_secs(15), || {
+            sim2.leads() || sim3.leads()
+        })
+        .await;
+        let winner = if sim2.leads() { &sim2 } else { &sim3 };
+        for n in 0..3 {
+            assert!(
+                marker(&winner.handle.store, &format!("kept-{n}")).is_some(),
+                "the new leader is missing confirmed write kept-{n}"
+            );
+        }
+        sim2.kill();
+        sim3.kill();
+    }
+
+    #[tokio::test]
+    async fn a_pull_from_a_newer_term_is_not_an_acknowledgement() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &api),
+            Member::voter("sim2", "http://127.0.0.1:9"),
+            Member::voter("sim3", "http://127.0.0.1:9"),
+        ];
+        // No follow loop: only the log route's own check is under test.
+        let sim = serve_voter("sim", listener, &members, true, 4, &api).await;
+        sim.handle
+            .store
+            .put_meta("pending", &"yes".to_string())
+            .unwrap();
+        let index = sim.handle.store.commit_index().unwrap();
+        let response = rpc_client()
+            .get(format!(
+                "{api}/cluster/log?after={index}&term=4&node=sim2&fterm=5"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 409);
+        assert!(!sim.leads(), "a leader told of a newer term keeps leading");
+        assert_eq!(sim.term(), 5);
+        assert!(
+            guard(&sim.handle.progress).get("sim2").is_none(),
+            "a pull from a newer term was counted as an acknowledgement"
+        );
+        sim.kill();
     }
 }
