@@ -133,7 +133,10 @@ pub struct ZoneStatus {
 
 resource!(
     /// An authoritative DNS zone.
-    Zone, ZoneSpec, ZoneStatus, kind::ZONE
+    Zone,
+    ZoneSpec,
+    ZoneStatus,
+    kind::ZONE
 );
 
 impl Zone {
@@ -223,7 +226,10 @@ pub struct RecordSetStatus {
 
 resource!(
     /// One owner name and one type in a zone.
-    RecordSet, RecordSetSpec, RecordSetStatus, kind::RECORD
+    RecordSet,
+    RecordSetSpec,
+    RecordSetStatus,
+    kind::RECORD
 );
 
 /// Every kind beacon owns, for the reconciler's event filter.

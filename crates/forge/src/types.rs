@@ -157,7 +157,10 @@ impl HostStatus {
 
 resource_kind!(
     /// A host the scheduler can place machines on.
-    Host, HostSpec, HostStatus, kind::HOST
+    Host,
+    HostSpec,
+    HostStatus,
+    kind::HOST
 );
 
 /// Build a host resource. `labels` land in `meta.labels` so the scheduler's
@@ -202,7 +205,10 @@ pub struct SizeStatus {}
 
 resource_kind!(
     /// A flavor: named bundle of resources.
-    Size, SizeSpec, SizeStatus, SIZE_KIND
+    Size,
+    SizeSpec,
+    SizeStatus,
+    SIZE_KIND
 );
 
 /// Sizes are cloud-scoped (project `None`).
@@ -367,7 +373,10 @@ impl MachineStatus {
 
 resource_kind!(
     /// A VM, container or bare-metal machine.
-    Machine, MachineSpec, MachineStatus, kind::MACHINE
+    Machine,
+    MachineSpec,
+    MachineStatus,
+    kind::MACHINE
 );
 
 pub fn new_machine(name: impl Into<String>, project: Option<Id>, spec: MachineSpec) -> Machine {
