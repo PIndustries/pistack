@@ -139,7 +139,9 @@ impl Slab {
 
     fn client_from(&self, ctx: &ModuleContext) -> Client {
         let store: Arc<Store> = ctx.store::<Store>();
-        let client = self.client((*store).clone());
+        let client = self
+            .client((*store).clone())
+            .with_node(ctx.node_name.clone());
         match &self.queue {
             Some(queue) => client.with_queue(queue.clone()),
             None => client,
@@ -164,6 +166,24 @@ impl Module for Slab {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let client = self.client_from(&ctx);
+        let checker = client.clone();
+        tokio::spawn(async move {
+            match checker.check_volume_types().await {
+                Ok(results) => {
+                    for (name, result) in results {
+                        match result {
+                            Ok(()) => tracing::info!(volume_type = %name, "volume type is usable"),
+                            Err(e) => tracing::warn!(
+                                volume_type = %name,
+                                error = %e,
+                                "volume type is not usable on this server"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "slab: could not check volume types"),
+            }
+        });
         tokio::spawn(reconcile::run(
             client,
             ctx.events.clone(),

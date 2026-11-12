@@ -8,6 +8,10 @@
 //! backend and stays the default. `lvm` runs only when the volume group, thin
 //! pool, and LVM tools exist. `rbd` runs only when the pool, monitors, and
 //! `rbd` binary exist. A missing binary or pool is unavailable.
+//!
+//! A local file and an LVM volume exist on one node, the one that ran the
+//! backend. The client records it as `status.home_node` and refuses to
+//! attach the volume anywhere else. Only `rbd` is reachable from every host.
 
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult};
@@ -312,34 +316,144 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> String {
     String::from_utf8_lossy(&buf).trim().to_owned()
 }
 
+/// Work a backend still has to do once every byte of a restore has been
+/// written. It is given the number of bytes written.
+pub(crate) type RestoreFinish = Box<
+    dyn FnOnce(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<()>> + Send>>
+        + Send,
+>;
+
 /// Write handle for a restore. The caller writes the object from byte 0.
-#[derive(Debug)]
+/// Dropping it before [`RestoreStream::finish`] stops an import command.
 pub struct RestoreStream {
-    file: tokio::fs::File,
+    kind: WriteKind,
+    written: u64,
+}
+
+impl std::fmt::Debug for RestoreStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            WriteKind::File(_) => f.write_str("RestoreStream::File"),
+            WriteKind::Child { label, .. } => write!(f, "RestoreStream::Child({label})"),
+        }
+    }
+}
+
+enum WriteKind {
+    File(tokio::fs::File),
+    Child {
+        stdin: tokio::process::ChildStdin,
+        child: tokio::process::Child,
+        stderr: tokio::sync::oneshot::Receiver<String>,
+        label: &'static str,
+        after: RestoreFinish,
+    },
 }
 
 impl RestoreStream {
     pub(crate) fn file(file: tokio::fs::File) -> Self {
-        Self { file }
+        Self {
+            kind: WriteKind::File(file),
+            written: 0,
+        }
+    }
+
+    /// Spawn `bin args…` and write the restore to its stdin. `after` runs
+    /// once the command has exited with success.
+    pub(crate) fn spawn(
+        bin: &str,
+        args: &[String],
+        label: &'static str,
+        after: RestoreFinish,
+    ) -> ApiResult<Self> {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::unavailable(format!("{label} is not available"))
+            } else {
+                ApiError::internal(format!("{label}: {e}"))
+            }
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ApiError::internal(format!("{label} has no stdin")))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let detail = drain_stderr(stderr).await;
+                let _ = tx.send(detail);
+            });
+        } else {
+            let _ = tx.send(String::new());
+        }
+        Ok(Self {
+            kind: WriteKind::Child {
+                stdin,
+                child,
+                stderr: rx,
+                label,
+                after,
+            },
+            written: 0,
+        })
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> ApiResult<()> {
-        self.file
-            .write_all(buf)
-            .await
-            .map_err(|e| ApiError::internal(format!("backup restore: {e}")))
+        let result = match &mut self.kind {
+            WriteKind::File(file) => file.write_all(buf).await,
+            WriteKind::Child { stdin, .. } => stdin.write_all(buf).await,
+        };
+        result.map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
+        self.written += buf.len() as u64;
+        Ok(())
     }
 
-    pub async fn finish(mut self) -> ApiResult<()> {
-        self.file
-            .flush()
-            .await
-            .map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
-        self.file
-            .sync_all()
-            .await
-            .map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
-        Ok(())
+    pub async fn finish(self) -> ApiResult<()> {
+        let written = self.written;
+        match self.kind {
+            WriteKind::File(mut file) => {
+                file.flush()
+                    .await
+                    .map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
+                file.sync_all()
+                    .await
+                    .map_err(|e| ApiError::internal(format!("backup restore: {e}")))?;
+                Ok(())
+            }
+            WriteKind::Child {
+                mut stdin,
+                mut child,
+                stderr,
+                label,
+                after,
+            } => {
+                // The command reads to end of input, so close it first.
+                let flushed = stdin.shutdown().await;
+                drop(stdin);
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| ApiError::internal(format!("{label}: {e}")))?;
+                let detail = stderr.await.unwrap_or_default();
+                if !status.success() {
+                    let code = status.code().unwrap_or(-1);
+                    let detail = if detail.is_empty() {
+                        format!("exit {code}")
+                    } else {
+                        format!("exit {code}: {detail}")
+                    };
+                    return Err(ApiError::internal(format!("{label} failed: {detail}")));
+                }
+                flushed.map_err(|e| ApiError::internal(format!("{label}: {e}")))?;
+                after(written).await
+            }
+        }
     }
 }
 

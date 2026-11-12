@@ -2,7 +2,9 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Sparse raw files under one directory. The development backend, and good
-//! enough for a single host: `anvil` attaches the file directly.
+//! enough for a single host: `anvil` attaches the file directly. The path
+//! means something only on the node that holds the file, so the client
+//! checks the host before it hands the path out.
 //!
 //! Layout: `<dir>/<vol-id>.raw`, `<dir>/snapshots/<snap-id>.raw`.
 //!

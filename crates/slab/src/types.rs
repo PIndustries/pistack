@@ -146,6 +146,11 @@ pub struct VolumeStatus {
     /// Opaque backend handle: a file path, an LV path, an RBD image name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_ref: Option<String>,
+    /// Node that holds the bytes of a local file or an LVM volume. Such a
+    /// volume attaches only on that node. Absent for RBD, which every host
+    /// reaches over the network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }
