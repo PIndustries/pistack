@@ -182,7 +182,7 @@ async fn login(
     let store = &st.store;
     let invalid = || ApiError::unauthorized("invalid credentials");
 
-    let (principal, key_project) = if let Some(secret) = req.api_key.as_deref() {
+    let (principal, key_project, key) = if let Some(secret) = req.api_key.as_deref() {
         let hash = credentials::hash_api_key(secret);
         let key = store
             .collection::<ApiKey>()
@@ -197,7 +197,7 @@ async fn login(
             .collection::<Principal>()
             .try_get(&key.spec.principal)?
             .ok_or_else(invalid)?;
-        (p, key.spec.project)
+        (p, key.spec.project.clone(), Some(key.meta.id))
     } else {
         let name = req
             .name
@@ -216,7 +216,7 @@ async fn login(
             tracing::info!(principal = name, "failed password login");
             return Err(invalid());
         }
-        (p, None)
+        (p, None, None)
     };
 
     let project = match req.project.as_deref() {
@@ -228,7 +228,7 @@ async fn login(
         Some(s) => Duration::seconds(s).min(MAX_TTL),
         None => DEFAULT_TTL,
     };
-    Ok(Json(issue_token(&st, &principal, project, ttl)?))
+    Ok(Json(issue_token(&st, &principal, project, key, ttl)?))
 }
 
 /// Resolve roles from bindings and sign a token. Library entry point so
@@ -237,13 +237,14 @@ pub fn issue_token(
     st: &AppState,
     principal: &Principal,
     project: Option<Id>,
+    key: Option<Id>,
     ttl: Duration,
 ) -> ApiResult<TokenResponse> {
     if !principal.spec.enabled {
         return Err(ApiError::unauthorized("principal is disabled"));
     }
     let caller = caller_for(&st.store, principal, project)?;
-    let (token, claims) = st.keys.sign(&caller, ttl)?;
+    let (token, claims) = st.keys.sign_for_key(&caller, key, ttl)?;
     Ok(TokenResponse {
         token,
         token_type: "Bearer".into(),

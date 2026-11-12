@@ -504,3 +504,89 @@ async fn attach_caller_aws4_rules() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(to_bytes(res.into_body(), 1024).await.unwrap(), "silo-ok");
 }
+
+#[tokio::test]
+async fn a_token_stops_working_when_what_it_stood_on_is_gone() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let admin = v["token"].as_str().unwrap().to_owned();
+    let post = |path: &'static str, tok: String, body: Value| {
+        let app = app.clone();
+        async move { call(&app, "POST", path, Some(&tok), Some(body)).await }
+    };
+    let (s, _) = post("/projects", admin.clone(), json!({"name": "web"})).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = post(
+        "/principals",
+        admin.clone(),
+        json!({"name": "alice", "password": "pw-alice", "default_project": "web"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, binding) = post(
+        "/bindings",
+        admin.clone(),
+        json!({"principal": "alice", "role": "member", "project": "web"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let (_, v) = login(&app, "alice", "pw-alice").await;
+    let by_password = v["token"].as_str().unwrap().to_owned();
+    let (s, key) = post("/keys", by_password.clone(), json!({"name": "laptop"})).await;
+    assert_eq!(s, StatusCode::CREATED, "{key}");
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/tokens",
+        None,
+        Some(json!({"api_key": key["secret"]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let by_key = v["token"].as_str().unwrap().to_owned();
+    let who = |tok: String| {
+        let app = app.clone();
+        async move { call(&app, "GET", "/tokens/self", Some(&tok), None).await }
+    };
+    assert_eq!(who(by_key.clone()).await.0, StatusCode::OK);
+
+    // The key is deleted: its token dies, the password one does not.
+    let path = format!("/keys/{}", key["id"].as_str().unwrap());
+    let (s, _) = call(&app, "DELETE", &path, Some(&by_password), None).await;
+    assert!(s.is_success(), "{s}");
+    let (s, v) = who(by_key).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["error"]["message"], "token revoked");
+    let (s, v) = who(by_password.clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["roles"], json!(["member"]));
+
+    // The binding is removed: the token says so on the next request.
+    let path = format!("/bindings/{}", binding["id"].as_str().unwrap());
+    let (s, _) = call(&app, "DELETE", &path, Some(&admin), None).await;
+    assert!(s.is_success(), "{s}");
+    let (s, v) = who(by_password.clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["roles"], json!([]));
+
+    // The user is disabled: the token is refused.
+    let (_, alice) = call(&app, "GET", "/principals/alice", Some(&admin), None).await;
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/principals/alice")
+                .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, alice["revision"].to_string())
+                .body(Body::from(json!({"enabled": false}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.status());
+    assert_eq!(who(by_password).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(who(admin).await.0, StatusCode::OK);
+}
