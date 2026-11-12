@@ -9,8 +9,8 @@
 //! port. Unspecified, public, multicast, broadcast, link-local, and
 //! 100.64/10 addresses are refused.
 //! `provider_ref` is the bound socket, `127.0.0.1:PORT` when the bind
-//! address is loopback. The TCP accept loop dials the first member and
-//! copies both directions. An empty TCP member list, or a member that does
+//! address is loopback. The TCP accept loop dials the members in turn, one
+//! per connection, and copies both directions. An empty TCP member list, or a member that does
 //! not accept, is accepted and closed. UDP copies datagrams to an up member
 //! and is not ready when that list is empty. A later `ensure_listener`
 //! replaces the member list without rebinding. `delete_listener` and
@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -117,6 +118,7 @@ async fn accept_loop(
     members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
+    let cursor = Arc::new(AtomicUsize::new(0));
     loop {
         tokio::select! {
             biased;
@@ -125,8 +127,9 @@ async fn accept_loop(
                 match accepted {
                     Ok((stream, _)) => {
                         let members = members.clone();
+                        let cursor = cursor.clone();
                         tokio::spawn(async move {
-                            forward_one(stream, members).await;
+                            forward_one(stream, members, cursor).await;
                         });
                     }
                     Err(e) => {
@@ -139,9 +142,21 @@ async fn accept_loop(
     }
 }
 
-async fn forward_one(mut inbound: TcpStream, members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>) {
+fn pick(members: &[SocketAddr], cursor: &AtomicUsize) -> Option<SocketAddr> {
+    if members.is_empty() {
+        return None;
+    }
+    let n = cursor.fetch_add(1, Ordering::Relaxed);
+    Some(members[n % members.len()])
+}
+
+async fn forward_one(
+    mut inbound: TcpStream,
+    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    cursor: Arc<AtomicUsize>,
+) {
     let _ = inbound.set_nodelay(true);
-    let dest = members.lock().first().copied();
+    let dest = pick(&members.lock(), &cursor);
     let Some(dest) = dest else {
         return;
     };
@@ -510,6 +525,34 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn connections_take_the_members_in_turn() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addrs = vec![first.local_addr().unwrap(), second.local_addr().unwrap()];
+        for (member, body) in [(first, b"one!"), (second, b"two!")] {
+            tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = member.accept().await.unwrap();
+                    let mut buf = [0u8; 4];
+                    sock.read_exact(&mut buf).await.unwrap();
+                    sock.write_all(body).await.unwrap();
+                }
+            });
+        }
+
+        let p = ForwardProvider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        p.ensure_listener(&view_with(&lb, addrs)).await.unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(read_n(&realized.provider_ref, 4).await);
+        }
+        assert_eq!(seen, [b"one!", b"two!", b"one!", b"two!"]);
+        p.delete_balancer(&lb.meta.id).await.unwrap();
     }
 
     #[tokio::test]
