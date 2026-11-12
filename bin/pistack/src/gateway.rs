@@ -139,7 +139,41 @@ pub fn build(
             )
         }),
     )
-    .layer(CorsLayer::permissive())
+    .layer(cors_layer(std::env::var(CORS_ORIGINS_ENV).ok().as_deref()))
+}
+
+/// Comma-separated origins allowed to call the API from a browser page
+/// served somewhere else. Unset, there are none: the console is served by
+/// this gateway and needs no cross-origin access.
+pub const CORS_ORIGINS_ENV: &str = "PISTACK_CORS_ORIGINS";
+
+/// Cross-origin rules for the listed origins. An empty or unset list sends
+/// no CORS headers, so a browser refuses a page on another origin. An entry
+/// that is not a valid header value is skipped with a warning.
+fn cors_layer(origins: Option<&str>) -> CorsLayer {
+    let allowed: Vec<axum::http::HeaderValue> = origins
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .filter_map(|o| match o.trim_end_matches('/').parse() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(
+                    origin = o,
+                    "ignoring a malformed entry in {CORS_ORIGINS_ENV}"
+                );
+                None
+            }
+        })
+        .collect();
+    if allowed.is_empty() {
+        return CorsLayer::new();
+    }
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
 }
 
 fn agent_image_routes(images: mold::Client) -> Router {
@@ -256,7 +290,7 @@ async fn dev_admin(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_admin, enforce_write_role};
+    use super::{cors_layer, dev_admin, enforce_write_role};
     use axum::{
         body::{to_bytes, Body},
         extract::Request,
@@ -293,6 +327,36 @@ mod tests {
             verifier,
             gate::attach_caller,
         ))
+    }
+
+    async fn allowed_origin(layer: tower_http::cors::CorsLayer, origin: &str) -> Option<String> {
+        let app = Router::new().route("/healthz", get(who)).layer(layer);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_owned())
+    }
+
+    #[tokio::test]
+    async fn only_a_listed_origin_is_allowed_cross_origin() {
+        let other = "https://elsewhere.example";
+        assert_eq!(allowed_origin(cors_layer(None), other).await, None);
+        assert_eq!(allowed_origin(cors_layer(Some(" , ")), other).await, None);
+        let listed = Some("https://portal.example/, https://ops.example");
+        assert_eq!(allowed_origin(cors_layer(listed), other).await, None);
+        assert_eq!(
+            allowed_origin(cors_layer(listed), "https://portal.example").await,
+            Some("https://portal.example".into())
+        );
     }
 
     async fn body(resp: axum::response::Response) -> String {
