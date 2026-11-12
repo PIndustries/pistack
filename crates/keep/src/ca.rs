@@ -308,6 +308,20 @@ impl Ca {
     }
 }
 
+/// Is the DER certificate's serial on any authority's revocation list?
+/// Serials come from one cloud-wide counter, so one match is enough. Reads
+/// the store only; needs no key.
+pub fn is_revoked(store: &Store, der: &[u8]) -> Result<bool> {
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| KeepError::Pki(format!("cannot parse certificate: {e}")))?;
+    let serial = serial_u64(cert.serial.to_bytes_be().as_slice());
+    Ok(store
+        .collection::<CertificateAuthority>()
+        .list(None)?
+        .iter()
+        .any(|ca| ca.status.revoked.iter().any(|r| r.serial == serial)))
+}
+
 // ---- helpers -----------------------------------------------------------------
 
 fn try_by_name(store: &Store, name: &str) -> Result<Option<CertificateAuthority>> {
@@ -665,7 +679,7 @@ mod tests {
 
     #[test]
     fn client_cert_verifies_and_revokes() {
-        let (_store, ca) = boot();
+        let (store, ca) = boot();
         let issued = ca
             .issue(&CertificateSpec {
                 common_name: "agent-01".into(),
@@ -702,6 +716,7 @@ mod tests {
             .is_err());
 
         // Revocation.
+        assert!(!is_revoked(&store, &der).unwrap());
         ca.revoke(ca.issuing_id(), issued.serial).unwrap();
         ca.revoke(ca.issuing_id(), issued.serial).unwrap();
         let crl = ca.crl(ca.issuing_id()).unwrap();
@@ -711,6 +726,7 @@ mod tests {
             ca.verify_client_cert(&der),
             Err(KeepError::Unauthorized(_))
         ));
+        assert!(is_revoked(&store, &der).unwrap());
     }
 
     #[test]
