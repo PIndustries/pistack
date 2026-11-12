@@ -7,8 +7,9 @@
 //! Actions are `"<resource>.<verb>"`, e.g. `machines.create`, `projects.list`.
 //! Verbs `get`, `list`, `read`, `watch` are reads; everything else is a write.
 //!
-//! * `admin` (system-scoped, or the `admin` role on the token) may do anything.
-//! * `member` may read and write within the project the token is scoped to.
+//! * `admin` bound at system scope may do anything.
+//! * `admin` bound in a project, and `member`, may read and write within the
+//!   project the token is scoped to.
 //! * `reader` may read within the project the token is scoped to.
 //! * Anything with no project (`project: None`) is a system action: admin only.
 
@@ -40,7 +41,7 @@ pub fn authorize(caller: &Caller, action: &str, project: Option<&Id>) -> ApiResu
     if caller.project.as_ref() != Some(project) {
         return deny("token is not scoped to this project");
     }
-    if caller.has_role(ROLE_MEMBER) {
+    if caller.has_role(ROLE_MEMBER) || caller.has_role(ROLE_ADMIN) {
         return Ok(());
     }
     if caller.has_role(ROLE_READER) && is_read(action) {
@@ -73,8 +74,13 @@ pub fn document() -> PolicyDocument {
         roles: vec![
             PolicyRole {
                 name: ROLE_ADMIN,
-                scope: "system or project",
+                scope: "system",
                 allows: "*",
+            },
+            PolicyRole {
+                name: ROLE_ADMIN,
+                scope: "project",
+                allows: "read and write within the scoped project",
             },
             PolicyRole {
                 name: ROLE_MEMBER,
@@ -120,7 +126,9 @@ mod tests {
         let cases: Vec<(&Caller, &str, Option<&Id>, bool)> = vec![
             (&sys_admin, "projects.list", None, true),
             (&sys_admin, "machines.create", Some(&other), true),
-            (&proj_admin, "projects.list", None, true),
+            (&proj_admin, "projects.list", None, false),
+            (&proj_admin, "machines.create", Some(&p), true),
+            (&proj_admin, "machines.create", Some(&other), false),
             (&member, "projects.list", None, false),
             (&member, "machines.create", Some(&p), true),
             (&member, "machines.get", Some(&p), true),

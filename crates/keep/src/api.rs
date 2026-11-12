@@ -152,12 +152,22 @@ impl Scope {
     }
     /// Member or admin: may create, change, rotate, delete, read payloads.
     fn require_write(&self) -> ApiResult<()> {
-        if self.0.is_admin() || self.0.has_role("member") {
+        if self.0.can_write() {
             Ok(())
         } else {
             Err(ApiError::forbidden("member role required"))
         }
     }
+    /// Cloud admin, or `admin` in the token's project. For actions on
+    /// something already checked to be in that project.
+    fn require_project_admin(&self) -> ApiResult<()> {
+        if self.0.is_admin() || self.0.has_role("admin") {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden("admin role required"))
+        }
+    }
+    /// Cloud admin only: authorities, join tokens.
     fn require_admin(&self) -> ApiResult<()> {
         if self.0.is_admin() {
             Ok(())
@@ -492,7 +502,7 @@ async fn create_access_key(
         .ok_or_else(|| ApiError::bad_request("an access key needs a project"))?;
     let principal = match req.principal {
         Some(p) if p != scope.caller().principal => {
-            scope.require_admin()?;
+            scope.require_project_admin()?;
             p
         }
         _ => scope.caller().principal.clone(),
@@ -638,7 +648,7 @@ async fn get_certificate_key(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<CertificateKey>> {
-    scope.require_admin()?;
+    scope.require_project_admin()?;
     let cert = resolve::<Certificate>(&c, &scope, &id)?;
     let key_pem = c.certificate_key_pem(&cert)?;
     Ok(Json(CertificateKey {

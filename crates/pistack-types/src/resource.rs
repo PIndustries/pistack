@@ -275,13 +275,16 @@ impl Caller {
     pub fn has_role(&self, r: &str) -> bool {
         self.roles.iter().any(|x| x == r)
     }
+    /// Cloud admin: holds `admin` at system scope. The `admin` role bound
+    /// inside one project does not count; it writes there like a `member`.
     pub fn is_admin(&self) -> bool {
-        self.system || self.has_role("admin")
+        self.system
     }
-    /// Admin or `member`: may create, change and delete. A `reader`, or a
-    /// caller with no role, may only read.
+    /// Cloud admin, or `admin` or `member` in the token's project: may
+    /// create, change and delete. A `reader`, or a caller with no role, may
+    /// only read.
     pub fn can_write(&self) -> bool {
-        self.is_admin() || self.has_role("member")
+        self.system || self.has_role("admin") || self.has_role("member")
     }
     /// [`Caller::can_write`] as an error for handlers and middleware.
     pub fn require_write(&self) -> crate::ApiResult<()> {

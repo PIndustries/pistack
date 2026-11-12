@@ -440,6 +440,18 @@ async fn certificates_and_cas_over_http() {
     assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, key) = call(&app, "GET", "/certificates/web/key", Some(&padmin), None).await;
     assert_eq!(st, StatusCode::OK, "{key}");
+    // Admin in one project is not admin of the cloud.
+    let (st, _) = call(&app, "GET", "/cas", Some(&padmin), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/join-tokens",
+        Some(&padmin),
+        Some(json!({"name": "rogue"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
     assert!(key["key_pem"].as_str().unwrap().contains("PRIVATE KEY"));
     assert_eq!(key["cert_pem"], cert["status"]["cert_pem"]);
     assert_eq!(
