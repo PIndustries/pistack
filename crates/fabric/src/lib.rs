@@ -163,6 +163,9 @@ impl Module for Fabric {
                                 _ = tick.tick() => {
                                     run_auto_fips(&client);
                                     client.reconcile_pending().await;
+                                    if let Err(e) = client.backend().refresh().await {
+                                        tracing::warn!(error = %e.message, "fabric: backend refresh");
+                                    }
                                 },
                             }
                         }

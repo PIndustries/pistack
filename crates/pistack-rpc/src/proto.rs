@@ -80,6 +80,40 @@ pub struct HelloAck {
     pub heartbeat_interval_secs: u64,
     /// Upper bound the server will honour for `?wait=` on the command poll.
     pub max_long_poll_secs: u64,
+    /// Set when the cluster's networks are OVN and the server knows the
+    /// southbound address. The agent points this host's Open vSwitch at it.
+    /// Absent leaves the host as the operator configured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ovn: Option<OvnHostConfig>,
+}
+
+/// What a host needs to join the cluster's OVN as a chassis.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OvnHostConfig {
+    /// Southbound database, as `ovn-controller` takes it:
+    /// `tcp:10.0.0.11:6642`, or several separated by commas.
+    pub sb_remote: String,
+    /// Tunnel encapsulation: `geneve` or `vxlan`.
+    pub encap_type: String,
+}
+
+/// OVN on one host, as its agent last saw it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OvnReport {
+    /// `external_ids:system-id`, the name OVN knows this chassis by.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chassis: String,
+    /// The integration bridge exists and `ovn-controller` is connected to
+    /// the southbound database.
+    #[serde(default)]
+    pub ready: bool,
+    /// Why the host is not ready. Empty when it is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// `external_ids:ovn-bridge-mappings`, `physnet:bridge` pairs. A host
+    /// that has one can carry a router's gateway port.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bridge_mappings: String,
 }
 
 /// Periodic state report.
@@ -91,6 +125,10 @@ pub struct Heartbeat {
     pub machines: Vec<MachineReport>,
     #[serde(default = "Utc::now")]
     pub at: DateTime<Utc>,
+    /// OVN on this host. Absent when the host has no Open vSwitch or the
+    /// agent has not looked yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ovn: Option<OvnReport>,
 }
 
 /// One machine as the host sees it.

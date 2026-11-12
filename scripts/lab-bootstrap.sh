@@ -59,6 +59,8 @@ install() {
     sudo -u pistack bash -lc 'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt'
   fi
   # OVN in single-node mode so fabric can talk to the NB DB on this box.
+  # On a multi-node lab the agent replaces ovn-remote and ovn-encap-ip with
+  # what the server hands out (PISTACK_OVN_SB); system-id set here is kept.
   ovs-vsctl set open . external-ids:ovn-remote=unix:/var/run/ovn/ovnsb_db.sock \
     external-ids:ovn-encap-type=geneve external-ids:ovn-encap-ip="$(hostname -I | awk '{print $1}')" \
     external-ids:system-id="$(hostname)" || true

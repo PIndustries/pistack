@@ -31,8 +31,8 @@ pub use proto::{
     AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, DiskTarget,
     EnrollRequest, EnrollResponse, ExecEnv, ExecOutput, ExecRequest, Heartbeat, HeartbeatAck,
     HelloAck, ImageSource, LogText, MachineKind, MachineRef, MachineReport, MachineRequest,
-    PortPlug, PowerState, ProbeReport, ReportAck, RunningMachine, VolumeAttach, VolumeAttached,
-    VolumeDetach, JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
+    OvnHostConfig, OvnReport, PortPlug, PowerState, ProbeReport, ReportAck, RunningMachine,
+    VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
 pub use server::{
@@ -67,6 +67,7 @@ mod loopback {
             command_timeout: Duration::from_secs(30),
             capacity: 16,
             heartbeat_interval: Duration::from_secs(7),
+            ovn: None,
         });
         let (base, server) = serve(queue.clone()).await;
         let client = AgentClient::new(&base, "host-a")
@@ -141,6 +142,7 @@ mod loopback {
                     probes: Vec::new(),
                 }],
                 at: Utc::now(),
+                ovn: None,
             })
             .await
             .unwrap();
@@ -174,6 +176,7 @@ mod loopback {
             command_timeout: Duration::from_secs(5),
             capacity: 4,
             heartbeat_interval: Duration::from_secs(30),
+            ovn: None,
         });
         let (base, server) = serve(queue.clone()).await;
         let client = AgentClient::new(&base, "host-a").unwrap();

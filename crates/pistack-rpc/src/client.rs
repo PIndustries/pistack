@@ -496,6 +496,7 @@ mod tests {
             resources_free: Default::default(),
             machines: vec![],
             at: chrono::Utc::now(),
+            ovn: None,
         }
     }
 
@@ -681,6 +682,7 @@ mod tests {
                         resources_free: pistack_types::Resources::default(),
                         machines: vec![],
                         at: chrono::Utc::now(),
+                        ovn: None,
                     })
                     .await;
                 let _ = client.next_commands(Duration::ZERO).await;

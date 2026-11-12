@@ -63,6 +63,12 @@ pub trait NetBackend: Send + Sync + 'static {
     /// leadership before each write.
     fn attach(&self, _leadership: &Leadership, _store: &Store) {}
 
+    /// Called on the reconciler's timer. A backend whose state depends on
+    /// something other than fabric's own records re-reads it here.
+    async fn refresh(&self) -> ApiResult<()> {
+        Ok(())
+    }
+
     async fn ensure_network(&self, net: &Network) -> ApiResult<()>;
     async fn delete_network(&self, id: &Id) -> ApiResult<()>;
 

@@ -635,6 +635,7 @@ mod tests {
                 resources_free: Resources::default(),
                 machines: vec![],
                 at: Utc::now(),
+                ovn: None,
             })
             .await
             .unwrap();
@@ -720,6 +721,7 @@ mod tests {
             resources_free: Resources::default(),
             machines: vec![],
             at: Utc::now(),
+            ovn: None,
         };
         let ack: HeartbeatAck = http
             .post(format!("{base}/agents/heartbeat"))
@@ -788,6 +790,7 @@ mod tests {
                 resources_free: Resources::default(),
                 machines: vec![],
                 at: Utc::now(),
+                ovn: None,
             })
             .send()
             .await
@@ -819,6 +822,7 @@ mod tests {
                 resources_free: Resources::default(),
                 machines: vec![],
                 at: Utc::now(),
+                ovn: None,
             })
             .await
             .unwrap();

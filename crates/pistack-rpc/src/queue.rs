@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::error::RpcError;
 use crate::proto::{
     AgentEvent, AgentHello, Command, CommandId, CommandKind, CommandResult, Heartbeat,
-    HeartbeatAck, HelloAck, MachineReport, MAX_LONG_POLL_SECS,
+    HeartbeatAck, HelloAck, MachineReport, OvnHostConfig, MAX_LONG_POLL_SECS,
 };
 
 /// Capacity of the [`AgentEvent`] broadcast; a subscriber this far behind
@@ -46,6 +46,9 @@ pub struct QueueConfig {
     pub capacity: usize,
     /// Interval agents are told to heartbeat at.
     pub heartbeat_interval: Duration,
+    /// OVN settings handed to every agent in the hello answer. `None`
+    /// when the cluster's networks are not OVN.
+    pub ovn: Option<OvnHostConfig>,
 }
 
 impl Default for QueueConfig {
@@ -54,6 +57,7 @@ impl Default for QueueConfig {
             command_timeout: Duration::from_secs(120),
             capacity: 1024,
             heartbeat_interval: Duration::from_secs(15),
+            ovn: None,
         }
     }
 }
@@ -253,6 +257,7 @@ impl CommandQueue {
             server_time: now,
             heartbeat_interval_secs: self.0.cfg.heartbeat_interval.as_secs().max(1),
             max_long_poll_secs: MAX_LONG_POLL_SECS,
+            ovn: self.0.cfg.ovn.clone(),
         }
     }
 
@@ -546,6 +551,7 @@ mod tests {
             command_timeout: Duration::from_secs(timeout_secs),
             capacity: 4,
             heartbeat_interval: Duration::from_secs(5),
+            ovn: None,
         }
     }
 
@@ -742,6 +748,7 @@ mod tests {
             resources_free: Resources::default(),
             machines: vec![],
             at: Utc::now(),
+            ovn: None,
         });
         assert!(!ack.known);
         assert_eq!(q.pending_count(), 0);
@@ -796,6 +803,7 @@ mod tests {
             },
             machines: vec![],
             at: Utc::now(),
+            ovn: None,
         });
         assert!(hb.known);
         assert_eq!(hb.commands_waiting, 1);
@@ -827,6 +835,7 @@ mod tests {
             resources_free: Resources::default(),
             machines: vec![],
             at: Utc::now(),
+            ovn: None,
         };
         q.heartbeat(&hb);
         assert_eq!(rx.recv().await.unwrap(), AgentEvent::Hello(hello));

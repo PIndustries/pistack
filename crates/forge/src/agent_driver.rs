@@ -125,6 +125,21 @@ impl RpcDriver {
 impl HostDriver for RpcDriver {
     async fn start(&self, m: &Machine) -> ApiResult<MachineRuntime> {
         let mut req = self.request_for(m);
+        if crate::ovn::enabled() && crate::nic::wants_port(m) {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| ApiError::internal("ovn placement needs the store"))?;
+            req.nics = crate::nic::attachments(store, m)?;
+            // The agent plugs the tap with the port's iface-id. A port fabric
+            // has not written to OVN yet has no binding to plug with.
+            if req.nics.iter().any(|n| n.binding.is_none()) {
+                return Err(ApiError::unavailable(format!(
+                    "machine {} has a port that is not bound in OVN yet",
+                    m.meta.id
+                )));
+            }
+        }
         if crate::overlay::enabled() && crate::nic::wants_port(m) {
             let store = self
                 .store
@@ -581,6 +596,7 @@ impl Registrar {
         let now = Utc::now();
         match col.modify(&host.meta.id, |x| {
             x.status.last_seen = Some(now);
+            x.status.set_ovn(hb.ovn.as_ref());
             if x.status.phase == Phase::Error && x.status.message.starts_with("no report") {
                 x.status.phase = Phase::Ready;
                 x.status.message.clear();
@@ -766,6 +782,7 @@ mod tests {
             command_timeout: Duration::from_millis(50),
             capacity: 4,
             heartbeat_interval: Duration::from_secs(5),
+            ovn: None,
         });
         let driver = RpcDriver::for_node(queue, "offline");
         let e = driver
@@ -818,6 +835,7 @@ mod tests {
                 probes: Vec::new(),
             }],
             at: Utc::now(),
+            ovn: None,
         })
         .unwrap();
         let m = store.collection::<Machine>().get(&m.meta.id).unwrap();
@@ -849,6 +867,7 @@ mod tests {
             resources_free: Resources::default(),
             machines: vec![],
             at: Utc::now(),
+            ovn: None,
         })
         .unwrap();
         assert_eq!(store.collection::<Host>().list(None).unwrap().len(), 1);
@@ -895,12 +914,85 @@ mod tests {
                 probes: vec![report.clone()],
             }],
             at: Utc::now(),
+            ovn: None,
         })
         .unwrap();
         let stored = store.collection::<Machine>().get(&m.meta.id).unwrap();
         assert_eq!(stored.status.addresses, vec!["10.0.0.7"]);
         assert_eq!(stored.status.power, PowerState::On);
         assert_eq!(stored.status.probes, vec![report]);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_keeps_the_ovn_report_and_fabric_can_read_it() {
+        let store = Store::in_memory().unwrap();
+        let drivers = Arc::new(DriverRegistry::new());
+        let queue = CommandQueue::default();
+        let reg = Registrar::new(store.clone(), drivers, queue.clone());
+        let host = reg.on_hello(&hello("h1")).unwrap();
+        assert_eq!(host.status.ovn, None);
+        let col = store.collection::<Host>();
+        let beat = |ovn: Option<pistack_rpc::OvnReport>| Heartbeat {
+            node_name: "h1".into(),
+            resources_free: Resources::default(),
+            machines: vec![],
+            at: Utc::now(),
+            ovn,
+        };
+
+        let down = pistack_rpc::OvnReport {
+            chassis: "h1".into(),
+            ready: false,
+            message: "ovn-controller did not answer; is it running?".into(),
+            bridge_mappings: "physnet1:br-ex".into(),
+        };
+        reg.on_heartbeat(&beat(Some(down.clone()))).unwrap();
+        let got = col.get(&host.meta.id).unwrap();
+        assert_eq!(got.status.ovn.as_ref(), Some(&down));
+        let cond = got
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "OvnReady")
+            .unwrap();
+        assert!(!cond.status);
+        assert_eq!(cond.reason, "ChassisNotReady");
+        assert!(cond.message.contains("ovn-controller"));
+        assert!(!crate::ovn::chassis_ready(&got));
+        assert!(fabric::backend::ovn::gateway_candidates(&store)
+            .unwrap()
+            .is_empty());
+
+        let up = pistack_rpc::OvnReport {
+            ready: true,
+            message: String::new(),
+            ..down
+        };
+        reg.on_heartbeat(&beat(Some(up))).unwrap();
+        let got = col.get(&host.meta.id).unwrap();
+        assert!(crate::ovn::chassis_ready(&got));
+        let cond = got
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "OvnReady")
+            .unwrap();
+        assert!(cond.status);
+        assert_eq!(cond.reason, "ChassisConnected");
+        // The record forge writes is the one fabric picks gateways from.
+        assert_eq!(
+            fabric::backend::ovn::gateway_candidates(&store).unwrap(),
+            vec!["h1".to_string()]
+        );
+
+        // An agent that stops reporting OVN clears it.
+        reg.on_heartbeat(&beat(None)).unwrap();
+        let got = col.get(&host.meta.id).unwrap();
+        assert_eq!(got.status.ovn, None);
+        assert!(got.status.conditions.iter().all(|c| c.kind != "OvnReady"));
+        assert!(fabric::backend::ovn::gateway_candidates(&store)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -38,6 +38,7 @@ async fn machine_runs_on_a_joined_agent() {
         command_timeout: Duration::from_secs(10),
         capacity: 64,
         heartbeat_interval: Duration::from_secs(1),
+        ovn: None,
     });
     let forge = Forge::with_queue(Arc::new(DriverRegistry::new()), queue.clone()).dev_admin(true);
     let app = Router::new()
