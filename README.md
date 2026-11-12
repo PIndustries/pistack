@@ -38,6 +38,36 @@ Shared crates: `pistack-types` (resource model, errors, the `Module` contract), 
 
 The binary mounts every module on one API. The shape of the system is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The phase list is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## Installing
+
+Releases for Linux x86_64 and aarch64 are on the [releases page](https://github.com/PIndustries/pistack/releases). Each tarball holds `pistack`, `pi`, the host helpers, the systemd units and an install script.
+
+```sh
+tar -xzf pistack-0.1.0-linux-x86_64.tar.gz
+cd pistack-0.1.0-linux-x86_64
+sudo ./install.sh
+```
+
+Check the download against `SHA256SUMS` first; [docs/RELEASING.md](docs/RELEASING.md) shows how.
+
+The script puts the binaries in `/usr/local/bin`, the helpers in `/usr/local/sbin`, the units in `/etc/systemd/system` and the settings in `/etc/pistack`. It starts nothing. Both units run as root. The helpers need `python3` and `sudo`.
+
+On the first control-plane node set `PISTACK_SERVER_ARGS=--init` in `/etc/pistack/server.env`, then:
+
+```sh
+sudo systemctl enable --now pistack-server
+```
+
+On every host that runs workloads set `PISTACK_JOIN` to the server's URL and `PISTACK_JOIN_TOKEN` to a join token in `/etc/pistack/agent.env`, then:
+
+```sh
+sudo systemctl enable --now pistack-agent
+```
+
+From a checkout, `cargo build --release -p pistack -p bench` and `sudo packaging/install.sh` do the same.
+
+There are container images too: `ghcr.io/pindustries/pistack` for the server and `ghcr.io/pindustries/pistack:latest-agent` for the agent. The agent image cannot run virtual machines or set up host networking. [docs/RELEASING.md](docs/RELEASING.md) has the details.
+
 ## Building
 
 ```sh
