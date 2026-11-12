@@ -262,6 +262,44 @@ impl AgentClient {
         }
     }
 
+    /// Open the bytes of catalog image `id`. The body is not read here: the
+    /// caller streams it with [`reqwest::Response::chunk`]. A follower's
+    /// leader hint is followed like any other call.
+    pub async fn open_image(&self, id: &str) -> Result<Response, RpcError> {
+        let mut hops = 0;
+        loop {
+            let base = self.base_url();
+            // No request timeout: an image can take minutes. The caller
+            // gives up when the body stalls.
+            let request = self.http.get(format!("{base}/images/{id}/data"));
+            let resp = match self.prepare(request).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if e.is_connect() || e.is_timeout() {
+                        self.rotate(&base);
+                    }
+                    return Err(RpcError::Http(e));
+                }
+            };
+            if resp.status().is_success() {
+                return Ok(resp);
+            }
+            let err = api_error(resp).await;
+            if hops < MAX_LEADER_HOPS {
+                if let RpcError::Api { error, .. } = &err {
+                    if let Some(next) = leader_hint(error) {
+                        if next != base {
+                            self.switch(&base, next);
+                            hops += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            return Err(err);
+        }
+    }
+
     fn prepare(&self, rb: RequestBuilder) -> RequestBuilder {
         match &self.token {
             Some(t) => rb.header(JOIN_HEADER, t),
@@ -369,15 +407,21 @@ async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, RpcError> {
     if status.is_success() {
         return Ok(resp.json::<T>().await?);
     }
+    Err(api_error(resp).await)
+}
+
+/// The error a non-success answer carries.
+async fn api_error(resp: Response) -> RpcError {
+    let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     let error = match serde_json::from_str::<Envelope>(&body) {
         Ok(env) => env.error,
         Err(_) => synthesize(status, &body),
     };
-    Err(RpcError::Api {
+    RpcError::Api {
         status: status.as_u16(),
         error,
-    })
+    }
 }
 
 fn synthesize(status: StatusCode, body: &str) -> ApiError {

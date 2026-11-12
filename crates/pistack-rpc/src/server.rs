@@ -112,6 +112,13 @@ pub fn router(queue: CommandQueue) -> Router {
 /// [`JOIN_HEADER`] matching an unexpired stored join token that is not a
 /// spent one-time token. The token is not redeemed on those paths.
 pub fn router_with_store(queue: CommandQueue, store: Store) -> Router {
+    router_with_extra(queue, store, Router::new())
+}
+
+/// [`router_with_store`] plus `extra` routes that belong to the agent
+/// transport but need state this crate does not have (the image download).
+/// They sit behind the same client-certificate and join-token checks.
+pub fn router_with_extra(queue: CommandQueue, store: Store, extra: Router) -> Router {
     let auth = RpcAuth::from_env();
     if auth.require_client_cert {
         tracing::info!("/rpc requires a client certificate (set {RPC_INSECURE_ENV}=1 to disable)");
@@ -119,16 +126,28 @@ pub fn router_with_store(queue: CommandQueue, store: Store) -> Router {
     if auth.require_join {
         tracing::info!("/rpc requires a join token");
     }
-    router_with_auth(queue, store, auth)
+    router_with_auth_and(queue, store, auth, extra)
 }
 
 /// Routes with an explicit [`RpcAuth`]. Tests use this so they do not touch
 /// the process environment.
 pub fn router_with_auth(queue: CommandQueue, store: Store, auth: RpcAuth) -> Router {
+    router_with_auth_and(queue, store, auth, Router::new())
+}
+
+/// [`router_with_auth`] with `extra` routes behind the same checks.
+pub fn router_with_auth_and(
+    queue: CommandQueue,
+    store: Store,
+    auth: RpcAuth,
+    extra: Router,
+) -> Router {
     let enroll = Router::new()
         .route("/agents/enroll", post(enroll))
         .with_state(store.clone());
-    let app = enroll.merge(routes(queue).layer(axum::Extension(store.clone())));
+    let app = enroll
+        .merge(routes(queue).layer(axum::Extension(store.clone())))
+        .merge(extra);
     if !auth.require_join && !auth.require_client_cert {
         return app;
     }

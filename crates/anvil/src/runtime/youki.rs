@@ -5063,6 +5063,7 @@ fi
             name: name.into(),
             kind: MachineKind::Container,
             image: image.into(),
+            image_source: None,
             resources: Resources {
                 vcpus: 1,
                 memory_mib: 128,

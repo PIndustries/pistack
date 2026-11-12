@@ -213,6 +213,22 @@ pub struct NicAttachment {
     pub binding: Option<NicBinding>,
 }
 
+/// A catalog image the server holds, for an agent that does not have the
+/// file. The agent downloads it from `/rpc/images/{id}/data`, checks the
+/// digest, and keeps it under its data directory.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageSource {
+    /// Image id in the catalog.
+    pub id: String,
+    /// Lowercase hex SHA-256 of the image bytes.
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Disk or archive format as the catalog records it, e.g. `qcow2`.
+    #[serde(default)]
+    pub format: String,
+}
+
 /// Payload of [`CommandKind::StartMachine`]: everything a runtime needs to
 /// bring a machine up.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,6 +238,10 @@ pub struct MachineRequest {
     #[serde(default)]
     pub kind: MachineKind,
     pub image: String,
+    /// Set when `image` came from the catalog. `image` may then be a path
+    /// on the server that this host does not have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<ImageSource>,
     #[serde(default)]
     pub resources: Resources,
     #[serde(default)]

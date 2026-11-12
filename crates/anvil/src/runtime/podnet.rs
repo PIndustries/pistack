@@ -845,6 +845,7 @@ mod tests {
             name: "web".into(),
             kind: super::super::MachineKind::Container,
             image: "/img".into(),
+            image_source: None,
             resources: Default::default(),
             networks: vec!["labnet".into()],
             nics,
