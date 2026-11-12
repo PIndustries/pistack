@@ -95,13 +95,13 @@ roles      member
 system     false
 ```
 
-Role changes take effect on the next token. A token already issued keeps the roles it was issued with until it expires.
+Role changes take effect on the next request. The server reads the bindings each time and does not trust the roles written in the token.
 
 ### What is enforced today
 
 Be careful with `reader`.
 
-- Any token with the `admin` role is treated as a full admin, including when the binding is only in one project. A project admin can list hosts and create users.
+- `admin` bound system-wide is the cloud admin. `admin` bound in one project writes there like a `member`. In `keep` it can also read a certificate's key and create an access key for another principal of that project. It cannot see other projects, manage users, publish public images or create join tokens.
 - `gate` and `keep` enforce the difference between `member` and `reader`.
 - The other modules check only that the token is scoped to the resource's project. A `reader` token can create and delete machines, networks, volumes and the rest in its project.
 
@@ -119,9 +119,9 @@ pi login http://10.0.0.11:8443 --name alice
 
 - Tokens are signed JSON Web Tokens (HS256). The signing key is generated on first start and kept in the store.
 - The default lifetime is 12 hours. The maximum is 7 days.
-- A token carries the principal, project and roles. The server verifies it without looking anything up.
+- A token carries the principal and project. On every request the server checks that the principal still exists and is enabled, and reads its roles.
 
-There is no way to revoke a token. Disabling or deleting a principal stops new logins and does not invalidate tokens already issued. Keep lifetimes short for that reason.
+Disabling or deleting a principal refuses its tokens from the next request, with `401 token revoked`. There is no way to cancel a single token; it lasts until it expires.
 
 `pi` reads its connection from a profile file: `~/.config/pistack/config.toml` on Linux, `~/Library/Application Support/pistack/config.toml` on macOS, or the file named by `--config` or `PI_CONFIG`. `--url` and `--token` (or `PI_URL` and `PI_TOKEN`) override the profile for one command.
 
@@ -153,7 +153,7 @@ curl -s -X POST http://10.0.0.11:8443/identity/tokens \
  "caller":{"principal_name":"ci","project":"proj-...","roles":["member"],"system":false}}
 ```
 
-Pass the token to `pi` with `--token` or `PI_TOKEN`. `pi key delete` revokes the key. Tokens already exchanged from it stay valid until they expire.
+Pass the token to `pi` with `--token` or `PI_TOKEN`. `pi key delete` revokes the key and every token exchanged from it.
 
 ## Access keys
 
