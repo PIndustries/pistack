@@ -93,6 +93,10 @@ pub struct Client {
     /// Set on the server so attach/detach hotplug through the agent.
     /// Absent in unit tests, which only record the attachment.
     queue: Option<CommandQueue>,
+    /// Name of the node this process runs on. A local file or an LVM
+    /// volume is held by the node that created it. Absent in unit tests,
+    /// which skip the node checks.
+    node: Option<String>,
     /// Directory silo uses for backup object bytes.
     silo_root: PathBuf,
     /// Mold blob store. Volume create reads an image from here.
@@ -204,6 +208,11 @@ fn backend_needs_host_path(backend: &str) -> bool {
     backend.trim() != "rbd"
 }
 
+/// A local file or an LVM volume exists on one node only.
+fn backend_is_node_local(backend: &str) -> bool {
+    matches!(backend.trim(), "" | "local" | "lvm")
+}
+
 fn condition_holds(vol: &Volume, kind: &str) -> bool {
     vol.status
         .conditions
@@ -263,6 +272,7 @@ impl Client {
             backend,
             quota,
             queue: None,
+            node: None,
             silo_root: silo::Silo::data_root(),
             images: Arc::new(mold::LocalDirStore::new(mold::default_image_dir())),
             spool_dir: crate::default_spool_dir(),
@@ -289,6 +299,18 @@ impl Client {
 
     pub fn with_queue(mut self, queue: CommandQueue) -> Self {
         self.queue = Some(queue);
+        self
+    }
+
+    /// Node this process runs on. A local file or an LVM volume created
+    /// from here on records it as `status.home_node`.
+    pub fn with_node(mut self, node: impl Into<String>) -> Self {
+        let node = node.into();
+        self.node = if node.trim().is_empty() {
+            None
+        } else {
+            Some(node)
+        };
         self
     }
 
@@ -591,6 +613,9 @@ impl Client {
             validate_device(d)?;
         }
         let node = place::node_for_machine(&self.store, machine).ok();
+        if let Some(node) = &node {
+            self.check_attach_node(&self.volumes().get(id)?, node)?;
+        }
         Ok(self.volumes().modify(id, |v| {
             if v.status.phase != Phase::Ready {
                 return Err(StoreError::Conflict(format!(
@@ -813,8 +838,9 @@ impl Client {
         })?;
         let vol = self.ready_volume(id).await?;
         let node = place::node_for_machine(&self.store, machine)?;
+        self.check_attach_node(&vol, &node)?;
         let info = self
-            .volume_backend(&vol)
+            .backend_for(&vol)
             .await?
             .attach_info(&vol, &node)
             .await?;
@@ -841,7 +867,7 @@ impl Client {
         let vol = self.volumes().get(id)?;
         let node = place::node_for_machine(&self.store, machine)?;
         let info = self
-            .volume_backend(&vol)
+            .backend_for(&vol)
             .await?
             .attach_info(&vol, &node)
             .await?;
@@ -907,7 +933,53 @@ impl Client {
         Ok(vol)
     }
 
+    /// Node a volume is tied to, when it is tied to one.
+    ///
+    /// A local file or an LVM volume lives on the node that created it and
+    /// attaches only there. A volume made before the node was recorded is
+    /// taken to be on this one. `None` means any host can attach it.
+    pub fn home_node(&self, vol: &Volume) -> ApiResult<Option<String>> {
+        let vt = self.get_volume_type(&vol.spec.volume_type).map_err(|_| {
+            ApiError::unprocessable(format!("unknown volume type '{}'", vol.spec.volume_type))
+        })?;
+        if !backend_is_node_local(&vt.spec.backend) {
+            return Ok(None);
+        }
+        Ok(vol.status.home_node.clone().or_else(|| self.node.clone()))
+    }
+
+    /// Refuse an attach on a node that cannot see the volume's bytes.
+    fn check_attach_node(&self, vol: &Volume, node: &str) -> ApiResult<()> {
+        match self.home_node(vol)? {
+            Some(home) if home != node => Err(ApiError::unprocessable(format!(
+                "volume {} is held on node {home} and cannot attach on node {node}; \
+                 only an rbd volume attaches on any host",
+                vol.meta.id
+            ))
+            .with_detail("home_node", home)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuse to touch the bytes of a volume another node holds.
+    fn check_held_here(&self, vol: &Volume) -> ApiResult<()> {
+        let Some(here) = self.node.as_deref() else {
+            return Ok(());
+        };
+        match self.home_node(vol)? {
+            Some(home) if home != here => Err(ApiError::unavailable(format!(
+                "volume {} is held on node {home}; this server is {here}",
+                vol.meta.id
+            ))
+            .with_detail("home_node", home)),
+            _ => Ok(()),
+        }
+    }
+
     /// How `host` should attach the volume. Public API for `forge`.
+    ///
+    /// A local file or an LVM volume is refused for any host other than
+    /// the node that holds it.
     pub async fn attach_info(&self, volume: &Id, host: &str) -> ApiResult<AttachInfo> {
         let vol = self.volumes().get(volume)?;
         if vol.status.phase != Phase::Ready {
@@ -916,10 +988,8 @@ impl Client {
                 vol.status.phase
             )));
         }
-        self.volume_backend(&vol)
-            .await?
-            .attach_info(&vol, host)
-            .await
+        self.check_attach_node(&vol, host)?;
+        self.backend_for(&vol).await?.attach_info(&vol, host).await
     }
 
     // ---- snapshots --------------------------------------------------------
@@ -1102,7 +1172,7 @@ impl Client {
             vol
         } else {
             let src = self.volumes().get(&backup.spec.volume)?;
-            let backend_name = self.volume_backend(&src).await?.name();
+            let backend_name = self.backend_for(&src).await?.name();
             if !restore_supported(backend_name) {
                 return Err(ApiError::unavailable(format!(
                     "{backend_name} backup restore is not available"
@@ -1276,7 +1346,22 @@ impl Client {
                 }
             }
             Phase::Deleting => {
-                let backend = match self.volume_backend(&vol).await {
+                // The bytes are on a node this server cannot reach. Keeping
+                // the record would leave it undeletable once that node is
+                // gone, so drop it and say what is left behind.
+                if let Err(e) = self.check_held_here(&vol) {
+                    if e.code == ErrorCode::Unavailable {
+                        tracing::warn!(
+                            volume = %id,
+                            backend_ref = vol.status.backend_ref.as_deref().unwrap_or(""),
+                            error = %e,
+                            "volume record deleted; its bytes stay on the other node"
+                        );
+                        col.delete(id)?;
+                        return Ok(None);
+                    }
+                }
+                let backend = match self.backend_for(&vol).await {
                     Ok(backend) => backend,
                     Err(_) if vol.status.backend_ref.is_none() => {
                         col.delete(id)?;
@@ -1352,8 +1437,14 @@ impl Client {
             Ok(created) => created,
             Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
         };
+        let home = if backend_is_node_local(backend.name()) {
+            self.node.clone()
+        } else {
+            None
+        };
         let vol = col.modify(id, |v| {
             v.status.backend_ref = Some(created.to_string());
+            v.status.home_node = home.clone();
             Ok(())
         })?;
         if let (Some(image), Some(staged)) = (&image_id, staged.as_ref()) {
@@ -1522,6 +1613,9 @@ impl Client {
             tracing::warn!(error = %e, "slab: stale attach reconcile failed");
         }
         for v in self.volumes().list(None)? {
+            if let Err(e) = self.adopt_home_node(&v) {
+                tracing::warn!(volume = %v.meta.id, error = %e, "recording the home node failed");
+            }
             if let Err(e) = self.reconcile_volume(&v.meta.id).await {
                 tracing::warn!(volume = %v.meta.id, error = %e, "resync failed");
             }
@@ -1536,6 +1630,72 @@ impl Client {
                 tracing::warn!(backup = %b.meta.id, error = %e, "resync failed");
             }
         }
+        Ok(())
+    }
+
+    /// Ask each LVM and RBD volume type whether its tools, volume group or
+    /// pool are there. Returns one result per such type, by name.
+    ///
+    /// Run at start so a wrong pool name or a missing `rbd` binary is in
+    /// the log before the first volume fails on it.
+    pub async fn check_volume_types(&self) -> ApiResult<Vec<(String, ApiResult<()>)>> {
+        let mut out = Vec::new();
+        for vt in self.list_volume_types()? {
+            let result = match vt.spec.backend.trim() {
+                "lvm" => match LvmBackend::validate_params(&vt.spec.params) {
+                    Ok(()) => {
+                        LvmBackend::from_params(&vt.spec.params)
+                            .require_available()
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                "rbd" => match RbdBackend::validate_params(&vt.spec.params) {
+                    // Looking must not create the pool.
+                    Ok(()) => {
+                        RbdBackend::from_params(&vt.spec.params)
+                            .with_create_pool(false)
+                            .require_available()
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                _ => continue,
+            };
+            out.push((vt.meta.name, result));
+        }
+        Ok(out)
+    }
+
+    /// Record this node as the home of a local or LVM volume that predates
+    /// `status.home_node`, when its file or device is present here.
+    fn adopt_home_node(&self, vol: &Volume) -> ApiResult<()> {
+        let Some(here) = self.node.clone() else {
+            return Ok(());
+        };
+        if vol.status.home_node.is_some() || vol.status.phase != Phase::Ready {
+            return Ok(());
+        }
+        let Ok(vt) = self.get_volume_type(&vol.spec.volume_type) else {
+            return Ok(());
+        };
+        if !backend_is_node_local(&vt.spec.backend) {
+            return Ok(());
+        }
+        let present = vol
+            .status
+            .backend_ref
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_absolute() && Path::new(path).exists());
+        if !present {
+            return Ok(());
+        }
+        self.volumes().modify(&vol.meta.id, |v| {
+            if v.status.home_node.is_none() {
+                v.status.home_node = Some(here.clone());
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1695,7 +1855,7 @@ impl Client {
         machine: &Id,
         node: &str,
     ) -> ApiResult<VolumeDetach> {
-        let backend = self.volume_backend(vol).await?;
+        let backend = self.backend_for(vol).await?;
         if backend.name() == "rbd" {
             if let Ok(info) = backend.attach_info(vol, node).await {
                 return queue_detach(
@@ -1744,7 +1904,17 @@ impl Client {
     /// Empty or `local` uses the configured file backend. `lvm` and `rbd`
     /// are built from the volume type. They still refuse to run until their
     /// own tools and pool exist.
+    ///
+    /// Fails when the volume's bytes are on another node, so a snapshot,
+    /// extend, backup or restore says so instead of missing a file.
     async fn volume_backend(&self, vol: &Volume) -> ApiResult<Arc<dyn BlockBackend>> {
+        self.check_held_here(vol)?;
+        self.backend_for(vol).await
+    }
+
+    /// The backend without the node check. Attach and detach only build a
+    /// request for the agent, and a delete must still drop the record.
+    async fn backend_for(&self, vol: &Volume) -> ApiResult<Arc<dyn BlockBackend>> {
         let vt = self.get_volume_type(&vol.spec.volume_type).map_err(|_| {
             ApiError::unprocessable(format!("unknown volume type '{}'", vol.spec.volume_type))
         })?;
@@ -2029,6 +2199,11 @@ fn normalize_backend(mut spec: VolumeTypeSpec) -> ApiResult<VolumeTypeSpec> {
         spec.backend = "local".into();
     }
     known_backend(&spec.backend)?;
+    match spec.backend.trim() {
+        "lvm" => LvmBackend::validate_params(&spec.params)?,
+        "rbd" => RbdBackend::validate_params(&spec.params)?,
+        _ => {}
+    }
     Ok(spec)
 }
 
@@ -2055,7 +2230,7 @@ fn io_err(err: std::io::Error) -> ApiError {
 }
 
 fn restore_supported(backend: &str) -> bool {
-    matches!(backend, "local" | "lvm")
+    matches!(backend, "local" | "lvm" | "rbd")
 }
 
 struct UploadedBackup {

@@ -71,6 +71,18 @@ impl LvmBackend {
         }
     }
 
+    /// Reject a volume group or thin pool name no LVM command could use.
+    /// A name that is left out stays unavailable until it is set.
+    pub fn validate_params(params: &BTreeMap<String, String>) -> ApiResult<()> {
+        if let Some(vg) = params.get("vg").filter(|v| !v.is_empty()) {
+            ident("vg", vg)?;
+        }
+        if let Some(pool) = params.get("pool").filter(|p| !p.is_empty()) {
+            ident("pool", pool)?;
+        }
+        Ok(())
+    }
+
     /// Tools, volume group, and thin pool must all exist. No LVM command
     /// that creates or removes a logical volume runs before this returns.
     pub async fn require_available(&self) -> ApiResult<()> {

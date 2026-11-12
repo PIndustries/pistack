@@ -19,7 +19,8 @@
 //! | attach_info     | `Rbd { pool, image: vol_id, monitors, user }` |
 //! | image           | `qemu-img convert -O raw -f <fmt> -n <src> rbd:{pool}/{vol_id}` |
 //! | backup          | `rbd export {pool}/{vol_id} -` (stdout is the byte stream) |
-//! | backup restore  | unavailable; an existing image has no stdin import |
+//! | backup restore  | `rbd import --image-feature layering,exclusive-lock - {pool}/{vol_id}.restore` (stdin is the byte stream), then `rbd rm {pool}/{vol_id}`, `rbd rename {pool}/{vol_id}.restore {pool}/{vol_id}` and, when the stream was shorter than the volume, `rbd resize` |
+//! | pool (opt-in)   | `ceph osd pool create {pool}` then `rbd pool init {pool}` |
 //!
 //! The image is created with `rbd create` first. `qemu-img convert -n`
 //! then writes raw bytes into that image (`-n` is qemu-img's "do not
@@ -28,13 +29,22 @@
 //! create` just made. Monitors stay in the host ceph config, the same way
 //! `rbd create` is invoked.
 //!
+//! `rbd import` cannot write into an image that exists, so a restore
+//! imports into `{vol_id}.restore` and swaps it in once the import has
+//! exited cleanly. Until then the volume is untouched. A volume with
+//! snapshots is refused before any byte is read: removing the image
+//! would fail, and the snapshots would not describe the restored bytes.
+//!
 //! Parameters from `VolumeTypeSpec::params`: `pool` (default `volumes`),
-//! `user` (default `pistack`), `monitors` (comma separated).
+//! `user` (default `pistack`), `monitors` (comma separated), `create_pool`
+//! (`true` or `false`, default `false`).
 //!
 //! A mutating command runs only when monitors are configured, `rbd` is
 //! executable, and `rbd pool stats {pool}` succeeds. A missing binary,
-//! monitor list, or pool is unavailable. This backend does not create
-//! the pool.
+//! monitor list, or pool is unavailable. The pool is created only when
+//! the volume type sets `create_pool=true`; placement group counts and
+//! replication are the operator's call, so the default is to say which
+//! commands to run. `$PISTACK_CEPH_BIN` replaces the `ceph` binary.
 
 use async_trait::async_trait;
 use pistack_types::error::ErrorCode;
@@ -48,11 +58,15 @@ use crate::types::{Snapshot, Volume};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const ENV_BIN: &str = "PISTACK_RBD_BIN";
+const ENV_CEPH_BIN: &str = "PISTACK_CEPH_BIN";
+const IMAGE_FEATURES: &str = "layering,exclusive-lock";
 
 pub struct RbdBackend {
     pub pool: String,
     pub user: String,
     pub monitors: Vec<String>,
+    /// Create the pool when it does not exist.
+    pub create_pool: bool,
 }
 
 impl Default for RbdBackend {
@@ -61,6 +75,7 @@ impl Default for RbdBackend {
             pool: "volumes".into(),
             user: "pistack".into(),
             monitors: Vec::new(),
+            create_pool: false,
         }
     }
 }
@@ -71,26 +86,59 @@ impl RbdBackend {
             pool: pool.into(),
             user: user.into(),
             monitors,
+            create_pool: false,
         }
     }
 
-    /// `pool`, `user`, and comma-separated `monitors` from a volume type.
+    /// Create the pool when it is missing.
+    pub fn with_create_pool(mut self, create: bool) -> Self {
+        self.create_pool = create;
+        self
+    }
+
+    /// `pool`, `user`, comma-separated `monitors` and `create_pool` from a
+    /// volume type.
     pub fn from_params(params: &BTreeMap<String, String>) -> Self {
-        let monitors = params
-            .get("monitors")
-            .map(|raw| {
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
         Self {
             pool: params.get("pool").cloned().unwrap_or_default(),
             user: params.get("user").cloned().unwrap_or_default(),
-            monitors,
+            monitors: split_monitors(params.get("monitors")),
+            create_pool: params
+                .get("create_pool")
+                .and_then(|raw| parse_bool(raw))
+                .unwrap_or(false),
         }
+    }
+
+    /// Reject parameters no command could use. A parameter that is left
+    /// out is not an error here: the type can be created first and
+    /// completed later, and stays unavailable until then.
+    pub fn validate_params(params: &BTreeMap<String, String>) -> ApiResult<()> {
+        if let Some(pool) = params.get("pool").filter(|p| !p.is_empty()) {
+            ident("pool", pool)?;
+        }
+        if let Some(user) = params.get("user").filter(|u| !u.is_empty()) {
+            ident("user", user)?;
+        }
+        for monitor in split_monitors(params.get("monitors")) {
+            let ok = monitor.len() <= 255
+                && monitor.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'-' | b'[' | b']')
+                });
+            if !ok {
+                return Err(ApiError::bad_request(format!(
+                    "monitor '{monitor}' is not a host or host:port"
+                )));
+            }
+        }
+        if let Some(raw) = params.get("create_pool") {
+            if parse_bool(raw).is_none() {
+                return Err(ApiError::bad_request(
+                    "create_pool must be 'true' or 'false'",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Monitors, the `rbd` binary, and the pool must all exist. No `rbd`
@@ -101,16 +149,38 @@ impl RbdBackend {
             return Err(ApiError::unavailable("rbd monitors are not configured"));
         }
         let bin = super::configured_bin_ready(ENV_BIN, "rbd")?;
-        run(&bin, &["pool".into(), "stats".into(), pool.clone()], false)
-            .await
-            .map_err(|e| {
-                if e.code == ErrorCode::Unavailable {
-                    e
-                } else {
-                    ApiError::unavailable(format!("rbd pool {pool} is not available"))
-                }
-            })?;
-        Ok(())
+        let stats = ["pool".into(), "stats".into(), pool.clone()];
+        let probe = match run(&bin, &stats, false).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.code == ErrorCode::Unavailable => return Err(e),
+            Err(e) => e,
+        };
+        if !self.create_pool {
+            return Err(ApiError::unavailable(format!(
+                "rbd pool {pool} is not available; create it with \
+                 `ceph osd pool create {pool}` and `rbd pool init {pool}`, \
+                 or set create_pool=true on the volume type"
+            )));
+        }
+        tracing::info!(pool = %pool, probe = %probe.message, "creating the rbd pool");
+        let ceph = super::configured_bin_ready(ENV_CEPH_BIN, "ceph")?;
+        let created = async {
+            let create = ["osd".into(), "pool".into(), "create".into(), pool.clone()];
+            run(&ceph, &create, false).await?;
+            run(&bin, &["pool".into(), "init".into(), pool.clone()], false).await?;
+            run(&bin, &stats, false).await
+        }
+        .await;
+        created.map_err(|e| {
+            if e.code == ErrorCode::Unavailable {
+                e
+            } else {
+                ApiError::unavailable(format!(
+                    "rbd pool {pool} could not be created: {}",
+                    e.message
+                ))
+            }
+        })
     }
 
     fn pool(&self) -> ApiResult<&str> {
@@ -182,7 +252,7 @@ impl BlockBackend for RbdBackend {
                 "--size".into(),
                 size,
                 "--image-feature".into(),
-                "layering,exclusive-lock".into(),
+                IMAGE_FEATURES.into(),
                 image.clone(),
             ],
             false,
@@ -335,8 +405,72 @@ impl BlockBackend for RbdBackend {
     }
 
     async fn open_restore(&self, vol: &Volume) -> ApiResult<RestoreStream> {
-        let _ = vol;
-        Err(ApiError::unavailable("rbd backup restore is not available"))
+        self.require_available().await?;
+        let pool = self.pool()?.to_owned();
+        let id = vol_id(vol)?;
+        let staging_id = format!("{id}.restore");
+        ident("volume id", &staging_id)?;
+        let image = format!("{pool}/{id}");
+        let staging = format!("{pool}/{staging_id}");
+        let bin = super::configured_bin(ENV_BIN, "rbd");
+
+        let snaps = run_out(
+            &bin,
+            &[
+                "snap".into(),
+                "ls".into(),
+                "--format".into(),
+                "json".into(),
+                image.clone(),
+            ],
+            true,
+        )
+        .await?;
+        if !matches!(snaps.trim(), "" | "[]") {
+            return Err(ApiError::conflict(format!(
+                "volume {id} has snapshots; restore the backup into a new volume"
+            )));
+        }
+        // Left behind by a restore that did not finish.
+        run(&bin, &["rm".into(), staging.clone()], true).await?;
+
+        let want = super::gib_to_bytes(vol.spec.size_gib);
+        let size = format!("{}G", vol.spec.size_gib);
+        let after_bin = bin.clone();
+        let after: super::RestoreFinish = Box::new(move |written| {
+            Box::pin(async move {
+                let bin = after_bin;
+                if let Err(e) = run(&bin, &["rm".into(), image.clone()], true).await {
+                    // The volume is as it was. Do not leave the copy around.
+                    if let Err(del) = run(&bin, &["rm".into(), staging.clone()], true).await {
+                        tracing::warn!(image = %staging, error = %del, "removing a restore image failed");
+                    }
+                    return Err(e);
+                }
+                run(&bin, &["rename".into(), staging, image.clone()], false).await?;
+                if written < want {
+                    run(
+                        &bin,
+                        &["resize".into(), "--size".into(), size, image],
+                        false,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        });
+        RestoreStream::spawn(
+            &bin,
+            &[
+                "import".into(),
+                "--image-feature".into(),
+                IMAGE_FEATURES.into(),
+                "-".into(),
+                format!("{pool}/{staging_id}"),
+            ],
+            "rbd import",
+            after,
+        )
     }
 }
 
@@ -377,7 +511,32 @@ fn ident(kind: &str, value: &str) -> ApiResult<()> {
     }
 }
 
+fn split_monitors(raw: Option<&String>) -> Vec<String> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" | "" => Some(false),
+        _ => None,
+    }
+}
+
 async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
+    run_out(bin, args, missing_ok).await.map(|_| ())
+}
+
+/// Run a command and return its stdout. With `missing_ok`, a command that
+/// failed because the image or snapshot is gone returns an empty string.
+async fn run_out(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -394,11 +553,11 @@ async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
         Ok(Ok(output)) => output,
     };
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     let detail = format!("{}{}", clip(&output.stderr), clip(&output.stdout));
     if missing_ok && object_absent(&detail) {
-        return Ok(());
+        return Ok(String::new());
     }
     let code = output.status.code().unwrap_or(-1);
     Err(ApiError::internal(format!("{bin} exited {code}: {detail}")))
@@ -746,9 +905,136 @@ mod tests {
         assert!(logged.contains("export"), "{logged}");
         assert!(logged.contains(&format!("volumes/{id}")), "{logged}");
         assert!(logged.lines().any(|line| line == "-"), "{logged}");
+    }
 
+    /// Write `body` as an executable `name` in `dir` that first appends its
+    /// arguments, one invocation per line, to `<name>.log`.
+    fn script(dir: &Path, name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join(format!("{name}.log"));
+        let bin = dir.join(name);
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{quoted}'\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, log)
+    }
+
+    struct ResetBins;
+    impl Drop for ResetBins {
+        fn drop(&mut self) {
+            std::env::remove_var(ENV_BIN);
+            std::env::remove_var(ENV_CEPH_BIN);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_volume_with_snapshots() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, log) = script(
+            dir.path(),
+            "rbd",
+            "if [ \"$1\" = \"snap\" ]; then printf '[{\"id\":4,\"name\":\"nightly\"}]\\n'; fi\nexit 0",
+        );
+        std::env::set_var(ENV_BIN, &bin);
+        let _reset = ResetBins;
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let vol = volume(2);
         let err = backend.open_restore(&vol).await.unwrap_err();
-        assert_eq!(err.code, pistack_types::error::ErrorCode::Unavailable);
-        assert!(err.message.contains("restore"), "{err}");
+        assert_eq!(err.code, ErrorCode::Conflict, "{err}");
+        assert!(err.message.contains("snapshots"), "{err}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.contains("import"), "{logged}");
+        assert!(!logged.lines().any(|l| l.starts_with("rm ")), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_import_leaves_the_volume_in_place() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, log) = script(
+            dir.path(),
+            "rbd",
+            "case \"$1\" in\n  snap) printf '[]\\n' ;;\n  import) cat > /dev/null; echo 'no space' >&2; exit 28 ;;\nesac\nexit 0",
+        );
+        std::env::set_var(ENV_BIN, &bin);
+        let _reset = ResetBins;
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let vol = volume(2);
+        let id = vol.meta.id.to_string();
+        let mut stream = backend.open_restore(&vol).await.unwrap();
+        stream.write_all(b"abc").await.unwrap();
+        let err = stream.finish().await.unwrap_err();
+        assert!(err.message.contains("rbd import failed"), "{err}");
+        assert!(err.message.contains("no space"), "{err}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        // Only the leftover of an earlier restore is ever removed.
+        assert!(
+            !logged.lines().any(|l| l == format!("rm volumes/{id}")),
+            "{logged}"
+        );
+        assert!(!logged.contains("rename"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn the_pool_is_created_only_when_asked() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let made = dir.path().join("pool-made");
+        let quoted = made.display().to_string().replace('\'', "'\\''");
+        let (bin, log) = script(
+            dir.path(),
+            "rbd",
+            &format!(
+                "if [ \"$1 $2\" = \"pool init\" ]; then : > '{quoted}'; fi\n\
+                 if [ \"$1 $2\" = \"pool stats\" ] && [ ! -e '{quoted}' ]; then exit 2; fi\nexit 0"
+            ),
+        );
+        let (ceph, ceph_log) = script(dir.path(), "ceph", "exit 0");
+        std::env::set_var(ENV_BIN, &bin);
+        std::env::set_var(ENV_CEPH_BIN, &ceph);
+        let _reset = ResetBins;
+
+        let backend = RbdBackend::new("volumes", "pistack", vec!["10.0.0.1:6789".into()]);
+        let err = backend.require_available().await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(
+            err.message.contains("ceph osd pool create volumes"),
+            "{err}"
+        );
+        assert!(err.message.contains("rbd pool init volumes"), "{err}");
+        assert!(!ceph_log.exists(), "ceph must not run unless asked");
+
+        let mut params = BTreeMap::new();
+        params.insert("monitors".to_owned(), "10.0.0.1:6789".to_owned());
+        params.insert("create_pool".to_owned(), "true".to_owned());
+        RbdBackend::validate_params(&params).unwrap();
+        let backend = RbdBackend::from_params(&params);
+        backend.require_available().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ceph_log).unwrap(),
+            "osd pool create volumes\n"
+        );
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.lines().any(|l| l == "pool init volumes"), "{logged}");
+
+        // The pool is there now, so nothing is created a second time.
+        backend.require_available().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ceph_log).unwrap(),
+            "osd pool create volumes\n"
+        );
+
+        std::env::set_var(ENV_CEPH_BIN, dir.path().join("missing-ceph"));
+        std::fs::remove_file(&made).unwrap();
+        let err = backend.require_available().await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+        assert!(err.message.contains("ceph is not available"), "{err}");
     }
 }

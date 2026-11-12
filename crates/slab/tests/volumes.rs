@@ -11,6 +11,7 @@ use axum::{
 use pistack_rpc::{
     AgentHello, CommandKind, CommandQueue, CommandResult, QueueConfig, VolumeAttach, VolumeDetach,
 };
+use pistack_types::error::ErrorCode;
 use pistack_types::{kind, Caller, Id, Phase, Resource, Spec};
 use serde_json::{json, Value};
 use slab::{
@@ -979,8 +980,13 @@ async fn empty_backend_uses_local_files() {
     assert!(LocalFileBackend::new(dir.path()).volume_path(&vol).exists());
 }
 
+/// Held by every test that points `PISTACK_LVM_BIN` or `PISTACK_RBD_BIN`
+/// at a script, since the environment is shared by the whole test binary.
+static TOOL_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
+    let _tools = TOOL_ENV.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let c = client(&dir);
     let lvm_log = dir.path().join("lvm.log");
@@ -1098,6 +1104,303 @@ async fn lvm_and_rbd_types_stay_unavailable_without_pool() {
         .expect("exists");
     assert_ne!(bare.status.phase, Phase::Ready);
     assert!(!quiet.exists(), "missing monitors must not run rbd");
+
+    // The start-up check names each type and why it cannot be used. The
+    // rbd script now answers every command, so only `ceph` passes.
+    let checked: std::collections::BTreeMap<_, _> = c
+        .check_volume_types()
+        .await
+        .expect("check")
+        .into_iter()
+        .collect();
+    assert_eq!(checked.len(), 3, "local types are not checked: {checked:?}");
+    assert!(checked["ceph"].is_ok(), "{checked:?}");
+    let thin = checked["thin"].as_ref().unwrap_err();
+    assert_eq!(thin.code, ErrorCode::Unavailable, "{thin}");
+    let nomon = checked["nomon"].as_ref().unwrap_err();
+    assert!(nomon.message.contains("monitors"), "{nomon}");
+
+    // A value no command could use is refused when the type is written.
+    for (backend, params) in [
+        ("rbd", json!({"pool": "bad/pool"})),
+        ("rbd", json!({"monitors": "10.0.0.1:6789, two words"})),
+        ("rbd", json!({"create_pool": "maybe"})),
+        ("lvm", json!({"vg": "vg;rm"})),
+    ] {
+        let err = c
+            .create_volume_type(type_create("bad", backend, params.clone()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "{params}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn local_volume_attaches_only_on_its_home_node() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let c = client(&dir).with_node("alpha");
+    let vol = c
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_eq!(vol.status.home_node.as_deref(), Some("alpha"));
+    assert_eq!(c.home_node(&vol).expect("home").as_deref(), Some("alpha"));
+
+    c.attach_info(&vol.meta.id, "alpha")
+        .await
+        .expect("the home node gets the path");
+    let err = c.attach_info(&vol.meta.id, "beta").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unprocessable, "{err}");
+    assert!(err.message.contains("held on node alpha"), "{err}");
+    assert!(err.message.contains("node beta"), "{err}");
+
+    // An attach to a machine on another node is refused before anything
+    // is recorded, so the volume stays free.
+    let far = place_machine(&c, "beta");
+    let err = c.begin_attach(&vol.meta.id, &far, None).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unprocessable, "{err}");
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+
+    let near = place_machine(&c, "alpha");
+    let v = c.begin_attach(&vol.meta.id, &near, None).expect("attach");
+    assert_eq!(v.status.attached_to.as_ref(), Some(&near));
+
+    // An rbd image is reached over the network, so it has no home node.
+    c.create_volume_type(type_create(
+        "ceph",
+        "rbd",
+        json!({"pool": "volumes", "monitors": "10.0.0.1:6789"}),
+    ))
+    .expect("rbd type");
+    let net = c
+        .create_volume(create(
+            "net",
+            VolumeSpec {
+                volume_type: "ceph".into(),
+                ..spec(1)
+            },
+        ))
+        .await
+        .expect("rbd volume");
+    assert_eq!(c.home_node(&net).expect("home"), None);
+}
+
+#[tokio::test]
+async fn another_server_leaves_a_local_volume_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = client(&dir).with_node("alpha");
+    let other = tempfile::tempdir().expect("tempdir");
+    // The server that takes over after a failover: same records, its own disk.
+    let beta = Client::new(
+        alpha.store().clone(),
+        std::sync::Arc::new(LocalFileBackend::new(other.path())),
+        std::sync::Arc::new(slab::AllowAll),
+    )
+    .with_node("beta");
+
+    let vol = alpha
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = alpha
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let path = LocalFileBackend::new(dir.path()).volume_path(&vol);
+
+    let snap = beta
+        .create_snapshot(Create {
+            name: "snap".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: SnapshotSpec {
+                volume: vol.meta.id.clone(),
+            },
+        })
+        .await
+        .expect("snapshot record");
+    let snap = beta
+        .reconcile_snapshot(&snap.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_eq!(snap.status.phase, Phase::Error);
+    let why = &snap.status.conditions[0].message;
+    assert!(why.contains("held on node alpha"), "{why}");
+    assert!(why.contains("this server is beta"), "{why}");
+    beta.request_delete_snapshot(&snap.meta.id).expect("delete");
+    assert!(beta
+        .reconcile_snapshot(&snap.meta.id)
+        .await
+        .expect("reconcile")
+        .is_none());
+
+    // A delete still removes the record, or the volume could never be
+    // deleted once alpha is gone. The file is alpha's to clean up.
+    beta.request_delete_volume(&vol.meta.id).expect("delete");
+    assert!(beta
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .is_none());
+    assert!(path.exists(), "the other node's file is not touched");
+}
+
+#[tokio::test]
+async fn a_volume_from_before_home_nodes_is_adopted_where_its_file_is() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old = client(&dir);
+    let vol = old
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = old
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert!(vol.status.home_node.is_none());
+
+    let c = old.with_node("alpha");
+    c.reconcile_all().await.expect("reconcile");
+    let vol = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert_eq!(vol.status.home_node.as_deref(), Some("alpha"));
+}
+
+/// An `rbd` that keeps each image as a file, so a backup and a restore
+/// move real bytes through the same commands a cluster would get.
+fn file_backed_rbd(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = dir.join("rbd.log");
+    let images = dir.join("rbd-images");
+    let bin = dir.join("rbd-files");
+    let quote = |p: &std::path::Path| p.display().to_string().replace('\'', "'\\''");
+    std::fs::write(
+        &bin,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+d='{images}'
+mkdir -p "$d"
+file() {{ printf '%s/%s' "$d" "$(printf '%s' "$1" | tr '/' '_')"; }}
+for a in "$@"; do last=$a; done
+case "$1" in
+  create) : > "$(file "$last")" ;;
+  export) cat "$(file "$2")" ;;
+  import) cat > "$(file "$last")" ;;
+  rm) rm -f "$(file "$2")" ;;
+  rename) mv "$(file "$2")" "$(file "$3")" ;;
+  snap) printf '[]\n' ;;
+esac
+exit 0
+"#,
+            log = quote(&log),
+            images = quote(&images),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+#[tokio::test]
+async fn rbd_backup_restores_into_a_new_image() {
+    let _tools = TOOL_ENV.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (bin, log) = file_backed_rbd(dir.path());
+    std::env::set_var("PISTACK_RBD_BIN", &bin);
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            std::env::remove_var("PISTACK_RBD_BIN");
+        }
+    }
+    let _reset = Reset;
+
+    let c = client(&dir);
+    c.create_volume_type(type_create(
+        "ceph",
+        "rbd",
+        json!({"pool": "volumes", "monitors": "10.0.0.1:6789"}),
+    ))
+    .expect("rbd type");
+    let vol = c
+        .create_volume(create(
+            "src",
+            VolumeSpec {
+                volume_type: "ceph".into(),
+                ..spec(1)
+            },
+        ))
+        .await
+        .expect("volume");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_eq!(vol.status.phase, Phase::Ready, "{vol:?}");
+    assert!(vol.status.home_node.is_none());
+    let image = |id: &Id| dir.path().join("rbd-images").join(format!("volumes_{id}"));
+    let payload = b"pistack-rbd-backup-payload";
+    std::fs::write(image(&vol.meta.id), payload).expect("fill the image");
+
+    let project = vol.meta.project.clone().expect("project");
+    make_bucket(&c, &project, "backups");
+    let bak = c
+        .create_backup(Create {
+            name: "nightly".into(),
+            description: String::new(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            project: None,
+            spec: backup_spec(vol.meta.id.clone()),
+        })
+        .await
+        .expect("backup");
+    let bak = c
+        .reconcile_backup(&bak.meta.id)
+        .await
+        .expect("upload")
+        .expect("exists");
+    assert_eq!(bak.status.phase, Phase::Ready, "{bak:?}");
+
+    let restored = c.restore_backup(&bak.meta.id).await.expect("restore");
+    assert_eq!(restored.status.phase, Phase::Ready, "{restored:?}");
+    assert_ne!(restored.meta.id, vol.meta.id);
+    assert_eq!(std::fs::read(image(&restored.meta.id)).unwrap(), payload);
+    assert_eq!(
+        std::fs::read(image(&vol.meta.id)).unwrap(),
+        payload,
+        "the source image is only read"
+    );
+
+    let id = &restored.meta.id;
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let tail: Vec<&str> = logged
+        .lines()
+        .skip_while(|line| !line.starts_with("import "))
+        .filter(|line| !line.starts_with("pool stats"))
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            format!("import --image-feature layering,exclusive-lock - volumes/{id}.restore"),
+            format!("rm volumes/{id}"),
+            format!("rename volumes/{id}.restore volumes/{id}"),
+            format!("resize --size 1G volumes/{id}"),
+            format!("export volumes/{id} -"),
+        ],
+        "{logged}"
+    );
 }
 
 #[tokio::test]

@@ -41,7 +41,8 @@ Each phase ends at a gate an outside tool decides.
 - [x] libvirt/KVM driver in anvil (virsh, one NAT network `pistack` on 10.88.0.0/24, cloud-init seed). `pi volume attach` hotplugs a local slab file into that guest as a virtio disk.
 - [x] Host NAT floating IPs when `PISTACK_FABRIC_BACKEND=hostnat`. `pi fip associate --machine` uses the guest address.
 - [x] Overlay datapath when `PISTACK_FABRIC_BACKEND=overlay`: one VXLAN segment per network, one router namespace per router, static forwarding to peer underlays, DHCP and subnet routes from that router, a provider bridge for a physical link, floating-IP translation on the host that owns the port, and placement only onto a host that reported an underlay address. Host NAT stays in place for networks already realised that way.
-- [ ] LVM and Ceph RBD in slab; qemu-img in mold. Attach uses the local file backend.
+- [x] LVM and Ceph RBD backends in slab, chosen by the volume type; qemu-img in mold. An RBD volume attaches on any host: a VM gets a network disk, a pod gets a mapped device. A local file or an LVM volume stays on the node that made it (`status.home_node`), and attaches only there; placement does not take that into account. RBD backups restore through `rbd import`. Not run against a Ceph cluster yet.
+- [ ] Not done in slab: RBD credentials from keep (agents use the host's `ceph.conf` and keyring), moving a local volume between nodes, and LVM on any host but the control-plane server.
 - TLS everywhere via keep
 - Gate: a VM boots on three nodes and gets an IP, a volume and a floating IP from the CLI.
 
