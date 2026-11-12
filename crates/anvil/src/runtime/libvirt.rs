@@ -13,6 +13,7 @@
 //! bridge. Disks live under `/var/lib/libvirt/images/pistack`, which the
 //! Ubuntu libvirt AppArmor profile already allows.
 
+use super::ovsplug::{self, HostPlug};
 use super::{
     MachineRequest, MachineRuntime, NicAttachment, PowerState, RunningMachine, VolumeAttach,
     VolumeDetach,
@@ -1224,6 +1225,17 @@ fn interfaces(nics: &[NicAttachment]) -> ApiResult<String> {
     }
     let mut out = String::new();
     for nic in nics {
+        if let Some(HostPlug::Ovs { bridge, iface_id }) = ovsplug::ovs_binding(nic)? {
+            // libvirt adds the tap to the OVS bridge itself and sets
+            // `external_ids:iface-id`, which is what ovn-controller binds on.
+            out.push_str(&format!(
+                "    <interface type='bridge'>\n      <source bridge='{bridge}'/>\n      <virtualport type='openvswitch'>\n        <parameters interfaceid='{iface_id}'/>\n      </virtualport>\n      <mac address='{mac}'/>\n      <model type='virtio'/>\n    </interface>\n",
+                bridge = xml_escape(&bridge),
+                iface_id = xml_escape(&iface_id),
+                mac = xml_escape(&nic.mac),
+            ));
+            continue;
+        }
         if nic.segment_id.is_some() {
             let bridge = overlay_bridge(&nic.network_id)?;
             out.push_str(&format!(
@@ -1246,6 +1258,8 @@ fn interfaces(nics: &[NicAttachment]) -> ApiResult<String> {
 enum NicEndpoint {
     Bridge(String),
     Network(String),
+    /// An OVS bridge. The port is bound by its `iface-id`, not by the bridge.
+    Ovs(String),
 }
 
 struct IfaceRow {
@@ -1259,6 +1273,9 @@ struct IfaceRow {
 /// even when the address is on the shared subnet.
 fn nic_endpoint(nic: &NicAttachment) -> ApiResult<NicEndpoint> {
     check_nic(nic)?;
+    if let Some(HostPlug::Ovs { bridge, .. }) = ovsplug::ovs_binding(nic)? {
+        return Ok(NicEndpoint::Ovs(bridge));
+    }
     if nic.segment_id.is_some() {
         let bridge = overlay_bridge(&nic.network_id)?;
         if bridge == BRIDGE || bridge.starts_with("pi") || !bridge.starts_with("po") {
@@ -1278,7 +1295,7 @@ fn nic_endpoint(nic: &NicAttachment) -> ApiResult<NicEndpoint> {
 /// `pi` plus 12 hex digits of the network id.
 pub(crate) fn port_bridge(nic: &NicAttachment) -> ApiResult<String> {
     match nic_endpoint(nic)? {
-        NicEndpoint::Bridge(name) => Ok(name),
+        NicEndpoint::Bridge(name) | NicEndpoint::Ovs(name) => Ok(name),
         NicEndpoint::Network(net) => Ok(bridge_of(&net)),
     }
 }
@@ -1289,6 +1306,7 @@ fn endpoint_matches(ep: &NicEndpoint, row: &IfaceRow) -> bool {
             row.kind == "bridge" && row.source == *bridge && row.source != BRIDGE
         }
         NicEndpoint::Network(net) => row.kind == "network" && row.source == *net,
+        NicEndpoint::Ovs(bridge) => row.kind == "bridge" && row.source == *bridge,
     }
 }
 
@@ -1633,6 +1651,10 @@ fn project_network_xml(name: &str, nic: &NicAttachment) -> ApiResult<String> {
 }
 
 async fn prepare_nic(nic: &NicAttachment) -> ApiResult<()> {
+    if ovsplug::ovs_binding(nic)?.is_some() {
+        // OVN owns the bridge, the addresses and DHCP for this port.
+        return Ok(());
+    }
     if nic.segment_id.is_some() {
         // The overlay helper owns this bridge. Do not define a NAT network
         // and do not move an address onto it from here.
@@ -2043,6 +2065,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn ovn_nic() -> NicAttachment {
+        let mut port = nic("10.90.0.10", false);
+        port.binding = Some(pistack_rpc::proto::NicBinding {
+            vif_type: "ovs".into(),
+            vif_details: [("bridge", "br-int"), ("iface_id", "port-0195c0de")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        });
+        port
+    }
+
+    #[test]
+    fn an_ovn_port_is_an_openvswitch_virtualport_on_the_integration_bridge() {
+        let port = ovn_nic();
+        for xml in [
+            interfaces(std::slice::from_ref(&port)).unwrap(),
+            hotplug_xml(&port).unwrap(),
+        ] {
+            assert!(xml.contains("<source bridge='br-int'/>"), "{xml}");
+            assert!(xml.contains("<virtualport type='openvswitch'>"), "{xml}");
+            assert!(
+                xml.contains("<parameters interfaceid='port-0195c0de'/>"),
+                "{xml}"
+            );
+            assert!(xml.contains("<mac address='52:54:00:aa:bb:cc'/>"), "{xml}");
+            assert!(!xml.contains("type='network'"), "{xml}");
+            assert!(!xml.contains("pistack"), "{xml}");
+        }
+        assert_eq!(port_bridge(&port).unwrap(), "br-int");
+
+        // The binding wins over an overlay segment on the same port.
+        let mut both = ovn_nic();
+        both.segment_id = Some(4);
+        let xml = interfaces(std::slice::from_ref(&both)).unwrap();
+        assert!(xml.contains("<virtualport type='openvswitch'>"), "{xml}");
+        assert!(!xml.contains("po01a102de3f33"), "{xml}");
+
+        // A binding that names no port is refused, not plugged unbound.
+        let mut unbound = ovn_nic();
+        unbound
+            .binding
+            .as_mut()
+            .unwrap()
+            .vif_details
+            .remove("iface_id");
+        assert!(interfaces(std::slice::from_ref(&unbound)).is_err());
+    }
+
     #[test]
     fn overlay_plug_uses_the_po_bridge_and_not_pistack0() {
         let mut overlay = nic("10.88.0.10", true);
@@ -2054,7 +2125,7 @@ mod tests {
         assert!(!xml.contains("network='pistack'"));
         match nic_endpoint(&overlay).unwrap() {
             NicEndpoint::Bridge(name) => assert_eq!(name, "po01a102de3f33"),
-            NicEndpoint::Network(_) => panic!("overlay port must not use a libvirt network"),
+            _ => panic!("overlay port must use its po bridge"),
         }
 
         let shared = hotplug_xml(&nic("10.88.0.10", true)).unwrap();

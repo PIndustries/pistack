@@ -29,12 +29,21 @@ pub(crate) enum HostPlug {
 /// `vif_type` other than `ovs`, including an absent binding, keeps
 /// [`crate::runtime::libvirt::port_bridge`].
 pub(crate) fn host_plug(nic: &NicAttachment) -> ApiResult<HostPlug> {
-    if let Some(binding) = nic.binding.as_ref().filter(|b| b.vif_type == "ovs") {
-        return ovs_plug(binding);
+    if let Some(plug) = ovs_binding(nic)? {
+        return Ok(plug);
     }
     Ok(HostPlug::LinuxBridge {
         bridge: crate::runtime::libvirt::port_bridge(nic)?,
     })
+}
+
+/// The OVS plug for a port whose binding is `ovs`. `None` for any other
+/// binding, including an absent one.
+pub(crate) fn ovs_binding(nic: &NicAttachment) -> ApiResult<Option<HostPlug>> {
+    match nic.binding.as_ref().filter(|b| b.vif_type == "ovs") {
+        Some(binding) => ovs_plug(binding).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn ovs_plug(binding: &NicBinding) -> ApiResult<HostPlug> {
