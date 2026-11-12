@@ -132,7 +132,10 @@ pub struct BalancerStatus {
 
 resource!(
     /// A load balancer: one VIP, many listeners.
-    Balancer, BalancerSpec, BalancerStatus, kind::BALANCER
+    Balancer,
+    BalancerSpec,
+    BalancerStatus,
+    kind::BALANCER
 );
 
 // ---- Listener ----------------------------------------------------------------
@@ -232,7 +235,10 @@ pub struct ListenerStatus {
 
 resource!(
     /// A protocol and port on a balancer's VIP.
-    Listener, ListenerSpec, ListenerStatus, kinds::LISTENER
+    Listener,
+    ListenerSpec,
+    ListenerStatus,
+    kinds::LISTENER
 );
 
 // ---- Pool --------------------------------------------------------------------
@@ -364,7 +370,10 @@ pub struct PoolStatus {
 
 resource!(
     /// A set of members with a balancing algorithm and a health monitor.
-    Pool, PoolSpec, PoolStatus, kinds::POOL
+    Pool,
+    PoolSpec,
+    PoolStatus,
+    kinds::POOL
 );
 
 // ---- Member ------------------------------------------------------------------
@@ -418,7 +427,10 @@ pub struct MemberStatus {
 
 resource!(
     /// One backend address:port in a pool.
-    Member, MemberSpec, MemberStatus, kinds::MEMBER
+    Member,
+    MemberSpec,
+    MemberStatus,
+    kinds::MEMBER
 );
 
 impl Member {

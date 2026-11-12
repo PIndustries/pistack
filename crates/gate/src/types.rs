@@ -105,7 +105,10 @@ pub struct ProjectStatus {
 
 resource!(
     /// A tenant. Quotas live in `spec`, usage in `status`.
-    Project, ProjectSpec, ProjectStatus, kind::PROJECT
+    Project,
+    ProjectSpec,
+    ProjectStatus,
+    kind::PROJECT
 );
 
 // ---- Principal -------------------------------------------------------------
@@ -153,7 +156,10 @@ pub struct PrincipalStatus {}
 
 resource!(
     /// A user or service account. Names are global (no project).
-    Principal, PrincipalSpec, PrincipalStatus, kind::PRINCIPAL
+    Principal,
+    PrincipalSpec,
+    PrincipalStatus,
+    kind::PRINCIPAL
 );
 
 impl Principal {
@@ -179,7 +185,10 @@ pub struct RoleStatus {}
 
 resource!(
     /// A role. Its `name` and `description` are in `meta`.
-    Role, RoleSpec, RoleStatus, kind::ROLE
+    Role,
+    RoleSpec,
+    RoleStatus,
+    kind::ROLE
 );
 
 // ---- RoleBinding -----------------------------------------------------------
@@ -216,7 +225,10 @@ pub struct RoleBindingStatus {}
 
 resource!(
     /// Grants `role` to `principal` at `scope`. `meta.project` mirrors a project scope.
-    RoleBinding, RoleBindingSpec, RoleBindingStatus, KIND_BINDING
+    RoleBinding,
+    RoleBindingSpec,
+    RoleBindingStatus,
+    KIND_BINDING
 );
 
 // ---- ApiKey ----------------------------------------------------------------
@@ -239,7 +251,10 @@ pub struct ApiKeyStatus {}
 
 resource!(
     /// A long-lived credential. Named `<principal>/<name>`; `meta.project` is its scope.
-    ApiKey, ApiKeySpec, ApiKeyStatus, KIND_KEY
+    ApiKey,
+    ApiKeySpec,
+    ApiKeyStatus,
+    KIND_KEY
 );
 
 impl ApiKey {
