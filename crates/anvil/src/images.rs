@@ -177,6 +177,41 @@ impl ImageCache {
         Ok(())
     }
 
+    /// The cache path for an image file that is already on this host under
+    /// another name: a hard link, or a copy when the file is on another
+    /// filesystem. The server's blob store keeps an image under its bare
+    /// digest, and libvirt's AppArmor helper only lets a guest open a disk
+    /// whose name ends in an image extension.
+    pub async fn adopt(&self, local: &Path, source: &ImageSource) -> ApiResult<PathBuf> {
+        let path = self.path_for(source)?;
+        let lock = {
+            let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+            busy.entry(source.sha256.clone()).or_default().clone()
+        };
+        let _held = lock.lock().await;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(path);
+        }
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .map_err(|err| io("create the image directory", &err))?;
+        open_to_readers(&self.dir, 0o755).await;
+        if tokio::fs::hard_link(local, &path).await.is_err() {
+            let partial =
+                self.dir
+                    .join(format!(".{}.{}.partial", source.sha256, std::process::id()));
+            if let Err(err) = tokio::fs::copy(local, &partial).await {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(io("copy the image", &err));
+            }
+            tokio::fs::rename(&partial, &path)
+                .await
+                .map_err(|err| io("install the image", &err))?;
+        }
+        open_to_readers(&path, 0o644).await;
+        Ok(path)
+    }
+
     /// `<dir>/<sha256>.<format>`. Both parts come from the server and end
     /// up in a file name, so both are checked.
     fn path_for(&self, source: &ImageSource) -> ApiResult<PathBuf> {
@@ -322,6 +357,33 @@ mod tests {
         let restarted = ImageCache::new(dir.path());
         restarted.ensure(&server, &src).await.unwrap();
         assert_eq!(server.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_file_already_here_is_given_a_name_with_its_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"the server's blob";
+        let src = source(bytes);
+        let blob = dir.path().join(&src.sha256);
+        std::fs::write(&blob, bytes).unwrap();
+        let cache = ImageCache::new(dir.path());
+
+        let path = cache.adopt(&blob, &src).await.unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("{}.qcow2", src.sha256)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(cache.adopt(&blob, &src).await.unwrap(), path);
+        assert_eq!(leftovers(dir.path()), vec![format!("{}.qcow2", src.sha256)]);
+
+        // Nothing to adopt is an error, and leaves nothing behind.
+        let other = source(b"another image");
+        assert!(cache
+            .adopt(&dir.path().join("missing"), &other)
+            .await
+            .is_err());
+        assert_eq!(leftovers(dir.path()).len(), 1);
     }
 
     #[tokio::test]
