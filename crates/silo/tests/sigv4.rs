@@ -23,6 +23,9 @@ struct World {
     bucket: String,
     access_key_id: String,
     secret: Vec<u8>,
+    /// A key whose principal holds only `reader` in the same project.
+    reader_access_key_id: String,
+    reader_secret: Vec<u8>,
     region: String,
 }
 
@@ -99,6 +102,11 @@ async fn world() -> World {
     let created = keep
         .create_access_key(&project, &alice, "sigv4-test")
         .expect("access key");
+    let rita = principal(&store, "sigv4-rita");
+    bind(&store, &rita, "reader", &project);
+    let reader_key = keep
+        .create_access_key(&project, &rita, "sigv4-reader")
+        .expect("reader access key");
     let region = DEFAULT_REGION.to_owned();
     let silo_root = dir.path().join("silo");
     let client = Client::new(store.clone(), &silo_root).with_max_object_bytes(1024 * 1024);
@@ -134,6 +142,8 @@ async fn world() -> World {
         bucket: "widgets".into(),
         access_key_id: created.access_key.access_key_id,
         secret: created.secret_access_key.into_bytes(),
+        reader_access_key_id: reader_key.access_key.access_key_id,
+        reader_secret: reader_key.secret_access_key.into_bytes(),
         region,
     }
 }
@@ -250,6 +260,106 @@ async fn signed_put_get_round_trip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "signed get");
+    assert_eq!(body, payload);
+}
+
+#[tokio::test]
+async fn reader_key_reads_but_cannot_write() {
+    let w = world().await;
+    let payload = b"members only";
+    let hash = sha256_hex(payload);
+    let path = format!("/{}/notes.txt", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "PUT",
+        &path,
+        "",
+        payload,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &hash,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member put");
+
+    // The reader's key may read the object.
+    let (status, body, _) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        "",
+        b"",
+        &w.reader_access_key_id,
+        &w.reader_secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reader get");
+    assert_eq!(body, payload);
+
+    // It may not overwrite or delete it.
+    let (status, body, _) = signed_call(
+        &w.app,
+        "PUT",
+        &path,
+        "",
+        payload,
+        &w.reader_access_key_id,
+        &w.reader_secret,
+        &w.region,
+        &amz_now(),
+        &hash,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "reader put");
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "AccessDenied"
+    );
+    let (status, _, _) = signed_call(
+        &w.app,
+        "DELETE",
+        &path,
+        "",
+        b"",
+        &w.reader_access_key_id,
+        &w.reader_secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "reader delete");
+
+    // The object is untouched.
+    let (status, body, _) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body, payload);
 }
 

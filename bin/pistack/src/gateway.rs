@@ -11,6 +11,13 @@
 //! replaced by a synthetic admin so a laptop works with no login, except
 //! `/silo` SigV4 (header or presigned), which must reach silo without a
 //! bearer `Caller`.
+//!
+//! Role enforcement for writes also lives here (`enforce_write_role`): a
+//! caller who is neither admin nor `member` is refused every mutating
+//! request, and the machine console ticket, before the module sees it.
+//! `gate` (`/identity`) applies its own policy, and `/rpc` is the agent
+//! transport, so both are left alone. Silo's SigV4 callers are attached
+//! inside silo, which applies the same rule there.
 
 use crate::server::Assembly;
 use axum::{
@@ -97,6 +104,8 @@ pub fn build(
         .route("/healthz", get(|| async { "ok" }));
 
     // Inner to authentication so the Caller, when present, is already attached.
+    // The role check is inner to the audit, so a refused write is recorded.
+    app = app.layer(middleware::from_fn(enforce_write_role));
     app = app.layer(middleware::from_fn_with_state(store, audit_mutation));
 
     if let Some(handle) = cluster {
@@ -132,6 +141,38 @@ pub fn build(
 
 fn is_mutation(method: &str) -> bool {
     !matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// Paths the write-role check leaves to their own rules: `gate` runs the
+/// RBAC policy on `/identity`, `/rpc` is the agent transport, and redeeming
+/// a join token is authorised by the token itself.
+fn write_role_exempt(path: &str) -> bool {
+    path == "/identity"
+        || path.starts_with("/identity/")
+        || path == "/rpc"
+        || path.starts_with("/rpc/")
+        || path == "/secrets/join-tokens/redeem"
+}
+
+/// A read by method that hands out control of a resource: the machine
+/// console ticket (`GET /compute/machines/{id}/console`).
+fn is_privileged_read(path: &str) -> bool {
+    path.starts_with("/compute/machines/") && path.ends_with("/console")
+}
+
+/// A caller without the admin or `member` role may only read. A request
+/// with no caller passes through; the module answers it as unauthorized.
+async fn enforce_write_role(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if (is_mutation(req.method().as_str()) || is_privileged_read(path)) && !write_role_exempt(path)
+    {
+        if let Some(caller) = req.extensions().get::<Caller>() {
+            if let Err(err) = caller.require_write() {
+                return axum::response::IntoResponse::into_response(err);
+            }
+        }
+    }
+    next.run(req).await
 }
 
 /// After the response, record a mutation. The path has no query string.
@@ -180,7 +221,7 @@ async fn dev_admin(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::dev_admin;
+    use super::{dev_admin, enforce_write_role};
     use axum::{
         body::{to_bytes, Body},
         extract::Request,
@@ -288,5 +329,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body(res).await, "no-caller");
+    }
+
+    fn caller(roles: &[&str]) -> Caller {
+        Caller {
+            principal: pistack_types::Id::new(pistack_types::kind::PRINCIPAL),
+            principal_name: "someone".into(),
+            project: Some(pistack_types::Id::new(pistack_types::kind::PROJECT)),
+            roles: roles.iter().map(|r| (*r).to_owned()).collect(),
+            system: false,
+        }
+    }
+
+    /// Every path answers 200 unless the role check refuses it first.
+    fn guarded(caller: Option<Caller>) -> Router {
+        let mut app = Router::new()
+            .fallback(|| async { "ok" })
+            .layer(middleware::from_fn(enforce_write_role));
+        if let Some(c) = caller {
+            app = app.layer(Extension(c));
+        }
+        app
+    }
+
+    async fn status(app: &Router, method: &str, path: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    const WRITES: [(&str, &str); 12] = [
+        ("POST", "/compute/machines"),
+        ("DELETE", "/compute/machines/mach-1"),
+        ("POST", "/network/networks"),
+        ("PATCH", "/network/ports/port-1"),
+        ("POST", "/volume/volumes/vol-1/attach"),
+        ("POST", "/dns/zones"),
+        ("POST", "/balancers/balancers"),
+        ("POST", "/blueprint/stacks/stack-1/apply"),
+        ("POST", "/gauge/alarms"),
+        ("PUT", "/silo/buckets/b/objects/k"),
+        ("POST", "/loom/pods/pod-1/exec"),
+        ("GET", "/compute/machines/mach-1/console"),
+    ];
+
+    #[tokio::test]
+    async fn reader_cannot_write_in_any_module() {
+        let app = guarded(Some(caller(&["reader"])));
+        for (method, path) in WRITES {
+            assert_eq!(
+                status(&app, method, path).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+        }
+        // Reads stay open.
+        for path in ["/compute/machines", "/network/networks/net-1", "/"] {
+            assert_eq!(status(&app, "GET", path).await, StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_with_no_role_cannot_write() {
+        let app = guarded(Some(caller(&[])));
+        assert_eq!(
+            status(&app, "POST", "/compute/machines").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn member_and_admin_can_write() {
+        for roles in [&["member"][..], &["admin"][..]] {
+            let app = guarded(Some(caller(roles)));
+            for (method, path) in WRITES {
+                assert_eq!(
+                    status(&app, method, path).await,
+                    StatusCode::OK,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exempt_paths_and_anonymous_requests_pass_through() {
+        let reader = guarded(Some(caller(&["reader"])));
+        for path in [
+            "/identity/tokens",
+            "/identity/principals/p/password",
+            "/rpc/agents/hello",
+            "/secrets/join-tokens/redeem",
+        ] {
+            assert_eq!(
+                status(&reader, "POST", path).await,
+                StatusCode::OK,
+                "{path}"
+            );
+        }
+        // No caller: the module decides (it answers unauthorized).
+        let anonymous = guarded(None);
+        assert_eq!(
+            status(&anonymous, "POST", "/compute/machines").await,
+            StatusCode::OK
+        );
     }
 }
