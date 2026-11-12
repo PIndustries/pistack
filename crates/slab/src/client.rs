@@ -1282,8 +1282,9 @@ impl Client {
         }
     }
 
-    /// Create the blank volume, then copy an image into it while the phase
-    /// stays `Creating`. A failed copy removes the blank volume.
+    /// Create the volume, blank or from its snapshot or source volume, then
+    /// copy an image into it while the phase stays `Creating`. A failed
+    /// image copy removes the blank volume.
     async fn provision_volume(
         &self,
         id: &Id,
@@ -1315,7 +1316,20 @@ impl Client {
         } else {
             None
         };
-        let created = match backend.create(&vol).await {
+        // Only `create` makes a blank volume. A snapshot or volume source
+        // carries data, so the backend restores or clones it instead.
+        let created = match &vol.spec.source {
+            VolumeSource::None | VolumeSource::Image(_) => backend.create(&vol).await,
+            VolumeSource::Snapshot(snap) => match self.snapshots().get(snap) {
+                Ok(snap) => backend.restore(&snap, &vol).await,
+                Err(e) => Err(e.into()),
+            },
+            VolumeSource::Volume(src) => match col.get(src) {
+                Ok(src) => backend.clone_volume(&src, &vol).await,
+                Err(e) => Err(e.into()),
+            },
+        };
+        let created = match created {
             Ok(created) => created,
             Err(e) => return Ok(Some(self.fail_volume(id, "create", e)?)),
         };

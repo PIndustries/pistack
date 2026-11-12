@@ -15,7 +15,8 @@
 //! | delete          | `lvremove --force {vg}/{vol_id}` |
 //! | snapshot        | `lvcreate --snapshot --name {snap_id} {vg}/{vol_id}` (thin snapshots need no size) |
 //! | delete_snapshot | `lvremove --force {vg}/{snap_id}` |
-//! | restore         | `lvcreate --snapshot --name {new_vol_id} {vg}/{snap_id}` then `lvchange -ay -K {vg}/{new_vol_id}` |
+//! | restore         | `lvcreate --snapshot --name {new_vol_id} {vg}/{snap_id}` then `lvchange -ay -K {vg}/{new_vol_id}` and, when the new volume is larger, `lvextend --size {size_gib}G {vg}/{new_vol_id}` |
+//! | clone           | the same as restore, from `{vg}/{src_vol_id}` |
 //! | extend          | `lvextend --size {new_size_gib}G {vg}/{vol_id}` |
 //! | attach_info     | same host: `Local { path: /dev/{vg}/{vol_id} }` |
 //! | image           | `qemu-img convert -O raw -f <fmt> -n <src> /dev/{vg}/{vol_id}` |
@@ -160,6 +161,49 @@ impl LvmBackend {
         Ok(pool)
     }
 
+    /// Thin snapshot of `{vg}/{origin}` named after `into`. A thin snapshot
+    /// is created with activation skipped, hence `-K`. It has the origin's
+    /// size, so it is grown when `into` asks for more than `origin_gib`.
+    async fn snapshot_into(
+        &self,
+        origin: &str,
+        origin_gib: u64,
+        into: &Volume,
+    ) -> ApiResult<BackendRef> {
+        let vg = self.vg()?;
+        let id = vol_id(into)?;
+        run(
+            &super::configured_bin(ENV_BIN, "lvcreate"),
+            &[
+                "--snapshot".into(),
+                "--name".into(),
+                id.clone(),
+                format!("{vg}/{origin}"),
+            ],
+            false,
+        )
+        .await?;
+        run(
+            &super::configured_bin(ENV_BIN, "lvchange"),
+            &["-ay".into(), "-K".into(), format!("{vg}/{id}")],
+            false,
+        )
+        .await?;
+        if into.spec.size_gib > origin_gib {
+            run(
+                &super::configured_bin(ENV_BIN, "lvextend"),
+                &[
+                    "--size".into(),
+                    format!("{}G", into.spec.size_gib),
+                    format!("{vg}/{id}"),
+                ],
+                false,
+            )
+            .await?;
+        }
+        Ok(BackendRef::new(format!("/dev/{vg}/{id}")))
+    }
+
     /// `qemu-img convert -O raw -f <format> -n <src> /dev/{vg}/{id}`.
     fn image_convert_args(&self, vol: &Volume, src: &Path, format: &str) -> ApiResult<Vec<String>> {
         let vg = self.vg()?;
@@ -179,6 +223,7 @@ impl BlockBackend for LvmBackend {
     }
 
     async fn create(&self, vol: &Volume) -> ApiResult<BackendRef> {
+        blank_only(vol)?;
         self.require_available().await?;
         let vg = self.vg()?;
         let pool = self.pool()?;
@@ -250,27 +295,15 @@ impl BlockBackend for LvmBackend {
 
     async fn restore(&self, snap: &Snapshot, into: &Volume) -> ApiResult<BackendRef> {
         self.require_available().await?;
-        let vg = self.vg()?;
         let snap_id = snap_id(snap)?;
-        let id = vol_id(into)?;
-        run(
-            &super::configured_bin(ENV_BIN, "lvcreate"),
-            &[
-                "--snapshot".into(),
-                "--name".into(),
-                id.clone(),
-                format!("{vg}/{snap_id}"),
-            ],
-            false,
-        )
-        .await?;
-        run(
-            &super::configured_bin(ENV_BIN, "lvchange"),
-            &["-ay".into(), "-K".into(), format!("{vg}/{id}")],
-            false,
-        )
-        .await?;
-        Ok(BackendRef::new(format!("/dev/{vg}/{id}")))
+        self.snapshot_into(&snap_id, snap.status.size_gib, into)
+            .await
+    }
+
+    async fn clone_volume(&self, src: &Volume, into: &Volume) -> ApiResult<BackendRef> {
+        self.require_available().await?;
+        let src_id = vol_id(src)?;
+        self.snapshot_into(&src_id, src.spec.size_gib, into).await
     }
 
     async fn extend(&self, vol: &Volume, new_size_gib: u64) -> ApiResult<()> {
@@ -321,6 +354,17 @@ fn vol_id(vol: &Volume) -> ApiResult<String> {
     let id = vol.meta.id.to_string();
     ident("volume id", &id)?;
     Ok(id)
+}
+
+/// `create` makes a blank volume. Refuse a source it would drop.
+fn blank_only(vol: &Volume) -> ApiResult<()> {
+    use crate::types::VolumeSource;
+    match vol.spec.source {
+        VolumeSource::None | VolumeSource::Image(_) => Ok(()),
+        VolumeSource::Snapshot(_) | VolumeSource::Volume(_) => Err(ApiError::internal(
+            "lvm create makes a blank volume; a snapshot or volume source is restored or cloned",
+        )),
+    }
 }
 
 fn snap_id(snap: &Snapshot) -> ApiResult<String> {
@@ -517,6 +561,92 @@ mod tests {
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(!logged.contains("--thin"), "{logged}");
         assert!(!logged.contains("--virtualsize"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn restore_and_clone_snapshot_the_source() {
+        let _guard = LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let script = dir.path().join("lvm");
+        let quoted = log.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{quoted}'\nexit 0\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(ENV_BIN, &script);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_BIN);
+            }
+        }
+        let _reset = Reset;
+        // One line per command, without the `vgs` and `lvs` probes.
+        let issued = || -> Vec<String> {
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            logged
+                .lines()
+                .filter(|line| !line.starts_with("--noheadings"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let backend = LvmBackend::new("vg0", "pistack-thin");
+        let src = volume(4);
+        let src_id = src.meta.id.to_string();
+        let snap = Snapshot {
+            meta: Meta::new(kind::SNAPSHOT, "snap", None),
+            spec: crate::types::SnapshotSpec {
+                volume: src.meta.id.clone(),
+            },
+            status: crate::types::SnapshotStatus {
+                size_gib: 4,
+                ..Default::default()
+            },
+        };
+        let snap_id = snap.meta.id.to_string();
+
+        // Same size: a snapshot of the snapshot, activated, not resized.
+        let mut restored = volume(4);
+        restored.spec.source = crate::types::VolumeSource::Snapshot(snap.meta.id.clone());
+        let id = restored.meta.id.to_string();
+        let made = backend.restore(&snap, &restored).await.unwrap();
+        assert_eq!(made.as_str(), format!("/dev/vg0/{id}"));
+        assert_eq!(
+            issued(),
+            vec![
+                format!("--snapshot --name {id} vg0/{snap_id}"),
+                format!("-ay -K vg0/{id}"),
+            ]
+        );
+
+        // Larger than the source volume: grown to the requested size.
+        let mut cloned = volume(6);
+        cloned.spec.source = crate::types::VolumeSource::Volume(src.meta.id.clone());
+        let id = cloned.meta.id.to_string();
+        let made = backend.clone_volume(&src, &cloned).await.unwrap();
+        assert_eq!(made.as_str(), format!("/dev/vg0/{id}"));
+        assert_eq!(
+            issued(),
+            vec![
+                format!("--snapshot --name {id} vg0/{src_id}"),
+                format!("-ay -K vg0/{id}"),
+                format!("--size 6G vg0/{id}"),
+            ]
+        );
+
+        // `create` would drop the source, so it refuses and runs nothing.
+        for vol in [&restored, &cloned] {
+            let err = backend.create(vol).await.unwrap_err();
+            assert_eq!(err.code, pistack_types::error::ErrorCode::Internal);
+            assert!(err.message.contains("blank"), "{err}");
+        }
+        assert!(issued().is_empty());
     }
 
     #[tokio::test]
