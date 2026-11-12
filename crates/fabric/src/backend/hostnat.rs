@@ -30,14 +30,45 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-/// Fixed addresses this process last programmed, and which group wrote them.
-/// `delete_security_group` is only handed an id: the ports have already left
-/// the group. Clearing an address a later group rewrote would drop that
-/// group's rules.
+/// Each group's fixed addresses and the rules it gives them, as last applied
+/// by this process. The helper holds one rule set per address and replaces
+/// it whole, so an address in several groups is sent the rules of all of
+/// them together. `delete_security_group` is only handed an id: the ports
+/// have already left the group.
 #[derive(Clone, Debug, Default)]
 struct Applied {
-    by_group: HashMap<Id, Vec<IpAddr>>,
-    owner: HashMap<IpAddr, Id>,
+    by_group: HashMap<Id, (Vec<IpAddr>, SgPolicy)>,
+}
+
+impl Applied {
+    /// The rules of every group that holds `ip`, or `None` when no group
+    /// does. Groups are taken in id order so the same set of groups always
+    /// gives the same rules.
+    fn policy_for(&self, ip: IpAddr) -> Option<SgPolicy> {
+        let mut groups: Vec<_> = self
+            .by_group
+            .iter()
+            .filter(|(_, (targets, _))| targets.contains(&ip))
+            .collect();
+        if groups.is_empty() {
+            return None;
+        }
+        groups.sort_by(|a, b| a.0.cmp(b.0));
+        let mut merged = SgPolicy::default();
+        for (_, (_, policy)) in groups {
+            for rule in &policy.ingress {
+                if !merged.ingress.contains(rule) {
+                    merged.ingress.push(rule.clone());
+                }
+            }
+            for rule in &policy.egress {
+                if !merged.egress.contains(rule) {
+                    merged.egress.push(rule.clone());
+                }
+            }
+        }
+        Some(merged)
+    }
 }
 
 /// Runs `pistack-fip` (via sudo, unless a test points at its own program).
@@ -139,6 +170,20 @@ impl HostNat {
         .await
     }
 
+    /// Send `ip` the rules of the groups it is in now, or clear it when it
+    /// is in none.
+    async fn sg_sync(&self, ip: IpAddr) -> ApiResult<()> {
+        let policy = self.applied().policy_for(ip);
+        match policy {
+            Some(policy) => {
+                let body = serde_json::to_vec(&policy)
+                    .map_err(|e| ApiError::internal(format!("security group policy: {e}")))?;
+                self.sg_policy(ip, &body).await
+            }
+            None => self.sg_clear(ip).await,
+        }
+    }
+
     async fn sg_clear(&self, ip: IpAddr) -> ApiResult<()> {
         self.run_stdin(
             &[
@@ -214,49 +259,29 @@ impl NetBackend for HostNat {
     }
     async fn apply_security_group(&self, sg: &SecurityGroup, members: &[Port]) -> ApiResult<()> {
         let targets = member_v4(members);
-        let body = serde_json::to_vec(&sg_policy(sg, members))
-            .map_err(|e| ApiError::internal(format!("security group policy: {e}")))?;
-        let id = sg.meta.id.clone();
-        let removed = {
-            let mut applied = self.applied();
-            let previous = applied.by_group.get(&id).cloned().unwrap_or_default();
-            applied.by_group.insert(id.clone(), targets.clone());
-            previous
-                .into_iter()
-                .filter(|ip| !targets.contains(ip) && applied.owner.get(ip) == Some(&id))
-                .collect::<Vec<_>>()
-        };
+        let policy = sg_policy(sg, members);
+        let previous = self
+            .applied()
+            .by_group
+            .insert(sg.meta.id.clone(), (targets.clone(), policy))
+            .map(|(ips, _)| ips)
+            .unwrap_or_default();
         for ip in &targets {
-            self.sg_policy(*ip, &body).await?;
-            self.applied().owner.insert(*ip, id.clone());
+            self.sg_sync(*ip).await?;
         }
-        for ip in removed {
-            self.sg_clear(ip).await?;
-            let mut applied = self.applied();
-            if applied.owner.get(&ip) == Some(&id) {
-                applied.owner.remove(&ip);
+        // An address that left this group keeps what its other groups give.
+        for ip in previous {
+            if !targets.contains(&ip) {
+                self.sg_sync(ip).await?;
             }
         }
         Ok(())
     }
 
     async fn delete_security_group(&self, id: &Id) -> ApiResult<()> {
-        let ips = {
-            let mut applied = self.applied();
-            applied
-                .by_group
-                .remove(id)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|ip| applied.owner.get(ip) == Some(id))
-                .collect::<Vec<_>>()
-        };
-        for ip in ips {
-            self.sg_clear(ip).await?;
-            let mut applied = self.applied();
-            if applied.owner.get(&ip) == Some(id) {
-                applied.owner.remove(&ip);
-            }
+        let previous = self.applied().by_group.remove(id);
+        for ip in previous.map(|(ips, _)| ips).unwrap_or_default() {
+            self.sg_sync(ip).await?;
         }
         Ok(())
     }
@@ -301,13 +326,13 @@ fn member_v4(members: &[Port]) -> Vec<IpAddr> {
     out
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct SgPolicy {
     ingress: Vec<SgMatch>,
     egress: Vec<SgMatch>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct SgMatch {
     proto: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,6 +583,100 @@ mod tests {
         assert!(!text.contains("fe80"), "{text}");
         assert!(!text.contains("\"port_min\":80"), "{text}");
         assert!(!text.contains("\"port_min\":443"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn group(name: &str, port: u16) -> SecurityGroup {
+        let mut sg = SecurityGroup {
+            meta: Meta::new(kind::SECGROUP, name, None),
+            spec: SecurityGroupSpec::default(),
+            status: SecurityGroupStatus::default(),
+        };
+        sg.spec.rules.push(
+            Rule::new(Direction::Ingress, EtherType::IPv4)
+                .protocol(Protocol::Tcp)
+                .ports(port, port)
+                .remote(Remote::Any),
+        );
+        sg
+    }
+
+    /// The last thing the helper was told for `ip`: its arguments and, for
+    /// a policy, the JSON it read.
+    fn last_call(log: &std::path::Path, ip: &str) -> (String, String) {
+        let text = std::fs::read_to_string(log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .rposition(|l| l.starts_with(&format!("sg --fixed {ip} ")))
+            .unwrap_or_else(|| panic!("no sg call for {ip}: {text}"));
+        let body = lines.get(at + 1).copied().unwrap_or_default();
+        (lines[at].to_owned(), body.to_owned())
+    }
+
+    #[tokio::test]
+    async fn port_in_two_groups_gets_the_rules_of_both() {
+        let dir = std::env::temp_dir().join(format!("pistack-fip-sg2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (nat, log) = sg_helper(&dir);
+        let both = guest_port("10.88.0.187".parse().unwrap());
+        let web_only = guest_port("10.88.0.188".parse().unwrap());
+        let ssh = group("ssh", 22);
+        let mut web = group("web", 80);
+
+        nat.apply_security_group(&ssh, std::slice::from_ref(&both))
+            .await
+            .unwrap();
+        nat.apply_security_group(&web, &[both.clone(), web_only.clone()])
+            .await
+            .unwrap();
+        let (_, body) = last_call(&log, "10.88.0.187");
+        assert!(body.contains("\"port_min\":22"), "{body}");
+        assert!(body.contains("\"port_min\":80"), "{body}");
+        let (_, body) = last_call(&log, "10.88.0.188");
+        assert!(!body.contains("\"port_min\":22"), "{body}");
+        assert!(body.contains("\"port_min\":80"), "{body}");
+
+        // The other group applied again, and a second pass, change nothing.
+        nat.apply_security_group(&ssh, std::slice::from_ref(&both))
+            .await
+            .unwrap();
+        let (_, again) = last_call(&log, "10.88.0.187");
+        nat.apply_security_group(&web, &[both.clone(), web_only.clone()])
+            .await
+            .unwrap();
+        assert_eq!(last_call(&log, "10.88.0.187").1, again);
+        assert!(again.contains("\"port_min\":22"), "{again}");
+        assert!(again.contains("\"port_min\":80"), "{again}");
+
+        // A rule taken out of one group leaves the other group's rule.
+        let rules = std::mem::take(&mut web.spec.rules);
+        nat.apply_security_group(&web, &[both.clone(), web_only.clone()])
+            .await
+            .unwrap();
+        let (_, body) = last_call(&log, "10.88.0.187");
+        assert!(body.contains("\"port_min\":22"), "{body}");
+        assert!(!body.contains("\"port_min\":80"), "{body}");
+
+        // The port leaves ssh: only web's rules are left on it.
+        web.spec.rules = rules;
+        nat.apply_security_group(&web, &[both.clone(), web_only.clone()])
+            .await
+            .unwrap();
+        nat.apply_security_group(&ssh, &[]).await.unwrap();
+        let (args, body) = last_call(&log, "10.88.0.187");
+        assert!(args.ends_with("--policy -"), "{args}");
+        assert!(!body.contains("\"port_min\":22"), "{body}");
+        assert!(body.contains("\"port_min\":80"), "{body}");
+
+        // Deleting ssh does not touch it; deleting web clears it.
+        let before = std::fs::read_to_string(&log).unwrap();
+        nat.delete_security_group(&ssh.meta.id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+        nat.delete_security_group(&web.meta.id).await.unwrap();
+        assert!(last_call(&log, "10.88.0.187").0.ends_with("--clear"));
+        assert!(last_call(&log, "10.88.0.188").0.ends_with("--clear"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
