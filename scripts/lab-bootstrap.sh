@@ -7,11 +7,12 @@
 #
 #   sudo ./scripts/lab-bootstrap.sh --report              # just print what this box has
 #   sudo ./scripts/lab-bootstrap.sh --install             # install KVM, libvirt, OVS/OVN, LVM, Rust
+#   sudo ./scripts/lab-bootstrap.sh --helpers             # put the host helpers in /usr/local/sbin
 #   sudo ./scripts/lab-bootstrap.sh --runner TOKEN [--labels kvm,ovn,gpu]
 #        (TOKEN from: gh api -X POST repos/PIndustries/pistack/actions/runners/registration-token -q .token)
 #
-# Safe to re-run. Touches nothing outside packages, /opt/actions-runner and a
-# dedicated `pistack` user.
+# Safe to re-run. Touches nothing outside packages, /opt/actions-runner, the
+# helpers in /usr/local/sbin and a dedicated `pistack` user.
 set -euo pipefail
 
 REPO_URL="https://github.com/PIndustries/pistack"
@@ -61,8 +62,14 @@ install() {
   ovs-vsctl set open . external-ids:ovn-remote=unix:/var/run/ovn/ovnsb_db.sock \
     external-ids:ovn-encap-type=geneve external-ids:ovn-encap-ip="$(hostname -I | awk '{print $1}')" \
     external-ids:system-id="$(hostname)" || true
+  helpers
   say "Done"
   report
+}
+
+helpers() {
+  say "Installing the host helpers"
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../packaging/install.sh" --helpers-only
 }
 
 runner() {
@@ -89,6 +96,7 @@ runner() {
 case "${1:-}" in
   --report) report ;;
   --install) install ;;
+  --helpers) helpers ;;
   --runner) tok="${2:-}"; [ "${3:-}" = "--labels" ] && EXTRA_LABELS="${4:-}"; runner "$tok" ;;
-  *) sed -n '5,15p' "$0"; exit 2 ;;
+  *) sed -n '5,16p' "$0"; exit 2 ;;
 esac
