@@ -6,7 +6,7 @@ What does not work yet, as of version 0.1.0 on `main`. Each item was read in the
 
 - **The API listener is plain HTTP.** `--tls-listen` adds HTTPS with a certificate from the cloud CA, but `pi` and agents do not trust that CA. `pi` needs `--insecure` to use it.
 - **Agents cannot join with certificates.** Enrollment over HTTPS fails the TLS handshake, and over HTTP the agent cannot present the certificate it was issued. Agents only connect when the server runs with `PISTACK_RPC_INSECURE=1`, which lets anything that reaches the port register as a host.
-- **Cluster routes are open by default.** `/cluster` (membership, snapshot download, join) needs no credentials unless `PISTACK_REQUIRE_JOIN=1` is set. A snapshot is the whole store.
+- **Cluster traffic is not encrypted.** `/cluster` answers only a member or a server with a join token, but servers talk to each other over plain HTTP, so the member key and the snapshot cross the network in the clear. Keep that network private.
 - **`reader` is not read-only.** Only `gate` and `keep` enforce it. In the other modules a `reader` token can create and delete resources in its project. Fixed by [PIndustries/pistack#103](https://github.com/PIndustries/pistack/pull/103), not merged.
 - **A project admin is a cloud admin.** Any token carrying the `admin` role passes every admin check, including for bindings made in a single project.
 - **Tokens cannot be revoked.** Disabling or deleting a principal does not invalidate tokens already issued. The maximum lifetime is 7 days.

@@ -23,14 +23,19 @@ Until this is finished, put the API on a private network.
 ## Adding servers
 
 ```sh
-pistack --data-dir /var/lib/pistack server --join http://10.0.0.11:8443 --listen 10.0.0.12:8443
+pi join-token create server-2
+PISTACK_JOIN_TOKEN=pij_... pistack --data-dir /var/lib/pistack server --join http://10.0.0.11:8443 --listen 10.0.0.12:8443
 ```
+
+A new server needs a join token, in `PISTACK_JOIN_TOKEN`, to download the snapshot and to join. It needs it only for that first start: once it holds the store it is a member, and the token can expire. A server found by discovery needs the token too.
 
 `--join URL` names any reachable address of the current leader. The new server downloads a snapshot of the store, registers as a member, and starts replicating. Only the leader serves joins; another server answers `409`.
 
 With neither `--init` nor `--join`, a server with an empty data directory tries discovery, but only when `--listen` is a private IPv4 address. It probes every address in its /24 on UDP port 18445. If no cluster answers it founds one. If exactly one answers it joins it. If more than one answers it stops and asks for `--join`. With `--listen 0.0.0.0:8443` (the default) there is no discovery and the server exits, asking for `--init` or `--join`.
 
-Cluster traffic between servers uses the same API port, under `/cluster`. By default those routes are open to anyone who can reach the port. Setting `PISTACK_REQUIRE_JOIN=1` on the servers makes them require a join token, and a joining server sends the one in `PISTACK_JOIN_TOKEN`. Create tokens with `pi join-token create`.
+Cluster traffic between servers uses the same API port, under `/cluster`. Those routes hand out the whole store, so they answer only a member or a server holding a valid join token. Members prove themselves with a key derived from the token signing secret, which is in every member's store and in every snapshot; nothing has to be handed to them and it does not expire. A server that is refused says so and names `PISTACK_JOIN_TOKEN`.
+
+`PISTACK_REQUIRE_JOIN=0` opens the routes to anything that reaches the port. Servers older than this check send no key, so replacing them one at a time stops replication between old and new; set `PISTACK_REQUIRE_JOIN=0` on every server for that one upgrade, then take it out.
 
 `GET /cluster` on any server shows what it believes:
 

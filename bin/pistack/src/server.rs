@@ -186,6 +186,8 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
             return Err(err).context("opening state store");
         }
     };
+    crate::cluster::set_peer_store(&store);
+    crate::cluster::warn_if_open();
 
     // One stable node name for this machine, shared with an agent that uses
     // the same data dir. Kept in <data_dir>/node.name across restarts.

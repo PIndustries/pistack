@@ -692,7 +692,7 @@ async fn show(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
     headers: HeaderMap,
 ) -> Result<Json<ClusterStatus>, ApiError> {
-    enforce_join(&handle.store, &headers)?;
+    enforce_peer(&handle.store, &headers)?;
     let members = members_of(&handle.store)?;
     Ok(Json(status_of(&handle, &members)?))
 }
@@ -702,7 +702,7 @@ async fn join(
     headers: HeaderMap,
     Json(body): Json<JoinRequest>,
 ) -> Result<Json<ClusterStatus>, ApiError> {
-    enforce_join(&handle.store, &headers)?;
+    enforce_peer(&handle.store, &headers)?;
     if !handle.leader.load(Ordering::Acquire) {
         return Err(not_leader(&handle));
     }
@@ -729,7 +729,7 @@ async fn snapshot(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    enforce_join(&handle.store, &headers)?;
+    enforce_peer(&handle.store, &headers)?;
     if !handle.leader.load(Ordering::Relaxed) {
         return Err(not_leader(&handle));
     }
@@ -770,7 +770,7 @@ async fn log(
     headers: HeaderMap,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<LogEntry>>, ApiError> {
-    enforce_join(&handle.store, &headers)?;
+    enforce_peer(&handle.store, &headers)?;
     let term = handle.term.load(Ordering::Relaxed);
     if query.fterm > term {
         // The puller has voted in a newer term. Its pull must not count as
@@ -832,7 +832,7 @@ async fn vote(
     headers: HeaderMap,
     Json(req): Json<VoteRequest>,
 ) -> Result<Json<VoteResponse>, ApiError> {
-    enforce_join(&handle.store, &headers)?;
+    enforce_peer(&handle.store, &headers)?;
     let refuse = |handle: &ClusterHandle| {
         Json(VoteResponse {
             term: handle.term.load(Ordering::Relaxed),
@@ -1620,28 +1620,91 @@ fn store_err(err: impl std::fmt::Display) -> ApiError {
     ApiError::internal(text)
 }
 
-fn enforce_join(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
-    let configured = std::env::var(REQUIRE_JOIN_ENV).ok();
-    enforce_join_value(store, headers, configured.as_deref())
+/// Header a member sends on every call to another server: the peer key.
+pub const PEER_HEADER: &str = "x-pistack-cluster";
+
+/// Who may call `/cluster`. The routes hand out the whole store, admit new
+/// servers and count votes, so by default the caller must be a member or
+/// hold a join token. `PISTACK_REQUIRE_JOIN=0` opens them, for a lab or for
+/// the one restart in which servers older than this check are replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerAuth {
+    Open,
+    Required,
 }
 
-fn join_required_value(value: Option<&str>) -> bool {
-    value.is_some_and(|item| item.trim() == "1")
+fn peer_auth_value(value: Option<&str>) -> PeerAuth {
+    match value.map(str::trim) {
+        Some("0") => PeerAuth::Open,
+        _ => PeerAuth::Required,
+    }
 }
 
-/// When `required` is not exactly `1`, the route stays open. Otherwise the
-/// header must name an unexpired token that is not spent. This does not
-/// redeem, and it does not log the clear text.
-fn enforce_join_value(
-    store: &Store,
-    headers: &HeaderMap,
-    required: Option<&str>,
-) -> Result<(), ApiError> {
-    if !join_required_value(required) {
+/// The in-process cluster tests run servers with no identity store, so
+/// there is no key to check; they exercise the check through
+/// [`enforce_peer_with`].
+#[cfg(test)]
+fn peer_auth() -> PeerAuth {
+    PeerAuth::Open
+}
+
+#[cfg(not(test))]
+fn peer_auth() -> PeerAuth {
+    peer_auth_value(std::env::var(REQUIRE_JOIN_ENV).ok().as_deref())
+}
+
+/// Say at start-up when the cluster routes were opened on purpose.
+pub fn warn_if_open() {
+    if peer_auth_value(std::env::var(REQUIRE_JOIN_ENV).ok().as_deref()) == PeerAuth::Open {
+        tracing::warn!(
+            "{REQUIRE_JOIN_ENV}=0: /cluster is open to anything that reaches this port, \
+             including the store snapshot"
+        );
+    }
+}
+
+/// The key members prove themselves with. It is derived from the token
+/// signing secret, which is in every member's store and in every snapshot
+/// and nowhere else, so a server has it from the moment it holds the
+/// cluster's state and needs nothing handed to it. `None` before the
+/// identity module has made that secret.
+pub fn peer_key(store: &Store) -> Option<String> {
+    use hmac::Mac;
+    let secret = store
+        .get_meta::<String>(gate::token::META_JWT_SECRET)
+        .ok()??;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(b"pistack cluster peer v1");
+    let digest = mac.finalize().into_bytes();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn enforce_peer(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
+    enforce_peer_with(store, headers, peer_auth())
+}
+
+/// A member's peer key, or else a join token that is unexpired and not
+/// spent. A new server has only the token: it uses it to download the
+/// snapshot and to join, and from then on it has the key. Checking a token
+/// does not redeem it, and neither secret is logged or echoed.
+fn enforce_peer_with(store: &Store, headers: &HeaderMap, auth: PeerAuth) -> Result<(), ApiError> {
+    use subtle::ConstantTimeEq;
+    if auth == PeerAuth::Open {
         return Ok(());
     }
+    if let Some(offered) = headers.get(PEER_HEADER) {
+        let known = peer_key(store);
+        return match known {
+            Some(key) if bool::from(key.as_bytes().ct_eq(offered.as_bytes())) => Ok(()),
+            _ => Err(ApiError::unauthorized("not a member of this cluster")),
+        };
+    }
     let token = match headers.get(JOIN_HEADER) {
-        None => return Err(ApiError::unauthorized("missing join token")),
+        None => {
+            return Err(ApiError::unauthorized(
+                "cluster routes need a member or a join token",
+            ))
+        }
         Some(value) => match value.to_str() {
             Ok(text) if !text.trim().is_empty() => text.trim(),
             Ok(_) => return Err(ApiError::unauthorized("missing join token")),
@@ -1672,12 +1735,30 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The store this server keeps, for the peer key on outgoing calls. Set
+/// once the store is open; a server still downloading its first snapshot
+/// has none and sends only its join token.
+static PEER_STORE: std::sync::OnceLock<Store> = std::sync::OnceLock::new();
+
+pub fn set_peer_store(store: &Store) {
+    let _ = PEER_STORE.set(store.clone());
+}
+
+/// Credentials for a call to another server: the peer key when this server
+/// has the cluster's state, otherwise the join token it was started with.
 fn with_join(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Some(key) = PEER_STORE.get().and_then(peer_key) {
+        return builder.header(PEER_HEADER, key);
+    }
     match std::env::var("PISTACK_JOIN_TOKEN") {
         Ok(token) if !token.trim().is_empty() => builder.header(JOIN_HEADER, token.trim()),
         _ => builder,
     }
 }
+
+/// What to tell the operator when another server refuses this one.
+const REFUSED_HINT: &str = "the server refused this one: start it with PISTACK_JOIN_TOKEN set to \
+     a join token (`pi join-token create`)";
 
 fn rpc_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -1727,6 +1808,9 @@ where
     while tokio::time::Instant::now() < deadline {
         match with_join(http_client().post(url)).json(body).send().await {
             Ok(response) if response.status().is_success() => return Ok(response.json().await?),
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                anyhow::bail!("{url} returned 401; {REFUSED_HINT}");
+            }
             Ok(response) if response.status().is_client_error() => {
                 anyhow::bail!("{url} returned {}", response.status());
             }
@@ -1860,6 +1944,11 @@ async fn download_once(url: &str, partial: &Path, stall: Duration) -> Result<Dow
         Ok(Ok(response)) => response,
     };
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Attempt::Refused(anyhow::anyhow!(
+            "snapshot {url} returned 401; {REFUSED_HINT}"
+        )));
+    }
     if status.is_client_error() {
         return Err(Attempt::Refused(anyhow::anyhow!(
             "snapshot {url} returned {status}"
@@ -2962,40 +3051,62 @@ mod tests {
     }
 
     #[test]
-    fn join_stays_open_until_required_and_a_redeem_spends_once() {
-        assert!(!join_required_value(None));
-        assert!(!join_required_value(Some("")));
-        assert!(!join_required_value(Some("true")));
-        assert!(join_required_value(Some("1")));
-        assert!(join_required_value(Some(" 1 ")));
+    fn cluster_routes_need_a_member_or_a_join_token() {
+        assert_eq!(peer_auth_value(None), PeerAuth::Required);
+        assert_eq!(peer_auth_value(Some("")), PeerAuth::Required);
+        assert_eq!(peer_auth_value(Some("1")), PeerAuth::Required);
+        assert_eq!(peer_auth_value(Some("false")), PeerAuth::Required);
+        assert_eq!(peer_auth_value(Some(" 0 ")), PeerAuth::Open);
 
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let (once, clear) = keep::create_join_token(&store, "once", "admin", false, None).unwrap();
         let open = HeaderMap::new();
-        enforce_join_value(&store, &open, None).unwrap();
-        enforce_join_value(&store, &open, Some("")).unwrap();
+        enforce_peer_with(&store, &open, PeerAuth::Open).unwrap();
+        let missing = enforce_peer_with(&store, &open, PeerAuth::Required).unwrap_err();
+        assert_eq!(
+            missing.message,
+            "cluster routes need a member or a join token"
+        );
 
-        let missing = enforce_join_value(&store, &open, Some("1")).unwrap_err();
-        assert_eq!(missing.message, "missing join token");
+        // A member: the key comes from the signing secret in its store.
+        assert!(peer_key(&store).is_none());
+        let mut member = HeaderMap::new();
+        member.insert(PEER_HEADER, "anything".parse().unwrap());
+        let early = enforce_peer_with(&store, &member, PeerAuth::Required).unwrap_err();
+        assert_eq!(early.message, "not a member of this cluster");
+        gate::Keys::load_or_create(&store).unwrap();
+        let key = peer_key(&store).unwrap();
+        assert_eq!(key.len(), 64);
+        assert_eq!(peer_key(&store).unwrap(), key);
+        let wrong = enforce_peer_with(&store, &member, PeerAuth::Required).unwrap_err();
+        assert_eq!(wrong.message, "not a member of this cluster");
+        member.insert(PEER_HEADER, key.parse().unwrap());
+        enforce_peer_with(&store, &member, PeerAuth::Required).unwrap();
+        // Another cluster's key is not this one's.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = open_store(other_dir.path());
+        gate::Keys::load_or_create(&other).unwrap();
+        assert_ne!(peer_key(&other).unwrap(), key);
+        enforce_peer_with(&other, &member, PeerAuth::Required).unwrap_err();
 
         let mut bad = HeaderMap::new();
         bad.insert(
             JOIN_HEADER,
             axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
         );
-        let malformed = enforce_join_value(&store, &bad, Some("1")).unwrap_err();
+        let malformed = enforce_peer_with(&store, &bad, PeerAuth::Required).unwrap_err();
         assert_eq!(malformed.message, "malformed join token");
 
         let mut unknown = HeaderMap::new();
         unknown.insert(JOIN_HEADER, "pij_nope".parse().unwrap());
-        let unknown = enforce_join_value(&store, &unknown, Some("1")).unwrap_err();
+        let unknown = enforce_peer_with(&store, &unknown, PeerAuth::Required).unwrap_err();
         assert_eq!(unknown.message, "unknown join token");
         assert!(!unknown.message.contains("pij_nope"));
 
         let mut headers = HeaderMap::new();
         headers.insert(JOIN_HEADER, format!("  {clear}  ").parse().unwrap());
-        enforce_join_value(&store, &headers, Some("1")).unwrap();
+        enforce_peer_with(&store, &headers, PeerAuth::Required).unwrap();
         assert_eq!(
             store
                 .collection::<keep::JoinToken>()
@@ -3007,7 +3118,7 @@ mod tests {
         );
 
         keep::redeem_join_token(&store, &clear).unwrap();
-        let spent = enforce_join_value(&store, &headers, Some("1")).unwrap_err();
+        let spent = enforce_peer_with(&store, &headers, PeerAuth::Required).unwrap_err();
         assert_eq!(spent.message, "join token already used");
         assert!(!spent.message.contains(&clear));
         assert_eq!(
@@ -3031,7 +3142,7 @@ mod tests {
             .unwrap();
         let mut expired = HeaderMap::new();
         expired.insert(JOIN_HEADER, old_clear.parse().unwrap());
-        let expired = enforce_join_value(&store, &expired, Some("1")).unwrap_err();
+        let expired = enforce_peer_with(&store, &expired, PeerAuth::Required).unwrap_err();
         assert_eq!(expired.message, "join token expired");
         assert!(!expired.message.contains(&old_clear));
         assert_eq!(
@@ -3049,7 +3160,7 @@ mod tests {
         keep::redeem_join_token(&store, &many_clear).unwrap();
         let mut multi = HeaderMap::new();
         multi.insert(JOIN_HEADER, many_clear.parse().unwrap());
-        enforce_join_value(&store, &multi, Some("1")).unwrap();
+        enforce_peer_with(&store, &multi, PeerAuth::Required).unwrap();
         assert_eq!(
             store
                 .collection::<keep::JoinToken>()
