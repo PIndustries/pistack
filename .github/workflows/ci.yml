@@ -25,6 +25,6 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           set -e
-          for c in $(git rev-list origin/${{ github.base_ref }}..HEAD); do
+          for c in $(git rev-list --no-merges origin/${{ github.base_ref }}..HEAD); do
             git log -1 --format=%B "$c" | grep -q '^Signed-off-by: ' || { echo "missing Signed-off-by on $c"; exit 1; }
           done
