@@ -135,6 +135,24 @@ mod tests {
         assert!(text.contains("Create alarm"));
         assert!(text.contains("\"Apply\""));
         assert!(text.contains("#7e9b86"));
+        // The navigation is grouped and opens on the overview.
+        assert!(text.contains("data-view=\"overview\" aria-current=\"page\""));
+        for group in [
+            "Compute",
+            "Network",
+            "Storage",
+            "Workloads",
+            "Access",
+            "Monitoring",
+        ] {
+            assert!(text.contains(&format!("data-group=\"{group}\"")), "{group}");
+        }
+        assert_eq!(
+            text.matches("<button type=\"button\" data-view=\"").count(),
+            29
+        );
+        assert!(text.contains("Needs attention"));
+        assert!(!text.contains("10.66.66."));
         assert!(!text.contains("pistack0"));
         assert!(!text.to_ascii_lowercase().contains("ovn"));
     }
