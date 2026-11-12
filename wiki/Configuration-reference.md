@@ -100,6 +100,7 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 | `PISTACK_TLS_LISTEN` | none | Same as `--tls-listen`. |
 | `PISTACK_CONFIG` | none | Path of the config file. |
 | `PISTACK_NODE_NAME` | host name | Node name. Written to `<data_dir>/node.name` and kept from then on. |
+| `PISTACK_CORS_ORIGINS` | none | Comma-separated origins whose pages may call the API from a browser, such as `https://portal.example`. With none, no cross-origin access is allowed; the console is same-origin and needs none. |
 | `PISTACK_ADMIN_PASSWORD` | generated | Password of the bootstrap `admin` principal. Read only when the store has no principals. A generated one is written to `<data_dir>/admin-password`. |
 
 ### Cluster and agent transport
