@@ -20,8 +20,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use pistack_rpc::proto::{
-    AgentEvent, AgentHello, CommandKind, Heartbeat, MachineRef, MachineReport, MachineRequest,
-    MigrateRequest, RunningMachine,
+    AgentEvent, AgentHello, CommandKind, Heartbeat, ImageSource, MachineRef, MachineReport,
+    MachineRequest, MigrateRequest, RunningMachine,
 };
 use pistack_rpc::CommandQueue;
 use pistack_store::{Store, StoreError};
@@ -80,13 +80,16 @@ impl RpcDriver {
     /// that name whose `file_path` or `backing_ref` is an absolute file
     /// that exists. Anything else, including `ubuntu-24.04` and a
     /// `sha256:` blob id, is sent unchanged so anvil can still resolve
-    /// `bases/<name>.qcow2`.
+    /// `bases/<name>.qcow2`. A catalog image with a digest also sets
+    /// `image_source`, so a host without the file can download it.
     pub fn request_for(&self, m: &Machine) -> MachineRequest {
+        let (image, image_source) = resolve_boot_image(self.store.as_ref(), &m.spec.image);
         MachineRequest {
             id: m.meta.id.clone(),
             name: m.meta.name.clone(),
             kind: kind_to_wire(m.spec.kind),
-            image: resolve_boot_image(self.store.as_ref(), &m.spec.image),
+            image,
+            image_source,
             resources: self.resources_for(m),
             networks: m.spec.networks.clone(),
             nics: self
@@ -186,9 +189,18 @@ impl HostDriver for RpcDriver {
 /// Catalog row, read as JSON so forge does not depend on mold.
 #[derive(serde::Deserialize)]
 struct CatalogImage {
+    id: String,
     name: String,
     #[serde(default)]
+    spec: CatalogSpec,
+    #[serde(default)]
     status: CatalogStatus,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CatalogSpec {
+    #[serde(default)]
+    format: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -199,19 +211,74 @@ struct CatalogStatus {
     backing_ref: Option<String>,
     #[serde(default)]
     file_path: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
 }
 
-fn resolve_boot_image(store: Option<&Store>, image: &str) -> String {
-    if Path::new(image).is_absolute() {
-        return image.to_owned();
+impl CatalogImage {
+    /// The image's file on this server, when it has one that exists.
+    fn local_file(&self) -> Option<String> {
+        let path = self
+            .status
+            .file_path
+            .clone()
+            .filter(|p| !p.is_empty())
+            .or_else(|| self.status.backing_ref.clone())?;
+        let file = Path::new(&path);
+        (file.is_absolute() && file.is_file()).then_some(path)
     }
-    store
-        .and_then(|store| catalog_backing(store, image))
-        .unwrap_or_else(|| image.to_owned())
+
+    /// What an agent needs to download the image: the id and the digest.
+    /// The digest is `status.sha256`, or the hex of a `sha256:` blob id.
+    fn source(&self) -> Option<ImageSource> {
+        let sha256 = self
+            .status
+            .sha256
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.status
+                    .backing_ref
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("sha256:"))
+                    .map(str::to_owned)
+            })?;
+        Some(ImageSource {
+            id: self.id.clone(),
+            sha256,
+            size_bytes: self.status.size_bytes,
+            format: self.spec.format.clone(),
+        })
+    }
 }
 
-fn catalog_backing(store: &Store, name: &str) -> Option<String> {
+/// The image string for the wire, and where an agent can fetch it.
+///
+/// An absolute path is sent as it is. A bare name that matches a ready
+/// catalog image becomes that image's file on this server when there is
+/// one, and carries the image's id and digest so a host that does not have
+/// the file downloads it. Anything else is sent unchanged.
+fn resolve_boot_image(store: Option<&Store>, image: &str) -> (String, Option<ImageSource>) {
+    if Path::new(image).is_absolute() {
+        return (image.to_owned(), None);
+    }
+    let Some(found) = store.and_then(|store| catalog_image(store, image)) else {
+        return (image.to_owned(), None);
+    };
+    let source = found.source();
+    (
+        found.local_file().unwrap_or_else(|| image.to_owned()),
+        source,
+    )
+}
+
+/// The ready catalog image called `name`. One whose file is on this server
+/// wins over one that only has a digest.
+fn catalog_image(store: &Store, name: &str) -> Option<CatalogImage> {
     let rows = store.raw_scan("resources", "img/").ok()?;
+    let mut fetchable = None;
     for (_, bytes) in rows {
         let Ok(view) = serde_json::from_slice::<CatalogImage>(&bytes) else {
             continue;
@@ -219,20 +286,14 @@ fn catalog_backing(store: &Store, name: &str) -> Option<String> {
         if view.name != name || view.status.phase != "ready" {
             continue;
         }
-        let Some(path) = view
-            .status
-            .file_path
-            .filter(|p| !p.is_empty())
-            .or(view.status.backing_ref)
-        else {
-            continue;
-        };
-        let file = Path::new(&path);
-        if file.is_absolute() && file.is_file() {
-            return Some(path);
+        if view.local_file().is_some() {
+            return Some(view);
+        }
+        if fetchable.is_none() && view.source().is_some() {
+            fetchable = Some(view);
         }
     }
-    None
+    fetchable
 }
 
 pub fn kind_to_wire(k: MachineKind) -> pistack_rpc::proto::MachineKind {
@@ -961,6 +1022,71 @@ mod tests {
         m.spec.image = path.display().to_string();
         assert_eq!(driver.request_for(&m).image, path.display().to_string());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_catalog_image_tells_the_agent_where_to_fetch_it() {
+        let store = Store::in_memory().unwrap();
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let on_another_server = std::env::temp_dir().join(format!(
+            "pistack-boot-elsewhere-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let meta = Meta::new(pistack_types::kind::IMAGE, "noble", None);
+        let id = meta.id.to_string();
+        store
+            .collection::<ImgRow>()
+            .create(ImgRow {
+                meta,
+                spec: serde_json::json!({ "format": "qcow2" }),
+                status: serde_json::json!({
+                    "phase": "ready",
+                    "sha256": digest,
+                    "size_bytes": 4096,
+                    "backing_ref": format!("sha256:{digest}"),
+                    "file_path": on_another_server.to_string_lossy(),
+                }),
+            })
+            .unwrap();
+        // A digest in the blob id alone is enough.
+        put_image(&store, "by-ref", "ready", Some(&format!("sha256:{digest}")));
+        // Not ready, or no digest: nothing to fetch.
+        put_image(
+            &store,
+            "uploading",
+            "creating",
+            Some(&format!("sha256:{digest}")),
+        );
+        put_image(&store, "no-digest", "ready", None);
+
+        let driver = RpcDriver::for_node(CommandQueue::default(), "h1").with_store(store);
+        let mut m = machine("web");
+        m.spec.image = "noble".into();
+        let req = driver.request_for(&m);
+        // The file is not on this server, so the name goes out unchanged.
+        assert_eq!(req.image, "noble");
+        assert_eq!(
+            req.image_source,
+            Some(ImageSource {
+                id,
+                sha256: digest.into(),
+                size_bytes: Some(4096),
+                format: "qcow2".into(),
+            })
+        );
+
+        m.spec.image = "by-ref".into();
+        let source = driver.request_for(&m).image_source.unwrap();
+        assert_eq!(source.sha256, digest);
+
+        for name in ["uploading", "no-digest", "no-such-image"] {
+            m.spec.image = name.into();
+            assert_eq!(driver.request_for(&m).image_source, None, "{name}");
+        }
+        // A path the user gave is theirs to stage.
+        m.spec.image = "/var/lib/images/mine.qcow2".into();
+        assert_eq!(driver.request_for(&m).image_source, None);
     }
 
     #[test]

@@ -81,9 +81,12 @@ pub fn build(
     // is not Authorization: a bearer that is not a gate token is rejected by
     // `attach_caller` below.
     let store = (*ctx.store::<pistack_store::Store>()).clone();
+    // The image download sits on the same transport and behind the same
+    // checks: an agent has a client certificate, not a gate token.
+    let images = agent_image_routes(mold::Client::new(store.clone(), asm.images.clone()));
     app = app.nest(
         "/rpc",
-        pistack_rpc::router_with_store(asm.queue.clone(), store.clone()),
+        pistack_rpc::router_with_extra(asm.queue.clone(), store.clone(), images),
     );
 
     let discovery = Discovery {
@@ -137,6 +140,38 @@ pub fn build(
         }),
     )
     .layer(CorsLayer::permissive())
+}
+
+fn agent_image_routes(images: mold::Client) -> Router {
+    Router::new()
+        .route("/images/{id}/data", get(agent_image))
+        .with_state(images)
+}
+
+/// `GET /rpc/images/{id}/data`: a ready catalog image's bytes for an agent
+/// that has to boot from it. By id only; the start request names the id.
+async fn agent_image(
+    axum::extract::State(images): axum::extract::State<mold::Client>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Response, pistack_types::ApiError> {
+    let not_found = || pistack_types::ApiError::not_found(format!("image {id} not found"));
+    let id = Id::parse(pistack_types::kind::IMAGE, &id).ok_or_else(not_found)?;
+    let image = images.images().get(&id)?;
+    let data = images.open_image(&image).await?;
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+        data,
+        256 * 1024,
+    ));
+    let mut response = axum::response::IntoResponse::into_response(body);
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Some(size) = image.status.size_bytes {
+        headers.insert(axum::http::header::CONTENT_LENGTH, size.into());
+    }
+    Ok(response)
 }
 
 fn is_mutation(method: &str) -> bool {
@@ -441,5 +476,84 @@ mod tests {
             status(&anonymous, "POST", "/compute/machines").await,
             StatusCode::OK
         );
+    }
+
+    /// A server holding one ready image, with the agent transport on a real
+    /// socket. Returns the transport's base URL and what forge would send.
+    async fn image_server(
+        auth: pistack_rpc::RpcAuth,
+        bytes: &'static [u8],
+    ) -> (String, pistack_rpc::ImageSource, tempfile::TempDir) {
+        let blobs = tempfile::tempdir().unwrap();
+        let images = mold::Client::local(blobs.path()).unwrap();
+        let created = images
+            .create(mold::CreateImage {
+                name: "noble".into(),
+                description: String::new(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                project: None,
+                spec: serde_json::from_value(serde_json::json!({ "format": "raw" })).unwrap(),
+            })
+            .unwrap();
+        let ready = images
+            .upload(&created.meta.id, Box::pin(bytes))
+            .await
+            .unwrap();
+        let source = pistack_rpc::ImageSource {
+            id: ready.meta.id.to_string(),
+            sha256: ready.status.sha256.clone().unwrap(),
+            size_bytes: ready.status.size_bytes,
+            format: ready.spec.format.to_string(),
+        };
+        let app = Router::new().nest(
+            "/rpc",
+            pistack_rpc::router_with_auth_and(
+                pistack_rpc::CommandQueue::default(),
+                images.store().clone(),
+                auth,
+                super::agent_image_routes(images),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (base, source, blobs)
+    }
+
+    #[tokio::test]
+    async fn an_agent_downloads_a_catalog_image_it_does_not_have() {
+        let bytes: &[u8] = b"not a real disk, but the same bytes on both ends";
+        let (base, source, _blobs) = image_server(pistack_rpc::RpcAuth::open(), bytes).await;
+        let client = pistack_rpc::AgentClient::new(format!("{base}/rpc"), "n1").unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let cache = anvil::images::ImageCache::new(host.path());
+
+        let path = cache.ensure(&client, &source).await.unwrap();
+        assert!(path.starts_with(host.path()));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // An id the catalog does not have is an error, not an empty file.
+        let mut missing = source.clone();
+        missing.id = pistack_types::Id::new(pistack_types::kind::IMAGE).to_string();
+        missing.sha256 = "0".repeat(64);
+        let err = cache.ensure(&client, &missing).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            pistack_types::error::ErrorCode::NotFound,
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_image_download_needs_the_agent_certificate() {
+        let (base, source, _blobs) =
+            image_server(pistack_rpc::RpcAuth::mtls_only(), b"bytes").await;
+        let response = reqwest::get(format!("{base}/rpc/images/{}/data", source.id))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
     }
 }

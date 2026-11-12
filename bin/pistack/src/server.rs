@@ -34,6 +34,8 @@ pub struct Assembly {
     pub gate: Arc<gate::Gate>,
     pub forge: Arc<forge::Forge>,
     pub queue: CommandQueue,
+    /// Image bytes, for the agent download under `/rpc`.
+    pub images: Arc<dyn mold::ImageStore>,
 }
 
 /// Every module in the binary, in mount order. Adding a module = one line.
@@ -67,7 +69,7 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
                 .with_queue(queue.clone())
                 .with_images(images.clone()),
         ),
-        Arc::new(mold::Mold::new(images)),
+        Arc::new(mold::Mold::new(images.clone())),
         Arc::new(silo::Silo::configured(silo_cfg)),
         Arc::new(shelf::Shelf),
         Arc::new(beacon::Beacon::with_cluster_hint(listen)),
@@ -82,6 +84,7 @@ pub fn assemble(dev: bool, silo_cfg: silo::SiloConfig, listen: &str) -> Assembly
         gate: gate_m,
         forge: forge_m,
         queue,
+        images,
     }
 }
 

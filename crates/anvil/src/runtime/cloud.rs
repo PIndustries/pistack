@@ -1267,6 +1267,7 @@ mod tests {
             name: name.into(),
             kind: MachineKind::Vm,
             image: image.into(),
+            image_source: None,
             resources: Resources {
                 vcpus: 1,
                 memory_mib: 128,

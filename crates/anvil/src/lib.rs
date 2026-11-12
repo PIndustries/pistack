@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod facts;
+pub mod images;
 mod overlay;
 mod probe;
 pub mod runtime;

@@ -1767,6 +1767,7 @@ mod tests {
             name: "Web Tier".into(),
             kind: super::super::MachineKind::Vm,
             image: image.into(),
+            image_source: None,
             resources: Resources {
                 vcpus: 1,
                 memory_mib: 1024,

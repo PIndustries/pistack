@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::images::ImageCache;
 use chrono::Utc;
 use keep::Pki;
 use pistack_rpc::proto::{
@@ -355,6 +356,7 @@ pub async fn run_agent_with_facts(
         runtimes,
         facts,
         probes: Arc::new(ProbeBook::new()),
+        images: ImageCache::new(&data_dir()),
     };
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -390,6 +392,16 @@ struct Agent {
     runtimes: Runtimes,
     facts: HostFacts,
     probes: Arc<ProbeBook>,
+    images: ImageCache,
+}
+
+/// The agent's data directory: `PISTACK_DATA_DIR`, which `pistack agent`
+/// sets from its flag, or the packaged default.
+fn data_dir() -> std::path::PathBuf {
+    std::env::var_os("PISTACK_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/pistack"))
 }
 
 impl Agent {
@@ -495,11 +507,32 @@ impl Agent {
         }
     }
 
+    /// Point `req.image` at a file on this host. The server sends the path
+    /// the image has there; when that file is not here and the request says
+    /// which catalog image it is, download it. A runtime that boots nothing
+    /// from the file (mock, metal) is left alone.
+    async fn localize_image(&self, req: &mut MachineRequest) -> ApiResult<()> {
+        let Some(source) = &req.image_source else {
+            return Ok(());
+        };
+        let reads_file = self
+            .runtimes
+            .get(req.kind)
+            .is_some_and(|rt| !matches!(rt.name(), "mock" | "metal"));
+        if !reads_file || std::path::Path::new(&req.image).is_file() {
+            return Ok(());
+        }
+        let path = self.images.ensure(&self.client, source).await?;
+        req.image = path.to_string_lossy().into_owned();
+        Ok(())
+    }
+
     async fn execute(&self, c: Command) -> Result<serde_json::Value, ApiError> {
         match c.kind {
             CommandKind::StartMachine => {
-                let req: MachineRequest = payload(c.payload)?;
+                let mut req: MachineRequest = payload(c.payload)?;
                 tracing::info!(machine = %req.id, name = %req.name, kind = ?req.kind, "anvil: start");
+                self.localize_image(&mut req).await?;
                 let rt = self.runtimes.start(&req).await?;
                 self.probes.install(
                     &req.id,
@@ -1733,6 +1766,7 @@ still here
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
+            images: ImageCache::new(std::path::Path::new("/nonexistent")),
         };
         let bad = agent
             .execute(Command {
@@ -1859,6 +1893,7 @@ still here
             name: "web".into(),
             kind: crate::runtime::MachineKind::Container,
             image: "not-a-path".into(),
+            image_source: None,
             resources: Resources {
                 vcpus: 1,
                 memory_mib: 128,
@@ -1897,6 +1932,7 @@ still here
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
+            images: ImageCache::new(std::path::Path::new("/nonexistent")),
         };
         let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
             command_timeout: Duration::from_secs(5),
@@ -2257,6 +2293,76 @@ still here
                 "mount".to_owned()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_start_request_is_pointed_at_a_file_on_this_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = "ab".repeat(32);
+        let source = pistack_rpc::ImageSource {
+            id: "img-1".into(),
+            sha256: digest.clone(),
+            size_bytes: None,
+            format: "qcow2".into(),
+        };
+        // The server is not reachable: any download attempt is an error.
+        let agent = |rt: crate::runtime::SharedRuntime| Agent {
+            client: AgentClient::new("http://127.0.0.1:1", "n1").unwrap(),
+            runtimes: Runtimes::all(rt),
+            facts: facts::gather(),
+            probes: Arc::new(ProbeBook::new()),
+            images: ImageCache::new(dir.path()),
+        };
+        let request = |image: &str, source: Option<pistack_rpc::ImageSource>| MachineRequest {
+            id: Id::new(pistack_types::kind::MACHINE),
+            name: "web".into(),
+            kind: MachineKind::Vm,
+            image: image.into(),
+            image_source: source,
+            resources: Default::default(),
+            networks: vec![],
+            nics: vec![],
+            volumes: vec![],
+            user_data: None,
+            ssh_keys: vec![],
+            overlay: None,
+            bmc_address: None,
+            bmc_user: None,
+        };
+        let libvirt = || -> crate::runtime::SharedRuntime { Arc::new(HoldRuntime) };
+
+        // The file the server named is here too (one host, or shared disk).
+        let here = dir.path().join("here.qcow2");
+        std::fs::write(&here, b"disk").unwrap();
+        let here = here.to_string_lossy().into_owned();
+        let mut req = request(&here, Some(source.clone()));
+        agent(libvirt()).localize_image(&mut req).await.unwrap();
+        assert_eq!(req.image, here);
+
+        // No catalog image named: the runtime resolves the name as before.
+        let mut req = request("ubuntu-24.04", None);
+        agent(libvirt()).localize_image(&mut req).await.unwrap();
+        assert_eq!(req.image, "ubuntu-24.04");
+
+        // The mock runtime boots nothing, so it downloads nothing.
+        let mut req = request("/srv/images/elsewhere.qcow2", Some(source.clone()));
+        agent(Arc::new(crate::runtime::MockRuntime::new()))
+            .localize_image(&mut req)
+            .await
+            .unwrap();
+        assert_eq!(req.image, "/srv/images/elsewhere.qcow2");
+
+        // Not here and not cached: the agent asks the server.
+        let mut req = request("/srv/images/elsewhere.qcow2", Some(source.clone()));
+        assert!(agent(libvirt()).localize_image(&mut req).await.is_err());
+
+        // Already downloaded: the request gets the local copy.
+        let cached = dir.path().join("images").join(format!("{digest}.qcow2"));
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"disk").unwrap();
+        let mut req = request("/srv/images/elsewhere.qcow2", Some(source));
+        agent(libvirt()).localize_image(&mut req).await.unwrap();
+        assert_eq!(req.image, cached.to_string_lossy());
     }
 
     /// A runtime that accepts the disk and does not write `disks.json`.

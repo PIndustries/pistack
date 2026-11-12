@@ -817,6 +817,7 @@ mod tests {
             name: name.into(),
             kind: MachineKind::Metal,
             image: "bare".into(),
+            image_source: None,
             resources: Resources {
                 vcpus: 1,
                 memory_mib: 512,
