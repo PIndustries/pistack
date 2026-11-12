@@ -108,6 +108,16 @@ pub async fn middleware(State(state): State<SigV4State>, mut req: Request, next:
     match authenticate(&state, &req) {
         Ok(None) => next.run(req).await,
         Ok(Some(auth)) => {
+            // The gateway's role check ran before this caller existed, so
+            // the same rule is applied here: writes need admin or `member`.
+            if !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS")
+                && !auth.caller.can_write()
+            {
+                return sigv4_error(s3_err(
+                    "AccessDenied",
+                    "this access key's principal may only read",
+                ));
+            }
             req.extensions_mut().insert(auth.caller);
             if let Some(sha) = auth.expected_payload_sha256 {
                 req.extensions_mut().insert(ExpectedPayloadSha256(sha));

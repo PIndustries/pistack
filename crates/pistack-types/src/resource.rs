@@ -278,6 +278,23 @@ impl Caller {
     pub fn is_admin(&self) -> bool {
         self.system || self.has_role("admin")
     }
+    /// Admin or `member`: may create, change and delete. A `reader`, or a
+    /// caller with no role, may only read.
+    pub fn can_write(&self) -> bool {
+        self.is_admin() || self.has_role("member")
+    }
+    /// [`Caller::can_write`] as an error for handlers and middleware.
+    pub fn require_write(&self) -> crate::ApiResult<()> {
+        if self.can_write() {
+            Ok(())
+        } else if self.has_role("reader") {
+            Err(crate::ApiError::forbidden("reader role is read-only")
+                .with_detail("principal", self.principal_name.as_str()))
+        } else {
+            Err(crate::ApiError::forbidden("member role required")
+                .with_detail("principal", self.principal_name.as_str()))
+        }
+    }
 }
 
 /// Resource sizes used by forge, loom and the scheduler.
