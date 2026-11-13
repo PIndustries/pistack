@@ -25,6 +25,7 @@ mod fabricchoice;
 mod gateway;
 mod keepcmd;
 mod listen;
+mod metrics;
 mod restore;
 mod server;
 
