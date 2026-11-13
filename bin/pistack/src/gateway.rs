@@ -111,6 +111,12 @@ pub fn build(
         )
         .route("/healthz", get(|| async { "ok" }));
 
+    // Before the two layers below, so removing a server is audited like any
+    // other mutation. The peer routes are merged after them.
+    if let Some(handle) = &cluster {
+        app = app.merge(crate::cluster::admin_router(handle.clone()));
+    }
+
     // Inner to authentication so the Caller, when present, is already attached.
     // The role check is inner to the audit, so a refused write is recorded.
     app = app.layer(middleware::from_fn(enforce_write_role));

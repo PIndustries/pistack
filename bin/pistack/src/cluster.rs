@@ -21,6 +21,12 @@
 //! to win, so the next leader holds every confirmed write. A write that is
 //! not confirmed in time is answered 503: it is in the leader's log and may
 //! still take effect, but nothing was promised.
+//!
+//! A server is taken out of the membership on the leader
+//! ([`remove_member`]). The new member list and the removed id are one
+//! logged write, confirmed like any other, so every server agrees. From then
+//! on the `/cluster` routes refuse that id, on every server, until it joins
+//! again with a join token.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,17 +37,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use pistack_cluster::{
     accepts_writes, check_advertise, check_follower_tip, classify, consider_pre_vote,
     consider_vote, election_seed, election_timeout, follow_candidate, in_leader_lease, is_voter,
-    join_membership, lost_quorum, pick_leader, plan_promotions, scan_targets, seed_membership,
-    should_campaign, sweep, with_agent_address, Announce, Ballot, Formation, JoinRequest, Member,
-    PeerView, Role, VoteRequest, VoteResponse, DISCOVER_PORT,
+    join_membership, lost_quorum, pick_leader, plan_promotions, plan_removal, scan_targets,
+    seed_membership, should_campaign, sweep, with_agent_address, Announce, Ballot, Formation,
+    JoinRequest, Member, PeerView, RemovalRefused, Role, VoteRequest, VoteResponse, DISCOVER_PORT,
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
@@ -173,9 +179,14 @@ pub struct ClusterHandle {
     pub log_grew: tokio::sync::Notify,
     /// How long a write waits for a majority; [`CONFIRM_WAIT`] outside tests.
     pub confirm_wait: Mutex<Duration>,
+    /// Held while the leader reads the member list and writes the next one,
+    /// so a join, a promotion and a removal cannot undo each other.
+    pub membership: Mutex<()>,
+    /// Set when another server answered that this one was removed.
+    pub removed: AtomicBool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ClusterStatus {
     cluster_id: String,
     node_id: String,
@@ -487,7 +498,7 @@ pub async fn adopt(
         api: self_api.to_owned(),
         agent_api: agent_api.map(str::to_owned),
     };
-    let status: ClusterStatus = post_json(&url, &body)
+    let status: ClusterStatus = post_json(&url, node_id, &body)
         .await
         .with_context(|| format!("joining {url}"))?;
     store.set_record_log(false);
@@ -567,6 +578,8 @@ pub fn handle_from(
         acks: tokio::sync::Notify::new(),
         log_grew: tokio::sync::Notify::new(),
         confirm_wait: Mutex::new(CONFIRM_WAIT),
+        membership: Mutex::new(()),
+        removed: AtomicBool::new(false),
     }
 }
 
@@ -611,6 +624,15 @@ pub fn router(handle: std::sync::Arc<ClusterHandle>) -> Router {
         .with_state(handle)
 }
 
+/// The route an operator takes a server out with. The caller is a cloud
+/// admin with a gate token, not a peer. The same admin reads the members
+/// from `GET /cluster`.
+pub fn admin_router(handle: std::sync::Arc<ClusterHandle>) -> Router {
+    Router::new()
+        .route("/cluster/members/{id}", axum::routing::delete(remove))
+        .with_state(handle)
+}
+
 pub async fn reject_follower_writes(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
     req: axum::extract::Request,
@@ -629,7 +651,10 @@ pub async fn reject_follower_writes(
         .extensions()
         .get::<keep::PeerIdentity>()
         .is_some_and(|peer| peer.tls);
-    if (read && !rpc) || path == "/healthz" || path == "/" || path.starts_with("/cluster") {
+    // The peer routes answer for themselves. Removing a member is an
+    // operator's write and is held to the leader like any other.
+    let peer = path.starts_with("/cluster") && !path.starts_with("/cluster/members");
+    if (read && !rpc) || path == "/healthz" || path == "/" || peer {
         return next.run(req).await;
     }
     if handle.leader.load(Ordering::Acquire) {
@@ -778,7 +803,9 @@ async fn join(
     headers: HeaderMap,
     Json(body): Json<JoinRequest>,
 ) -> Result<Json<ClusterStatus>, ApiError> {
-    enforce_peer(&handle.store, &headers)?;
+    // Not `enforce_peer`: this is the one route a removed server may call,
+    // and the check for it is below.
+    enforce_peer_with(&handle.store, &headers, peer_auth())?;
     if !handle.leader.load(Ordering::Acquire) {
         return Err(not_leader(&handle));
     }
@@ -791,9 +818,23 @@ async fn join(
         return Err(ApiError::conflict("a server cannot join itself"));
     }
     let agent_api = checked_agent_api(body.agent_api.as_deref())?;
-    let current = members_of(&handle.store)?;
-    let next = join_membership(&current, node_id, api, agent_api);
-    handle.store.put_meta("members", &next).map_err(store_err)?;
+    let next = {
+        let _membership = guard(&handle.membership);
+        let current = members_of(&handle.store)?;
+        let next = join_membership(&current, node_id, api, agent_api);
+        let mut removed = removed_of(&handle.store)?;
+        if removed.iter().any(|id| id == node_id) {
+            rejoin_token(&handle.store, &headers)?;
+            removed.retain(|id| id != node_id);
+            handle
+                .store
+                .put_meta_pair(("members", &next), (REMOVED_KEY, &removed))
+                .map_err(store_err)?;
+        } else {
+            handle.store.put_meta("members", &next).map_err(store_err)?;
+        }
+        next
+    };
     guard(&handle.progress).remove(node_id);
     tracing::info!(node = %node_id, api = %api, "server joined as a learner");
     if let Some(me) = next.iter().find(|member| member.id == handle.node_id) {
@@ -836,6 +877,9 @@ async fn agent_address(
     }
     let node_id = body.node_id.trim();
     let agent_api = checked_agent_api(body.agent_api.as_deref())?;
+    // The lock keeps this from putting back a member a removal just took
+    // out. A removed server is no member, and was refused above by its id.
+    let _membership = guard(&handle.membership);
     let current = members_of(&handle.store)?;
     if !current.iter().any(|member| member.id == node_id) {
         return Err(ApiError::not_found(format!(
@@ -852,6 +896,87 @@ async fn agent_address(
         "server changed its agent address"
     );
     Ok(Json(status_of(&handle, &next)?))
+}
+
+#[derive(Deserialize)]
+struct RemoveQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+fn require_admin(caller: Option<Extension<Caller>>) -> Result<Caller, ApiError> {
+    match caller {
+        Some(Extension(caller)) if caller.is_admin() => Ok(caller),
+        Some(_) => Err(ApiError::forbidden("admin role required")),
+        None => Err(ApiError::unauthorized("no credentials")),
+    }
+}
+
+async fn remove(
+    State(handle): State<std::sync::Arc<ClusterHandle>>,
+    caller: Option<Extension<Caller>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<RemoveQuery>,
+) -> Result<Json<ClusterStatus>, ApiError> {
+    let caller = require_admin(caller)?;
+    let status = remove_member(&handle, id.trim(), query.force).await?;
+    tracing::info!(
+        node = %id.trim(),
+        by = %caller.principal_name,
+        force = query.force,
+        "server removed from the cluster"
+    );
+    Ok(Json(status))
+}
+
+/// Take `id` out of the membership. Leader only.
+///
+/// The member list without it and the list of removed ids are written
+/// together and the answer waits for a majority of the voters that are
+/// left, as any write does. A server counts as reachable for the safety
+/// check in [`plan_removal`] when it pulled within [`PROGRESS_FRESH`].
+///
+/// The leader does not remove itself. Stepping down first would leave no
+/// server to carry the change through, so it is refused: the operator stops
+/// it and removes it from whichever server takes over.
+async fn remove_member(
+    handle: &ClusterHandle,
+    id: &str,
+    force: bool,
+) -> Result<ClusterStatus, ApiError> {
+    if !handle.leader.load(Ordering::Acquire) {
+        return Err(not_leader(handle));
+    }
+    let term = handle.term.load(Ordering::Relaxed);
+    let (next, index) = {
+        let _membership = guard(&handle.membership);
+        let members = members_of(&handle.store)?;
+        let progress = guard(&handle.progress).clone();
+        let reachable = |peer: &str| {
+            progress
+                .get(peer)
+                .is_some_and(|(_, at)| at.elapsed() < PROGRESS_FRESH)
+        };
+        let next =
+            plan_removal(&members, id, &handle.node_id, reachable, force).map_err(|refused| {
+                match refused {
+                    RemovalRefused::NotMember => ApiError::not_found(refused.to_string()),
+                    _ => ApiError::conflict(refused.to_string()),
+                }
+            })?;
+        let mut removed = removed_of(&handle.store)?;
+        if !removed.iter().any(|gone| gone == id) {
+            removed.push(id.to_owned());
+        }
+        handle
+            .store
+            .put_meta_pair(("members", &next), (REMOVED_KEY, &removed))
+            .map_err(store_err)?;
+        guard(&handle.progress).remove(id);
+        (next, handle.store.commit_index().map_err(store_err)?)
+    };
+    confirm_write(handle, index, term).await?;
+    status_of(handle, &next)
 }
 
 async fn snapshot(
@@ -1044,7 +1169,7 @@ async fn pull_page(
         leader.trim_end_matches('/'),
         wait.as_millis()
     );
-    let response = with_join(rpc_client().get(&url))
+    let response = as_node(with_join(rpc_client().get(&url)), node)
         .timeout(RPC_TIMEOUT)
         .send()
         .await?;
@@ -1052,7 +1177,7 @@ async fn pull_page(
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("leader refused the pull: {body}");
     }
-    let entries: Vec<LogEntry> = response.error_for_status()?.json().await?;
+    let entries: Vec<LogEntry> = checked(&url, response).await?.json().await?;
     if entries.is_empty() {
         return Ok(0);
     }
@@ -1120,7 +1245,10 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
         if !known.is_empty() && known != handle.self_api {
             match refresh(&handle, &known).await {
                 Ok(()) => heard = true,
-                Err(err) => tracing::debug!(leader = %known, error = %err, "leader check failed"),
+                Err(err) => {
+                    note_refusal(&handle, &err);
+                    tracing::debug!(leader = %known, error = %err, "leader check failed")
+                }
             }
         }
         if !heard {
@@ -1137,6 +1265,7 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
                         }
                     }
                     Err(err) => {
+                        note_refusal(&handle, &err);
                         tracing::debug!(leader = %found, error = %err, "leader check failed")
                     }
                 }
@@ -1145,8 +1274,12 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
         let silent = guard(&handle.last_heard).elapsed();
         let timeout = *guard(&handle.election_timeout);
         // A pull still running means the leader answered moments ago; let it
-        // finish (it is bounded by the RPC timeout) before deciding.
-        if should_campaign(silent, timeout) && !handle.pulling.load(Ordering::Acquire) {
+        // finish (it is bounded by the RPC timeout) before deciding. A
+        // removed server has nobody to ask for a vote.
+        if should_campaign(silent, timeout)
+            && !handle.pulling.load(Ordering::Acquire)
+            && !handle.removed.load(Ordering::Relaxed)
+        {
             if let Err(err) = campaign(&handle).await {
                 tracing::info!(error = %err, "election did not complete");
             }
@@ -1210,6 +1343,7 @@ async fn lead(handle: &ClusterHandle) {
 /// Keep the leader's own member record equal to the agent address it was
 /// started with. A logged write, so every server copies it.
 fn settle_agent_address(handle: &ClusterHandle) {
+    let _membership = guard(&handle.membership);
     let Ok(members) = members_of(&handle.store) else {
         return;
     };
@@ -1247,7 +1381,8 @@ fn report_agent_address(handle: &ClusterHandle, leader: &str) {
         agent_api: handle.agent_api.clone(),
     };
     tokio::spawn(async move {
-        if let Err(err) = rpc_post_json::<_, ClusterStatus>(&url, &body).await {
+        let sent = rpc_post_json::<_, ClusterStatus>(&url, &body.node_id, &body).await;
+        if let Err(err) = sent {
             tracing::warn!(
                 error = %err,
                 "the leader did not take this server's agent address; agents are not sent here until it does"
@@ -1260,6 +1395,7 @@ fn report_agent_address(handle: &ClusterHandle, leader: &str) {
 /// commit index, as [`plan_promotions`] allows. The membership change is an
 /// ordinary logged write, so every server copies it.
 fn promote_caught_up(handle: &ClusterHandle) {
+    let _membership = guard(&handle.membership);
     let Ok(members) = members_of(&handle.store) else {
         return;
     };
@@ -1370,17 +1506,22 @@ async fn probe_voters(handle: &ClusterHandle) -> Vec<ClusterStatus> {
         .filter(|member| member.role == Role::Voter && member.id != handle.node_id)
     {
         let url = format!("{}/cluster", member.api.trim_end_matches('/'));
+        let node = handle.node_id.clone();
         probes.spawn(async move {
-            match tokio::time::timeout(PROBE_TIMEOUT, rpc_get_json::<ClusterStatus>(&url)).await {
-                Ok(Ok(status)) if status.node_id == member.id => Some(status),
-                _ => None,
+            let probe = rpc_get_json::<ClusterStatus>(&url, &node);
+            match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+                Ok(Ok(status)) if status.node_id == member.id => Ok(Some(status)),
+                Ok(Err(err)) if says_removed(&err) => Err(()),
+                _ => Ok(None),
             }
         });
     }
     let mut heard = Vec::new();
     while let Some(joined) = probes.join_next().await {
-        if let Ok(Some(status)) = joined {
-            heard.push(status);
+        match joined {
+            Ok(Ok(Some(status))) => heard.push(status),
+            Ok(Err(())) => note_removed(handle),
+            _ => {}
         }
     }
     heard
@@ -1391,7 +1532,7 @@ async fn probe_voters(handle: &ClusterHandle) -> Vec<ClusterStatus> {
 /// undo either.
 async fn refresh(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow::Result<()> {
     let url = format!("{}/cluster", leader.trim_end_matches('/'));
-    let status: ClusterStatus = rpc_get_json(&url).await?;
+    let status: ClusterStatus = rpc_get_json(&url, &handle.node_id).await?;
     if !status.leader {
         anyhow::bail!("peer is not the leader");
     }
@@ -1430,9 +1571,34 @@ async fn refresh(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow
             report_agent_address(handle, leader);
         }
     }
+    if handle.removed.swap(false, Ordering::Relaxed) {
+        tracing::info!(leader = %leader, "the leader answers this server again");
+    }
     publish(handle);
     start_pull(handle, leader);
     Ok(())
+}
+
+fn says_removed(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(REMOVED_MARK)
+}
+
+fn note_refusal(handle: &ClusterHandle, err: &anyhow::Error) {
+    if says_removed(err) {
+        note_removed(handle);
+    }
+}
+
+/// Another server said this one was removed. Say so once; the follow loop
+/// stops campaigning until a leader answers again.
+fn note_removed(handle: &ClusterHandle) {
+    if handle.removed.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        node = %handle.node_id,
+        "this server was removed from the cluster: the other servers refuse it and it no longer replicates. To bring it back, stop it, move state.redb aside and start it with --join <leader api> and PISTACK_JOIN_TOKEN set to a join token"
+    );
 }
 
 fn note_pull(handle: &ClusterHandle, leader: &str, pulled: anyhow::Result<()>) {
@@ -1445,7 +1611,9 @@ fn note_pull(handle: &ClusterHandle, leader: &str, pulled: anyhow::Result<()>) {
         }
         Err(err) => {
             let text = format!("{err:#}");
-            if last.as_deref() == Some(text.as_str()) {
+            if text.contains(REMOVED_MARK) {
+                note_removed(handle);
+            } else if last.as_deref() == Some(text.as_str()) {
                 tracing::debug!(leader = %leader, error = %text, "replication pull failed");
             } else if text.contains("compacted") {
                 tracing::warn!(
@@ -1626,7 +1794,8 @@ async fn ask_votes(peers: &[String], request: &VoteRequest, need: usize) -> (usi
         let url = url.clone();
         let request = request.clone();
         votes.spawn(async move {
-            let result: anyhow::Result<VoteResponse> = rpc_post_json(&url, &request).await;
+            let result: anyhow::Result<VoteResponse> =
+                rpc_post_json(&url, &request.candidate_id, &request).await;
             (url, result)
         });
     }
@@ -1845,7 +2014,62 @@ pub fn warn_if_open() {
 }
 
 fn enforce_peer(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
-    enforce_peer_with(store, headers, peer_auth())
+    enforce_peer_with(store, headers, peer_auth())?;
+    refuse_removed(store, headers)
+}
+
+/// Header a server puts its node id in on every call to another server.
+pub const NODE_HEADER: &str = "x-pistack-node";
+
+/// Meta key: ids of removed servers, until they join again.
+const REMOVED_KEY: &str = "cluster_removed";
+
+/// Part of the refusal a removed server is given. The caller looks for it in
+/// the answer to tell this refusal from any other.
+const REMOVED_MARK: &str = "removed from the cluster";
+
+fn removed_of(store: &Store) -> Result<Vec<String>, ApiError> {
+    store
+        .get_meta(REMOVED_KEY)
+        .map_err(store_err)
+        .map(|v| v.unwrap_or_default())
+}
+
+fn removed_error() -> ApiError {
+    ApiError::forbidden(format!(
+        "this server was {REMOVED_MARK}; it joins again only with a join token"
+    ))
+}
+
+/// Refuse a caller that names itself as a removed server. A removed server
+/// still holds the peer key, which is the same for every member, so the key
+/// alone cannot tell it apart; its node id does. This holds whether or not
+/// the routes are open. A caller that sends no id (a server older than this
+/// check, or one still downloading its first snapshot) passes.
+fn refuse_removed(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(id) = headers.get(NODE_HEADER).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    let id = id.trim();
+    if removed_of(store)?.iter().any(|gone| gone == id) {
+        return Err(removed_error());
+    }
+    Ok(())
+}
+
+/// What lets a removed server join again: an unexpired, unspent join token.
+/// It is asked for even when the routes are open, and even though the server
+/// can show the peer key from its old store.
+fn rejoin_token(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = headers
+        .get(JOIN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(removed_error)?;
+    keep::authorize_join_token(store, token)
+        .map(|_| ())
+        .map_err(ApiError::from)
 }
 
 /// A member's peer key, or else a join token that is unexpired and not
@@ -1899,6 +2123,7 @@ fn may_read_status(
         Err(_) if caller.is_some() && !as_server => {
             Err(ApiError::forbidden("cluster status needs a cloud admin"))
         }
+        Ok(()) => refuse_removed(store, headers),
         other => other,
     }
 }
@@ -1937,15 +2162,53 @@ fn with_join(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if let Some(key) = PEER_STORE.get().and_then(peer_key) {
         return builder.header(PEER_HEADER, key);
     }
+    with_token(builder)
+}
+
+fn with_token(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match std::env::var("PISTACK_JOIN_TOKEN") {
         Ok(token) if !token.trim().is_empty() => builder.header(JOIN_HEADER, token.trim()),
         _ => builder,
     }
 }
 
+/// Credentials for the join call. The peer key when there is one, and the
+/// join token beside it: a server that was removed has the key from its old
+/// store and is let back in only by the token.
+fn with_key_and_token(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match PEER_STORE.get().and_then(peer_key) {
+        Some(key) => with_token(builder.header(PEER_HEADER, key)),
+        None => with_token(builder),
+    }
+}
+
+/// Name this server on a call to another one. An id that cannot be a header
+/// value is left out.
+fn as_node(builder: reqwest::RequestBuilder, node: &str) -> reqwest::RequestBuilder {
+    match reqwest::header::HeaderValue::from_str(node) {
+        Ok(value) if !node.is_empty() => builder.header(NODE_HEADER, value),
+        _ => builder,
+    }
+}
+
+/// A 403 keeps its body in the error: it is how a removed server learns
+/// what happened to it.
+async fn checked(url: &str, response: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("{url} returned 403: {body}");
+    }
+    Ok(response.error_for_status()?)
+}
+
 /// What to tell the operator when another server refuses this one.
 const REFUSED_HINT: &str = "the server refused this one: start it with PISTACK_JOIN_TOKEN set to \
      a join token (`pi join-token create`)";
+
+/// What to tell the operator when a join is refused because this server
+/// was removed.
+const REMOVED_HINT: &str = "this server was removed from the cluster: start it with \
+     PISTACK_JOIN_TOKEN set to a join token (`pi join-token create`) to join again";
 
 fn rpc_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -1962,30 +2225,31 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-async fn rpc_get_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
-    let response = with_join(rpc_client().get(url))
+/// GET `url` as server `node`.
+async fn rpc_get_json<T: serde::de::DeserializeOwned>(url: &str, node: &str) -> anyhow::Result<T> {
+    let response = as_node(with_join(rpc_client().get(url)), node)
         .timeout(RPC_TIMEOUT)
         .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+        .await?;
+    Ok(checked(url, response).await?.json().await?)
 }
 
-async fn rpc_post_json<B, T>(url: &str, body: &B) -> anyhow::Result<T>
+/// POST `body` to `url` as server `node`.
+async fn rpc_post_json<B, T>(url: &str, node: &str, body: &B) -> anyhow::Result<T>
 where
     B: serde::Serialize + ?Sized,
     T: serde::de::DeserializeOwned,
 {
-    let response = with_join(rpc_client().post(url))
+    let response = as_node(with_join(rpc_client().post(url)), node)
         .timeout(RPC_TIMEOUT)
         .json(body)
         .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+        .await?;
+    Ok(checked(url, response).await?.json().await?)
 }
 
-async fn post_json<B, T>(url: &str, body: &B) -> anyhow::Result<T>
+/// The join call, as server `node`. Retries a leader that is not up yet.
+async fn post_json<B, T>(url: &str, node: &str, body: &B) -> anyhow::Result<T>
 where
     B: serde::Serialize + ?Sized,
     T: serde::de::DeserializeOwned,
@@ -1993,10 +2257,14 @@ where
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
-        match with_join(http_client().post(url)).json(body).send().await {
+        let request = as_node(with_key_and_token(http_client().post(url)), node);
+        match request.json(body).send().await {
             Ok(response) if response.status().is_success() => return Ok(response.json().await?),
             Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
                 anyhow::bail!("{url} returned 401; {REFUSED_HINT}");
+            }
+            Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
+                anyhow::bail!("{url} returned 403; {REMOVED_HINT}");
             }
             Ok(response) if response.status().is_client_error() => {
                 anyhow::bail!("{url} returned {}", response.status());
@@ -4353,6 +4621,315 @@ mod tests {
             guard(&sim.handle.progress).get("sim2").is_none(),
             "a pull from a newer term was counted as an acknowledgement"
         );
+        sim.kill();
+    }
+
+    fn voters_in(store: &Store) -> Vec<String> {
+        members_of(store)
+            .unwrap()
+            .into_iter()
+            .filter(|member| member.role == Role::Voter)
+            .map(|member| member.id)
+            .collect()
+    }
+
+    /// The status a peer route answers a caller that names itself `node`.
+    async fn peer_get(url: &str, node: &str) -> u16 {
+        as_node(rpc_client().get(url), node)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn removing_a_server_shrinks_the_voters_and_writes_commit_with_those_left() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        assert_eq!(post_write(&sim.api, "three").await, 200);
+        // sim3 is gone for good.
+        sim3.kill();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = remove_member(&sim.handle, "sim3", false).await.unwrap();
+        assert_eq!(status.members.len(), 2);
+        assert_eq!(voters_in(&sim.handle.store), ["sim", "sim2"]);
+        // The answer waited for sim2, so it already holds the change.
+        assert_eq!(voters_in(&sim2.handle.store), ["sim", "sim2"]);
+        assert_eq!(removed_of(&sim2.handle.store).unwrap(), ["sim3"]);
+        assert!(guard(&sim.handle.progress).get("sim3").is_none());
+        assert_eq!(post_write(&sim.api, "two").await, 200);
+        assert!(marker(&sim2.handle.store, "two").is_some());
+        assert!(sim.leads());
+
+        // Down to one voter: it is its own majority, with nobody else up.
+        let status = remove_member(&sim.handle, "sim2", false).await.unwrap();
+        assert_eq!(status.members.len(), 1);
+        assert_eq!(voters_in(&sim.handle.store), ["sim"]);
+        wait_for("sim2 learns it was removed", Duration::from_secs(5), || {
+            sim2.handle.removed.load(Ordering::Relaxed)
+        })
+        .await;
+        sim2.kill();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(post_write(&sim.api, "one").await, 200);
+        assert!(marker(&sim2.handle.store, "one").is_none());
+        // It still leads after the window in which a leader that lost its
+        // majority would have stepped down.
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
+        assert!(sim.leads());
+        assert_eq!(post_write(&sim.api, "still-one").await, 200);
+        sim.kill();
+    }
+
+    #[tokio::test]
+    async fn a_removed_server_is_refused_until_it_joins_again_with_a_token() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        assert_eq!(post_write(&sim.api, "before").await, 200);
+        let before = sim3.term();
+        // Both followers are up, so taking one out leaves a majority.
+        remove_member(&sim.handle, "sim3", false).await.unwrap();
+        wait_for("sim2 copies the removal", Duration::from_secs(5), || {
+            removed_of(&sim2.handle.store).unwrap() == ["sim3"]
+        })
+        .await;
+
+        // Every server refuses it, on every peer route, by its node id.
+        for api in [&sim.api, &sim2.api] {
+            assert_eq!(peer_get(&format!("{api}/cluster"), "sim3").await, 403);
+            assert_eq!(peer_get(&format!("{api}/cluster"), "sim2").await, 200);
+            assert_eq!(peer_get(&format!("{api}/cluster"), "").await, 200);
+        }
+        let log = format!("{}/cluster/log?after=0&node=sim3", sim.api);
+        assert_eq!(peer_get(&log, "sim3").await, 403);
+        assert_eq!(
+            peer_get(&format!("{}/cluster/snapshot", sim.api), "sim3").await,
+            403
+        );
+        let asked = as_node(
+            rpc_client().post(format!("{}/cluster/vote", sim2.api)),
+            "sim3",
+        )
+        .json(&VoteRequest {
+            term: 99,
+            candidate_id: "sim3".into(),
+            last_index: 1_000_000,
+            last_term: 1_000,
+            pre: false,
+        })
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(asked.status().as_u16(), 403);
+        assert_eq!(sim2.term(), 4, "a removed server moved a voter's term");
+
+        // Nor can it change an address in the member list it is no longer in.
+        let address = format!("{}/cluster/agent-address", sim.api);
+        let moved = as_node(rpc_client().post(&address), "sim3")
+            .json(&AgentAddress {
+                node_id: "sim2".into(),
+                agent_api: Some("https://127.0.0.1:9".into()),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(moved.status().as_u16(), 403);
+        assert!(members_of(&sim.handle.store)
+            .unwrap()
+            .iter()
+            .all(|member| member.agent_api.is_none()));
+
+        // The removed server hears it, stops asking for votes and never leads.
+        wait_for("sim3 learns it was removed", Duration::from_secs(5), || {
+            sim3.handle.removed.load(Ordering::Relaxed)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!sim3.leads());
+        assert_eq!(sim3.term(), before, "a removed server started an election");
+        assert_eq!(post_write(&sim.api, "after").await, 200);
+        assert!(marker(&sim3.handle.store, "after").is_none());
+        sim3.kill();
+
+        // Coming back is a join, and a join needs a token: not nothing, not
+        // a wrong one.
+        let join = |token: Option<String>| {
+            let mut request = as_node(
+                rpc_client().post(format!("{}/cluster/join", sim.api)),
+                "sim3",
+            )
+            .json(&JoinRequest {
+                node_id: "sim3".into(),
+                api: sim3.api.clone(),
+                agent_api: None,
+            });
+            if let Some(token) = token {
+                request = request.header(JOIN_HEADER, token);
+            }
+            async move { request.send().await.unwrap() }
+        };
+        let refused = join(None).await;
+        assert_eq!(refused.status().as_u16(), 403);
+        assert!(refused.text().await.unwrap().contains(REMOVED_MARK));
+        assert_eq!(join(Some("pij_nope".into())).await.status().as_u16(), 401);
+        let err = adopt(&sim3.handle.store, &sim.api, "sim3", &sim3.api, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("PISTACK_JOIN_TOKEN"), "{err:#}");
+        assert_eq!(members_of(&sim.handle.store).unwrap().len(), 2);
+
+        let (_, clear) =
+            keep::create_join_token(&sim.handle.store, "back", "admin", false, None).unwrap();
+        let joined = join(Some(clear)).await;
+        assert_eq!(joined.status().as_u16(), 200);
+        let status: ClusterStatus = joined.json().await.unwrap();
+        let back = status.members.iter().find(|m| m.id == "sim3").unwrap();
+        assert_eq!(back.role, Role::Learner, "it comes back without a vote");
+        assert!(removed_of(&sim.handle.store).unwrap().is_empty());
+        assert_eq!(peer_get(&format!("{}/cluster", sim.api), "sim3").await, 200);
+        sim.kill();
+        sim2.kill();
+    }
+
+    #[tokio::test]
+    async fn a_removal_that_leaves_no_majority_is_refused_without_force() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        assert_eq!(post_write(&sim.api, "healthy").await, 200);
+        // sim3 stopped a while ago: the leader has not heard from it.
+        sim3.kill();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        guard(&sim.handle.progress).remove("sim3");
+
+        // Taking out sim2 would leave the leader with a server that is down.
+        let refused = remove_member(&sim.handle, "sim2", false).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert!(refused.message.contains("not a majority"), "{refused:?}");
+        assert!(refused.message.contains("force"), "{refused:?}");
+        assert_eq!(voters_in(&sim.handle.store).len(), 3);
+        assert!(removed_of(&sim.handle.store).unwrap().is_empty());
+
+        // The leader does not remove itself, forced or not.
+        let own = remove_member(&sim.handle, "sim", true).await.unwrap_err();
+        assert_eq!(own.status(), StatusCode::CONFLICT);
+        assert!(own.message.contains("is the leader"), "{own:?}");
+        let stranger = remove_member(&sim.handle, "nobody", true)
+            .await
+            .unwrap_err();
+        assert_eq!(stranger.status(), StatusCode::NOT_FOUND);
+        // Only the leader changes the membership.
+        let follower = remove_member(&sim2.handle, "sim3", true).await.unwrap_err();
+        assert_eq!(follower.message, "not the leader");
+        assert_eq!(voters_in(&sim.handle.store).len(), 3);
+        assert_eq!(voters_in(&sim2.handle.store).len(), 3);
+        assert_eq!(post_write(&sim.api, "untouched").await, 200);
+
+        // Forced, it is done. Nobody is left to confirm it, and the answer
+        // says so instead of promising.
+        *guard(&sim.handle.confirm_wait) = Duration::from_millis(400);
+        let forced = remove_member(&sim.handle, "sim2", true).await.unwrap_err();
+        assert_eq!(forced.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(voters_in(&sim.handle.store), ["sim", "sim3"]);
+        assert_eq!(removed_of(&sim.handle.store).unwrap(), ["sim2"]);
+        sim.kill();
+        sim2.kill();
+    }
+
+    #[tokio::test]
+    async fn only_a_cloud_admin_lists_and_removes_servers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &api),
+            Member::learner("sim2", "http://127.0.0.1:9"),
+        ];
+        let sim = serve_voter("sim", listener, &members, true, 4, &api).await;
+        // The operator routes as the gateway mounts them: behind the write
+        // gate, with the caller the token layer would have attached.
+        let app = admin_router(sim.handle.clone())
+            .layer(middleware::from_fn_with_state(
+                sim.handle.clone(),
+                reject_follower_writes,
+            ))
+            .layer(middleware::from_fn(
+                |mut req: axum::extract::Request, next: Next| async move {
+                    let who = req
+                        .headers()
+                        .get("x-test-caller")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    if let Some(who) = who {
+                        req.extensions_mut().insert(Caller {
+                            principal: pistack_types::Id::new(pistack_types::kind::PRINCIPAL),
+                            principal_name: who.clone(),
+                            project: None,
+                            roles: vec!["admin".into()],
+                            system: who == "cloud-admin",
+                        });
+                    }
+                    next.run(req).await
+                },
+            ));
+        let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", admin.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(admin, app).await.ok() });
+        let call = |method: reqwest::Method, path: &str, who: Option<&str>| {
+            let mut request = rpc_client().request(method, format!("{base}{path}"));
+            if let Some(who) = who {
+                request = request.header("x-test-caller", who);
+            }
+            async move { request.send().await.unwrap() }
+        };
+        let get = reqwest::Method::GET;
+        let delete = reqwest::Method::DELETE;
+
+        // `admin` inside a project is not the cloud admin.
+        let project = Some("project-admin");
+        assert_eq!(
+            call(delete.clone(), "/cluster/members/sim2", project)
+                .await
+                .status(),
+            403
+        );
+        assert_eq!(
+            call(delete.clone(), "/cluster/members/sim2", None)
+                .await
+                .status(),
+            401
+        );
+        assert_eq!(members_of(&sim.handle.store).unwrap().len(), 2);
+
+        let cloud = Some("cloud-admin");
+        // The route is for removal only: the members are read on /cluster.
+        assert_eq!(
+            call(get.clone(), "/cluster/members", cloud).await.status(),
+            404
+        );
+        assert_eq!(
+            call(delete.clone(), "/cluster/members/nobody", cloud)
+                .await
+                .status(),
+            404
+        );
+        assert_eq!(
+            call(delete.clone(), "/cluster/members/sim", cloud)
+                .await
+                .status(),
+            409
+        );
+
+        // A server that does not lead sends the operator to the leader.
+        sim.handle.leader.store(false, Ordering::Release);
+        let elsewhere = call(delete.clone(), "/cluster/members/sim2", cloud).await;
+        assert_eq!(elsewhere.status(), 409);
+        let body: serde_json::Value = elsewhere.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "not the leader");
+        assert_eq!(body["error"]["details"]["leader"], api.as_str());
+        sim.handle.leader.store(true, Ordering::Release);
+
+        let removed = call(delete.clone(), "/cluster/members/sim2?force=false", cloud).await;
+        assert_eq!(removed.status(), 200);
+        let after: ClusterStatus = removed.json().await.unwrap();
+        assert_eq!(after.members, [Member::voter("sim", &api)]);
+        assert_eq!(removed_of(&sim.handle.store).unwrap(), ["sim2"]);
         sim.kill();
     }
 }
