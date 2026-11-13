@@ -18,7 +18,8 @@ What does not work yet, as of version 0.1.0 on `main`. Each item was read in the
 - **A write is durable on the leader only.** The leader answers before any follower has the entry. Losing the leader's disk at the wrong moment loses the write. Also addressed by #103.
 - **`pi` does not follow the leader.** A write sent to a follower fails with `409` and the leader's address. You have to point `pi` at the leader.
 - **At most three voters.** Further servers are learners. Two servers give one voter and one learner, with no failover.
-- **No way to remove a member.** A server that is gone for good stays in the member list.
+- **Removing a server needs a leader.** When the majority of voters is gone there is no leader, and the dead servers cannot be removed.
+- **Removal does not revoke secrets.** A removed server's store still holds the member key. The others refuse it by the id it states.
 - **Rejoining a server that fell behind is manual.** See [Running a cluster](Running-a-cluster).
 - **Restore brings back one server.** `pistack store restore` puts a backup in place and that server becomes the only member. The other servers are emptied and joined again by hand. See [Running a cluster](Running-a-cluster).
 - **Restore rolls back the store only.** Machines and volumes made after the backup are unknown to the restored store, and deleted ones are back in it. What the control plane does about the difference with the hosts has not been tested.
