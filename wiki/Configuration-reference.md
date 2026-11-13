@@ -108,6 +108,15 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 | `PISTACK_CORS_ORIGINS` | none | Comma-separated origins whose pages may call the API from a browser, such as `https://portal.example`. With none, no cross-origin access is allowed; the console is same-origin and needs none. |
 | `PISTACK_ADMIN_PASSWORD` | generated | Password of the bootstrap `admin` principal. Read only when the store has no principals. A generated one is written to `<data_dir>/admin-password`. |
 
+### Audit log
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_AUDIT_MAX_AGE_DAYS` | `90` | Days an audit record is kept. `0` keeps records until the count limit drops them. |
+| `PISTACK_AUDIT_MAX_RECORDS` | `50000` | Most audit records kept; the oldest are deleted first. Zero or a value that is not a number keeps the default. |
+
+The leader enforces both every five minutes. See [Identity and access](Identity-and-access#audit).
+
 ### Cluster and agent transport
 
 | Variable | Default | Meaning |
