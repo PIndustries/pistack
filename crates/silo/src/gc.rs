@@ -68,6 +68,9 @@ pub async fn sweep_expired_uploads(
         }
     };
     for bucket_dir in buckets {
+        // An upload cannot outlive the TTL, so at twice that no server
+        // still stages one this mark is there to keep away.
+        crate::staging::sweep_done(&bucket_dir, ttl.to_std().unwrap_or_default() * 2).await;
         let staged = match scan_staged(&bucket_dir.join(".uploads")).await {
             Ok(s) => s,
             Err(e) => {

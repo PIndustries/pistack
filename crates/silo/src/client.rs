@@ -69,8 +69,17 @@ impl Client {
         self
     }
 
+    pub(crate) fn put_copies(&self) -> u32 {
+        self.put_copies
+    }
+
     pub fn peers(&self) -> Option<&crate::replica::Peers> {
         self.peers.as_ref()
+    }
+
+    /// The key a call to another control-plane server carries.
+    pub(crate) fn peer_key(&self) -> Option<String> {
+        self.peers.as_ref().and_then(|peers| peers.key())
     }
 
     /// Cap for a single PUT. Used by HTTP and by [`Self::put_object`].
