@@ -25,9 +25,17 @@ use std::net::IpAddr;
 pub trait Observed: Kind {
     fn phase(&self) -> Phase;
     fn observed_revision(&self) -> u64;
+    fn message(&self) -> &str;
     fn set_result(&mut self, phase: Phase, message: String, observed: u64);
+    /// Written since the reconciler last looked. An event acts on this.
+    fn unseen(&self) -> bool {
+        self.observed_revision() != self.meta().revision
+    }
+    /// Due on the periodic pass: unseen, or failed last time. A failure is
+    /// not retried on events. The status write that records it is itself an
+    /// event, so retrying there never stops.
     fn stale(&self) -> bool {
-        self.observed_revision() != self.meta().revision || self.phase() == Phase::Error
+        self.unseen() || self.phase() == Phase::Error
     }
 }
 
@@ -39,6 +47,9 @@ macro_rules! observed {
             }
             fn observed_revision(&self) -> u64 {
                 self.status.observed_revision
+            }
+            fn message(&self) -> &str {
+                &self.status.message
             }
             fn set_result(&mut self, phase: Phase, message: String, observed: u64) {
                 self.status.phase = phase;
@@ -77,6 +88,20 @@ fn finish<K: Observed>(
         Ok(()) => (Phase::Ready, String::new()),
         Err(e) => (Phase::Error, e.to_string()),
     };
+    // A retry that fails the same way has nothing new to say. Writing it
+    // again would add a log entry per failed resource on every pass.
+    if phase == Phase::Error {
+        if let Ok(cur) = col.get(id) {
+            if cur.meta().revision == acted
+                && !cur.unseen()
+                && cur.phase() == Phase::Error
+                && cur.message() == msg
+            {
+                tracing::debug!(kind = K::KIND, %id, error = %msg, "reconcile still failing");
+                return phase;
+            }
+        }
+    }
     let res = col.modify(id, |cur| {
         if cur.meta().revision != acted {
             return Err(StoreError::Conflict("reconcile superseded".into()));
@@ -118,7 +143,8 @@ fn api(e: StoreError) -> ApiError {
 
 impl Client {
     /// React to one store event. Ignores kinds fabric does not own and
-    /// revisions already observed.
+    /// revisions already observed, a recorded failure among them: the
+    /// periodic pass retries those.
     pub async fn handle_event(&self, ev: &Event) {
         let k = ev.kind.as_str();
         if !KINDS.contains(&k) {
@@ -128,16 +154,16 @@ impl Client {
             self.handle_deleted(k, &ev.id).await;
             return;
         }
-        let stale = match k {
-            kind::NETWORK => self.is_stale(&self.networks(), &ev.id),
-            kind::SUBNET => self.is_stale(&self.subnets(), &ev.id),
-            kind::PORT => self.is_stale(&self.ports(), &ev.id),
-            kind::ROUTER => self.is_stale(&self.routers(), &ev.id),
-            kind::SECGROUP => self.is_stale(&self.security_groups(), &ev.id),
-            kind::FLOATING_IP => self.is_stale(&self.floating_ips(), &ev.id),
+        let unseen = match k {
+            kind::NETWORK => self.is_unseen(&self.networks(), &ev.id),
+            kind::SUBNET => self.is_unseen(&self.subnets(), &ev.id),
+            kind::PORT => self.is_unseen(&self.ports(), &ev.id),
+            kind::ROUTER => self.is_unseen(&self.routers(), &ev.id),
+            kind::SECGROUP => self.is_unseen(&self.security_groups(), &ev.id),
+            kind::FLOATING_IP => self.is_unseen(&self.floating_ips(), &ev.id),
             _ => false,
         };
-        if !stale {
+        if !unseen {
             return;
         }
         match k {
@@ -163,9 +189,9 @@ impl Client {
         }
     }
 
-    fn is_stale<K: Observed>(&self, col: &Collection<K>, id: &Id) -> bool {
+    fn is_unseen<K: Observed>(&self, col: &Collection<K>, id: &Id) -> bool {
         match col.get(id) {
-            Ok(r) => r.stale(),
+            Ok(r) => r.unseen(),
             Err(_) => false,
         }
     }

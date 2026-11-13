@@ -341,6 +341,46 @@ async fn fip_without_router_is_an_error_phase() {
     assert_eq!(fip.status.phase, Phase::Error);
     assert!(fip.status.message.contains("no router"));
     assert!(fip.stale(), "errors are retried by the pending pass");
+
+    // The write that recorded the failure is an event too. Acting on it
+    // would fail again, write again and never stop.
+    let recorded = fip.meta.revision;
+    let event = pistack_types::Event {
+        kind: kind::FLOATING_IP.to_owned(),
+        id: fip.meta.id.clone(),
+        project: fip.meta.project.clone(),
+        action: pistack_types::EventAction::Updated,
+        revision: recorded,
+        at: fip.meta.updated_at,
+    };
+    for _ in 0..3 {
+        h.client.handle_event(&event).await;
+    }
+    let after = h.client.floating_ips().get(&fip.meta.id).unwrap();
+    assert_eq!(after.meta.revision, recorded, "an event must not retry");
+
+    // The pending pass retries, and the same failure is not written again.
+    h.client.reconcile_pending().await;
+    let after = h.client.floating_ips().get(&fip.meta.id).unwrap();
+    assert_eq!(after.status.phase, Phase::Error);
+    assert_eq!(after.meta.revision, recorded, "nothing new to record");
+
+    // A router makes the next pass succeed.
+    let sub = h.client.subnets().list(None).unwrap();
+    let inner = sub.iter().find(|s| s.meta.name == "v4").unwrap();
+    h.client
+        .create_router(
+            h.meta(kind::ROUTER, "r"),
+            RouterSpec {
+                external_network: Some(ext.meta.id.clone()),
+                interfaces: vec![inner.meta.id.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    h.client.reconcile_pending().await;
+    let after = h.client.floating_ips().get(&fip.meta.id).unwrap();
+    assert_eq!(after.status.phase, Phase::Ready, "{}", after.status.message);
 }
 
 #[tokio::test]
