@@ -371,6 +371,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         agent_url = agent_api.as_deref().unwrap_or("none"),
         modules = asm.modules.len(),
         identity = asm.gate.info().version,
+        store_schema = store.schema_version()?,
         agent_rpc = asm.forge.queue().is_some(),
         "pistack server up"
     );
@@ -389,8 +390,10 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
 
 pub fn backup(data_dir: PathBuf, to: PathBuf) -> anyhow::Result<()> {
     let src = data_dir.join("state.redb");
-    pistack_store::backup_file(&src, &to)
+    let info = pistack_store::backup_file(&src, &to)
         .with_context(|| format!("backing up {} to {}", src.display(), to.display()))?;
+    // The path alone goes to stdout, for scripts.
+    eprintln!("store schema version {}", info.schema_version);
     println!("{}", to.display());
     Ok(())
 }
@@ -403,6 +406,11 @@ pub fn stats(data_dir: PathBuf) -> anyhow::Result<()> {
     let (events, _) = broadcast::channel(1);
     let store = Store::open(&path, events)?;
     println!("file\t{file_bytes} bytes\t{}", path.display());
+    println!(
+        "schema\tversion {}\tthis pistack reads up to {}",
+        store.schema_version()?,
+        pistack_store::SCHEMA_VERSION
+    );
     for table in store.stats()? {
         println!(
             "{}\t{} rows\t{} key bytes\t{} value bytes",
