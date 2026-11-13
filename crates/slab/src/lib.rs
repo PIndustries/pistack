@@ -11,8 +11,8 @@
 //! * [`Client`] — the module core; the only writer of `status`. `forge`
 //!   uses [`Client::attach_info`], [`Client::begin_attach`],
 //!   [`Client::confirm_attach`] and [`Client::mark_detached`].
-//! * [`quota`] — optional extra `QuotaCheck`. Project `volumes` quotas are
-//!   enforced in [`Client`] through `gate`.
+//! * [`quota`] — the `QuotaCheck` hook [`Client`] asks before it stores or
+//!   grows something. The default checks the project's limits in `gate`.
 //! * HTTP under `/volume`: `/volumes`, `/snapshots`, `/backups`,
 //!   `/volume-types`.
 
@@ -36,7 +36,7 @@ mod usage;
 
 pub use backend::{AttachInfo, AttachTarget, BackendRef, BlockBackend, LocalFileBackend, Protocol};
 pub use client::{Client, Create, RestoreRequest, UpdateMeta};
-pub use quota::{AllowAll, QuotaCheck, QuotaRequest};
+pub use quota::{AllowAll, ProjectQuota, QuotaCheck, QuotaRequest};
 pub use types::*;
 
 /// The slab module. `Default` runs the local file backend under
@@ -59,7 +59,7 @@ impl Default for Slab {
     fn default() -> Self {
         Self::new(
             Arc::new(LocalFileBackend::new(default_volume_dir())),
-            Arc::new(AllowAll),
+            Arc::new(ProjectQuota),
         )
     }
 }
