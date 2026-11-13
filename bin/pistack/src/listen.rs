@@ -15,8 +15,11 @@
 //! has the cloud CA certify it, replaces the files and presents the new
 //! certificate from the next handshake on. No restart, and connections
 //! already open are not cut. The leader issues it itself; a follower asks
-//! the leader, because only the leader writes the store. A certificate in
-//! `tls/` that this cloud did not issue is never replaced: renewal fails
+//! the leader, because only the leader writes the store. The leader may
+//! hold no record of a follower's certificate, since a follower's first one
+//! is issued from its own copy of the store; it goes by the cloud CA's
+//! signature on it and issues one with the same names. A certificate in
+//! `tls/` that the cloud CA did not sign is never replaced: renewal fails
 //! with a warning and the operator replaces the files and restarts.
 //!
 //! The TLS listener requests client certificates and verifies any that are
@@ -295,19 +298,22 @@ impl CertRenewal {
         if now < renew_at {
             return Ok(CertStep::NotDue { renew_at });
         }
-        let serial = keep::ca::serial_from_der(&der)?;
         let cn = keep::ca::common_name_from_der(&der)?;
         // The key is made here and stays here.
         let request = keep::ca::new_key_request(&cn)?;
         let issued = if self.leadership.is_leader() {
-            let (store, csr) = (self.store.clone(), request.csr_pem.clone());
+            let (store, cert, csr) = (
+                self.store.clone(),
+                pki.cert_pem.clone(),
+                request.csr_pem.clone(),
+            );
             tokio::task::spawn_blocking(move || {
-                keep::Client::open(&store)?.renew_certificate(serial, &cn, &csr)
+                keep::Client::open(&store)?.renew_listener_certificate(&cert, &csr)
             })
             .await
             .context("renewal task")??
         } else {
-            self.ask_leader(serial, &cn, &request.csr_pem).await?
+            self.ask_leader(&pki.cert_pem, &request.csr_pem).await?
         };
         let new = keep::Pki {
             cert_pem: issued.cert_pem,
@@ -329,7 +335,7 @@ impl CertRenewal {
 
     /// Have the leader renew it. This server proves it is a member with
     /// the peer key, as on every other call between servers.
-    async fn ask_leader(&self, serial: u64, cn: &str, csr_pem: &str) -> anyhow::Result<keep::Pki> {
+    async fn ask_leader(&self, cert_pem: &str, csr_pem: &str) -> anyhow::Result<keep::Pki> {
         let leader = crate::cluster::leader_hint(&self.store, &self.node_id)?
             .context("no leader is known to ask for a certificate")?;
         let key =
@@ -343,8 +349,7 @@ impl CertRenewal {
             .post(&url)
             .header(crate::cluster::PEER_HEADER, key)
             .json(&keep::api::PeerRenew {
-                serial,
-                common_name: cn.to_owned(),
+                cert_pem: cert_pem.to_owned(),
                 csr_pem: csr_pem.to_owned(),
             })
             .send()
@@ -871,6 +876,16 @@ mod tests {
             .put_meta("cluster_leader_id", &"srv-a".to_owned())
             .expect("leader id");
 
+        // A follower's first certificate was issued from its own copy of
+        // the store, so the leader has never seen it. Take the record
+        // away to stand where the leader stands.
+        let keep = keep::Client::open(&t.store).expect("keep");
+        let record = keep
+            .managed_certificate(first)
+            .expect("record")
+            .expect("record");
+        keep.delete_certificate(&record.meta.id).expect("delete");
+
         let step = t
             .renewal
             .check(due)
@@ -881,12 +896,22 @@ mod tests {
         };
         assert_ne!(serial, first);
         assert_eq!(served_serial(t.addr, &ca).await, serial);
+        // The new one is on record with the names of the old, and the
+        // next renewal finds it there.
+        let new = keep.managed_certificate(serial).expect("new").expect("new");
+        assert_eq!(new.spec.sans, record.spec.sans);
+        let step = t.renewal.check(due).await.expect("renew again");
+        let CertStep::Renewed { serial: third, .. } = step else {
+            panic!("not renewed: {step:?}");
+        };
+        let new = keep.managed_certificate(serial).expect("new").expect("new");
+        assert_eq!(new.status.renewed_by, Some(third));
+        assert_eq!(served_serial(t.addr, &ca).await, third);
 
         // Without the peer key the leader issues nothing.
         let http = reqwest::Client::new();
         let body = keep::api::PeerRenew {
-            serial,
-            common_name: "pistack".into(),
+            cert_pem: read("cert.pem"),
             csr_pem: keep::ca::new_key_request("pistack").expect("csr").csr_pem,
         };
         let url = format!("{leader}/secrets/peer/renew-certificate");
@@ -901,11 +926,7 @@ mod tests {
             .expect("send");
         assert_eq!(resp.status(), 401);
         // A member cannot get an agent's certificate renewed this way.
-        let keep = keep::Client::open(&t.store).expect("keep");
         let agent = keep.issue_client_cert("n1").expect("agent cert");
-        let agent_serial =
-            keep::ca::serial_from_der(&keep::ca::pem_to_der(&agent.cert_pem).expect("der"))
-                .expect("serial");
         let resp = http
             .post(&url)
             .header(
@@ -913,14 +934,13 @@ mod tests {
                 crate::cluster::peer_key(&t.store).expect("peer key"),
             )
             .json(&keep::api::PeerRenew {
-                serial: agent_serial,
-                common_name: "n1".into(),
+                cert_pem: agent.cert_pem,
                 csr_pem: keep::ca::new_key_request("n1").expect("csr").csr_pem,
             })
             .send()
             .await
             .expect("send");
-        assert_eq!(resp.status(), 403);
+        assert_eq!(resp.status(), 401);
 
         leader_task.abort();
         t.shutdown.cancel();
