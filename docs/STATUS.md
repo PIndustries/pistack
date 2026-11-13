@@ -308,7 +308,7 @@ Partial
 - Backup works; restore is copying a file by hand
 - Upgrades: no schema version, no upgrade check
 - TLS: the main listener is plain HTTP; HTTPS is a second port
-- Command queue is in memory on the leader and lost on restart
+- Command queue is in memory on the leader. Machine start, stop and delete and volume attach and detach keep their id in the store and are issued again by the next leader, and the host runs each once. A live migration in flight at a leader change is not followed up
 - Health: `/healthz` only
 
 Missing
@@ -337,6 +337,6 @@ Missing
 ## Order of work
 
 1. Merge and prove PRs 109 and 110 on real Ceph and LVM. Fix what the three-server run found. Cut the first build.
-2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, durable command queue, evacuation.
+2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, evacuation.
 3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, metadata on OVN, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
 4. Long tail, on request: GPU and passthrough, UEFI and vTPM, bare metal deploy, trunks, QoS, VPN, BGP, DNSSEC, erasure coding, regions, billing.
