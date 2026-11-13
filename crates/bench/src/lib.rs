@@ -66,7 +66,6 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("/identity/tokens"));
         assert!(text.contains("/compute/machines"));
-        assert!(text.contains("Create machine"));
         assert!(text.contains("#login:not([hidden])"));
         assert!(text.contains("#shell:not([hidden])"));
         assert!(!text.contains("not built yet"));
@@ -153,6 +152,7 @@ mod tests {
         );
         assert!(text.contains("Needs attention"));
         assert!(text.contains("Control plane"));
+        assert!(text.contains("Launch a machine"));
         assert!(text.contains("Recent activity"));
         assert!(text.contains("/gauge/samples"));
         assert!(!text.contains("10.66.66."));
