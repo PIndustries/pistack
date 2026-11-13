@@ -33,7 +33,14 @@ What does not work yet, as of version 0.1.0 on `main`. Each item was read in the
 
 - **The agent is Linux only.** Elsewhere it reports no memory and nothing is placed on it.
 - **Cloud Hypervisor and bare metal are not selectable.** The runtimes are in the source, and the agent never picks them. A machine of kind `metal` is only placed on a mock host.
-- **Hosts cannot be labelled, drained or removed.** The host API is read-only.
+- **Hosts cannot be removed.** A host that is gone for good stays in the list.
+- **Drain only moves running virtual machines on libvirt hosts.** Containers, pods, bare metal and stopped machines are reported and left where they are.
+- **Live migration does not copy disks.** It only works when the destination host already sees the machine's disk at the same path. A failed migration leaves the machine in phase `error` on the old host, still running.
+- **Evacuating a host loses root disks.** A root disk is a file on its host. An evacuated machine starts from its image, and `pi host evacuate` moves nothing without `--rebuild-from-image`.
+- **Evacuation does not fence.** PiStack cannot power off a host. If an evacuated host is still running its machines, they run twice until its agent reports again, and both copies write to any shared volume.
+- **A machine with a local or LVM volume is not evacuated.** The volume was on the dead host.
+- **Pods pinned to a host by a volume are not drained or evacuated.**
+- **The web console has no host controls.** Label, disable, drain and evacuate are in `pi` and the API only.
 - **Free capacity is bookkeeping.** It is the reported total minus what was placed, not a measurement.
 - **Container images are not pulled from registries.** An OCI image has to be uploaded as a tarball.
 
