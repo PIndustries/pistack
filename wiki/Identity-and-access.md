@@ -54,6 +54,8 @@ Every token is scoped to one project, fixed when the token is issued. The projec
 2. the project of the API key, when logging in with one,
 3. the principal's default project.
 
+A token is only issued for a project the principal has a role in, or to a principal with a role at system scope. Asking for any other project is refused with `403`: a token with no role can still read, so one for a project you are not in would show you what it holds. A default project the principal has no role in is skipped, and the token has no project. A token for a project stops working when the principal's last role in it is removed.
+
 The scope decides which resources the token sees and where new resources go. There is no header or path segment to switch project on a single request. To work in another project, log in again with `--scope-project`, usually into a second profile:
 
 ```sh
