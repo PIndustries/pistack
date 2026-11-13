@@ -773,6 +773,22 @@ impl Store {
         self.backend.delete("meta", key)
     }
 
+    /// Delete several meta keys in one transaction, and so in one log entry
+    /// and one sync. A key that is not there is skipped.
+    pub fn delete_meta_many(&self, keys: &[String]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.backend.batch(
+            keys.iter()
+                .map(|key| Op::Delete {
+                    table: "meta".into(),
+                    key: key.clone(),
+                })
+                .collect(),
+        )
+    }
+
     pub fn set_record_log(&self, on: bool) {
         self.backend.set_record_log(on);
     }
