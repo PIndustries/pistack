@@ -29,6 +29,10 @@
 //!   yet run in the lab against a production Vault.
 //! * `pkcs11`: **parked**. Refused with an error; nothing pretends to work.
 //!
+//! `pistack keep rotate-root-key` (`rekey.rs`) seals everything again under
+//! a new root key, for the software backend, with the server stopped. It
+//! can be interrupted and run again. Nothing rotates the key by itself.
+//!
 //! Every path that needs the key, including [`read_payload`], goes through
 //! the configured backend; there is no fallback between backends.
 //!
@@ -57,6 +61,7 @@ pub mod files;
 pub mod join;
 pub mod peer;
 pub mod quota;
+pub mod rekey;
 pub mod sweep;
 pub mod tls;
 pub mod types;

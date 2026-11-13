@@ -47,6 +47,8 @@
 //!   raised, so a crash at any point is harmless. Rewrap before raising
 //!   `min_decryption_version`.
 //! * [`root_key_state`]: what the store holds, for `pistack keep status`.
+//! * [`rotate_root_key`](crate::rekey::rotate_root_key): seal every payload
+//!   again under a new software root key. See `rekey.rs`.
 //!
 //! If a store ever holds both keys (for example after hand edits or a
 //! partial restore), startup refuses and explains how to finish with the
@@ -177,6 +179,11 @@ impl KeyBackend {
     /// Read the root key when one exists. Never creates one, never calls
     /// Vault to wrap.
     pub fn load_existing(&self, store: &Store) -> Result<Option<RootKey>> {
+        // Half the secrets are under one key and half under another: no
+        // single key serves this store until the rotation is finished.
+        if crate::rekey::in_progress(store)? {
+            return Err(crate::rekey::refuse_start());
+        }
         let plain = store.get_meta::<String>(META_ROOT_KEY)?;
         let wrapped = store.get_meta::<WrappedRootKey>(META_ROOT_KEY_WRAPPED)?;
         match (self, plain, wrapped) {
