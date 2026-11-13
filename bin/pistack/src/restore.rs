@@ -22,8 +22,8 @@
 //! * `admin-password` is renamed with the old store. It was written when
 //!   that store was founded and the restored store has its own admin
 //!   password.
-//! * `adopt.url` and `state.partial` are left over from a join that was
-//!   under way. They are removed.
+//! * `adopt.url`, `state.partial` and `state.resync` are left over from a
+//!   join or a store replacement that was under way. They are removed.
 //! * `node.id` and `node.name` stay. The server seeds the membership with
 //!   whatever id it finds, so the same machine keeps its id and a new
 //!   machine makes one.
@@ -41,8 +41,9 @@ const STORE_FILE: &str = "state.redb";
 const INCOMING_FILE: &str = "state.restore";
 /// Renamed with the old store.
 const SET_ASIDE: [&str; 2] = [STORE_FILE, gate::ADMIN_PASSWORD_FILE];
-/// Left over from a join; they describe the old store.
-const REMOVED: [&str; 2] = ["adopt.url", "state.partial"];
+/// Left over from a join or a store replacement; they describe the old
+/// store.
+const REMOVED: [&str; 3] = ["adopt.url", "state.partial", "state.resync"];
 
 #[derive(Debug)]
 pub struct Restored {
@@ -446,6 +447,7 @@ mod tests {
         std::fs::write(target.join(gate::ADMIN_PASSWORD_FILE), "old password\n").unwrap();
         std::fs::write(target.join("adopt.url"), "http://10.0.0.2:8443").unwrap();
         std::fs::write(target.join("state.partial"), "half a snapshot").unwrap();
+        std::fs::write(target.join("state.resync"), "a whole one").unwrap();
         let listing = entries(&target).unwrap();
         let err = restore(&target, &backup, false).unwrap_err().to_string();
         assert!(err.contains("--force"), "{err}");
@@ -476,9 +478,10 @@ mod tests {
         assert!(!target.join(gate::ADMIN_PASSWORD_FILE).exists());
 
         // What a join left behind is gone; the rest was not touched.
-        assert_eq!(done.removed.len(), 2);
+        assert_eq!(done.removed.len(), 3);
         assert!(!target.join("adopt.url").exists());
         assert!(!target.join("state.partial").exists());
+        assert!(!target.join("state.resync").exists());
         assert_eq!(done.left, ["node.id", "tls"]);
         assert_eq!(
             std::fs::read_to_string(target.join("node.id")).unwrap(),
