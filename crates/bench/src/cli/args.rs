@@ -82,6 +82,12 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
+    /// Project quotas: limits and usage.
+    #[command(alias = "quotas")]
+    Quota {
+        #[command(subcommand)]
+        cmd: QuotaCmd,
+    },
     /// Users and service accounts.
     User {
         #[command(subcommand)]
@@ -383,6 +389,30 @@ pub struct ProjectCreate {
     pub disabled: bool,
 }
 crud!(ProjectCmd, ProjectCreate);
+
+#[derive(Subcommand, Debug)]
+pub enum QuotaCmd {
+    /// Show a project's limits and usage.
+    #[command(alias = "get")]
+    Show(QuotaShow),
+    /// Set or remove limits (admin). Limits not named keep their value.
+    Set(QuotaSet),
+}
+
+#[derive(Args, Debug)]
+pub struct QuotaShow {
+    /// Project (name or id); default: the current scope.
+    pub project: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct QuotaSet {
+    /// Project (name or id).
+    pub project: String,
+    /// Limit `resource=N`; `resource=unlimited` removes it (repeatable).
+    #[arg(value_name = "RES=N", required = true)]
+    pub limits: Vec<String>,
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
 pub enum PrincipalKind {

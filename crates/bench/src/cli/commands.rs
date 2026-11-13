@@ -44,6 +44,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Completion { .. } => Ok(()),
 
         Cmd::Project { cmd } => project(ctx, cmd, io).await,
+        Cmd::Quota { cmd } => quota(ctx, cmd, io).await,
         Cmd::User { cmd } => user(ctx, cmd, io).await,
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
@@ -1004,6 +1005,80 @@ async fn project(ctx: &Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
             do_create(ctx, io, k, body, false).await.map(|_| ())
         }
     }
+}
+
+/// `resource=N` sets a limit; `resource=unlimited` (or `none`) removes it.
+fn parse_limits(pairs: &[String]) -> CliResult<Map<String, Value>> {
+    let mut m = Map::new();
+    for p in pairs {
+        let (k, v) = p
+            .split_once('=')
+            .ok_or_else(|| CliError::usage(format!("a limit must be resource=N, got '{p}'")))?;
+        let limit = match v.trim() {
+            "unlimited" | "none" => Value::Null,
+            n => json!(n.parse::<u64>().map_err(|_| {
+                CliError::usage(format!("limit '{v}' is not a number or 'unlimited'"))
+            })?),
+        };
+        m.insert(k.trim().to_owned(), limit);
+    }
+    Ok(m)
+}
+
+async fn quota(ctx: &Ctx, cmd: QuotaCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let c = ctx.client()?;
+    let k = kind("project");
+    let report = match cmd {
+        QuotaCmd::Show(a) => {
+            let project = match a.project.or_else(|| ctx.project.clone()) {
+                Some(p) => p,
+                None => {
+                    let me = c.get_value("/identity/tokens/self").await?;
+                    let p = str_at(&me, "/project");
+                    if p.is_empty() {
+                        return Err(CliError::usage(
+                            "the token is not scoped to a project: name one, `pi quota show PROJECT`",
+                        ));
+                    }
+                    p
+                }
+            };
+            c.get_value(&format!("{}/quotas", k.item_path(&project)))
+                .await?
+        }
+        QuotaCmd::Set(a) => {
+            let body = json!({ "quotas": parse_limits(&a.limits)? });
+            c.put(&format!("{}/quotas", k.item_path(&a.project)), &body)
+                .await?
+        }
+    };
+    let lines = report.get("quotas").and_then(Value::as_object);
+    match (ctx.fmt.output, lines) {
+        (Output::Table | Output::Wide, Some(lines)) => {
+            let rows: Vec<Vec<String>> = lines
+                .iter()
+                .map(|(resource, line)| {
+                    let limit = match line.get("limit") {
+                        Some(Value::Null) | None => "-".to_owned(),
+                        Some(n) => output::scalar(n),
+                    };
+                    vec![resource.clone(), limit, str_at(line, "/used")]
+                })
+                .collect();
+            write!(
+                io.stdout,
+                "{}",
+                output::table(&["resource", "limit", "used"], &rows, ctx.fmt.no_headers)
+            )?;
+        }
+        (Output::Name, Some(lines)) => {
+            for resource in lines.keys() {
+                writeln!(io.stdout, "{resource}")?;
+            }
+        }
+        _ => print_value(io.stdout, ctx.fmt, &report)?,
+    }
+    Ok(())
 }
 
 async fn user(ctx: &Ctx, cmd: UserCmd, io: &mut Io<'_>) -> CliResult<()> {
