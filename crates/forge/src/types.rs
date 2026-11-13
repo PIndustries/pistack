@@ -314,6 +314,11 @@ pub struct MachineSpec {
     pub security_groups: Vec<String>,
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Volumes this machine will have attached later. Nothing is attached
+    /// at start. Hard constraint: a volume held on one node (a local file
+    /// or LVM) keeps the machine on that node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub near_volumes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
     #[serde(default)]

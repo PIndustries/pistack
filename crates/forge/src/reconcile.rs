@@ -419,8 +419,17 @@ impl Reconciler {
                 };
                 let pinned = pinned_hosts(&m, hosts);
                 let candidates = pinned.as_deref().unwrap_or(hosts);
-                let decided =
-                    scheduler::place_networked(&m.spec, &size, candidates, alloc, self.strategy);
+                // A local or LVM volume attaches only on the node that
+                // holds it, so the machine goes there or nowhere.
+                let held = crate::volumes::held(
+                    &self.store,
+                    m.meta.project.as_ref(),
+                    &m.spec.near_volumes,
+                );
+                let decided = crate::volumes::hosts_near(&held, candidates).and_then(|near| {
+                    let candidates = near.as_deref().unwrap_or(candidates);
+                    scheduler::place_networked(&m.spec, &size, candidates, alloc, self.strategy)
+                });
                 let host = match decided {
                     Ok(h) => h,
                     Err(e) => {

@@ -953,7 +953,8 @@ impl Client {
         match self.home_node(vol)? {
             Some(home) if home != node => Err(ApiError::unprocessable(format!(
                 "volume {} is held on node {home} and cannot attach on node {node}; \
-                 only an rbd volume attaches on any host",
+                 only an rbd volume attaches on any host. A machine created with \
+                 --near-volume is placed on that node",
                 vol.meta.id
             ))
             .with_detail("home_node", home)),

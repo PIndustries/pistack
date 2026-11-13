@@ -33,6 +33,7 @@ pub mod reconcile;
 pub mod scheduler;
 pub mod types;
 mod usage;
+mod volumes;
 
 pub use agent_driver::{Registrar, RpcDriver};
 pub use driver::{

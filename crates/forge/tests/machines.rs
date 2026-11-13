@@ -21,6 +21,7 @@ use tower::ServiceExt;
 
 struct Harness {
     app: Router,
+    store: Store,
     shutdown: CancellationToken,
 }
 
@@ -58,7 +59,11 @@ async fn harness() -> Harness {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    Harness { app, shutdown }
+    Harness {
+        app,
+        store,
+        shutdown,
+    }
 }
 
 async fn call<T: DeserializeOwned>(
@@ -524,4 +529,70 @@ async fn a_member_is_refused_at_the_projects_limit_and_a_delete_frees_it() {
     assert_eq!(st, StatusCode::CREATED, "{again}");
 
     shutdown.cancel();
+}
+
+/// The two fields of a slab volume that placement reads.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct VolumeSpec {}
+
+impl pistack_types::Spec for VolumeSpec {
+    const KIND: &'static str = pistack_types::kind::VOLUME;
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct VolumeStatus {
+    home_node: Option<String>,
+}
+
+fn volume_on(store: &Store, name: &str, node: &str) -> String {
+    let mut vol =
+        pistack_types::Resource::<VolumeSpec, VolumeStatus>::new(name, None, VolumeSpec {});
+    vol.status.home_node = Some(node.into());
+    store
+        .collection::<pistack_types::Resource<VolumeSpec, VolumeStatus>>()
+        .create(vol)
+        .unwrap()
+        .meta
+        .id
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_machine_is_placed_on_the_node_that_holds_its_volume() {
+    let h = harness().await;
+    let app = &h.app;
+    let (_, hosts) = call::<Page<Host>>(app, "GET", "/hosts", None).await;
+    let here = hosts.items[0].spec.node_name.clone();
+
+    let far = volume_on(&h.store, "far", "some-other-node");
+    let body = serde_json::json!({
+        "name": "stranded",
+        "spec": {"size": "m.2x4", "image": "i", "near_volumes": [far]}
+    });
+    let (st, m) = call::<Machine>(app, "POST", "/machines", Some(body)).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let m = wait_for(app, &m.meta.id.to_string(), |m| {
+        m.status
+            .conditions
+            .iter()
+            .any(|c| c.kind == "Scheduled" && !c.status)
+    })
+    .await;
+    assert_eq!(m.status.phase, Phase::Pending);
+    assert!(m.status.host.is_none());
+    assert!(
+        m.status.message.contains("held on node some-other-node"),
+        "{}",
+        m.status.message
+    );
+
+    let near = volume_on(&h.store, "near", &here);
+    let body = serde_json::json!({
+        "name": "home",
+        "spec": {"size": "m.2x4", "image": "i", "near_volumes": [near]}
+    });
+    let (st, m) = call::<Machine>(app, "POST", "/machines", Some(body)).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let m = wait_for(app, &m.meta.id.to_string(), |m| m.status.host.is_some()).await;
+    assert_eq!(m.status.host, Some(hosts.items[0].meta.id.clone()));
 }
