@@ -1,6 +1,6 @@
 # CLI reference
 
-`pi` is the PiStack command-line client. This page lists every command in version 0.1.0. It was generated from the output of `pi <command> -h`, so the descriptions are the ones the tool prints.
+`pi` is the PiStack command-line client. This page lists every command as of `main`. It was generated from the output of `pi <command> -h`, so the descriptions are the ones the tool prints.
 
 ```text
 pi [OPTIONS] <COMMAND>

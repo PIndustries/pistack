@@ -6,7 +6,7 @@ It is for people who run their own hardware and want a full cloud on it (compute
 
 ## Status
 
-PiStack is early. Version 0.1.0, no releases yet, built from source.
+PiStack is early. No releases yet, built from source.
 
 A single node works. You can start a server, log in, and create projects, users, networks, volumes, images and machines through `pi` and the API. In `--dev` mode a mock host stands in for a hypervisor, so the whole API can be tried on a laptop. A three-server control plane forms, replicates, elects a new leader when one stops, and takes the old leader back.
 

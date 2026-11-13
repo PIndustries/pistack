@@ -2,7 +2,7 @@
 
 PiStack is configured with command-line flags and environment variables. A config file exists and is only partly wired in; see below.
 
-This page lists every flag of `pistack` and every `PISTACK_*` variable found in the source at version 0.1.0.
+This page lists every flag of `pistack` and every `PISTACK_*` variable found in the source as of `main`.
 
 ## pistack flags
 
