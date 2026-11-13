@@ -578,6 +578,8 @@ crud!(
     Stop(PowerArgs),
     /// Reboot.
     Reboot(PowerArgs),
+    /// What the machine is using now: CPU, memory, disk and network.
+    Stats(NameArg),
 );
 
 #[derive(Args, Debug)]
@@ -644,6 +646,8 @@ pub enum HostCmd {
     /// Show a host.
     #[command(alias = "get")]
     Show(NameArg),
+    /// What the host is using now: load, memory and its data disk.
+    Stats(NameArg),
     /// Set or remove labels on a host. `zone` is the availability zone.
     Label(HostLabelArgs),
     /// Stop placing machines on a host. Its machines keep running.

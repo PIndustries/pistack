@@ -1423,7 +1423,114 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
         MachineCmd::Start(a) => power(ctx, io, k, a, "start").await,
         MachineCmd::Stop(a) => power(ctx, io, k, a, "stop").await,
         MachineCmd::Reboot(a) => power(ctx, io, k, a, "reboot").await,
+        MachineCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
     }
+}
+
+/// `1536` -> `1.5 KiB`. Whole bytes below 1024.
+fn human_bytes(n: f64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if n.abs() < 1024.0 {
+        return format!("{n:.0} B");
+    }
+    let mut value = n / 1024.0;
+    let mut unit = 0;
+    while value.abs() >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// A metric name without the prefix every one of a machine's or a host's
+/// series shares, with the disk or interface it is about.
+fn stat_name(series: &Value) -> String {
+    let metric = str_at(series, "/metric");
+    let short = metric
+        .strip_prefix("pistack_machine_")
+        .or_else(|| metric.strip_prefix("pistack_host_"))
+        .or_else(|| metric.strip_prefix("pistack_"))
+        .unwrap_or(&metric);
+    let of = ["device", "interface"]
+        .iter()
+        .map(|label| str_at(series, &format!("/labels/{label}")))
+        .find(|v| !v.is_empty());
+    match of {
+        Some(of) => format!("{short} ({of})"),
+        None => short.to_owned(),
+    }
+}
+
+/// A value in the unit its metric name ends in.
+fn stat_value(metric: &str, value: f64) -> String {
+    let name = metric.strip_suffix("_total").unwrap_or(metric);
+    if name.ends_with("_bytes") {
+        human_bytes(value)
+    } else if name.ends_with("_seconds") {
+        format!("{value:.1} s")
+    } else if name.ends_with("_mib") {
+        human_bytes(value * 1024.0 * 1024.0)
+    } else if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// `pi machine stats` and `pi host stats`: the current value of each
+/// series, and for a counter how fast it is rising.
+async fn stats(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, name: &str) -> CliResult<()> {
+    let c = ctx.client()?;
+    let report = c.get_value(&format!("{}/stats", k.item_path(name))).await?;
+    let series = report
+        .get("series")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    match ctx.fmt.output {
+        Output::Table | Output::Wide => {
+            if series.is_empty() {
+                writeln!(
+                    io.stderr,
+                    "no usage reported for {} \"{name}\" in the last five minutes",
+                    k.noun
+                )?;
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = series
+                .iter()
+                .map(|s| {
+                    let metric = str_at(s, "/metric");
+                    let value = s.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+                    let rate = match s.get("rate").and_then(Value::as_f64) {
+                        Some(rate) => {
+                            let per = metric.strip_suffix("_total").unwrap_or(&metric);
+                            if per.ends_with("_seconds") {
+                                // Seconds of CPU per second: CPUs in use.
+                                format!("{rate:.2} cpus")
+                            } else {
+                                format!("{}/s", stat_value(&metric, rate))
+                            }
+                        }
+                        None => String::new(),
+                    };
+                    vec![stat_name(s), stat_value(&metric, value), rate]
+                })
+                .collect();
+            write!(
+                io.stdout,
+                "{}",
+                output::table(&["metric", "value", "rate"], &rows, ctx.fmt.no_headers)
+            )?;
+        }
+        Output::Name => {
+            for s in &series {
+                writeln!(io.stdout, "{}", str_at(s, "/metric"))?;
+            }
+        }
+        _ => print_value(io.stdout, ctx.fmt, &report)?,
+    }
+    Ok(())
 }
 
 async fn power(
@@ -1489,6 +1596,7 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
     match cmd {
         HostCmd::List(a) => do_list(ctx, io, k, a).await,
         HostCmd::Show(a) => do_show(ctx, io, k, a).await,
+        HostCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
         HostCmd::Label(a) => {
             let c = ctx.client()?;
             let mut labels = Map::new();
