@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub use policy::authorize;
-pub use quota::{check_quota, check_quota_in, record_usage};
+pub use quota::check_quota_in;
 pub use token::{
     attach_caller, is_aws4_authorization, path_under_silo, require_caller, silo_sigv4_skips_bearer,
     verify, AuthCaller, Claims, Keys, Verifier,
