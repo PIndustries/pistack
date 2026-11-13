@@ -10,6 +10,7 @@
 //!   rejects images with backing files.
 //! * [`Client`] — the module core; `forge` and `slab` use
 //!   [`Client::open`] and [`Client::resolve`].
+//! * [`usage`] — the project's `images` and `images_bytes` quotas.
 //! * HTTP under `/image`: `/images`, `/images/{id}/data`, `/images/{id}/members`.
 
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ pub mod http;
 pub mod inspect;
 pub mod store;
 pub mod types;
+pub mod usage;
 
 pub use client::{Client, CreateImage, UpdateImage};
 pub use store::{ImageData, ImageStore, LocalDirStore, SiloStore, Stored};
