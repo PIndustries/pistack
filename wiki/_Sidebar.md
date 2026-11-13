@@ -12,6 +12,7 @@
 - [Networking](Networking)
 - [Storage](Storage)
 - [Identity and access](Identity-and-access)
+- [Metrics and alarms](Metrics-and-alarms)
 
 **Reference**
 

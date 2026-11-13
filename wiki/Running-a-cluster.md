@@ -246,7 +246,7 @@ pistack --data-dir /var/lib/pistack store dump
 | `state.partial` | A snapshot download in progress. |
 | `tls/` | Certificate, key and CA for `--tls-listen`. |
 | `agent/` | The agent's certificate, on a machine that also runs an agent. |
-| `images/`, `volumes/`, `silo/`, `shares/`, `gauge/` | Module data. See [Storage](Storage). |
+| `images/`, `volumes/`, `silo/`, `shares/` | Module data. See [Storage](Storage). |
 
 ## Settings that must match across servers
 

@@ -256,6 +256,7 @@ pi machine delete <NAME>
 pi machine start <NAME>
 pi machine stop <NAME>
 pi machine reboot <NAME>
+pi machine stats <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -275,6 +276,8 @@ pi machine reboot <NAME>
 | `machine start` | `--wait` |  |
 | `machine stop` | `--wait` |  |
 | `machine reboot` | `--wait` |  |
+
+`machine stats` prints the current value of each of the machine's usage series, and for a counter how fast it is rising. A machine that is off, or one whose runtime does not measure, has none. See [Metrics and alarms](Metrics-and-alarms).
 
 ## pi pod
 
@@ -326,6 +329,7 @@ Hosts (admin).
 ```text
 pi host list
 pi host show <NAME>
+pi host stats <NAME>
 pi host label <NAME> [K=V]...
 pi host disable <NAME>
 pi host enable <NAME>
@@ -342,6 +346,8 @@ pi host evacuate <NAME>
 | `host drain` | `--reason <REASON>` | Why, shown by `pi host show` |
 | `host evacuate` | `--rebuild-from-image` | Accept that every evacuated machine loses its root disk and starts again from its image. Without it no machine is moved |
 | `host evacuate` | `--confirm-dead` | The host is disabled but may still be reporting, and you know it is dead. If it is not, its machines will run twice until it reports |
+
+`host stats` prints what the host is using now: load, memory, its data disk and how many machines it holds. See [Metrics and alarms](Metrics-and-alarms).
 
 `host disable` stops new placements; the machines on the host keep running. `host drain` disables the host and live-migrates what it can. `host evacuate` is for a host that is down. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 
@@ -773,7 +779,7 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | Buckets | `/silo/buckets` |
 | Shares | `/shelf` |
 | Volume backups | `/volume/backups` |
-| Metrics and alarms | `/gauge` |
+| Alarms and posted samples | `/gauge` |
 
 ```sh
 pi api GET /dns/zones

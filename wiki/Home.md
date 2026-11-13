@@ -22,6 +22,7 @@ Running real workloads across several hosts is still being built. Images and loc
 - [Networking](Networking): the fabric backends and what each needs.
 - [Storage](Storage): volumes, images, object storage, shares.
 - [Identity and access](Identity-and-access): principals, tokens, keys.
+- [Metrics and alarms](Metrics-and-alarms): usage of hosts and machines, the Prometheus endpoint, alarms.
 - [CLI reference](CLI-reference): every `pi` command.
 - [Configuration reference](Configuration-reference): flags and environment variables.
 - [Known limits](Known-limits): what does not work yet.
