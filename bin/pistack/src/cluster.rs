@@ -754,6 +754,120 @@ pub async fn refuse_plain_peers(
     next.run(req).await
 }
 
+/// A client that cannot go to another address, a browser on the console
+/// above all, sends this header with the value `leader`. A server that
+/// does not lead then carries the request to the leader itself.
+pub const FORWARD_HEADER: &str = "x-pistack-forward";
+/// On the answer to a write: the log entry that write was held at.
+pub const COMMIT_HEADER: &str = "x-pistack-commit";
+/// The largest body a follower holds to pass on. Past it the client is
+/// told where the leader is, as before.
+const FORWARD_LIMIT: usize = 8 * 1024 * 1024;
+/// How long a follower waits for its own store to reach a write it carried.
+const FORWARD_CATCH_UP: Duration = Duration::from_secs(2);
+
+pub fn wants_forward(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(FORWARD_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("leader"))
+}
+
+/// Carry a request to the leader and hand its answer back. The caller's
+/// token goes with it and the leader checks it as it would any other. The
+/// header that asked for this does not, so a server that turns out not to
+/// lead answers with the usual refusal and nothing goes round in a circle.
+///
+/// After a write, this server waits a moment for its own store to reach
+/// that write, so what the client reads here next already has it.
+pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Request) -> Response {
+    let api = locked(&handle.leader_api);
+    if api.is_empty() || api == handle.self_api {
+        return ApiError::unavailable("no leader yet, retry soon").into_response();
+    }
+    let tls = members_of(&handle.store)
+        .ok()
+        .and_then(|members| members.into_iter().find(|member| member.api == api))
+        .and_then(|member| member.agent_api);
+    let (parts, body) = req.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, FORWARD_LIMIT).await else {
+        return ApiError::bad_request(
+            "the request is too large to pass on to the leader; send it to the leader",
+        )
+        .with_detail("leader", api)
+        .into_response();
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .to_owned();
+    const PASSED: [&str; 5] = [
+        "authorization",
+        "content-type",
+        "if-match",
+        "accept",
+        "x-request-id",
+    ];
+    let sent = handle
+        .peers
+        .send(
+            &api,
+            tls.as_deref(),
+            Duration::from_secs(3),
+            |client, base| {
+                let mut out = client
+                    .request(parts.method.clone(), format!("{base}{path}"))
+                    .timeout(Duration::from_secs(60))
+                    .body(body.clone());
+                for name in PASSED {
+                    if let Some(value) = parts.headers.get(name) {
+                        out = out.header(name, value.clone());
+                    }
+                }
+                out
+            },
+        )
+        .await;
+    let answer = match sent {
+        Ok(answer) => answer,
+        Err(why) => {
+            return ApiError::unavailable(format!("could not reach the leader at {api}: {why}"))
+                .with_detail("leader", api)
+                .into_response()
+        }
+    };
+    let status = answer.status();
+    let headers = answer.headers().clone();
+    let bytes = match answer.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return ApiError::unavailable(format!("the leader at {api} did not finish: {err}"))
+                .into_response()
+        }
+    };
+    let held_at = headers
+        .get(COMMIT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(index) = held_at {
+        let until = Instant::now() + FORWARD_CATCH_UP;
+        while handle.store.commit_index().is_ok_and(|have| have < index) && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let mut out = Response::new(axum::body::Body::from(bytes));
+    *out.status_mut() = status;
+    for name in ["content-type", "etag", "location", COMMIT_HEADER] {
+        if let Some(value) = headers.get(name) {
+            if let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) {
+                out.headers_mut().insert(name, value.clone());
+            }
+        }
+    }
+    out
+}
+
 pub async fn reject_follower_writes(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
     req: axum::extract::Request,
@@ -794,7 +908,15 @@ pub async fn reject_follower_writes(
             return response;
         }
         return match confirm_write(&handle, after, term).await {
-            Ok(()) => response,
+            Ok(()) => {
+                // Where the log stood once this write was held, so a
+                // follower that carried the request here can wait for it.
+                let mut response = response;
+                response
+                    .headers_mut()
+                    .insert(COMMIT_HEADER, axum::http::HeaderValue::from(after));
+                response
+            }
             Err(err) => err.into_response(),
         };
     }
@@ -808,6 +930,9 @@ pub async fn reject_follower_writes(
                 .into_response(),
             None => ApiError::unavailable("no leader yet, retry soon").into_response(),
         };
+    }
+    if wants_forward(req.headers()) {
+        return forward_to_leader(&handle, req).await;
     }
     let leader = locked(&handle.leader_api);
     ApiError::conflict("not the leader")
@@ -4926,6 +5051,44 @@ mod tests {
             .unwrap()
             .status()
             .as_u16()
+    }
+
+    #[tokio::test]
+    async fn a_follower_carries_a_write_to_the_leader_when_asked() {
+        let (sim, sim2, sim3) = three_voters(4).await;
+        // Unasked, a follower still says where the leader is.
+        assert_eq!(post_write(&sim2.api, "refused").await, 409);
+        let carried = reqwest::Client::new()
+            .post(format!("{}/write/carried", sim2.api))
+            .header(FORWARD_HEADER, "leader")
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(carried.status(), 200);
+        let held_at: u64 = carried.headers()[COMMIT_HEADER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The answer comes back once this follower has the write itself.
+        assert!(sim2.handle.store.commit_index().unwrap() >= held_at);
+        assert_eq!(sim.handle.store.commit_index().unwrap(), held_at);
+
+        // With no leader to carry it to, the answer says so and does not
+        // hang or go round.
+        sim.kill();
+        *guard(&sim3.handle.leader_api) = sim3.api.clone();
+        let nowhere = reqwest::Client::new()
+            .post(format!("{}/write/lost", sim3.api))
+            .header(FORWARD_HEADER, "leader")
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nowhere.status(), 503);
+        sim2.kill();
+        sim3.kill();
     }
 
     #[tokio::test]
