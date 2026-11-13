@@ -157,6 +157,9 @@ pub fn describe(method: &str, path: &str) -> (String, String, String) {
     };
     match s.as_slice() {
         ["identity", "tokens"] => ("login".into(), "tokens".into(), String::new()),
+        ["identity", "tokens", "self", "switch"] => {
+            ("switch_project".into(), "tokens".into(), String::new())
+        }
         ["rpc", "agents", "enroll"] => ("enroll".into(), "agents".into(), String::new()),
         [_, kind] => (verb.into(), (*kind).into(), String::new()),
         [_, kind, id] => (verb.into(), (*kind).into(), (*id).into()),

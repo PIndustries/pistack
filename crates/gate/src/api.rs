@@ -49,6 +49,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/tokens", post(login))
         .route("/tokens/self", get(whoami))
+        .route("/tokens/self/projects", get(my_projects))
+        .route("/tokens/self/switch", post(switch_project))
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{id}",
@@ -372,6 +374,123 @@ pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> 
 
 async fn whoami(AuthCaller(caller): AuthCaller) -> Json<Caller> {
     Json(caller)
+}
+
+/// A project the caller can hold a token for.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MyProject {
+    pub id: Id,
+    pub name: String,
+    /// The project this one sits under, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    /// The roles the caller would have there.
+    pub roles: Vec<String>,
+    /// The project of the token that asked.
+    pub current: bool,
+}
+
+/// The projects the caller can work in: those it has a role bound in, or
+/// every project for a caller with a role at system scope. Disabled
+/// projects are left out. Any caller may ask; it is how a user finds out
+/// where they can go without being able to list every project.
+async fn my_projects(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<Vec<MyProject>>> {
+    let bindings: Vec<RoleBinding> = st
+        .store
+        .collection::<RoleBinding>()
+        .list(None)?
+        .into_iter()
+        .filter(|b| b.spec.principal == caller.principal)
+        .collect();
+    let everywhere: Vec<String> = bindings
+        .iter()
+        .filter(|b| matches!(b.spec.scope, Scope::System))
+        .map(|b| b.spec.role.clone())
+        .collect();
+    let projects = st.store.collection::<Project>().list(None)?;
+    let names: BTreeMap<Id, String> = projects
+        .iter()
+        .map(|p| (p.meta.id.clone(), p.meta.name.clone()))
+        .collect();
+    let mut out: Vec<MyProject> = projects
+        .into_iter()
+        .filter(|p| p.spec.enabled)
+        .filter_map(|p| {
+            let mut roles = everywhere.clone();
+            for b in &bindings {
+                if matches!(&b.spec.scope, Scope::Project { project } if *project == p.meta.id) {
+                    roles.push(b.spec.role.clone());
+                }
+            }
+            if roles.is_empty() {
+                return None;
+            }
+            roles.sort();
+            roles.dedup();
+            Some(MyProject {
+                current: caller.project.as_ref() == Some(&p.meta.id),
+                parent_name: p.spec.parent.as_ref().and_then(|id| names.get(id).cloned()),
+                parent: p.spec.parent.clone(),
+                id: p.meta.id,
+                name: p.meta.name,
+                roles,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.parent_name, &a.name).cmp(&(&b.parent_name, &b.name)));
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwitchRequest {
+    /// Project name or id to move to.
+    pub project: String,
+}
+
+/// Trade the caller's token for one in another project, without the
+/// password. The new token ends when the old one would have: switching is
+/// not a way to stay signed in. `issue_token` refuses a project the
+/// principal has no role in. The old token goes on working until it
+/// expires.
+///
+/// A token from an API key cannot move: the key names its project.
+async fn switch_project(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    headers: HeaderMap,
+    Body(req): Body<SwitchRequest>,
+) -> ApiResult<Json<TokenResponse>> {
+    let claims = st
+        .keys
+        .verifier()
+        .claims(crate::token::bearer_in(&headers)?)?;
+    if claims.key.is_some() {
+        return Err(ApiError::forbidden(
+            "a token from an API key stays in the key's project",
+        ));
+    }
+    let left = claims.expires_at() - Utc::now();
+    if left <= Duration::zero() {
+        return Err(ApiError::unauthorized("token expired"));
+    }
+    let principal = st
+        .store
+        .collection::<Principal>()
+        .try_get(&caller.principal)?
+        .ok_or_else(|| ApiError::unauthorized("token revoked"))?;
+    let project = crate::resolve_project(&st.store, &req.project)?.meta.id;
+    Ok(Json(issue_token(
+        &st,
+        &principal,
+        Some(project),
+        None,
+        left,
+    )?))
 }
 
 // ---- projects --------------------------------------------------------------

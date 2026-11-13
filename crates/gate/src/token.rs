@@ -629,7 +629,12 @@ pub fn verify(verifier: &Verifier, token: &str) -> ApiResult<Caller> {
 }
 
 fn bearer(parts: &Parts) -> ApiResult<&str> {
-    let mut auths = parts.headers.get_all(header::AUTHORIZATION).iter();
+    bearer_in(&parts.headers)
+}
+
+/// The bearer token in a set of request headers.
+pub fn bearer_in(headers: &HeaderMap) -> ApiResult<&str> {
+    let mut auths = headers.get_all(header::AUTHORIZATION).iter();
     let raw = auths
         .next()
         .ok_or_else(|| ApiError::unauthorized("missing Authorization header"))?;
