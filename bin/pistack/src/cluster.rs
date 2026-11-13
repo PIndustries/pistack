@@ -1620,8 +1620,7 @@ fn store_err(err: impl std::fmt::Display) -> ApiError {
     ApiError::internal(text)
 }
 
-/// Header a member sends on every call to another server: the peer key.
-pub const PEER_HEADER: &str = "x-pistack-cluster";
+pub use keep::peer::{peer_key, PEER_HEADER};
 
 /// Who may call `/cluster`. The routes hand out the whole store, admit new
 /// servers and count votes, so by default the caller must be a member or
@@ -1663,22 +1662,6 @@ pub fn warn_if_open() {
     }
 }
 
-/// The key members prove themselves with. It is derived from the token
-/// signing secret, which is in every member's store and in every snapshot
-/// and nowhere else, so a server has it from the moment it holds the
-/// cluster's state and needs nothing handed to it. `None` before the
-/// identity module has made that secret.
-pub fn peer_key(store: &Store) -> Option<String> {
-    use hmac::Mac;
-    let secret = store
-        .get_meta::<String>(gate::token::META_JWT_SECRET)
-        .ok()??;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(b"pistack cluster peer v1");
-    let digest = mac.finalize().into_bytes();
-    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 fn enforce_peer(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
     enforce_peer_with(store, headers, peer_auth())
 }
@@ -1688,15 +1671,14 @@ fn enforce_peer(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
 /// snapshot and to join, and from then on it has the key. Checking a token
 /// does not redeem it, and neither secret is logged or echoed.
 fn enforce_peer_with(store: &Store, headers: &HeaderMap, auth: PeerAuth) -> Result<(), ApiError> {
-    use subtle::ConstantTimeEq;
     if auth == PeerAuth::Open {
         return Ok(());
     }
     if let Some(offered) = headers.get(PEER_HEADER) {
-        let known = peer_key(store);
-        return match known {
-            Some(key) if bool::from(key.as_bytes().ct_eq(offered.as_bytes())) => Ok(()),
-            _ => Err(ApiError::unauthorized("not a member of this cluster")),
+        return if keep::peer::is_member(store, offered.as_bytes()) {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized("not a member of this cluster"))
         };
     }
     let token = match headers.get(JOIN_HEADER) {

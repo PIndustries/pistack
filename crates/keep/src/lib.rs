@@ -50,6 +50,7 @@ pub mod client;
 pub mod crypto;
 pub mod error;
 pub mod join;
+pub mod peer;
 pub mod quota;
 pub mod sweep;
 pub mod tls;
