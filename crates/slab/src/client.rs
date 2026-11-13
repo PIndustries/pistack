@@ -26,7 +26,7 @@ use crate::backend::{
     AttachInfo, AttachTarget, BlockBackend, LocalFileBackend, LvmBackend, RbdBackend,
 };
 use crate::place;
-use crate::quota::{AllowAll, QuotaCheck, QuotaRequest};
+use crate::quota::{ProjectQuota, QuotaCheck, QuotaRequest};
 use crate::types::*;
 
 /// Body of `POST /volumes`, `POST /snapshots`, `POST /backups`,
@@ -322,8 +322,8 @@ impl Client {
         self.queue.is_some()
     }
 
-    /// In-memory store, local file backend under `dir`, no quotas. For tests
-    /// and the dev loop.
+    /// In-memory store, local file backend under `dir`, project quotas. For
+    /// tests and the dev loop.
     pub fn local(dir: impl Into<PathBuf>) -> ApiResult<Self> {
         let dir = dir.into();
         let silo_root = dir.join("silo");
@@ -331,7 +331,7 @@ impl Client {
         Ok(Self::new(
             store,
             Arc::new(LocalFileBackend::new(dir.clone())),
-            Arc::new(AllowAll),
+            Arc::new(ProjectQuota),
         )
         .with_silo_root(silo_root)
         .with_images(Arc::new(mold::LocalDirStore::new(dir.join("images"))))
@@ -486,16 +486,15 @@ impl Client {
             }
         }
 
-        self.quota
-            .check(
-                req.project.as_ref(),
-                &[
-                    QuotaRequest::volumes(1),
-                    QuotaRequest::gigabytes(spec.size_gib),
-                ],
-            )
-            .await?;
-        crate::usage::admit_create(self.store(), req.project.as_ref())?;
+        let _admission = gate::quota::admission();
+        self.quota.check(
+            self.store(),
+            req.project.as_ref(),
+            &[
+                QuotaRequest::volumes(1),
+                QuotaRequest::gigabytes(spec.size_gib),
+            ],
+        )?;
 
         let mut meta = Meta::new(KIND_VOLUME, req.name, req.project);
         meta.description = req.description;
@@ -509,7 +508,7 @@ impl Client {
                 ..Default::default()
             },
         })?;
-        crate::usage::note_create(self.store(), vol.meta.project.as_ref());
+        crate::usage::mirror(self.store(), vol.meta.project.as_ref());
         Ok(vol)
     }
 
@@ -563,7 +562,7 @@ impl Client {
             Ok(())
         })?;
         if release {
-            crate::usage::note_delete(self.store(), vol.meta.project.as_ref());
+            crate::usage::refresh(self.store(), vol.meta.project.as_ref());
         }
         Ok(vol)
     }
@@ -879,6 +878,8 @@ impl Client {
     /// Grow a volume. Sets `spec.size_gib` and phase `Updating`; the
     /// reconciler asks the backend and returns the volume to `Ready`.
     pub async fn extend_volume(&self, id: &Id, size_gib: u64) -> ApiResult<Volume> {
+        // Taken before the read so two extends cannot both count the old size.
+        let _admission = gate::quota::admission();
         let cur = self.volumes().get(id)?;
         if size_gib <= cur.spec.size_gib {
             return Err(ApiError::unprocessable(format!(
@@ -892,17 +893,18 @@ impl Client {
                 cur.status.phase
             )));
         }
-        self.quota
-            .check(
-                cur.meta.project.as_ref(),
-                &[QuotaRequest::gigabytes(size_gib - cur.spec.size_gib)],
-            )
-            .await?;
-        Ok(self.volumes().modify(id, |v| {
+        self.quota.check(
+            self.store(),
+            cur.meta.project.as_ref(),
+            &[QuotaRequest::gigabytes(size_gib - cur.spec.size_gib)],
+        )?;
+        let vol = self.volumes().modify(id, |v| {
             v.spec.size_gib = size_gib;
             v.status.phase = Phase::Updating;
             Ok(())
-        })?)
+        })?;
+        crate::usage::mirror(self.store(), vol.meta.project.as_ref());
+        Ok(vol)
     }
 
     /// How `host` should attach the volume. Public API for `forge`.
@@ -933,14 +935,17 @@ impl Client {
         }
         // A snapshot lives in its volume's project regardless of the body.
         let project = vol.meta.project.clone();
-        self.quota
-            .check(project.as_ref(), &[QuotaRequest::snapshots(1)])
-            .await?;
+        let _admission = gate::quota::admission();
+        self.quota.check(
+            self.store(),
+            project.as_ref(),
+            &[QuotaRequest::snapshots(1)],
+        )?;
         let mut meta = Meta::new(KIND_SNAPSHOT, req.name, project);
         meta.description = req.description;
         meta.labels = req.labels;
         meta.annotations = req.annotations;
-        Ok(self.snapshots().create(Snapshot {
+        let snap = self.snapshots().create(Snapshot {
             meta,
             spec: req.spec,
             status: SnapshotStatus {
@@ -948,7 +953,9 @@ impl Client {
                 size_gib: vol.spec.size_gib,
                 ..Default::default()
             },
-        })?)
+        })?;
+        crate::usage::mirror(self.store(), snap.meta.project.as_ref());
+        Ok(snap)
     }
 
     pub fn get_snapshot(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Snapshot> {
@@ -960,10 +967,12 @@ impl Client {
     }
 
     pub fn request_delete_snapshot(&self, id: &Id) -> ApiResult<Snapshot> {
-        Ok(self.snapshots().modify(id, |s| {
+        let snap = self.snapshots().modify(id, |s| {
             s.status.phase = Phase::Deleting;
             Ok(())
-        })?)
+        })?;
+        crate::usage::refresh(self.store(), snap.meta.project.as_ref());
+        Ok(snap)
     }
 
     // ---- backups ----------------------------------------------------------
@@ -977,14 +986,20 @@ impl Client {
         }
         let vol = self.volumes().get(&req.spec.volume)?;
         let project = vol.meta.project.clone();
-        self.quota
-            .check(project.as_ref(), &[QuotaRequest::backups(1)])
-            .await?;
+        let _admission = gate::quota::admission();
+        self.quota.check(
+            self.store(),
+            project.as_ref(),
+            &[
+                QuotaRequest::backups(1),
+                QuotaRequest::backup_gigabytes(vol.spec.size_gib),
+            ],
+        )?;
         let mut meta = Meta::new(KIND_BACKUP, req.name, project);
         meta.description = req.description;
         meta.labels = req.labels;
         meta.annotations = req.annotations;
-        Ok(self.backups().create(Backup {
+        let backup = self.backups().create(Backup {
             meta,
             spec: req.spec,
             status: BackupStatus {
@@ -992,7 +1007,9 @@ impl Client {
                 size_gib: vol.spec.size_gib,
                 ..Default::default()
             },
-        })?)
+        })?;
+        crate::usage::mirror(self.store(), backup.meta.project.as_ref());
+        Ok(backup)
     }
 
     pub fn get_backup(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Backup> {
@@ -1004,10 +1021,12 @@ impl Client {
     }
 
     pub fn request_delete_backup(&self, id: &Id) -> ApiResult<Backup> {
-        Ok(self.backups().modify(id, |b| {
+        let backup = self.backups().modify(id, |b| {
             b.status.phase = Phase::Deleting;
             Ok(())
-        })?)
+        })?;
+        crate::usage::refresh(self.store(), backup.meta.project.as_ref());
+        Ok(backup)
     }
 
     /// Copy a ready backup out of silo into a new volume.
