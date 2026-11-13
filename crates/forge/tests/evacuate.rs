@@ -176,6 +176,26 @@ async fn a_host_that_returns_after_an_evacuation_drops_its_stale_machines() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Something was still being asked of the dead host: an attach, say.
+    queue.attach_store(store.clone());
+    let asked = queue
+        .enqueue_keyed(
+            "first",
+            "volume/vol-1",
+            pistack_rpc::CommandKind::AttachVolume,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+    let records = || {
+        store
+            .raw_scan("meta", pistack_rpc::COMMAND_RECORD_PREFIX)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.contains("/first/"))
+            .count()
+    };
+    assert_eq!(records(), 1);
+
     // Evacuate it. Both machines must come up on the second host.
     let resp = http
         .post(format!("{base}/compute/hosts/first/evacuate"))
@@ -187,6 +207,13 @@ async fn a_host_that_returns_after_an_evacuation_drops_its_stale_machines() {
     let report: EvacuateReport = resp.json().await.unwrap();
     assert_eq!(report.evacuated.len(), 2, "{report:?}");
     assert!(report.skipped.is_empty(), "{report:?}");
+    // What was asked of the host is dropped, so it is not handed to the
+    // agent if the host comes back.
+    assert!(matches!(
+        asked.wait().await,
+        Err(pistack_rpc::RpcError::NodeRemoved { .. })
+    ));
+    assert_eq!(records(), 0);
     for id in &ids {
         loop {
             assert!(Instant::now() < deadline, "machine never came back");
