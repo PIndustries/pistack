@@ -99,6 +99,12 @@ pub enum Cmd {
         cmd: UserCmd,
     },
     /// Roles.
+    /// Token signing keys (admin).
+    #[command(alias = "signing-keys")]
+    SigningKey {
+        #[command(subcommand)]
+        cmd: SigningKeyCmd,
+    },
     Role {
         #[command(subcommand)]
         cmd: RoleCmd,
@@ -448,6 +454,26 @@ pub struct UserCreate {
     pub disabled: bool,
 }
 crud!(UserCmd, UserCreate);
+
+#[derive(Subcommand, Debug)]
+pub enum SigningKeyCmd {
+    /// List the token signing keys: id, age and when each stops verifying.
+    #[command(alias = "ls")]
+    List,
+    /// Sign new tokens with a new key. The key before it keeps verifying
+    /// until every token it signed has expired (7 days), then stops.
+    Rotate,
+    /// Drop every key but the current one now. Tokens signed with a
+    /// dropped key stop working at once.
+    Retire(SigningKeyRetire),
+}
+
+#[derive(Args, Debug)]
+pub struct SigningKeyRetire {
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct RoleCreate {

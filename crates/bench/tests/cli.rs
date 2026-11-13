@@ -30,6 +30,8 @@ struct Mock {
     removals: Arc<Mutex<Vec<(String, bool)>>>,
     quotas: Arc<Mutex<BTreeMap<String, u64>>>,
     networks: Arc<Mutex<BTreeMap<String, Value>>>,
+    /// Paths of the identity writes that take no body.
+    identity_posts: Arc<Mutex<Vec<String>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -273,6 +275,40 @@ async fn remove_server(
     Json(json!({"members": []})).into_response()
 }
 
+fn signing_keys(m: &Mock) -> Value {
+    let posts = m.identity_posts.lock().unwrap();
+    let rotated = posts.iter().any(|p| p.ends_with("/rotate"));
+    let retired = posts.iter().any(|p| p.ends_with("/retire"));
+    let old = json!({"kid": "aaaa1111", "current": !rotated, "created_at": "2026-01-01T00:00:00Z",
+        "retire_at": if rotated { json!("2026-11-20T00:00:05Z") } else { Value::Null }});
+    let new = json!({"kid": "bbbb2222", "current": true, "created_at": "2026-11-13T00:00:00Z"});
+    match (rotated, retired) {
+        (false, _) => json!({"keys": [old]}),
+        (true, false) => json!({"keys": [old, new]}),
+        (true, true) => json!({"keys": [new], "retired": ["aaaa1111"]}),
+    }
+}
+
+async fn list_signing_keys(State(m): State<Mock>, h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    Json(signing_keys(&m)).into_response()
+}
+
+async fn identity_post(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let path = uri.path().to_owned();
+    m.identity_posts.lock().unwrap().push(path.clone());
+    Json(signing_keys(&m)).into_response()
+}
+
 async fn discovery() -> Json<Value> {
     Json(json!({
         "name": "pistack", "version": "26.11.12.1", "public_url": "http://mock", "dev_mode": false,
@@ -500,6 +536,9 @@ async fn serve() -> (String, Mock) {
             "/network/networks/{id}",
             get(show_network).put(update_network),
         )
+        .route("/identity/signing-keys", get(list_signing_keys))
+        .route("/identity/signing-keys/rotate", post(identity_post))
+        .route("/identity/signing-keys/retire", post(identity_post))
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
         .route("/compute/machines/{id}/start", post(start))
@@ -1276,4 +1315,45 @@ async fn quota_set_then_show() {
     assert!(r.err.contains("not a number"), "{}", r.err);
     let r = pi(&cfg, "", &["quota", "set", "web"]).await;
     assert_eq!(r.code, 2, "{r:?}");
+}
+
+#[tokio::test]
+async fn signing_keys_are_listed_rotated_and_retired() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let admin = ["--url", url.as_str(), "--token", TOKEN];
+    let run = |rest: &[&'static str]| {
+        let args = [&admin[..], rest].concat();
+        let cfg = cfg.clone();
+        async move { pi(&cfg, "", &args).await }
+    };
+
+    let r = run(&["signing-key", "list"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", r.out);
+    assert!(lines[0].starts_with("KEY"), "{}", r.out);
+    assert!(lines[0].contains("VERIFIES-UNTIL"), "{}", r.out);
+    assert!(lines[1].starts_with("aaaa1111"), "{}", r.out);
+    assert!(lines[1].contains("yes"), "{}", r.out);
+
+    let r = run(&["signing-key", "rotate"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", r.out);
+    assert!(lines[1].contains("2026-11-20T00:00:05Z"), "{}", r.out);
+    assert!(!lines[1].contains("yes"), "{}", r.out);
+    assert!(lines[2].starts_with("bbbb2222"), "{}", r.out);
+
+    // No terminal to confirm on, and nothing is sent.
+    let r = run(&["signing-key", "retire"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("--yes"), "{}", r.err);
+    assert_eq!(mock.identity_posts.lock().unwrap().len(), 1);
+
+    let r = run(&["signing-key", "retire", "--yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("bbbb2222"), "{}", r.out);
+    assert!(r.out.ends_with("retired aaaa1111\n"), "{}", r.out);
 }

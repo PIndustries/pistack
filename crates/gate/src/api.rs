@@ -12,6 +12,9 @@
 //! GET    /projects/{id}/quotas   limit and usage per resource (member/reader of it, or admin)
 //! PUT    /projects/{id}/quotas   set or clear single limits (admin)
 //! GET|POST /principals, GET|PUT|DELETE /principals/{id}   (admin; GET self allowed)
+//! GET    /signing-keys           ids and dates of the token signing keys (admin)
+//! POST   /signing-keys/rotate    sign with a new key; the old one verifies for a while (admin)
+//! POST   /signing-keys/retire    drop every key but the current one now (admin)
 //! GET|POST /roles, GET|PUT|DELETE /roles/{id}             (read: any caller; write: admin)
 //! GET|POST /bindings, GET|DELETE /bindings/{id}           (admin)
 //! GET|POST /keys, GET|DELETE /keys/{id}                   (own keys, or any as admin)
@@ -58,6 +61,9 @@ pub fn router(state: AppState) -> Router {
                 .put(update_principal)
                 .delete(delete_principal),
         )
+        .route("/signing-keys", get(list_signing_keys))
+        .route("/signing-keys/rotate", post(rotate_signing_key))
+        .route("/signing-keys/retire", post(retire_signing_keys))
         .route("/roles", get(list_roles).post(create_role))
         .route(
             "/roles/{id}",
@@ -741,6 +747,71 @@ async fn delete_principal(
     }
     st.store.collection::<Principal>().delete(&p.meta.id)?;
     Ok(no_content())
+}
+
+// ---- signing keys ----------------------------------------------------------
+
+/// The signing keys as the API shows them: never a secret.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SigningKeys {
+    pub keys: Vec<crate::token::SigningKeyInfo>,
+    /// Ids dropped by this call (`retire` only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<String>,
+}
+
+fn internal(e: anyhow::Error) -> ApiError {
+    ApiError::internal(e.to_string())
+}
+
+async fn list_signing_keys(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<SigningKeys>> {
+    policy::authorize(&caller, "signing_keys.list", None)?;
+    let set = crate::token::KeySet::load(&st.store)
+        .map_err(internal)?
+        .unwrap_or_default();
+    Ok(Json(SigningKeys {
+        keys: set.describe(),
+        retired: Vec::new(),
+    }))
+}
+
+async fn rotate_signing_key(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<SigningKeys>> {
+    policy::authorize(&caller, "signing_keys.rotate", None)?;
+    let set = crate::token::rotate(&st.store, Utc::now()).map_err(internal)?;
+    tracing::info!(
+        current = set.current_kid(),
+        keys = set.describe().len(),
+        by = %caller.principal_name,
+        "token signing key rotated"
+    );
+    Ok(Json(SigningKeys {
+        keys: set.describe(),
+        retired: Vec::new(),
+    }))
+}
+
+async fn retire_signing_keys(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<SigningKeys>> {
+    policy::authorize(&caller, "signing_keys.retire", None)?;
+    let (set, retired) = crate::token::retire(&st.store).map_err(internal)?;
+    tracing::info!(
+        current = set.current_kid(),
+        retired = ?retired,
+        by = %caller.principal_name,
+        "token signing keys retired"
+    );
+    Ok(Json(SigningKeys {
+        keys: set.describe(),
+        retired,
+    }))
 }
 
 // ---- roles -----------------------------------------------------------------
