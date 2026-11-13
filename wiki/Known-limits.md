@@ -6,7 +6,10 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 - **The API listener is plain HTTP.** `--tls-listen` adds HTTPS with a certificate from the cloud CA, but `pi` and agents do not trust that CA. `pi` needs `--insecure` to use it.
 - **Agents cannot join with certificates.** Enrollment over HTTPS fails the TLS handshake, and over HTTP the agent cannot present the certificate it was issued. Agents only connect when the server runs with `PISTACK_RPC_INSECURE=1`, which lets anything that reaches the port register as a host.
-- **Cluster traffic is not encrypted.** `/cluster` answers only a member or a server with a join token, but servers talk to each other over plain HTTP, so the member key and the snapshot cross the network in the clear. Keep that network private.
+- **Cluster traffic is encrypted only between servers that have a TLS listener.** By default (`PISTACK_CLUSTER_TLS=preferred`) a server with no `--tls-listen` is called over plain HTTP, and so is one whose TLS listener cannot be reached, so the member key and the snapshot can still cross the network in the clear. `required` closes that. See [Running a cluster](Running-a-cluster#tls-between-servers).
+- **Servers do not show each other a certificate.** A server checks the certificate of the server it calls. The caller proves itself with the member key, which is one key for the whole cluster.
+- **A join by discovery is plain HTTP.** Discovery announces the API address, so a server that joins that way needs `--insecure-join`.
+- **TLS between servers was tried on one machine.** Three servers on loopback joined, replicated and elected with `required`. It has not been run across machines or through an upgrade from an older release.
 - **`reader` is not read-only.** Only `gate` and `keep` enforce it. In the other modules a `reader` token can create and delete resources in its project. Fixed by [PIndustries/pistack#103](https://github.com/PIndustries/pistack/pull/103), not merged.
 - **The token signing key does not rotate.** A token stops working when its principal is disabled or deleted, when the API key it came from is deleted, or when it expires. There is no way to cancel one token on its own.
 - **Custom roles grant nothing.** Authorization knows only `admin`, `member` and `reader`. The policy engine in `crates/pistack-policy` is not wired in.

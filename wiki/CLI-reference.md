@@ -238,6 +238,8 @@ pi join-token create <NAME>
 pi join-token delete <NAME>
 ```
 
+`create` prints the token once, and under it `ca sha256`, the fingerprint of the cloud's root CA. A new control-plane server is given both; see [Running a cluster](Running-a-cluster#adding-servers). An agent needs only the token.
+
 | Command | Argument or option | Meaning |
 | --- | --- | --- |
 | `join-token create` | `--multi-use` | Allow more than one redemption |
