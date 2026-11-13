@@ -151,9 +151,13 @@ impl Default for PrincipalSpec {
     }
 }
 
-/// Nothing observed yet; reserved for reconciler-written facts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct PrincipalStatus {}
+pub struct PrincipalStatus {
+    /// Tokens issued at or before this moment are refused. Set by
+    /// `POST /principals/{id}/revoke-tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_not_before: Option<DateTime<Utc>>,
+}
 
 resource!(
     /// A user or service account. Names are global (no project).

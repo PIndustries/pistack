@@ -12,6 +12,7 @@
 //! GET    /projects/{id}/quotas   limit and usage per resource (member/reader of it, or admin)
 //! PUT    /projects/{id}/quotas   set or clear single limits (admin)
 //! GET|POST /principals, GET|PUT|DELETE /principals/{id}   (admin; GET self allowed)
+//! POST   /principals/{id}/revoke-tokens   refuse every token issued up to now (admin, or self)
 //! GET    /signing-keys           ids and dates of the token signing keys (admin)
 //! POST   /signing-keys/rotate    sign with a new key; the old one verifies for a while (admin)
 //! POST   /signing-keys/retire    drop every key but the current one now (admin)
@@ -61,6 +62,7 @@ pub fn router(state: AppState) -> Router {
                 .put(update_principal)
                 .delete(delete_principal),
         )
+        .route("/principals/{id}/revoke-tokens", post(revoke_tokens))
         .route("/signing-keys", get(list_signing_keys))
         .route("/signing-keys/rotate", post(rotate_signing_key))
         .route("/signing-keys/retire", post(retire_signing_keys))
@@ -747,6 +749,26 @@ async fn delete_principal(
     }
     st.store.collection::<Principal>().delete(&p.meta.id)?;
     Ok(no_content())
+}
+
+/// Refuse every token this principal was issued up to now. A token cannot
+/// be revoked one at a time: it is not stored anywhere to mark.
+async fn revoke_tokens(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Principal>> {
+    let p = resolve_principal(&st.store, &id)?;
+    if p.meta.id != caller.principal {
+        policy::authorize(&caller, "principals.update", None)?;
+    }
+    let now = Utc::now();
+    let p = st.store.collection::<Principal>().modify(&p.meta.id, |p| {
+        p.status.tokens_not_before = Some(now);
+        Ok(())
+    })?;
+    tracing::info!(principal = %p.meta.name, by = %caller.principal_name, "tokens revoked");
+    Ok(Json(p.redacted()))
 }
 
 // ---- signing keys ----------------------------------------------------------

@@ -769,3 +769,59 @@ async fn signing_keys_rotate_and_retire_through_the_api() {
         assert_eq!(s, StatusCode::FORBIDDEN, "{method} {path}");
     }
 }
+
+#[tokio::test]
+async fn revoke_tokens_cuts_off_every_token_a_user_holds() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let admin = v["token"].as_str().unwrap().to_owned();
+    for name in ["bob", "eve"] {
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/principals",
+            Some(&admin),
+            Some(json!({"name": name, "password": format!("{name}-password-1")})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+    }
+    let (_, v) = login(&app, "bob", "bob-password-1").await;
+    let bob1 = v["token"].as_str().unwrap().to_owned();
+    let (_, v) = login(&app, "bob", "bob-password-1").await;
+    let bob2 = v["token"].as_str().unwrap().to_owned();
+    let (_, v) = login(&app, "eve", "eve-password-1").await;
+    let eve = v["token"].as_str().unwrap().to_owned();
+
+    // Another user may not; the admin may.
+    let path = "/principals/bob/revoke-tokens";
+    let (s, _) = call(&app, "POST", path, Some(&eve), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, v) = call(&app, "POST", path, Some(&admin), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["status"]["tokens_not_before"].is_string());
+
+    for t in [&bob1, &bob2] {
+        let (s, v) = call(&app, "GET", "/tokens/self", Some(t), None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(v["error"]["message"], "token revoked");
+    }
+    // Nobody else is touched.
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&eve), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&admin), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // A login after the stamp's second works again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, v) = login(&app, "bob", "bob-password-1").await;
+    let bob3 = v["token"].as_str().unwrap().to_owned();
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&bob3), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // A user may revoke their own.
+    let (s, _) = call(&app, "POST", path, Some(&bob3), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&bob3), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}

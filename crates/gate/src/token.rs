@@ -506,11 +506,13 @@ impl Keys {
 /// key.
 ///
 /// One built with [`Verifier::from_store`] also reads the store on every
-/// check: the principal must still exist and be enabled, the API key the
-/// login used must still exist and be unexpired, and the roles are the ones
-/// bound now, not the ones bound at login. So disabling a user, deleting a
-/// key or removing a binding takes effect on the next request. One built
-/// from a bare secret checks the signature and expiry only.
+/// check: the principal must still exist and be enabled, the token must
+/// not be older than the principal's "tokens before this are invalid"
+/// stamp, the API key the login used must still exist and be unexpired,
+/// and the roles are the ones bound now, not the ones bound at login. So
+/// disabling a user, deleting a key or removing a binding takes effect on
+/// the next request. One built from a bare secret checks the signature and
+/// expiry only.
 #[derive(Clone)]
 pub struct Verifier {
     ring: Arc<Ring>,
@@ -603,6 +605,13 @@ fn live_caller(store: &Store, claims: &Claims) -> ApiResult<Caller> {
         .map_err(internal)?
         .filter(|p| p.spec.enabled)
         .ok_or_else(revoked)?;
+    // `iat` is in whole seconds, so a token from the second of the stamp
+    // is taken as older than it.
+    if let Some(stamp) = principal.status.tokens_not_before {
+        if claims.iat <= stamp.timestamp() {
+            return Err(revoked());
+        }
+    }
     if let Some(key) = &claims.key {
         store
             .collection::<ApiKey>()
