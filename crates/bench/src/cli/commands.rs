@@ -54,6 +54,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Size { cmd } => size(ctx, cmd, io).await,
         Cmd::Host { cmd } => host(ctx, cmd, io).await,
         Cmd::Cluster { cmd } => cluster(ctx, cmd, io).await,
+        Cmd::Server { cmd } => server(ctx, cmd, io).await,
         Cmd::Network { cmd } => network(ctx, cmd, io).await,
         Cmd::Subnet { cmd } => subnet(ctx, cmd, io).await,
         Cmd::Port { cmd } => port(ctx, cmd, io).await,
@@ -1418,6 +1419,59 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             report(ctx, io, k, &v, "enabled")
         }
     }
+}
+
+// ---- control-plane servers ---------------------------------------------------------------
+
+/// The one member `want` names: a full id, an API address, or the start of
+/// exactly one id.
+fn pick_server<'a>(all: &'a [Value], want: &str) -> CliResult<&'a Value> {
+    let want = want.trim();
+    if let Some(m) = all
+        .iter()
+        .find(|m| str_at(m, "/id") == want || str_at(m, "/api") == want)
+    {
+        return Ok(m);
+    }
+    let starts: Vec<&Value> = all
+        .iter()
+        .filter(|m| !want.is_empty() && str_at(m, "/id").starts_with(want))
+        .collect();
+    match starts.as_slice() {
+        [one] => Ok(one),
+        [] => Err(CliError::usage(format!(
+            "no server '{want}' in this cluster; see `pi cluster status`"
+        ))),
+        _ => Err(CliError::usage(format!(
+            "'{want}' matches more than one server; give the whole id"
+        ))),
+    }
+}
+
+/// `pi server remove`. The members come from the same `GET /cluster` that
+/// `pi cluster status` prints.
+async fn server(ctx: &Ctx, cmd: ServerCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let ServerCmd::Remove(a) = cmd;
+    let c = ctx.client()?;
+    let v = c.get_value("/cluster").await?;
+    let all = v
+        .pointer("/members")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let found = pick_server(&all, &a.server)?;
+    let (id, api) = (str_at(found, "/id"), str_at(found, "/api"));
+    if !a.yes && !confirm(io, &format!("server {id} ({api}) from the cluster"))? {
+        writeln!(io.stderr, "aborted")?;
+        return Ok(());
+    }
+    let mut path = format!("/cluster/members/{id}");
+    if a.force {
+        path.push_str("?force=true");
+    }
+    c.delete(&path).await?;
+    writeln!(io.stdout, "server {id} ({api}) removed")?;
+    Ok(())
 }
 
 // ---- network nouns -----------------------------------------------------------------------

@@ -139,6 +139,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ClusterCmd,
     },
+    /// Take a control-plane server out of the cluster (admin).
+    Server {
+        #[command(subcommand)]
+        cmd: ServerCmd,
+    },
     /// Networks.
     Network {
         #[command(subcommand)]
@@ -664,6 +669,25 @@ pub struct HostLabelArgs {
 pub enum ClusterCmd {
     /// Show each server, its role and which one leads.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServerCmd {
+    /// Remove a server from the cluster. `pi cluster status` lists them.
+    #[command(alias = "rm")]
+    Remove(ServerRemove),
+}
+
+#[derive(Args, Debug)]
+pub struct ServerRemove {
+    /// Server id, the start of one, or its API address.
+    pub server: String,
+    /// Remove it even if the servers left could not form a majority.
+    #[arg(long)]
+    pub force: bool,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 // ---- network -----------------------------------------------------------------
