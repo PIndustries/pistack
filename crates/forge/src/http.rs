@@ -755,6 +755,14 @@ async fn evacuate_host(
     let opts: crate::maintain::EvacuateOptions = optional_body(&body)?;
     let host = hosts(&s).resolve(None, &id)?;
     let (evacuated, skipped) = crate::maintain::evacuate(&s.store, &host, opts)?;
+    // What was asked of the host no longer applies. If it comes back it
+    // must not be handed a start or an attach from before.
+    if let Some(queue) = &s.queue {
+        let dropped = queue.drop_commands(&host.spec.node_name);
+        if dropped > 0 {
+            tracing::info!(host = %host.meta.id, dropped, "forge: commands for the evacuated host dropped");
+        }
+    }
     Ok(Json(crate::maintain::EvacuateReport {
         host,
         evacuated,
