@@ -841,3 +841,135 @@ async fn revoke_tokens_cuts_off_every_token_a_user_holds() {
     let (s, _) = call(&app, "GET", "/tokens/self", Some(&bob3), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn a_user_sees_their_projects_and_moves_between_them() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let admin = v["token"].as_str().unwrap().to_owned();
+    let post = |path: &'static str, tok: String, body: Value| {
+        let app = app.clone();
+        async move { call(&app, "POST", path, Some(&tok), Some(body)).await }
+    };
+    for body in [
+        json!({"name": "acme"}),
+        json!({"name": "acme-web", "parent": "acme"}),
+        json!({"name": "acme-data", "parent": "acme"}),
+        json!({"name": "other"}),
+    ] {
+        let (s, v) = post("/projects", admin.clone(), body).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+    let (s, _) = post(
+        "/principals",
+        admin.clone(),
+        json!({"name": "alice", "password": "pw-alice", "default_project": "acme-web"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    for (role, project) in [("member", "acme-web"), ("reader", "acme-data")] {
+        let (s, v) = post(
+            "/bindings",
+            admin.clone(),
+            json!({"principal": "alice", "role": role, "project": project}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+
+    let (_, v) = login(&app, "alice", "pw-alice").await;
+    let in_web = v["token"].as_str().unwrap().to_owned();
+    let web_expires = v["expires_at"].as_str().unwrap().to_owned();
+
+    // Alice cannot list every project, but she can see her own two, with
+    // the project they sit under and the role she has in each.
+    let (s, _) = call(&app, "GET", "/projects", Some(&in_web), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, v) = call(&app, "GET", "/tokens/self/projects", Some(&in_web), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mine = v.as_array().unwrap();
+    let seen: Vec<(&str, &str, bool)> = mine
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap(),
+                p["roles"][0].as_str().unwrap(),
+                p["current"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![("acme-data", "reader", false), ("acme-web", "member", true)]
+    );
+    assert!(mine.iter().all(|p| p["parent_name"] == "acme"), "{v}");
+
+    // She moves to the other one without her password. The new token ends
+    // when the old one would have.
+    let (s, v) = post(
+        "/tokens/self/switch",
+        in_web.clone(),
+        json!({"project": "acme-data"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["roles"], json!(["reader"]));
+    let in_data = v["token"].as_str().unwrap().to_owned();
+    let moved: chrono::DateTime<chrono::Utc> = v["expires_at"].as_str().unwrap().parse().unwrap();
+    let first: chrono::DateTime<chrono::Utc> = web_expires.parse().unwrap();
+    assert!(moved <= first, "{moved} is after {first}");
+    let (_, who) = call(&app, "GET", "/tokens/self", Some(&in_data), None).await;
+    assert_eq!(who["roles"], json!(["reader"]));
+    let (_, v) = call(&app, "GET", "/tokens/self/projects", Some(&in_data), None).await;
+    let current: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["current"] == true)
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(current, vec!["acme-data"]);
+
+    // Not to a project she has no role in, and not to one that is not there.
+    for (project, status) in [
+        ("other", StatusCode::FORBIDDEN),
+        ("acme", StatusCode::FORBIDDEN),
+        ("nowhere", StatusCode::NOT_FOUND),
+    ] {
+        let (s, v) = post(
+            "/tokens/self/switch",
+            in_web.clone(),
+            json!({"project": project}),
+        )
+        .await;
+        assert_eq!(s, status, "{project}: {v}");
+    }
+
+    // A token from an API key stays where the key put it.
+    let (s, key) = post("/keys", in_web.clone(), json!({"name": "laptop"})).await;
+    assert_eq!(s, StatusCode::CREATED, "{key}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/tokens",
+        None,
+        Some(json!({"api_key": key["secret"]})),
+    )
+    .await;
+    let by_key = v["token"].as_str().unwrap().to_owned();
+    let (s, v) = post(
+        "/tokens/self/switch",
+        by_key,
+        json!({"project": "acme-data"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+
+    // The cloud admin can go anywhere, and is shown every project.
+    let (s, v) = call(&app, "GET", "/tokens/self/projects", Some(&admin), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.as_array().unwrap().len() >= 5, "{v}");
+    let (s, v) = post("/tokens/self/switch", admin, json!({"project": "other"})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["system"], true);
+}
