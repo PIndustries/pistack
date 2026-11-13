@@ -43,8 +43,8 @@ The binary mounts every module on one API. The shape of the system is in [docs/A
 Releases for Linux x86_64 and aarch64 are on the [releases page](https://github.com/PIndustries/pistack/releases). Each tarball holds `pistack`, `pi`, the host helpers, the systemd units and an install script.
 
 ```sh
-tar -xzf pistack-0.1.0-linux-x86_64.tar.gz
-cd pistack-0.1.0-linux-x86_64
+tar -xzf pistack-26.11.12.1-linux-x86_64.tar.gz
+cd pistack-26.11.12.1-linux-x86_64
 sudo ./install.sh
 ```
 

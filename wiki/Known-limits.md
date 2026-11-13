@@ -1,6 +1,6 @@
 # Known limits
 
-What does not work yet, as of version 0.1.0 on `main`. Each item was read in the source or seen on a running build. The list is long because the project is young, and it is kept here so nobody finds these out in production.
+What does not work yet, as of `main`. Each item was read in the source or seen on a running build. The list is long because the project is young, and it is kept here so nobody finds these out in production.
 
 ## Security
 
