@@ -9,11 +9,14 @@
 //!   refreshes the `Host` resource for that node and registers an
 //!   `RpcDriver` for it; a heartbeat bumps `last_seen` and folds the agent's
 //!   machine reports (addresses, power, probe streaks) into machine status.
+//!   The agent keeps no desired state of its own, so the heartbeat is also
+//!   where a host that reports a machine evacuated off it is told to delete
+//!   that copy.
 //!
 //! Wire shapes are `pistack_rpc::proto::{MachineRequest, MachineRef,
 //! RunningMachine}`, shared with `anvil`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,7 +33,10 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::{DriverRegistry, HostDriver, MachineRuntime};
-use crate::types::{new_host, usable_underlay, Host, Machine, MachineKind, PowerState, Size};
+use crate::types::{
+    new_host, usable_underlay, Host, Machine, MachineKind, PowerState, Size,
+    EVACUATED_FROM_ANNOTATION,
+};
 
 // ---- RpcDriver ---------------------------------------------------------------
 
@@ -495,6 +501,9 @@ pub struct Registrar {
     store: Store,
     drivers: Arc<DriverRegistry>,
     queue: CommandQueue,
+    /// Machines with a delete of a stale copy in flight, so a host that
+    /// heartbeats before it answers is not asked twice.
+    deleting_stale: Arc<parking_lot::Mutex<BTreeSet<Id>>>,
 }
 
 impl Registrar {
@@ -503,6 +512,7 @@ impl Registrar {
             store,
             drivers,
             queue,
+            deleting_stale: Default::default(),
         }
     }
 
@@ -672,7 +682,7 @@ impl Registrar {
         );
         tracing::trace!(node = %hb.node_name, free = ?hb.resources_free, "forge: heartbeat");
         for r in &hb.machines {
-            if let Err(e) = self.apply_report(&host.meta.id, r) {
+            if let Err(e) = self.apply_report(&host, r) {
                 tracing::debug!(machine = %r.id, error = %e, "forge: report not applied");
             }
         }
@@ -682,7 +692,8 @@ impl Registrar {
     /// Update a `Ready` machine's observed addresses/power from the host's
     /// report when they differ. Machines mid-transition are left to the
     /// reconciler, which owns those phases.
-    fn apply_report(&self, host: &Id, r: &MachineReport) -> anyhow::Result<()> {
+    fn apply_report(&self, reporter: &Host, r: &MachineReport) -> anyhow::Result<()> {
+        let host = &reporter.meta.id;
         let col = self.store.collection::<Machine>();
         let Some(m) = col.try_get(&r.id)? else {
             return Ok(());
@@ -712,7 +723,20 @@ impl Registrar {
             } else {
                 Ok(())
             }
-        } else if m.status.host.as_ref() != Some(host) || m.status.phase != Phase::Ready {
+        } else if m.status.host.as_ref() != Some(host) {
+            self.delete_stale_copy(reporter, &m);
+            Ok(())
+        } else if evacuated_off(&m, host) {
+            // Placed back on the host it was evacuated from: the copy there
+            // is the machine again, so the marker no longer applies.
+            match col.modify(&m.meta.id, |x| {
+                x.meta.annotations.remove(EVACUATED_FROM_ANNOTATION);
+                Ok(())
+            }) {
+                Ok(_) | Err(StoreError::NotFound(_)) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        } else if m.status.phase != Phase::Ready {
             Ok(())
         } else {
             let power = r.power.map(power_from_wire);
@@ -740,6 +764,68 @@ impl Registrar {
             }
         }
     }
+}
+
+impl Registrar {
+    /// `host` reports a machine the store places somewhere else, or nowhere
+    /// yet. When the machine was evacuated off `host`, that copy is stale:
+    /// the host was thought dead and has come back. Ask its agent to delete
+    /// the copy so the machine does not run twice. Any other machine a host
+    /// reports without owning is left alone.
+    fn delete_stale_copy(&self, host: &Host, m: &Machine) {
+        if !evacuated_off(m, &host.meta.id) {
+            return;
+        }
+        let id = m.meta.id.clone();
+        if !self.deleting_stale.lock().insert(id.clone()) {
+            return;
+        }
+        let node = host.spec.node_name.clone();
+        let payload = serde_json::json!(MachineRef { id: id.clone() });
+        let in_flight = self.deleting_stale.clone();
+        let ticket = match self
+            .queue
+            .enqueue(&node, CommandKind::DeleteMachine, payload)
+        {
+            Ok(ticket) => ticket,
+            Err(e) => {
+                in_flight.lock().remove(&id);
+                tracing::warn!(machine = %id, node, error = %e, "forge: stale copy delete was not queued");
+                return;
+            }
+        };
+        tracing::warn!(
+            machine = %id,
+            node,
+            "forge: host came back holding a machine that was evacuated; deleting its copy"
+        );
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            in_flight.lock().remove(&id);
+            return;
+        };
+        // A failed delete is asked for again on a later heartbeat, as long
+        // as the host still reports the machine.
+        runtime.spawn(async move {
+            match ticket.wait().await {
+                Ok(r) if r.ok => {}
+                Ok(r) => {
+                    tracing::warn!(machine = %id, node, error = %r.message, "forge: stale copy was not deleted")
+                }
+                Err(e) => {
+                    tracing::warn!(machine = %id, node, error = %e, "forge: stale copy was not deleted")
+                }
+            }
+            in_flight.lock().remove(&id);
+        });
+    }
+}
+
+/// Whether `m` carries the marker of an evacuation off `host`.
+fn evacuated_off(m: &Machine, host: &Id) -> bool {
+    m.meta
+        .annotations
+        .get(EVACUATED_FROM_ANNOTATION)
+        .is_some_and(|from| *from == host.to_string())
 }
 
 #[cfg(test)]
@@ -1438,6 +1524,184 @@ mod tests {
         h.spec.underlay_ip = underlay.map(str::to_owned);
         h.status.phase = phase;
         h
+    }
+
+    fn reports(node: &str, ids: &[&Id]) -> Heartbeat {
+        Heartbeat {
+            node_name: node.into(),
+            resources_free: Resources::default(),
+            machines: ids
+                .iter()
+                .map(|id| MachineReport {
+                    id: (*id).clone(),
+                    phase: Phase::Ready,
+                    message: String::new(),
+                    resources: None,
+                    addresses: vec![],
+                    power: Some(pistack_rpc::proto::PowerState::On),
+                    probes: vec![],
+                })
+                .collect(),
+            at: Utc::now(),
+            ovn: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_returning_host_is_told_to_delete_the_machines_evacuated_off_it() {
+        let store = Store::in_memory().unwrap();
+        let queue = CommandQueue::default();
+        let reg = Registrar::new(
+            store.clone(),
+            Arc::new(DriverRegistry::new()),
+            queue.clone(),
+        );
+        let old = reg.on_hello(&hello("old")).unwrap();
+        let new = reg.on_hello(&hello("new")).unwrap();
+        let col = store.collection::<Machine>();
+
+        // Evacuated off `old` and running on `new`.
+        let mut moved = placed("moved", &new.meta.id, &[]);
+        moved
+            .meta
+            .annotations
+            .insert(EVACUATED_FROM_ANNOTATION.into(), old.meta.id.to_string());
+        let moved = col.create(moved).unwrap();
+        // Evacuated off `old` and still waiting for a host.
+        let mut waiting = machine("waiting");
+        waiting
+            .meta
+            .annotations
+            .insert(EVACUATED_FROM_ANNOTATION.into(), old.meta.id.to_string());
+        let waiting = col.create(waiting).unwrap();
+        // On `new` and never evacuated. `old` reporting it proves nothing.
+        let other = col.create(placed("other", &new.meta.id, &[])).unwrap();
+        // Really on `old`.
+        let own = col.create(placed("own", &old.meta.id, &[])).unwrap();
+
+        let beat = reports(
+            "old",
+            &[
+                &moved.meta.id,
+                &waiting.meta.id,
+                &other.meta.id,
+                &own.meta.id,
+            ],
+        );
+        reg.on_heartbeat(&beat).unwrap();
+        let cmds = queue.next("old", Duration::from_secs(1), 8).await;
+        let mut deleted: Vec<Id> = cmds
+            .iter()
+            .map(|c| {
+                assert_eq!(c.kind, CommandKind::DeleteMachine);
+                serde_json::from_value::<MachineRef>(c.payload.clone())
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        deleted.sort();
+        let mut want = vec![moved.meta.id.clone(), waiting.meta.id.clone()];
+        want.sort();
+        assert_eq!(deleted, want);
+        // The new host is never asked to delete its copy.
+        reg.on_heartbeat(&reports("new", &[&moved.meta.id, &other.meta.id]))
+            .unwrap();
+        assert!(queue
+            .next("new", Duration::from_millis(50), 8)
+            .await
+            .is_empty());
+
+        // The host heartbeats again before it answered: nothing is queued twice.
+        reg.on_heartbeat(&beat).unwrap();
+        assert!(queue
+            .next("old", Duration::from_millis(50), 8)
+            .await
+            .is_empty());
+
+        // A delete that failed is asked for again while the host still
+        // reports the machine. One that worked is not: the host stops
+        // reporting it.
+        for c in &cmds {
+            let failed = serde_json::from_value::<MachineRef>(c.payload.clone())
+                .unwrap()
+                .id
+                == moved.meta.id;
+            let result = if failed {
+                CommandResult::failed(c.id, "domain is busy")
+            } else {
+                CommandResult::ok(c.id)
+            };
+            queue.ack("old", result).unwrap();
+        }
+        let still = reports("old", &[&moved.meta.id, &own.meta.id]);
+        let retry = loop {
+            reg.on_heartbeat(&still).unwrap();
+            let cmds = queue.next("old", Duration::from_millis(50), 8).await;
+            if !cmds.is_empty() {
+                break cmds;
+            }
+        };
+        assert_eq!(retry.len(), 1);
+        assert_eq!(
+            serde_json::from_value::<MachineRef>(retry[0].payload.clone())
+                .unwrap()
+                .id,
+            moved.meta.id
+        );
+        queue.ack("old", CommandResult::ok(retry[0].id)).unwrap();
+
+        // Nothing in the store moved.
+        assert_eq!(
+            col.get(&moved.meta.id).unwrap().status.host.as_ref(),
+            Some(&new.meta.id)
+        );
+        assert_eq!(
+            col.get(&own.meta.id).unwrap().status.host.as_ref(),
+            Some(&old.meta.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_migrated_back_to_the_host_it_was_evacuated_off_is_kept() {
+        let store = Store::in_memory().unwrap();
+        let queue = CommandQueue::default();
+        let reg = Registrar::new(
+            store.clone(),
+            Arc::new(DriverRegistry::new()),
+            queue.clone(),
+        );
+        let old = reg.on_hello(&hello("old")).unwrap();
+        let new = reg.on_hello(&hello("new")).unwrap();
+        let col = store.collection::<Machine>();
+        let mut m = placed("back", &new.meta.id, &[]);
+        m.meta
+            .annotations
+            .insert(EVACUATED_FROM_ANNOTATION.into(), old.meta.id.to_string());
+        m.status.phase = Phase::Updating;
+        m.status.message = format!("migrating {}", old.meta.id);
+        let m = col.create(m).unwrap();
+
+        // The destination of a live migration reports the machine before the
+        // store says it lives there. That is an arrival, not a stale copy.
+        let beat = reports("old", &[&m.meta.id]);
+        reg.on_heartbeat(&beat).unwrap();
+        assert!(queue
+            .next("old", Duration::from_millis(50), 8)
+            .await
+            .is_empty());
+        let got = col.get(&m.meta.id).unwrap();
+        assert_eq!(got.status.host.as_ref(), Some(&old.meta.id));
+        assert_eq!(got.status.phase, Phase::Ready);
+
+        // Once it lives there again the marker goes, so a later move off
+        // this host is not mistaken for the old evacuation.
+        reg.on_heartbeat(&beat).unwrap();
+        let got = col.get(&m.meta.id).unwrap();
+        assert!(!got.meta.annotations.contains_key(EVACUATED_FROM_ANNOTATION));
+        assert!(queue
+            .next("old", Duration::from_millis(50), 8)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
