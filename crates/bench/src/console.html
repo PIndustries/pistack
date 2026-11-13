@@ -153,7 +153,12 @@
     top: 0;
     height: 100vh;
     overflow-y: auto;
+    display: flex;
+    flex-direction: column;
   }
+  #side nav { flex: 1; }
+  .build { margin: 0; padding: 0.9rem 0.55rem 0; color: var(--muted); font: 0.72rem ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .02em; }
+  #login .build { padding: 1rem 0 0; text-align: center; }
   .brand { display: flex; align-items: center; gap: 0.6rem; padding: 0.2rem 0.55rem 0.9rem; font-size: 1.02rem; }
   #nav-filter { margin-bottom: 0.7rem; font-size: 0.86rem; }
   nav button {
@@ -273,6 +278,7 @@
     <input id="pass" name="password" type="password" autocomplete="off" spellcheck="false" required>
     <p id="login-err"></p>
     <button class="primary" type="submit">Sign in</button>
+    <p class="build" hidden></p>
   </form>
 </section>
 <div id="shell" hidden>
@@ -340,6 +346,7 @@
         </div>
       </div>
     </nav>
+    <p class="build" hidden></p>
   </aside>
   <div>
     <header>
@@ -1054,6 +1061,16 @@ function setTheme(name) {
   else delete document.documentElement.dataset.theme;
 }
 try { setTheme(localStorage.getItem("pistack.theme")); } catch (e) { /* private window */ }
+
+// The build this server runs, under the navigation and on the sign-in
+// card. The root of the API gives it to anyone.
+fetch("/").then((res) => res.json()).then((info) => {
+  if (!info || !info.version) return;
+  for (const el of document.querySelectorAll(".build")) {
+    el.textContent = "build " + info.version;
+    el.hidden = false;
+  }
+}).catch(() => { /* the page works without it */ });
 document.getElementById("theme").addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
   setTheme(next);
