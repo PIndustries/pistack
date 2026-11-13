@@ -149,29 +149,6 @@ pub fn check_quota_in(project: &Project, resource: &str, delta: u64) -> ApiResul
     admit_in(project, &[Demand::new(resource, used, delta)])
 }
 
-/// Would adding `delta` to the recorded usage exceed the limit? The check
-/// and the later [`record_usage`] are separate steps, so two requests can
-/// both pass. Use [`admission`] and [`admit`] instead.
-pub fn check_quota(store: &Store, project: &Id, resource: &str, delta: u64) -> ApiResult<()> {
-    let proj = store.collection::<Project>().get(project)?;
-    check_quota_in(&proj, resource, delta)
-}
-
-/// Adjust recorded usage of `resource` by `delta` (negative to release).
-/// Usage never goes below zero. Returns the new usage.
-pub fn record_usage(store: &Store, project: &Id, resource: &str, delta: i64) -> ApiResult<u64> {
-    let updated = store.collection::<Project>().modify(project, |p| {
-        let cur = p.status.usage.entry(resource.to_owned()).or_insert(0);
-        *cur = if delta >= 0 {
-            cur.saturating_add(delta as u64)
-        } else {
-            cur.saturating_sub(delta.unsigned_abs())
-        };
-        Ok(())
-    })?;
-    Ok(updated.status.usage.get(resource).copied().unwrap_or(0))
-}
-
 /// Copy counted usage into the project's `status.usage`. Best effort: the
 /// count that is enforced comes from the rows, so a missing project is
 /// skipped and a failed write is only logged.

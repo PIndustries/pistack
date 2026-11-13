@@ -98,7 +98,8 @@ impl Default for ProjectSpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ProjectStatus {
-    /// Resource name -> current usage, maintained through `quota::record_usage`.
+    /// Resource name -> usage, as last counted by the module that owns the
+    /// resource (`quota::mirror_usage`). Kept for reading; a check counts again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage: BTreeMap<String, u64>,
 }
