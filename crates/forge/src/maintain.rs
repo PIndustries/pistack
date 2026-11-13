@@ -5,16 +5,24 @@
 //!
 //! [`drain`] is for a host that is up. It live-migrates what can be
 //! live-migrated and reports the rest. It never stops a machine.
+//!
+//! [`evacuate`] is for a host that is gone. Nothing can be copied off it,
+//! so a machine is handed back to the scheduler and starts somewhere else
+//! from its image. Its root disk, which was a file on the dead host, is
+//! not there. Volumes on shared storage are plugged back in by slab;
+//! a machine with a volume that lived on the dead host is left alone.
+//! The agent of a host that returns is told to delete the copies it still
+//! holds; see `Registrar::delete_stale_copy`.
 
 use crate::agent_driver::begin_migration;
 use crate::scheduler::{self, Allocations, Strategy};
 use crate::types::{
     delete_requested, usable_underlay, Host, Machine, MachineKind, PowerState, Size,
-    NODE_PIN_ANNOTATION,
+    EVACUATED_FROM_ANNOTATION, NODE_PIN_ANNOTATION,
 };
 use pistack_rpc::CommandQueue;
 use pistack_store::Store;
-use pistack_types::{kind, ApiResult, Id, Phase, Resources};
+use pistack_types::{kind, ApiError, ApiResult, Id, Phase, Resource, Resources, Spec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -230,4 +238,236 @@ pub fn drain(
 
 fn phase_word(phase: Phase) -> String {
     format!("{phase:?}").to_lowercase()
+}
+
+// ---- evacuate ----------------------------------------------------------------
+
+/// Volume backends whose data is not on the host that attaches it.
+const SHARED_BACKENDS: &[&str] = &["rbd"];
+
+/// Body of `POST /hosts/{id}/evacuate`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct EvacuateOptions {
+    /// The operator says a disabled host that may still be reporting is
+    /// dead. Not needed for a host that is already down.
+    #[serde(default)]
+    pub confirm_dead: bool,
+    /// Accept that each machine starts again from its image without the
+    /// root disk it had. No machine is evacuated without it.
+    #[serde(default)]
+    pub rebuild_from_image: bool,
+}
+
+/// A machine that was handed back to the scheduler.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Evacuated {
+    pub id: Id,
+    pub name: String,
+    /// The image it starts from again. Its root disk stayed on the host.
+    pub rebuilt_from: String,
+    /// Shared volumes that are plugged back in once it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
+}
+
+/// What `POST /hosts/{id}/evacuate` answers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvacuateReport {
+    pub host: Host,
+    pub evacuated: Vec<Evacuated>,
+    /// Machines left on the host's record, and why.
+    pub skipped: Vec<Left>,
+}
+
+// slab's rows, read as views so forge does not depend on slab. They ignore
+// every field they do not need and are never written back.
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct VolumeSpecView {
+    #[serde(default)]
+    volume_type: String,
+}
+
+impl Spec for VolumeSpecView {
+    const KIND: &'static str = kind::VOLUME;
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct VolumeStatusView {
+    #[serde(default)]
+    attached_to: Option<Id>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct VolumeTypeSpecView {
+    #[serde(default)]
+    backend: String,
+}
+
+impl Spec for VolumeTypeSpecView {
+    const KIND: &'static str = "voltype";
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct NoStatus {}
+
+/// A host may be evacuated when it has stopped reporting, or when an
+/// operator disabled it and says it is dead. Anything else risks starting
+/// a second copy of a machine that is still running.
+fn may_evacuate(host: &Host, confirm_dead: bool) -> ApiResult<()> {
+    if host.status.phase == Phase::Error {
+        return Ok(());
+    }
+    if host.spec.disabled && confirm_dead {
+        return Ok(());
+    }
+    let name = &host.meta.name;
+    Err(ApiError::conflict(if host.spec.disabled {
+        format!(
+            "host {name} is disabled but still reporting. Its machines may be running, and \
+             evacuating them would start second copies. If the host is dead, confirm it \
+             (confirm_dead, `pi host evacuate --confirm-dead`)"
+        )
+    } else {
+        format!(
+            "host {name} is up. Evacuate only acts on a host that is down, or on a disabled \
+             host you confirm is dead. Use drain to empty a working host"
+        )
+    }))
+}
+
+/// Hand the machines of a dead host back to the scheduler.
+///
+/// Safe to call again: a machine that was evacuated is no longer on the
+/// host, so a second call only sees what the first one skipped.
+pub fn evacuate(
+    store: &Store,
+    host: &Host,
+    opts: EvacuateOptions,
+) -> ApiResult<(Vec<Evacuated>, Vec<Left>)> {
+    may_evacuate(host, opts.confirm_dead)?;
+    let col = store.collection::<Machine>();
+    let mut here: Vec<Machine> = col
+        .list(None)?
+        .into_iter()
+        .filter(|m| m.status.host.as_ref() == Some(&host.meta.id))
+        .collect();
+    here.sort_by(|a, b| a.meta.id.cmp(&b.meta.id));
+    let volumes = store
+        .collection::<Resource<VolumeSpecView, VolumeStatusView>>()
+        .list(None)?;
+    let types = store
+        .collection::<Resource<VolumeTypeSpecView, NoStatus>>()
+        .list(None)?;
+    let backend_of = |volume_type: &str| {
+        types
+            .iter()
+            .find(|t| t.meta.name == volume_type || t.meta.id.to_string() == volume_type)
+            .map(|t| t.spec.backend.trim().to_owned())
+    };
+
+    let from = host.meta.id.to_string();
+    let mut evacuated = Vec::new();
+    let mut skipped = Vec::new();
+    for m in here {
+        let mut skip = |reason: String| {
+            skipped.push(Left {
+                id: m.meta.id.clone(),
+                name: m.meta.name.clone(),
+                reason,
+            })
+        };
+        if delete_requested(&m) {
+            skip("is being deleted".into());
+            continue;
+        }
+        if migrating_to(&m).is_some() {
+            skip("is being live-migrated; wait for that to end".into());
+            continue;
+        }
+        if m.spec.kind == MachineKind::Metal {
+            skip("is a bare metal machine; it is the hardware and cannot start elsewhere".into());
+            continue;
+        }
+        if m.meta
+            .annotations
+            .get(NODE_PIN_ANNOTATION)
+            .is_some_and(|v| !v.is_empty())
+        {
+            skip("is a pod pinned to this host by its volumes".into());
+            continue;
+        }
+        let attached: Vec<_> = volumes
+            .iter()
+            .filter(|v| v.status.attached_to.as_ref() == Some(&m.meta.id))
+            .collect();
+        // A volume whose type is unknown is treated as local: nothing says
+        // its data is anywhere but on the dead host.
+        let stuck = attached.iter().find_map(|v| {
+            let backend = backend_of(&v.spec.volume_type);
+            match backend.as_deref() {
+                Some(b) if SHARED_BACKENDS.contains(&b) => None,
+                Some("") | None => Some((v, "local".to_owned())),
+                Some(b) => Some((v, b.to_owned())),
+            }
+        });
+        if let Some((v, backend)) = stuck {
+            skip(format!(
+                "volume {} is on {backend} storage on this host and cannot follow the machine",
+                v.meta.name
+            ));
+            continue;
+        }
+        if !opts.rebuild_from_image {
+            skip(format!(
+                "its root disk is on this host. To start it elsewhere from image {} without \
+                 that disk, ask for it (rebuild_from_image, `pi host evacuate --rebuild-from-image`)",
+                m.spec.image
+            ));
+            continue;
+        }
+        let note = format!(
+            "moved off host {} ({}); the root disk stayed there and the machine starts again from image {}",
+            host.meta.name, host.meta.id, m.spec.image
+        );
+        let mut done = false;
+        col.modify(&m.meta.id, |x| {
+            // Placed elsewhere or deleted since the list was read.
+            if x.status.host.as_ref() != Some(&host.meta.id) || delete_requested(x) {
+                return Ok(());
+            }
+            x.meta
+                .annotations
+                .insert(EVACUATED_FROM_ANNOTATION.into(), from.clone());
+            let st = &mut x.status;
+            st.host = None;
+            st.phase = Phase::Pending;
+            st.addresses.clear();
+            st.power = PowerState::Unknown;
+            st.probes.clear();
+            st.message = format!("evacuated from host {}", host.meta.name);
+            st.conditions.retain(|c| c.kind != "HostReachable");
+            st.set_condition("Evacuated", true, "RebuiltFromImage", &note);
+            done = true;
+            Ok(())
+        })?;
+        if !done {
+            skip("changed while the host was being evacuated; run it again".into());
+            continue;
+        }
+        tracing::warn!(
+            machine = %m.meta.id,
+            name = %m.meta.name,
+            host = %host.meta.id,
+            image = %m.spec.image,
+            "forge: machine evacuated; it starts from its image without its old root disk"
+        );
+        evacuated.push(Evacuated {
+            id: m.meta.id.clone(),
+            name: m.meta.name.clone(),
+            rebuilt_from: m.spec.image.clone(),
+            volumes: attached.iter().map(|v| v.meta.name.clone()).collect(),
+        });
+    }
+    Ok((evacuated, skipped))
 }

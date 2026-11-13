@@ -509,11 +509,19 @@ impl Reconciler {
             .await?;
             return Ok(());
         }
-        match driver.start(&m).await {
+        let started = driver.start(&m).await;
+        // The call can take as long as a command timeout. If the machine was
+        // evacuated off this host meanwhile, the answer is about a copy that
+        // no longer counts and must not be written over the new placement.
+        let here = |s: &MachineStatus| s.host.as_ref() == Some(&hid);
+        match started {
             Ok(rt) => {
                 tracing::info!(machine = %m.meta.id, name = %m.meta.name, host = %hid, addrs = ?rt.addresses, "forge: machine ready");
                 let network_message = rt.message.clone();
                 self.patch(&m.meta.id, |s| {
+                    if !here(s) {
+                        return;
+                    }
                     s.phase = Phase::Ready;
                     s.addresses = rt.addresses.clone();
                     s.power = rt.power;
@@ -527,6 +535,9 @@ impl Reconciler {
                 tracing::info!(machine = %m.meta.id, error = %e, "forge: waiting for the network segment");
                 let msg = e.message.clone();
                 self.patch(&m.meta.id, |s| {
+                    if !here(s) {
+                        return;
+                    }
                     s.message = msg.clone();
                     s.set_condition("Scheduled", true, "Segment", &msg);
                 })
@@ -538,6 +549,9 @@ impl Reconciler {
                 tracing::info!(machine = %m.meta.id, error = %e, "forge: waiting for the port binding");
                 let msg = e.message.clone();
                 self.patch(&m.meta.id, |s| {
+                    if !here(s) {
+                        return;
+                    }
                     s.message = msg.clone();
                     s.set_condition("Scheduled", true, "PortBinding", &msg);
                 })
@@ -547,6 +561,9 @@ impl Reconciler {
                 tracing::warn!(machine = %m.meta.id, host = %hid, error = %e, "forge: driver start failed");
                 let msg = e.message.clone();
                 self.patch(&m.meta.id, |s| {
+                    if !here(s) {
+                        return;
+                    }
                     s.phase = Phase::Error;
                     s.message = msg.clone();
                     s.set_condition("Running", false, "StartFailed", &msg);
