@@ -8,8 +8,9 @@
 //! never touch bytes. The `Backend` trait is the seam where `openraft`
 //! replication lands later: same API, replicated log underneath.
 //!
-//! Values are JSON. Human-inspectable with `pistack store dump`, and the
-//! schema can evolve with serde defaults instead of migrations.
+//! Values are JSON. Human-inspectable with `pistack store dump`. Most
+//! changes to what is stored are a serde default. One that older code would
+//! misread raises [`SCHEMA_VERSION`] and adds a step to `MIGRATIONS`.
 
 use parking_lot::RwLock;
 use pistack_types::{ApiError, Event, EventAction, Id, Kind, Meta};
@@ -28,6 +29,25 @@ const NAMES: TableDefinition<&str, &str> = TableDefinition::new("names");
 /// Misc small values (cluster id, key material refs, counters).
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
+/// Layout version of the store this binary reads and writes. The store
+/// keeps the version it was last written at in `meta`, and every open
+/// compares the two. Raise this by one, and add the step to `MIGRATIONS`,
+/// when a release changes what is stored in a way older code would misread.
+/// A store with no marker predates the marker and is version 1.
+pub const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_KEY: &str = "schema_version";
+
+/// One step up: `run` turns a store at `to - 1` into one at `to`. It runs in
+/// a write transaction that also records `to`, so a step is applied whole
+/// or not at all, and never twice.
+struct Migration {
+    to: u32,
+    run: fn(&redb::WriteTransaction) -> Result<()>,
+}
+
+/// Every step from version 2 up to [`SCHEMA_VERSION`]. None yet.
+const MIGRATIONS: &[Migration] = &[];
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("not found: {0}")]
@@ -40,6 +60,12 @@ pub enum StoreError {
     /// apply and cluster bookkeeping still go through.
     #[error("not the leader")]
     NotLeader,
+    /// The store was written by a newer binary. Nothing was changed.
+    #[error(
+        "the store is at schema version {found} and this pistack reads up to {supported}; \
+         run a pistack at least as new as the one that last opened this store"
+    )]
+    SchemaTooNew { found: u32, supported: u32 },
     #[error("storage: {0}")]
     Storage(String),
     #[error("codec: {0}")]
@@ -82,6 +108,7 @@ impl From<StoreError> for ApiError {
                 "resource changed: expected revision {expected}, found {found}"
             )),
             StoreError::NotLeader => ApiError::conflict("not the leader"),
+            e @ StoreError::SchemaTooNew { .. } => ApiError::internal(e.to_string()),
             StoreError::Storage(m) => ApiError::internal(m),
             StoreError::Codec(e) => ApiError::internal(e.to_string()),
         }
@@ -173,7 +200,12 @@ fn is_bookkeeping(op: &Op) -> bool {
             || key.starts_with("cluster_log/")
             || matches!(
                 key,
-                "cluster_term" | "cluster_voted_for" | "cluster_leader" | "node_id" | LOG_START_KEY
+                "cluster_term"
+                    | "cluster_voted_for"
+                    | "cluster_leader"
+                    | "node_id"
+                    | LOG_START_KEY
+                    | SCHEMA_KEY
             ))
 }
 
@@ -248,42 +280,32 @@ pub struct RedbBackend {
 
 impl RedbBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_at(path, SCHEMA_VERSION, MIGRATIONS)
+    }
+
+    /// Open as a binary whose schema version is `target` and whose steps are
+    /// `steps`. Tests use this to stand in for a newer binary.
+    fn open_at(path: impl AsRef<Path>, target: u32, steps: &[Migration]) -> Result<Self> {
         let db = Database::create(path)?;
-        // Ensure tables exist.
-        let tx = db.begin_write()?;
-        {
-            tx.open_table(RESOURCES)?;
-            tx.open_table(NAMES)?;
-            tx.open_table(META)?;
-        }
-        tx.commit()?;
-        Ok(Self {
-            db,
-            record: AtomicBool::new(false),
-            term: AtomicU64::new(0),
-            fenced: AtomicBool::new(false),
-            applying: AtomicBool::new(false),
-            gate: parking_lot::Mutex::new(()),
-        })
+        settle_schema(&db, target, steps)?;
+        Ok(Self::around(db))
     }
 
     pub fn in_memory() -> Result<Self> {
         let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
-        let tx = db.begin_write()?;
-        {
-            tx.open_table(RESOURCES)?;
-            tx.open_table(NAMES)?;
-            tx.open_table(META)?;
-        }
-        tx.commit()?;
-        Ok(Self {
+        settle_schema(&db, SCHEMA_VERSION, MIGRATIONS)?;
+        Ok(Self::around(db))
+    }
+
+    fn around(db: Database) -> Self {
+        Self {
             db,
             record: AtomicBool::new(false),
             term: AtomicU64::new(0),
             fenced: AtomicBool::new(false),
             applying: AtomicBool::new(false),
             gate: parking_lot::Mutex::new(()),
-        })
+        }
     }
 
     fn table_def(name: &str) -> Result<TableDefinition<'static, &'static str, &'static [u8]>> {
@@ -293,6 +315,61 @@ impl RedbBackend {
             other => Err(StoreError::Storage(format!("unknown table {other}"))),
         }
     }
+}
+
+/// Check the store's schema version against `target`, make sure the tables
+/// and the marker exist, and run the steps a newer binary brings. A store
+/// that is newer than `target` is refused before anything is written to it.
+fn settle_schema(db: &Database, target: u32, steps: &[Migration]) -> Result<()> {
+    let tx = db.begin_write()?;
+    let found = {
+        let meta = tx.open_table(META)?;
+        let raw = meta.get(SCHEMA_KEY)?;
+        match raw {
+            Some(raw) => Some(serde_json::from_slice::<u32>(raw.value())?),
+            None => None,
+        }
+    };
+    if let Some(found) = found.filter(|found| *found > target) {
+        tx.abort()?;
+        return Err(StoreError::SchemaTooNew {
+            found,
+            supported: target,
+        });
+    }
+    {
+        tx.open_table(RESOURCES)?;
+        tx.open_table(NAMES)?;
+        if found.is_none() {
+            let mut meta = tx.open_table(META)?;
+            meta.insert(SCHEMA_KEY, serde_json::to_vec(&1u32)?.as_slice())?;
+        }
+    }
+    tx.commit()?;
+    let mut at = found.unwrap_or(1);
+    while at < target {
+        let next = at + 1;
+        let step = steps.iter().find(|step| step.to == next).ok_or_else(|| {
+            StoreError::Storage(format!(
+                "the store is at schema version {at} and this pistack has no step to version {next}"
+            ))
+        })?;
+        // Dropping the transaction on an error undoes the step.
+        let tx = db.begin_write()?;
+        (step.run)(&tx).map_err(|err| {
+            StoreError::Storage(format!(
+                "migrating the store from schema version {at} to {next}: {err}"
+            ))
+        })?;
+        {
+            let mut meta = tx.open_table(META)?;
+            meta.insert(SCHEMA_KEY, serde_json::to_vec(&next)?.as_slice())?;
+        }
+        tx.commit()?;
+        tracing::info!(from = at, to = next, "store schema migrated");
+        at = next;
+    }
+    Ok(())
 }
 
 impl Backend for RedbBackend {
@@ -738,6 +815,11 @@ impl Store {
         Ok(end - start)
     }
 
+    /// The schema version recorded in this store. See [`SCHEMA_VERSION`].
+    pub fn schema_version(&self) -> Result<u32> {
+        Ok(self.get_meta::<u32>(SCHEMA_KEY)?.unwrap_or(1))
+    }
+
     /// Rows and bytes per table, and how much of `meta` is the log.
     pub fn stats(&self) -> Result<Vec<TableStats>> {
         self.backend.stats()
@@ -1156,6 +1238,184 @@ mod tests {
         assert_eq!(id.as_deref(), Some("abc"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn open_plain(path: &Path) -> Result<Store> {
+        let (events, _) = broadcast::channel(8);
+        Store::open(path, events)
+    }
+
+    /// A store as a binary at `target` with `steps` would open it.
+    fn open_as(path: &Path, target: u32, steps: &[Migration]) -> Result<Store> {
+        let (events, _) = broadcast::channel(8);
+        Ok(Store::new(
+            Arc::new(RedbBackend::open_at(path, target, steps)?),
+            events,
+        ))
+    }
+
+    /// A store file as binaries before the marker left it.
+    fn unmarked_store(path: &Path) {
+        let db = Database::create(path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(RESOURCES).unwrap();
+            tx.open_table(NAMES).unwrap();
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("cluster_id", b"\"abc\"".as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn trace(tx: &redb::WriteTransaction, step: &str) -> Result<()> {
+        let mut meta = tx.open_table(META)?;
+        let mut seen: Vec<String> = match meta.get("trace")? {
+            Some(raw) => serde_json::from_slice(raw.value())?,
+            None => Vec::new(),
+        };
+        seen.push(step.to_owned());
+        meta.insert("trace", serde_json::to_vec(&seen)?.as_slice())?;
+        Ok(())
+    }
+    fn to_two(tx: &redb::WriteTransaction) -> Result<()> {
+        trace(tx, "two")
+    }
+    fn to_three(tx: &redb::WriteTransaction) -> Result<()> {
+        trace(tx, "three")
+    }
+    fn fails(tx: &redb::WriteTransaction) -> Result<()> {
+        trace(tx, "half done")?;
+        Err(StoreError::Storage("step gave up".into()))
+    }
+    // Listed out of order on purpose: steps run by version, not by position.
+    const STEPS: &[Migration] = &[
+        Migration {
+            to: 3,
+            run: to_three,
+        },
+        Migration { to: 2, run: to_two },
+    ];
+
+    #[test]
+    fn the_registered_steps_reach_the_schema_version() {
+        // Exactly one step to each version above 1.
+        let mut steps: Vec<u32> = MIGRATIONS.iter().map(|step| step.to).collect();
+        steps.sort_unstable();
+        let wanted: Vec<u32> = (1..SCHEMA_VERSION).map(|version| version + 1).collect();
+        assert_eq!(steps, wanted);
+    }
+
+    #[test]
+    fn a_new_store_records_the_schema_version_and_a_reopen_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = open_plain(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store.get_meta::<u32>(SCHEMA_KEY).unwrap(),
+            Some(SCHEMA_VERSION)
+        );
+        // The marker is this file's own: it never goes into the log.
+        store.set_record_log(true);
+        store.put_meta(SCHEMA_KEY, &SCHEMA_VERSION).unwrap();
+        assert_eq!(store.commit_index().unwrap(), 0);
+        drop(store);
+        let store = open_plain(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(Store::in_memory().unwrap().schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_store_with_no_marker_is_version_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        unmarked_store(&path);
+        let store = open_plain(&path).unwrap();
+        assert_eq!(store.get_meta::<u32>(SCHEMA_KEY).unwrap(), Some(1));
+        let id: Option<String> = store.get_meta("cluster_id").unwrap();
+        assert_eq!(id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn migration_steps_run_once_in_order_and_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        unmarked_store(&path);
+        let trace_of =
+            |store: &Store| -> Vec<String> { store.get_meta("trace").unwrap().unwrap_or_default() };
+
+        let store = open_as(&path, 3, STEPS).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(trace_of(&store), ["two", "three"]);
+        let id: Option<String> = store.get_meta("cluster_id").unwrap();
+        assert_eq!(id.as_deref(), Some("abc"));
+        drop(store);
+
+        // A second open at the same version runs nothing.
+        let store = open_as(&path, 3, STEPS).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(trace_of(&store), ["two", "three"]);
+        drop(store);
+
+        // A store already at 2 only takes the step to 3.
+        let part = dir.path().join("part.redb");
+        drop(open_as(&part, 2, STEPS).unwrap());
+        let store = open_as(&part, 2, STEPS).unwrap();
+        assert_eq!(trace_of(&store), ["two"]);
+        drop(store);
+        let store = open_as(&part, 3, STEPS).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(trace_of(&store), ["two", "three"]);
+    }
+
+    #[test]
+    fn a_failed_step_changes_nothing_and_a_missing_step_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(open_as(&path, 2, STEPS).unwrap());
+        let broken = &[Migration { to: 3, run: fails }];
+        let err = open_as(&path, 3, broken).err().unwrap().to_string();
+        assert!(err.contains("from schema version 2 to 3"), "{err}");
+        assert!(err.contains("step gave up"), "{err}");
+        let err = open_as(&path, 3, &[]).err().unwrap().to_string();
+        assert!(err.contains("no step to version 3"), "{err}");
+        let store = open_as(&path, 2, STEPS).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
+        let seen: Vec<String> = store.get_meta("trace").unwrap().unwrap();
+        assert_eq!(seen, ["two"]);
+    }
+
+    #[test]
+    fn an_older_binary_refuses_a_newer_store_and_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = open_as(&path, 3, STEPS).unwrap();
+        store.put_meta("cluster_id", &"abc".to_owned()).unwrap();
+        drop(store);
+        let before = std::fs::read(&path).unwrap();
+
+        let err = open_as(&path, 2, STEPS).err().unwrap();
+        assert!(matches!(
+            err,
+            StoreError::SchemaTooNew {
+                found: 3,
+                supported: 2
+            }
+        ));
+        let text = err.to_string();
+        assert!(text.contains("schema version 3"), "{text}");
+        assert!(text.contains("reads up to 2"), "{text}");
+        // This binary is older than that store too.
+        assert!(matches!(
+            open_plain(&path).err().unwrap(),
+            StoreError::SchemaTooNew { found: 3, .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let store = open_as(&path, 3, STEPS).unwrap();
+        let id: Option<String> = store.get_meta("cluster_id").unwrap();
+        assert_eq!(id.as_deref(), Some("abc"));
+    }
+
     use serde::Deserialize;
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
