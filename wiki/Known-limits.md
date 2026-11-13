@@ -29,6 +29,8 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **The config file is mostly not applied.** Only `[modules.silo]` and `[modules.keep]` are read.
 - **No watch API.** Clients poll.
 - **The audit log cannot be read through the API.**
+- **A pod is not refused by a quota.** The machine behind a pod counts towards its project's `machines`, `vcpus`, `memory_mib` and `disk_gib`, but the pod controller creates it without checking the limits.
+- **Quota usage is shown from the last change.** The number `pi quota show` prints for a resource is written when something of that kind is created or deleted in the project. The check that refuses a request always counts the records.
 
 ## Hosts and runtimes
 
@@ -56,6 +58,8 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Object storage keeps one copy on one server.** No replication, no erasure coding.
 - **The S3 API is partial.** No bucket operations through S3, no `ListObjects` v1, no range reads, no batch delete, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption. Path-style addressing only.
 - **NFS share sizes are not enforced.**
+- **No quota on object bytes.** A project can be limited in buckets and not in what it stores in them.
+- **An image upload is checked against `images_bytes` after it is received.** The size is not known before, so an upload that does not fit is stored and then deleted.
 
 ## Networking
 

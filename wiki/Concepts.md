@@ -65,11 +65,55 @@ Some resources are cloud-wide and have no project: hosts, sizes, roles, principa
 
 ### Quotas
 
-A project's quotas are a map of counter to limit. A counter with no entry is unlimited. Going over a limit is refused with `403` and the code `quota_exceeded`. The counters that are enforced today are `machines`, `volumes`, `ports`, `floating_ips`, `secrets`, `certificates` and `access_keys`.
+A project's quotas are a map of resource name to limit. A name with no entry is unlimited. A request that would take the project over a limit is refused with `403` and the code `quota_exceeded`. The message names the resource, what is used, what was asked for and the limit, and `details` carries the same four values:
+
+```json
+{"error": {"code": "quota_exceeded",
+           "message": "quota exceeded for vcpus in project 'research': 14 used + 4 requested > 16",
+           "details": {"resource": "vcpus", "limit": 16, "used": 14, "requested": 4}}}
+```
+
+| Resource | What is counted | Checked when |
+| --- | --- | --- |
+| `machines` | Machines | A machine is created |
+| `vcpus`, `memory_mib`, `disk_gib` | The size of every machine, added up | A machine is created, or a pending machine is given a larger size |
+| `volumes` | Volumes | A volume is created |
+| `volumes_gib` | The size of every volume, added up | A volume is created or extended |
+| `snapshots` | Volume snapshots | A snapshot is created |
+| `backups` | Volume backups | A backup is created |
+| `backups_gib` | For every backup, the size of the volume it was taken from | A backup is created |
+| `networks`, `subnets`, `routers` | Networks, subnets, routers | One is created |
+| `security_groups` | Security groups, without the project's `default` group | A group is created |
+| `ports` | Ports, without the ports a router makes for itself | A port is created |
+| `floating_ips` | Floating IPs | One is allocated |
+| `images` | Image records | An image is created |
+| `images_bytes` | The stored bytes of every image | An upload or import has been stored |
+| `buckets` | Buckets | A bucket is created |
+| `secrets`, `certificates`, `access_keys` | Secrets, certificates, access keys | One is created |
+
+`secrets`, `certificates` and `access_keys` are the only ones with a limit when the project sets none. Their defaults are in `[modules.keep]`; see the [Configuration reference](Configuration-reference).
+
+A system admin sets limits. Anyone with a role in the project can read its limits and usage.
 
 ```sh
-pi project create research --quota machines=20 --quota volumes=50
+pi project create research --quota machines=20 --quota vcpus=64
+pi quota set research memory_mib=131072 volumes_gib=2000
+pi quota set research volumes_gib=unlimited
+pi quota show research
 ```
+
+`pi quota set` changes the limits it names and leaves the others. It refuses a name that is not in the table, so a typing mistake is not stored as a limit nothing checks. `--quota` on `pi project create` and `PUT /identity/projects/{id}` take any name, and the latter replaces the whole map. The API behind `pi quota` is `GET` and `PUT /identity/projects/{id}/quotas`.
+
+Usage is not a counter that could drift. Each module counts its own records when it checks a request, and the count, the check and the write happen one request at a time on the leader, so two requests sent together cannot both take the last unit. A resource stops counting when its delete is accepted, which for machines and volumes is before the host has finished removing it. Lowering a limit below what is used deletes nothing; it only refuses what would add more.
+
+What is not covered:
+
+- Object storage has a limit on buckets and none on bytes.
+- A pod is not refused. Its machine counts towards `machines`, `vcpus`, `memory_mib` and `disk_gib` once it exists, but the pod controller does not ask first.
+- An image upload is checked after it has been received, because its size is not known before. An upload that does not fit is deleted again.
+- Editing a size changes what every machine of that size counts for, without a check.
+- The usage that `pi quota show` prints is written when something in the project is created or deleted. A project that existed before an upgrade shows `0` for a resource until then. The check itself always counts.
+- During a change of leader, a server that has not yet learned it was replaced still admits requests against its own copy. For that moment each of the two can admit up to the limit.
 
 ## Roles
 
