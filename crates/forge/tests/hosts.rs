@@ -579,6 +579,7 @@ async fn drain_migrates_what_it_can_and_reports_the_rest() {
             }],
             at: chrono::Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
     let moved = h

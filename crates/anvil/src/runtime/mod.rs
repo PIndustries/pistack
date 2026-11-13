@@ -34,8 +34,8 @@ pub use youki::YoukiRuntime;
 /// The request/result shapes are the wire types from `pistack-rpc`, so a
 /// `Command` payload deserialises straight into what a runtime executes.
 pub use pistack_rpc::proto::{
-    MachineKind, MachineRef, MachineRequest, NicAttachment, NicBinding, PowerState, RunningMachine,
-    VolumeAttach, VolumeDetach,
+    MachineKind, MachineRef, MachineRequest, MachineUsage, NicAttachment, NicBinding, PowerState,
+    RunningMachine, VolumeAttach, VolumeDetach,
 };
 
 /// One per machine kind the host supports. Same semantics as
@@ -67,6 +67,13 @@ pub trait MachineRuntime: Send + Sync + 'static {
             "{} does not detach volumes",
             self.name()
         )))
+    }
+
+    /// What each running machine this runtime holds is using. Default:
+    /// this runtime does not measure. A runtime that cannot measure right
+    /// now answers with nothing rather than an error.
+    async fn usage(&self) -> Vec<MachineUsage> {
+        Vec::new()
     }
 
     /// Probe definitions for a pod this runtime holds. Empty when `id` is
@@ -277,6 +284,15 @@ impl Runtimes {
             }
         }
         Err(unsupported)
+    }
+
+    /// Usage of the machines every runtime holds.
+    pub async fn usage(&self) -> Vec<MachineUsage> {
+        let mut out = Vec::new();
+        for rt in self.distinct() {
+            out.extend(rt.usage().await);
+        }
+        out
     }
 
     /// Everything every runtime holds. A runtime that cannot list (a stub)

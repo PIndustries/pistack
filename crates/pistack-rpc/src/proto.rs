@@ -129,6 +129,87 @@ pub struct Heartbeat {
     /// agent has not looked yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ovn: Option<OvnReport>,
+    /// What the host and its machines are using. Sent at most every
+    /// [`USAGE_INTERVAL_SECS`]; a heartbeat in between leaves it out, and
+    /// so does an agent from before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageReport>,
+}
+
+/// The shortest time between two usage reports from one agent.
+pub const USAGE_INTERVAL_SECS: u64 = 10;
+
+/// Usage measured on a host. Every figure is an integer so the report
+/// compares exactly; counters are since the machine or the host started.
+///
+/// In JSON a machine with one disk and one interface is about 300 bytes,
+/// so a host with a hundred machines adds some 30 KiB to a heartbeat.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageReport {
+    pub host: HostUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<MachineUsage>,
+}
+
+/// The host itself.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostUsage {
+    /// Load averages over 1, 5 and 15 minutes, times 1000.
+    pub load_milli: [u32; 3],
+    /// Absent where the agent cannot read memory (not Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    /// What the kernel says is available without swapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    /// The filesystem that holds the agent's data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_disk_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_disk_free_bytes: Option<u64>,
+}
+
+/// One running machine.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineUsage {
+    pub id: Id,
+    /// CPU time used, in nanoseconds.
+    pub cpu_ns: u64,
+    /// Memory of the host the machine holds (resident set).
+    pub memory_bytes: u64,
+    /// Memory the machine is given now (the balloon). 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub memory_assigned_bytes: u64,
+    /// Memory in use inside the guest, when the guest reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_guest_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<DiskUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nics: Vec<NicUsage>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskUsage {
+    /// Device name in the guest, `vda`.
+    pub device: String,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NicUsage {
+    /// Interface name on the host, `vnet0`.
+    pub name: String,
+    /// Bytes the machine received and sent.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// One machine as the host sees it.

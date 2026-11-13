@@ -516,6 +516,7 @@ impl Agent {
             client: self.client.clone(),
             runtimes: self.runtimes.clone(),
             resources: self.facts.resources,
+            data_dir: data_dir(),
             probes: self.probes.clone(),
             ovn: self.ovn.clone(),
             ovn_watch: self.ovn_watch.clone(),
@@ -1196,10 +1197,15 @@ fn payload<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Result<T, Ap
         .map_err(|e| ApiError::bad_request(format!("bad command payload: {e}")))
 }
 
+/// Longest a heartbeat waits for the runtimes to say what machines use.
+const USAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct HeartbeatTask {
     client: AgentClient,
     runtimes: Runtimes,
     resources: Resources,
+    /// Whose filesystem the host usage reports on.
+    data_dir: std::path::PathBuf,
     probes: Arc<ProbeBook>,
     ovn: Arc<OvnHost>,
     ovn_watch: Arc<AtomicBool>,
@@ -1316,6 +1322,8 @@ impl HeartbeatTask {
     ) {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let usage_every = Duration::from_secs(pistack_rpc::proto::USAGE_INTERVAL_SECS);
+        let mut usage_sent: Option<std::time::Instant> = None;
         // The first tick fires immediately; a heartbeat right after hello
         // delivers the machine list without waiting a full interval.
         loop {
@@ -1331,6 +1339,25 @@ impl HeartbeatTask {
                 row.probes = self.probes.reports(&id);
                 rows.push(row);
             }
+            // Usage goes with a heartbeat, but not more often than it is
+            // worth measuring when the interval is short.
+            let usage = if usage_sent.is_none_or(|at| at.elapsed() >= usage_every) {
+                usage_sent = Some(std::time::Instant::now());
+                // A runtime that does not answer must not hold the
+                // heartbeat back; the host figures go without it.
+                let machines = tokio::time::timeout(USAGE_TIMEOUT, self.runtimes.usage())
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!("anvil: runtimes did not report usage in time");
+                        Vec::new()
+                    });
+                Some(pistack_rpc::proto::UsageReport {
+                    host: crate::usage::host_usage(&self.data_dir),
+                    machines,
+                })
+            } else {
+                None
+            };
             let hb = Heartbeat {
                 node_name: self.client.node_name().to_owned(),
                 resources_free: self.resources,
@@ -1341,6 +1368,7 @@ impl HeartbeatTask {
                 } else {
                     None
                 },
+                usage,
             };
             match self.client.heartbeat(&hb).await {
                 Ok(ack) if !ack.known => {
@@ -1700,6 +1728,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .await;
 

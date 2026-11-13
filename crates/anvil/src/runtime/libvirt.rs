@@ -210,6 +210,17 @@ impl MachineRuntime for LibvirtRuntime {
         copy_back(&staged, &source).await
     }
 
+    /// One `virsh domstats` call for every running guest.
+    async fn usage(&self) -> Vec<super::MachineUsage> {
+        match virsh(DOMSTATS_ARGS).await {
+            Ok(text) => crate::usage::parse_domstats(&text),
+            Err(e) => {
+                tracing::debug!(error = %e, "libvirt: no usage, domstats failed");
+                Vec::new()
+            }
+        }
+    }
+
     async fn list(&self) -> ApiResult<Vec<RunningMachine>> {
         let out = virsh(["list", "--all", "--name"]).await?;
         let mut machines = Vec::new();
@@ -461,6 +472,16 @@ async fn dom_state(domain: &str) -> ApiResult<String> {
     let out = virsh(["domstate", domain]).await?;
     Ok(out.trim().to_owned())
 }
+
+/// Usage of every active guest: CPU time, balloon, disks and interfaces.
+const DOMSTATS_ARGS: [&str; 6] = [
+    "domstats",
+    "--list-active",
+    "--cpu-total",
+    "--balloon",
+    "--block",
+    "--interface",
+];
 
 /// `PISTACK_VIRSH`, when set and non-empty, replaces the `virsh` binary.
 fn virsh_bin() -> String {
@@ -2052,6 +2073,41 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var(self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn usage_asks_virsh_once_for_every_active_guest() {
+        let _lock = VIRSH_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let recorded = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/virsh-domstats.txt");
+        let calls = root.path().join("calls");
+        // Answers `domstats` with the recording and anything else with an error.
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in *domstats*) cat '{recorded}';; *) exit 1;; esac\n",
+            calls.display()
+        );
+        let bin = root.path().join("virsh");
+        std::fs::write(&bin, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("PISTACK_VIRSH", &bin);
+        let _guard = ClearEnv("PISTACK_VIRSH");
+
+        let usage = LibvirtRuntime.usage().await;
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].disks[0].device, "vda");
+        assert_eq!(usage[1].nics[0].name, "vnet3");
+        let calls_made = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(
+            calls_made.trim(),
+            format!("-c {URI} domstats --list-active --cpu-total --balloon --block --interface")
+        );
+
+        // A virsh that fails is no usage, not an error.
+        std::env::set_var("PISTACK_VIRSH", root.path().join("no-such-virsh"));
+        assert!(LibvirtRuntime.usage().await.is_empty());
     }
 
     #[tokio::test]

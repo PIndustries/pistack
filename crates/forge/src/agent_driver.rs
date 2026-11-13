@@ -977,6 +977,7 @@ mod tests {
             }],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
         let m = store.collection::<Machine>().get(&m.meta.id).unwrap();
@@ -1009,6 +1010,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
         assert_eq!(store.collection::<Host>().list(None).unwrap().len(), 1);
@@ -1056,6 +1058,7 @@ mod tests {
             }],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
         let stored = store.collection::<Machine>().get(&m.meta.id).unwrap();
@@ -1079,6 +1082,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn,
+            usage: None,
         };
 
         let down = pistack_rpc::OvnReport {
@@ -1544,6 +1548,7 @@ mod tests {
                 .collect(),
             at: Utc::now(),
             ovn: None,
+            usage: None,
         }
     }
 

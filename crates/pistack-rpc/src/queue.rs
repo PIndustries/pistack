@@ -749,6 +749,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         });
         assert!(!ack.known);
         assert_eq!(q.pending_count(), 0);
@@ -804,6 +805,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         });
         assert!(hb.known);
         assert_eq!(hb.commands_waiting, 1);
@@ -836,6 +838,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         };
         q.heartbeat(&hb);
         assert_eq!(rx.recv().await.unwrap(), AgentEvent::Hello(hello));
