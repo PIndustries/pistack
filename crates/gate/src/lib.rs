@@ -124,8 +124,46 @@ impl Module for Gate {
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let state = self.state(&ctx)?;
-        bootstrap_with(&state.store, self.password_file.as_deref())
+        bootstrap_with(&state.store, self.password_file.as_deref())?;
+        spawn_audit_sweep(&ctx, state.store, audit::Retention::from_env());
+        Ok(())
     }
+}
+
+/// Keep the audit log inside its retention. Only the leader deletes; the
+/// deletions replicate like any other write.
+fn spawn_audit_sweep(ctx: &ModuleContext, store: Store, keep: audit::Retention) {
+    let shutdown = ctx.shutdown.clone();
+    let leadership = ctx.leadership.clone();
+    tracing::info!(
+        max_age_days = keep.max_age.map(|age| age.num_days()),
+        max_records = keep.max_records,
+        "audit log retention"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(audit::SWEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            if !leadership.is_leader() {
+                continue;
+            }
+            let store = store.clone();
+            let swept = tokio::task::spawn_blocking(move || {
+                audit::sweep(&store, &keep, chrono::Utc::now())
+            })
+            .await;
+            match swept {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => tracing::info!(deleted = n, "audit log swept"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "audit log sweep failed"),
+                Err(e) => tracing::warn!(error = %e, "audit log sweep did not run"),
+            }
+        }
+    });
 }
 
 /// First-run setup: built-in roles, the `admin` project and principal, and a

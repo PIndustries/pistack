@@ -117,13 +117,14 @@ pub fn build(
         app = app.merge(crate::cluster::admin_router(handle.clone()));
     }
 
-    // Inner to authentication so the Caller, when present, is already attached.
-    // The role check is inner to the audit, so a refused write is recorded.
-    app = app.layer(middleware::from_fn(enforce_write_role));
-    app = app.layer(middleware::from_fn_with_state(store, audit_mutation));
+    app = guarded(app, store);
 
     if let Some(handle) = cluster {
         app = app.merge(crate::cluster::router(handle.clone()));
+        app = app.layer(middleware::from_fn_with_state(
+            handle.clone(),
+            audited_reads_at_leader,
+        ));
         app = app.layer(middleware::from_fn_with_state(
             handle,
             crate::cluster::reject_follower_writes,
@@ -255,29 +256,56 @@ async fn enforce_write_role(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// After the response, record a mutation. The path has no query string.
-async fn audit_mutation(
-    axum::extract::State(store): axum::extract::State<pistack_store::Store>,
+/// The role check and the audit log around every route in `app`. Both are
+/// inner to authentication, so the `Caller`, when there is one, is already
+/// attached. The role check is inner to the audit, so a refused write is
+/// recorded.
+fn guarded(app: Router, store: pistack_store::Store) -> Router {
+    app.layer(middleware::from_fn(enforce_write_role))
+        .layer(middleware::from_fn_with_state(store, gate::audit::layer))
+        .layer(middleware::from_fn(note_client))
+}
+
+/// Tell the audit log where the request came from: the peer address of the
+/// connection. Forwarding headers are not trusted, so behind a proxy this
+/// is the proxy.
+async fn note_client(mut req: Request, next: Next) -> Response {
+    let addr = req
+        .extensions()
+        .get::<keep::PeerIdentity>()
+        .and_then(|peer| peer.addr);
+    if let Some(addr) = addr {
+        req.extensions_mut()
+            .insert(gate::audit::ClientAddr(addr.ip()));
+    }
+    next.run(req).await
+}
+
+/// A read that is audited is answered by the leader only. A follower cannot
+/// write the record, and a secret must not be read without one, so it sends
+/// the client to the leader the way it does for a write.
+async fn audited_reads_at_leader(
+    axum::extract::State(handle): axum::extract::State<
+        std::sync::Arc<crate::cluster::ClusterHandle>,
+    >,
     req: Request,
     next: Next,
 ) -> Response {
-    let method = req.method().as_str().to_owned();
-    let path = req.uri().path().to_owned();
-    let principal = req
-        .extensions()
-        .get::<Caller>()
-        .map(|c| c.principal_name.clone());
-    let response = next.run(req).await;
-    if is_mutation(&method) {
-        gate::audit::record(
-            &store,
-            &method,
-            &path,
-            principal.as_deref(),
-            response.status().as_u16(),
-        );
+    let leading = handle.leader.load(std::sync::atomic::Ordering::Acquire);
+    if leading
+        || req.method() != axum::http::Method::GET
+        || !gate::audit::audited_read(req.uri().path())
+    {
+        return next.run(req).await;
     }
-    response
+    let leader = handle
+        .leader_api
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    axum::response::IntoResponse::into_response(
+        pistack_types::ApiError::conflict("not the leader").with_detail("leader", leader),
+    )
 }
 
 /// Dev mode only: requests with no caller become the admin.
@@ -551,6 +579,127 @@ mod tests {
             status(&anonymous, "POST", "/compute/machines").await,
             StatusCode::OK
         );
+    }
+
+    fn records(store: &Store) -> Vec<gate::audit::AuditSpec> {
+        gate::audit::list(store, &gate::audit::AuditQuery::default())
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|record| record.spec)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_and_a_secret_read_are_recorded_with_the_client_address() {
+        let store = Store::in_memory().unwrap();
+        let peer = keep::PeerIdentity::plain("10.0.0.9:51234".parse().unwrap());
+        let app = |who: Caller| {
+            super::guarded(Router::new().fallback(|| async { "ok" }), store.clone())
+                .layer(Extension(peer.clone()))
+                .layer(Extension(who))
+        };
+        let reader = app(caller(&["reader"]));
+        assert_eq!(
+            status(&reader, "POST", "/compute/machines").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(&reader, "GET", "/secrets/secrets/db/payload").await,
+            StatusCode::OK
+        );
+        // An ordinary read leaves no record.
+        assert_eq!(
+            status(&reader, "GET", "/compute/machines").await,
+            StatusCode::OK
+        );
+        let mut admin = caller(&["admin"]);
+        admin.principal_name = "root".into();
+        admin.system = true;
+        let admin = app(admin);
+        for (method, path) in [
+            ("POST", "/compute/hosts/rack1/drain"),
+            ("POST", "/compute/hosts/rack1/evacuate"),
+            ("DELETE", "/cluster/members/n2"),
+            ("POST", "/rpc/agents/enroll"),
+            ("POST", "/rpc/agents/heartbeat"),
+        ] {
+            assert_eq!(status(&admin, method, path).await, StatusCode::OK);
+        }
+
+        let log = records(&store);
+        let seen: Vec<String> = log
+            .iter()
+            .map(|r| format!("{} {} {} {}", r.action, r.kind, r.resource, r.status))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                "create machines  403",
+                "read_payload secrets db 200",
+                "drain hosts rack1 200",
+                "evacuate hosts rack1 200",
+                "delete members n2 200",
+                "enroll agents  200",
+            ]
+        );
+        assert_eq!(log[0].principal.as_deref(), Some("someone"));
+        assert!(log[0].principal_id.is_some());
+        assert!(log[0].project.is_some());
+        assert_eq!(log[2].principal.as_deref(), Some("root"));
+        for record in &log {
+            assert_eq!(record.client.as_deref(), Some("10.0.0.9"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_sends_an_audited_read_to_the_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let leadership = pistack_types::Leadership::new(false);
+        let established = crate::cluster::Established {
+            role: pistack_cluster::Role::Voter,
+            leader: false,
+            leader_api: "http://10.0.0.11:8443".into(),
+            term: 1,
+            members: Vec::new(),
+        };
+        let handle = std::sync::Arc::new(crate::cluster::handle_from(
+            "n2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store.clone(),
+            dir.path().join("state.redb"),
+            &established,
+            None,
+            leadership,
+        ));
+        let app = Router::new()
+            .fallback(|| async { "ok" })
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                super::audited_reads_at_leader,
+            ));
+        let secret = "/secrets/secrets/db/payload";
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(secret).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let text = body(response).await;
+        assert!(text.contains("not the leader"), "{text}");
+        assert!(text.contains("http://10.0.0.11:8443"), "{text}");
+        // Other reads are still answered here, and so is this one once
+        // this server leads.
+        assert_eq!(
+            status(&app, "GET", "/secrets/secrets/db").await,
+            StatusCode::OK
+        );
+        handle
+            .leader
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(status(&app, "GET", secret).await, StatusCode::OK);
     }
 
     /// A server holding one ready image, with the agent transport on a real

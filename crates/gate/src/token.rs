@@ -336,8 +336,16 @@ pub async fn attach_caller(State(verifier): State<Verifier>, req: Request, next:
         let (parts, body) = req.into_parts();
         match verifier.caller_from_parts(&parts) {
             Ok(caller) => {
+                // Which API key the token was issued for, for the audit log.
+                let key = bearer(&parts)
+                    .ok()
+                    .and_then(|token| verifier.claims(token).ok())
+                    .and_then(|claims| claims.key);
                 let mut req = Request::from_parts(parts, body);
                 req.extensions_mut().insert(caller);
+                if let Some(key) = key {
+                    req.extensions_mut().insert(crate::audit::TokenKey(key));
+                }
                 return next.run(req).await;
             }
             Err(e) => return e.into_response(),
