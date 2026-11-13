@@ -66,6 +66,10 @@ enum Cmd {
         /// Plain HTTP on `--listen` stays up. No default.
         #[arg(long, env = "PISTACK_TLS_LISTEN")]
         tls_listen: Option<String>,
+        /// URL host agents use to reach `--tls-listen` (defaults to
+        /// https://<tls-listen>). Must be https.
+        #[arg(long, env = "PISTACK_AGENT_URL", requires = "tls_listen")]
+        agent_url: Option<String>,
         /// Dev mode: mock local host, unauthenticated requests act as admin.
         #[arg(long)]
         dev: bool,
@@ -140,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
             public_url,
             insecure_http,
             tls_listen,
+            agent_url,
             dev,
         } => {
             server::run(server::ServerOpts {
@@ -150,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 public_url,
                 insecure_http,
                 tls_listen,
+                agent_url,
                 dev,
             })
             .await

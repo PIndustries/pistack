@@ -128,6 +128,9 @@ pub fn client_config(ca_pem: &str, client: Option<&Pki>) -> Result<ClientConfig>
 pub struct PeerIdentity {
     pub addr: Option<std::net::SocketAddr>,
     pub common_name: Option<String>,
+    /// The request came in on the TLS listener, with or without a
+    /// certificate.
+    pub tls: bool,
 }
 
 impl PeerIdentity {
@@ -135,6 +138,7 @@ impl PeerIdentity {
         Self {
             addr: Some(addr),
             common_name: peer_common_name(conn),
+            tls: true,
         }
     }
 
@@ -142,6 +146,7 @@ impl PeerIdentity {
         Self {
             addr: Some(addr),
             common_name: None,
+            tls: false,
         }
     }
 }

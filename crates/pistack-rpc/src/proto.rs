@@ -538,9 +538,10 @@ pub struct HeartbeatAck {
     /// `false` when the server has never seen a hello from this node (for
     /// example after a control-plane restart) and wants one.
     pub known: bool,
-    /// API addresses of every server in the cluster, so the agent can try
-    /// another one if the server it talks to stops answering. Empty for a
-    /// single server.
+    /// Where this agent reaches every server in the cluster, so it can try
+    /// another one if the server it talks to stops answering: the TLS
+    /// listener of each server that has one, for an agent that called over
+    /// TLS. Empty for a single server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<String>,
 }

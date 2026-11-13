@@ -40,8 +40,8 @@ use pistack_cluster::{
     accepts_writes, check_advertise, check_follower_tip, classify, consider_pre_vote,
     consider_vote, election_seed, election_timeout, follow_candidate, in_leader_lease, is_voter,
     join_membership, lost_quorum, pick_leader, plan_promotions, scan_targets, seed_membership,
-    should_campaign, sweep, Announce, Ballot, Formation, JoinRequest, Member, PeerView, Role,
-    VoteRequest, VoteResponse, DISCOVER_PORT,
+    should_campaign, sweep, with_agent_address, Announce, Ballot, Formation, JoinRequest, Member,
+    PeerView, Role, VoteRequest, VoteResponse, DISCOVER_PORT,
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
@@ -88,6 +88,9 @@ const SNAPSHOT_STALL: Duration = Duration::from_secs(30);
 const SNAPSHOT_RESTARTS: u32 = 3;
 /// How long to keep retrying a leader that is not answering yet.
 const SNAPSHOT_STARTUP: Duration = Duration::from_secs(30);
+/// A follower whose record holds the wrong agent address tells the leader
+/// at most this often.
+const AGENT_REPORT_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct BootRequest<'a> {
@@ -126,6 +129,11 @@ pub enum LocalRole {
 pub struct ClusterHandle {
     pub node_id: String,
     pub self_api: String,
+    /// Where host agents reach this server, when it has a TLS listener.
+    /// The member record is kept equal to it.
+    pub agent_api: Option<String>,
+    /// When this follower last told the leader its agent address.
+    pub agent_report: Mutex<Option<Instant>>,
     pub cluster_id: String,
     pub raft: String,
     pub store: Store,
@@ -314,6 +322,7 @@ pub fn establish_local(
     store: &Store,
     node_id: &str,
     self_api: &str,
+    agent_api: Option<&str>,
     allow_seed: bool,
 ) -> anyhow::Result<LocalRole> {
     store.set_record_log(false);
@@ -337,7 +346,7 @@ pub fn establish_local(
         if !allow_seed {
             return Ok(LocalRole::NeedJoin);
         }
-        let members = seed_membership(node_id, self_api);
+        let members = seed_membership(node_id, self_api, agent_api);
         let term = store.get_meta::<u64>("cluster_term")?.unwrap_or(0).max(1);
         store.put_meta("node_id", &node_id)?;
         store.put_meta("members", &members)?;
@@ -443,11 +452,13 @@ pub async fn adopt(
     leader_api: &str,
     node_id: &str,
     self_api: &str,
+    agent_api: Option<&str>,
 ) -> anyhow::Result<Established> {
     let url = format!("{}/cluster/join", leader_api.trim_end_matches('/'));
     let body = JoinRequest {
         node_id: node_id.to_owned(),
         api: self_api.to_owned(),
+        agent_api: agent_api.map(str::to_owned),
     };
     let status: ClusterStatus = post_json(&url, &body)
         .await
@@ -505,6 +516,8 @@ pub fn handle_from(
     ClusterHandle {
         node_id,
         self_api,
+        agent_api: None,
+        agent_report: Mutex::new(None),
         cluster_id,
         raft,
         store,
@@ -527,6 +540,15 @@ pub fn handle_from(
         acks: tokio::sync::Notify::new(),
         log_grew: tokio::sync::Notify::new(),
         confirm_wait: Mutex::new(CONFIRM_WAIT),
+    }
+}
+
+impl ClusterHandle {
+    /// Set before the handle is shared. `None` is a server with no TLS
+    /// listener, which agents can only reach at its API address.
+    pub fn with_agent_api(mut self, agent_api: Option<String>) -> Self {
+        self.agent_api = agent_api;
+        self
     }
 }
 
@@ -555,6 +577,7 @@ pub fn router(handle: std::sync::Arc<ClusterHandle>) -> Router {
     Router::new()
         .route("/cluster", axum::routing::get(show))
         .route("/cluster/join", axum::routing::post(join))
+        .route("/cluster/agent-address", axum::routing::post(agent_address))
         .route("/cluster/snapshot", axum::routing::get(snapshot))
         .route("/cluster/log", axum::routing::get(log))
         .route("/cluster/vote", axum::routing::post(vote))
@@ -575,6 +598,10 @@ pub async fn reject_follower_writes(
     // follower's command queue never receives anything, so a long-poll
     // there would wait forever. They follow the leader address below.
     let rpc = path == "/rpc" || path.starts_with("/rpc/");
+    let over_tls = req
+        .extensions()
+        .get::<keep::PeerIdentity>()
+        .is_some_and(|peer| peer.tls);
     if (read && !rpc) || path == "/healthz" || path == "/" || path.starts_with("/cluster") {
         return next.run(req).await;
     }
@@ -604,7 +631,7 @@ pub async fn reject_follower_writes(
         // is none yet; the agent retries shortly.
         return match fresh_leader(&handle) {
             Some(leader) => ApiError::conflict("not the leader")
-                .with_detail("leader", leader)
+                .with_detail("leader", leader_for_agents(&handle, leader, over_tls))
                 .into_response(),
             None => ApiError::unavailable("no leader yet, retry soon").into_response(),
         };
@@ -674,6 +701,26 @@ async fn confirm_write(handle: &ClusterHandle, index: u64, term: u64) -> Result<
     }
 }
 
+/// The leader's address as an agent should use it: its TLS listener for an
+/// agent that called over TLS, when the leader's record names one.
+fn leader_for_agents(handle: &ClusterHandle, leader: String, over_tls: bool) -> String {
+    let members = members_of(&handle.store).unwrap_or_default();
+    // By address, or by id for a leader whose record holds an older one.
+    let leader_id: Option<String> = handle.store.get_meta("cluster_leader_id").ok().flatten();
+    let by_api = members.iter().find(|member| member.api == leader);
+    let by_id = || {
+        members
+            .iter()
+            .find(|member| Some(&member.id) == leader_id.as_ref())
+    };
+    match by_api.or_else(by_id) {
+        Some(member) => {
+            pistack_rpc::agent_address(&leader, member.agent_api.as_deref(), over_tls).to_owned()
+        }
+        None => leader,
+    }
+}
+
 /// The leader this follower tracks, if it heard from it within the current
 /// election timeout. Reads the follow loop's state; changes nothing.
 fn fresh_leader(handle: &ClusterHandle) -> Option<String> {
@@ -714,14 +761,67 @@ async fn join(
     if node_id == handle.node_id {
         return Err(ApiError::conflict("a server cannot join itself"));
     }
+    let agent_api = checked_agent_api(body.agent_api.as_deref())?;
     let current = members_of(&handle.store)?;
-    let next = join_membership(&current, node_id, api);
+    let next = join_membership(&current, node_id, api, agent_api);
     handle.store.put_meta("members", &next).map_err(store_err)?;
     guard(&handle.progress).remove(node_id);
     tracing::info!(node = %node_id, api = %api, "server joined as a learner");
     if let Some(me) = next.iter().find(|member| member.id == handle.node_id) {
         *guard(&handle.role) = me.role;
     }
+    Ok(Json(status_of(&handle, &next)?))
+}
+
+/// A member's agent address, as it tells the leader after a restart.
+#[derive(serde::Serialize, Deserialize)]
+struct AgentAddress {
+    node_id: String,
+    #[serde(default)]
+    agent_api: Option<String>,
+}
+
+/// An agent address is the TLS listener or nothing: agents prove who they
+/// are with a client certificate, which plain HTTP cannot carry.
+fn checked_agent_api(agent_api: Option<&str>) -> Result<Option<&str>, ApiError> {
+    match agent_api.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) if !a.starts_with("https://") => {
+            Err(ApiError::bad_request("agent_api must be an https address"))
+        }
+        other => Ok(other),
+    }
+}
+
+/// `POST /cluster/agent-address`: a member that started with another
+/// `--tls-listen` than its record holds has the leader correct the record.
+/// Nothing else about the member changes, and the write is logged like a
+/// join, so every server copies it.
+async fn agent_address(
+    State(handle): State<std::sync::Arc<ClusterHandle>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentAddress>,
+) -> Result<Json<ClusterStatus>, ApiError> {
+    enforce_peer(&handle.store, &headers)?;
+    if !handle.leader.load(Ordering::Acquire) {
+        return Err(not_leader(&handle));
+    }
+    let node_id = body.node_id.trim();
+    let agent_api = checked_agent_api(body.agent_api.as_deref())?;
+    let current = members_of(&handle.store)?;
+    if !current.iter().any(|member| member.id == node_id) {
+        return Err(ApiError::not_found(format!(
+            "server {node_id} is not a member"
+        )));
+    }
+    let Some(next) = with_agent_address(&current, node_id, agent_api) else {
+        return Ok(Json(status_of(&handle, &current)?));
+    };
+    handle.store.put_meta("members", &next).map_err(store_err)?;
+    tracing::info!(
+        node = %node_id,
+        agent_api = agent_api.unwrap_or("none"),
+        "server changed its agent address"
+    );
     Ok(Json(status_of(&handle, &next)?))
 }
 
@@ -1033,6 +1133,7 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
 
 async fn lead(handle: &ClusterHandle) {
     *guard(&handle.last_heard) = Instant::now();
+    settle_agent_address(handle);
     promote_caught_up(handle);
     let voters = members_of(&handle.store)
         .map(|members| {
@@ -1075,6 +1176,55 @@ async fn lead(handle: &ClusterHandle) {
     if lost_quorum(since) {
         stand_down(handle, "no voter majority answered");
     }
+}
+
+/// Keep the leader's own member record equal to the agent address it was
+/// started with. A logged write, so every server copies it.
+fn settle_agent_address(handle: &ClusterHandle) {
+    let Ok(members) = members_of(&handle.store) else {
+        return;
+    };
+    let Some(next) = with_agent_address(&members, &handle.node_id, handle.agent_api.as_deref())
+    else {
+        return;
+    };
+    if !handle.leader.load(Ordering::Acquire) {
+        return;
+    }
+    match handle.store.put_meta("members", &next) {
+        Ok(()) => tracing::info!(
+            node = %handle.node_id,
+            agent_api = handle.agent_api.as_deref().unwrap_or("none"),
+            "member record now holds this server's agent address"
+        ),
+        Err(err) => tracing::warn!(error = %err, "could not store this server's agent address"),
+    }
+}
+
+/// A follower cannot write the membership, so it asks the leader to. Asked
+/// again every [`AGENT_REPORT_EVERY`] until the leader's record agrees. A
+/// leader older than the route answers 404, which is logged and retried.
+fn report_agent_address(handle: &ClusterHandle, leader: &str) {
+    {
+        let mut last = guard(&handle.agent_report);
+        if last.is_some_and(|at| at.elapsed() < AGENT_REPORT_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let url = format!("{}/cluster/agent-address", leader.trim_end_matches('/'));
+    let body = AgentAddress {
+        node_id: handle.node_id.clone(),
+        agent_api: handle.agent_api.clone(),
+    };
+    tokio::spawn(async move {
+        if let Err(err) = rpc_post_json::<_, ClusterStatus>(&url, &body).await {
+            tracing::warn!(
+                error = %err,
+                "the leader did not take this server's agent address; agents are not sent here until it does"
+            );
+        }
+    });
 }
 
 /// Promote learners whose last pull was within [`PROMOTE_WINDOW`] of our
@@ -1247,6 +1397,9 @@ async fn refresh(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow
     {
         *guard(&handle.role) = me.role;
         handle.store.put_meta("members", &status.members)?;
+        if me.agent_api != handle.agent_api {
+            report_agent_address(handle, leader);
+        }
     }
     publish(handle);
     start_pull(handle, leader);
@@ -2070,7 +2223,8 @@ mod tests {
         store
             .put_meta("cluster_id", &"keep-me".to_string())
             .unwrap();
-        let established = establish_local(&store, "node-a", "http://10.1.1.1:18443", true).unwrap();
+        let established =
+            establish_local(&store, "node-a", "http://10.1.1.1:18443", None, true).unwrap();
         match established {
             LocalRole::Ready(ready) => {
                 assert!(ready.leader);
@@ -2090,12 +2244,12 @@ mod tests {
         let store = open_store(dir.path());
         store.put_meta("cluster_id", &"c1".to_string()).unwrap();
         store
-            .put_meta("members", &seed_membership("leader", "http://leader"))
+            .put_meta("members", &seed_membership("leader", "http://leader", None))
             .unwrap();
         store
             .put_meta("cluster_leader_id", &"leader".to_string())
             .unwrap();
-        let established = establish_local(&store, "node-b", "http://b", false).unwrap();
+        let established = establish_local(&store, "node-b", "http://b", None, false).unwrap();
         assert!(matches!(established, LocalRole::NeedJoin));
         let id: Option<String> = store.get_meta("cluster_id").unwrap();
         assert_eq!(id.as_deref(), Some("c1"));
@@ -2109,10 +2263,13 @@ mod tests {
         let path = dir.path().join("state.redb");
         let store = open_store(dir.path());
         store.put_meta("cluster_id", &"c1".to_string()).unwrap();
-        let ready = match establish_local(&store, "node-a", "http://leader", true).unwrap() {
-            LocalRole::Ready(ready) => ready,
-            LocalRole::NeedJoin => panic!("founder tried to join"),
-        };
+        let founder_tls = Some("https://leader:8444");
+        let ready =
+            match establish_local(&store, "node-a", "http://leader", founder_tls, true).unwrap() {
+                LocalRole::Ready(ready) => ready,
+                LocalRole::NeedJoin => panic!("founder tried to join"),
+            };
+        assert_eq!(ready.members[0].agent_api.as_deref(), founder_tls);
         let handle = Arc::new(handle_from(
             "node-a".into(),
             "http://leader".into(),
@@ -2183,9 +2340,21 @@ mod tests {
         let copy_path = copy_dir.path().join("state.redb");
         std::fs::write(&copy_path, &bytes).unwrap();
         let copy = open_store(copy_dir.path());
-        let adopted = adopt(&copy, &base, "node-b", "http://b").await.unwrap();
+        // The snapshot carries the founder's agent address.
+        assert_eq!(
+            members_of(&copy).unwrap()[0].agent_api.as_deref(),
+            founder_tls
+        );
+        let adopted = adopt(&copy, &base, "node-b", "http://b", Some("https://b:8444"))
+            .await
+            .unwrap();
         assert_eq!(adopted.role, Role::Learner);
         assert!(!adopted.leader);
+        // Both stores hold both servers' agent addresses after the join.
+        for held in [members_of(&store).unwrap(), members_of(&copy).unwrap()] {
+            assert_eq!(held[0].agent_api.as_deref(), founder_tls);
+            assert_eq!(held[1].agent_api.as_deref(), Some("https://b:8444"));
+        }
         let copied_id: Option<String> = copy.get_meta("cluster_id").unwrap();
         assert_eq!(copied_id.as_deref(), Some("c1"));
 
@@ -2199,6 +2368,7 @@ mod tests {
             .json(&JoinRequest {
                 node_id: "node-c".into(),
                 api: "http://c".into(),
+                agent_api: None,
             })
             .send()
             .await
@@ -2212,6 +2382,18 @@ mod tests {
         assert!(third.members.iter().any(|member| member.id == "node-b"));
         let c = third.members.iter().find(|m| m.id == "node-c").unwrap();
         assert_eq!(c.role, Role::Learner, "a join never adds a voter");
+        assert_eq!(c.agent_api, None, "node-c has no TLS listener");
+        let plain = client
+            .post(format!("{base}/cluster/join"))
+            .json(&JoinRequest {
+                node_id: "node-d".into(),
+                api: "http://d".into(),
+                agent_api: Some("http://d:8443".into()),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), StatusCode::BAD_REQUEST);
 
         // Both learners pulled up to the leader's commit: promoted together.
         promote_caught_up(&handle);
@@ -2225,10 +2407,242 @@ mod tests {
             guard(&handle.progress).insert(id.into(), (commit, Instant::now()));
         }
         promote_caught_up(&handle);
-        assert!(members_of(&store)
-            .unwrap()
-            .iter()
-            .all(|member| member.role == Role::Voter));
+        let promoted = members_of(&store).unwrap();
+        assert!(promoted.iter().all(|member| member.role == Role::Voter));
+        // A promotion rewrites the membership and keeps the addresses.
+        assert_eq!(promoted[0].agent_api.as_deref(), founder_tls);
+        assert_eq!(promoted[1].agent_api.as_deref(), Some("https://b:8444"));
+        assert_eq!(promoted[2].agent_api, None);
+        pull_log(&base, &copy).await.unwrap();
+        assert_eq!(members_of(&copy).unwrap(), promoted);
+    }
+
+    /// A handle for `id` over a fresh store seeded with `members`, started
+    /// with `agent_api`. Nothing is served and no loop runs.
+    fn bare_handle(
+        id: &str,
+        api: &str,
+        agent_api: Option<&str>,
+        members: &[Member],
+        leader: bool,
+        leader_api: &str,
+    ) -> (Arc<ClusterHandle>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        seed_voter(&store, id, members, 5);
+        store.set_log_term(5);
+        store.set_record_log(leader);
+        let ready = Established {
+            role: Role::Voter,
+            leader,
+            leader_api: leader_api.to_owned(),
+            term: 5,
+            members: members.to_vec(),
+        };
+        let handle = handle_from(
+            id.into(),
+            api.into(),
+            "c1".into(),
+            store,
+            dir.path().join("state.redb"),
+            &ready,
+            None,
+            Leadership::new(leader),
+        )
+        .with_agent_api(agent_api.map(str::to_owned));
+        (Arc::new(handle), dir)
+    }
+
+    /// Records written before servers had an agent address, or by a server
+    /// that has since moved its TLS listener, are corrected: the leader
+    /// fixes its own, a follower asks the leader, and both are logged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_server_gets_its_agent_address_into_its_record() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sim_api = format!("http://{}", listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", &sim_api),
+            Member::voter("sim2", "http://sim2").with_agent_api(Some("https://old:8444")),
+            Member::voter("sim3", "http://sim3"),
+        ];
+        let sim = serve_voter("sim", listener, &members, true, 5, &sim_api).await;
+        let agent_of = |store: &Store, id: &str| {
+            members_of(store)
+                .unwrap()
+                .into_iter()
+                .find(|member| member.id == id)
+                .unwrap()
+                .agent_api
+        };
+
+        // The route: only https, only a member, and nothing else changes.
+        let client = http_client();
+        let post = |node: &str, agent: Option<&str>| {
+            client
+                .post(format!("{sim_api}/cluster/agent-address"))
+                .json(&AgentAddress {
+                    node_id: node.into(),
+                    agent_api: agent.map(str::to_owned),
+                })
+                .send()
+        };
+        let plain = post("sim3", Some("http://sim3:8443")).await.unwrap();
+        assert_eq!(plain.status(), StatusCode::BAD_REQUEST);
+        let stranger = post("nobody", Some("https://nobody:8444")).await.unwrap();
+        assert_eq!(stranger.status(), StatusCode::NOT_FOUND);
+        let set = post("sim3", Some("https://sim3:8444")).await.unwrap();
+        assert_eq!(set.status(), StatusCode::OK);
+        let after = members_of(&sim.handle.store).unwrap();
+        assert_eq!(after[2].agent_api.as_deref(), Some("https://sim3:8444"));
+        assert_eq!(after[2].role, Role::Voter);
+        assert_eq!(after[2].api, "http://sim3");
+        assert_eq!(after[..2], members[..2]);
+
+        // A follower started with another address than its record holds
+        // tells the leader when it next checks in.
+        let (sim2, _sim2_dir) = bare_handle(
+            "sim2",
+            "http://sim2",
+            Some("https://sim2:8444"),
+            &members,
+            false,
+            &sim_api,
+        );
+        refresh(&sim2, &sim_api).await.unwrap();
+        wait_for(
+            "the leader to take the follower's address",
+            Duration::from_secs(5),
+            || agent_of(&sim.handle.store, "sim2").as_deref() == Some("https://sim2:8444"),
+        )
+        .await;
+        // The correction is in the log, so every server copies it.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = open_store(other_dir.path());
+        seed_voter(&other, "sim3", &members, 5);
+        pull_log(&sim_api, &other).await.unwrap();
+        assert_eq!(
+            agent_of(&other, "sim2").as_deref(),
+            Some("https://sim2:8444")
+        );
+        assert_eq!(
+            agent_of(&other, "sim3").as_deref(),
+            Some("https://sim3:8444")
+        );
+
+        // A follower does not take the call.
+        let (follower, _follower_dir) =
+            bare_handle("sim3", "http://sim3", None, &members, false, &sim_api);
+        let app = router(follower.clone());
+        let request = axum::http::Request::post("/cluster/agent-address")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"node_id":"sim3","agent_api":"https://sim3:8444"}"#,
+            ))
+            .unwrap();
+        let refused = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+
+        // The leader corrects its own record, and clears it when it was
+        // restarted without a TLS listener.
+        let (lead, _lead_dir) = bare_handle(
+            "sim",
+            "http://sim",
+            Some("https://sim:8444"),
+            &members,
+            true,
+            "http://sim",
+        );
+        let before = lead.store.commit_index().unwrap();
+        settle_agent_address(&lead);
+        assert_eq!(
+            agent_of(&lead.store, "sim").as_deref(),
+            Some("https://sim:8444")
+        );
+        let logged = lead.store.commit_index().unwrap();
+        assert!(logged > before, "the correction is a logged write");
+        settle_agent_address(&lead);
+        assert_eq!(lead.store.commit_index().unwrap(), logged, "settled once");
+        let (bare, _bare_dir) =
+            bare_handle("sim2", "http://sim2", None, &members, true, "http://sim2");
+        settle_agent_address(&bare);
+        assert_eq!(agent_of(&bare.store, "sim2"), None);
+        sim.kill();
+    }
+
+    /// A follower names the leader's TLS listener to an agent that called
+    /// over TLS, and the API address to one that did not or when the
+    /// leader's record has no TLS listener.
+    #[tokio::test]
+    async fn a_follower_sends_an_agent_to_the_leaders_tls_listener() {
+        let members = vec![
+            Member::voter("sim", "http://10.0.0.11:8443")
+                .with_agent_api(Some("https://10.0.0.11:8444")),
+            Member::voter("sim2", "http://10.0.0.12:8443")
+                .with_agent_api(Some("https://10.0.0.12:8444")),
+            Member::voter("sim3", "http://10.0.0.13:8443"),
+        ];
+        let (follower, _dir) = bare_handle(
+            "sim2",
+            "http://10.0.0.12:8443",
+            Some("https://10.0.0.12:8444"),
+            &members,
+            false,
+            "http://10.0.0.11:8443",
+        );
+        *guard(&follower.leader_contact) = Some(Instant::now());
+        let named = |tls: bool| {
+            let follower = follower.clone();
+            async move {
+                let app = Router::new()
+                    .route(
+                        "/rpc/agents/heartbeat",
+                        axum::routing::post(|| async { "ok" }),
+                    )
+                    .layer(middleware::from_fn_with_state(
+                        follower,
+                        reject_follower_writes,
+                    ))
+                    .layer(axum::Extension(keep::PeerIdentity {
+                        addr: None,
+                        common_name: None,
+                        tls,
+                    }));
+                let request = axum::http::Request::post("/rpc/agents/heartbeat")
+                    .body(Body::empty())
+                    .unwrap();
+                let answer = tower::ServiceExt::oneshot(app, request).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::CONFLICT);
+                let bytes = axum::body::to_bytes(answer.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                body["error"]["details"]["leader"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }
+        };
+        assert_eq!(named(true).await, "https://10.0.0.11:8444");
+        assert_eq!(named(false).await, "http://10.0.0.11:8443");
+        // A leader whose record has no TLS listener: its API address.
+        *guard(&follower.leader_api) = "http://10.0.0.13:8443".into();
+        assert_eq!(named(true).await, "http://10.0.0.13:8443");
+        // Everyone else is still told the API address.
+        let app = Router::new()
+            .route("/compute/machines", axum::routing::post(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                follower.clone(),
+                reject_follower_writes,
+            ));
+        let request = axum::http::Request::post("/compute/machines")
+            .body(Body::empty())
+            .unwrap();
+        let answer = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        let bytes = axum::body::to_bytes(answer.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["details"]["leader"], "http://10.0.0.13:8443");
     }
 
     struct LiveVoter {
@@ -2555,7 +2969,7 @@ mod tests {
         let store = sim.handle.store.clone();
         store.set_record_log(false);
         store.set_log_term(0);
-        let ready = match establish_local(&store, "sim", &sim.api, true).unwrap() {
+        let ready = match establish_local(&store, "sim", &sim.api, None, true).unwrap() {
             LocalRole::Ready(ready) => ready,
             LocalRole::NeedJoin => panic!("the old leader lost its membership"),
         };
@@ -3034,7 +3448,8 @@ mod tests {
             (dir, store)
         };
         let (_dir, store) = seeded();
-        let LocalRole::Ready(old) = establish_local(&store, "sim", "http://sim", true).unwrap()
+        let LocalRole::Ready(old) =
+            establish_local(&store, "sim", "http://sim", None, true).unwrap()
         else {
             panic!("member had to join");
         };
@@ -3042,7 +3457,8 @@ mod tests {
         assert_eq!(old.leader_api, "");
         assert_eq!(old.term, 6);
         let (_dir2, store) = seeded();
-        let LocalRole::Ready(peer) = establish_local(&store, "sim2", "http://sim2", true).unwrap()
+        let LocalRole::Ready(peer) =
+            establish_local(&store, "sim2", "http://sim2", None, true).unwrap()
         else {
             panic!("member had to join");
         };
@@ -3325,8 +3741,10 @@ mod tests {
         assert!(is_voter(&members_of(&copy).unwrap(), "sim3"));
 
         // Boot as the server does with an existing store (Keep).
-        let established = match establish_local(&copy, "sim3", &sim3_api, true).unwrap() {
-            LocalRole::NeedJoin => adopt(&copy, &sim.api, "sim3", &sim3_api).await.unwrap(),
+        let established = match establish_local(&copy, "sim3", &sim3_api, None, true).unwrap() {
+            LocalRole::NeedJoin => adopt(&copy, &sim.api, "sim3", &sim3_api, None)
+                .await
+                .unwrap(),
             LocalRole::Ready(_) => panic!("a copied store was trusted as this server's own"),
         };
         assert_eq!(established.role, Role::Learner);

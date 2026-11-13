@@ -99,6 +99,7 @@ impl Listener for TlsListener {
         Ok(GatewayPeer::plain(PeerIdentity {
             addr: Some(self.tcp.local_addr()?),
             common_name: None,
+            tls: true,
         }))
     }
 }

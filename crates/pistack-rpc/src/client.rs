@@ -49,14 +49,43 @@ pub fn rpc_base(api: &str) -> String {
 struct Servers {
     current: String,
     known: Vec<String>,
+    /// The agent joined over https. It then never moves to a plain-HTTP
+    /// address, whoever names it: its client certificate cannot be shown
+    /// there, and whatever it sent would cross the network in the clear.
+    secure: bool,
+    /// Plain-HTTP addresses already refused, so each is logged once.
+    refused: Vec<String>,
 }
 
 impl Servers {
-    fn learn(&mut self, base: String) {
+    /// Remember `base` unless it would be a downgrade. False when refused.
+    fn learn(&mut self, base: String) -> bool {
+        if !self.allows(&base) {
+            return false;
+        }
         if !self.known.contains(&base) {
             self.known.push(base);
         }
+        true
     }
+
+    fn allows(&mut self, base: &str) -> bool {
+        if !self.secure || is_https(base) {
+            return true;
+        }
+        if !self.refused.iter().any(|r| r == base) {
+            tracing::warn!(
+                server = base,
+                "agent rpc: joined over https, refusing a plain-http server address"
+            );
+            self.refused.push(base.to_owned());
+        }
+        false
+    }
+}
+
+fn is_https(url: &str) -> bool {
+    reqwest::Url::parse(url.trim()).is_ok_and(|u| u.scheme() == "https")
 }
 
 #[derive(Clone)]
@@ -105,8 +134,10 @@ impl AgentClient {
         Ok(Self {
             http,
             servers: Arc::new(Mutex::new(Servers {
+                secure: is_https(&base),
                 current: base.clone(),
                 known: vec![base],
+                refused: Vec::new(),
             })),
             node_name: node_name.into(),
             token: None,
@@ -172,7 +203,8 @@ impl AgentClient {
     }
 
     /// Remember more servers (API addresses or `/rpc` bases) to try when the
-    /// current one stops answering.
+    /// current one stops answering. A client that joined over https skips
+    /// plain-HTTP addresses.
     pub fn learn_servers<I, S>(&self, servers: I)
     where
         I: IntoIterator<Item = S>,
@@ -197,14 +229,18 @@ impl AgentClient {
         format!("{}{path}", self.base_url())
     }
 
-    /// Switch to `next` if we are still on `from`.
-    fn switch(&self, from: &str, next: String) {
+    /// Switch to `next` if we are still on `from`. False when `next` is a
+    /// plain-HTTP address and this client joined over https: it stays put.
+    fn switch(&self, from: &str, next: String) -> bool {
         let mut s = self.lock();
+        if !s.learn(next.clone()) {
+            return false;
+        }
         if s.current == from {
             tracing::info!(from, to = %next, "agent rpc: switching server");
-            s.current = next.clone();
+            s.current = next;
         }
-        s.learn(next);
+        true
     }
 
     /// Move on to the next known server after `from` stopped answering.
@@ -224,7 +260,8 @@ impl AgentClient {
     /// yet" answer moves the client to the next known server and returns
     /// the error, so the caller's retry lands somewhere new. A follower cut
     /// off from the majority keeps saying "no leader yet"; another server
-    /// may already know the winner.
+    /// may already know the winner. A leader address this client refuses
+    /// (see [`Servers::secure`]) is treated the same way.
     async fn send<T: DeserializeOwned>(
         &self,
         build: impl Fn(&str) -> RequestBuilder,
@@ -251,7 +288,10 @@ impl AgentClient {
                 if let Err(RpcError::Api { error, .. }) = &result {
                     if let Some(next) = leader_hint(error) {
                         if next != base {
-                            self.switch(&base, next);
+                            if !self.switch(&base, next) {
+                                self.rotate(&base);
+                                return result;
+                            }
                             hops += 1;
                             continue;
                         }
@@ -289,7 +329,10 @@ impl AgentClient {
                 if let RpcError::Api { error, .. } = &err {
                     if let Some(next) = leader_hint(error) {
                         if next != base {
-                            self.switch(&base, next);
+                            if !self.switch(&base, next) {
+                                self.rotate(&base);
+                                return Err(err);
+                            }
                             hops += 1;
                             continue;
                         }
@@ -604,6 +647,52 @@ mod tests {
         let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
         assert!(matches!(&err, RpcError::Http(e) if e.is_timeout()), "{err}");
         assert_eq!(c.base_url(), rpc_base(&lead));
+    }
+
+    #[test]
+    fn a_client_that_joined_over_https_learns_no_plain_http_server() {
+        let c = AgentClient::new("https://10.0.0.11:8444/rpc", "n1").unwrap();
+        c.learn_servers([
+            "http://10.0.0.12:8443",
+            "https://10.0.0.12:8444",
+            "HTTP://10.0.0.13:8443",
+            "https://10.0.0.13:8444",
+        ]);
+        assert_eq!(
+            c.known_servers(),
+            vec![
+                "https://10.0.0.11:8444/rpc",
+                "https://10.0.0.12:8444/rpc",
+                "https://10.0.0.13:8444/rpc",
+            ]
+        );
+        // Named as the leader, a plain address is still refused.
+        let from = c.base_url();
+        assert!(!c.switch(&from, "http://10.0.0.12:8443/rpc".into()));
+        assert_eq!(c.base_url(), from);
+        assert!(c.switch(&from, "https://10.0.0.12:8444/rpc".into()));
+        assert_eq!(c.base_url(), "https://10.0.0.12:8444/rpc");
+
+        // A client that joined over plain HTTP may move either way.
+        let plain = AgentClient::new("http://10.0.0.11:8443/rpc", "n1").unwrap();
+        plain.learn_servers(["http://10.0.0.12:8443", "https://10.0.0.13:8444"]);
+        assert_eq!(plain.known_servers().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_plain_http_leader_is_refused_and_the_next_server_is_tried() {
+        let follow = follower("http://10.0.0.13:8443".into()).await;
+        let c = AgentClient::new(rpc_base(&follow), "n1").unwrap();
+        // The stub speaks plain HTTP; mark the client as one that joined
+        // over https, which is all the rule looks at.
+        c.lock().secure = true;
+        c.learn_servers(["https://10.0.0.12:8444"]);
+        let err = c.next_commands(Duration::from_secs(0)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Api { status: 409, .. }), "{err}");
+        assert_eq!(c.base_url(), "https://10.0.0.12:8444/rpc");
+        assert!(!c
+            .known_servers()
+            .contains(&"http://10.0.0.13:8443/rpc".to_owned()));
     }
 
     #[test]

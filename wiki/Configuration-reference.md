@@ -25,9 +25,12 @@ These go before the subcommand: `pistack --data-dir /srv/pistack server ...`.
 | `--public-url <URL>` | `PISTACK_PUBLIC_URL` | derived from `--listen` | The URL clients, agents and other servers use to reach this server. |
 | `--insecure-http` | | | Acknowledge that `--listen` is plain HTTP. Makes the default public URL `http://`. |
 | `--tls-listen <ADDR>` | `PISTACK_TLS_LISTEN` | none | Additional HTTPS listener. Must be a specific address. |
+| `--agent-url <URL>` | `PISTACK_AGENT_URL` | `https://<tls-listen>` | The URL agents are told to use for the HTTPS listener. Must be `https://`. Needs `--tls-listen`. |
 | `--dev` | | | Dev mode: a mock local host, and requests without credentials act as admin. |
 
 When `--public-url` is not given it is `https://<listen>`, or `http://<listen>` with `--insecure-http`, with `0.0.0.0` replaced by `127.0.0.1`. Other servers and agents are told this URL, so set it explicitly when listening on `0.0.0.0`.
+
+A server with `--tls-listen` also records an agent URL in its member record. An agent that calls over HTTPS is told that URL for every server that has one, never the plain one. Set `--agent-url` when agents reach the HTTPS listener under another name or port than the one it binds.
 
 ### pistack agent
 
@@ -98,6 +101,7 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 | `PISTACK_LISTEN` | `0.0.0.0:8443` | Same as `--listen`. |
 | `PISTACK_PUBLIC_URL` | derived | Same as `--public-url`. |
 | `PISTACK_TLS_LISTEN` | none | Same as `--tls-listen`. |
+| `PISTACK_AGENT_URL` | derived | Same as `--agent-url`. |
 | `PISTACK_CONFIG` | none | Path of the config file. |
 | `PISTACK_NODE_NAME` | host name | Node name. Written to `<data_dir>/node.name` and kept from then on. |
 | `PISTACK_CORS_ORIGINS` | none | Comma-separated origins whose pages may call the API from a browser, such as `https://portal.example`. With none, no cross-origin access is allowed; the console is same-origin and needs none. |

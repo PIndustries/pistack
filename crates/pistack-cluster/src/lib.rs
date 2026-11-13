@@ -22,8 +22,8 @@ pub use replicate::{
     accepts_writes, check_follower_tip, classify, consider_pre_vote, consider_vote, election_seed,
     election_timeout, entries_after, follow_candidate, in_leader_lease, is_voter, join_membership,
     lost_quorum, pick_leader, plan_promotions, seed_membership, should_campaign, should_discover,
-    voter_target, Ballot, Formation, JoinRequest, PeerView, StoredEntry, StoredOp, VoteRequest,
-    VoteResponse, ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_SPAN,
+    voter_target, with_agent_address, Ballot, Formation, JoinRequest, PeerView, StoredEntry,
+    StoredOp, VoteRequest, VoteResponse, ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_SPAN,
 };
 
 /// What a starting server does with the peers it heard.
