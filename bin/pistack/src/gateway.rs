@@ -150,6 +150,7 @@ pub fn build(
 
     if let Some(handle) = cluster {
         app = app.merge(crate::cluster::router(handle.clone()));
+        let tls_mode = handle.peers.mode();
         app = app.layer(middleware::from_fn_with_state(
             handle.clone(),
             reads_at_leader,
@@ -157,6 +158,12 @@ pub fn build(
         app = app.layer(middleware::from_fn_with_state(
             handle,
             crate::cluster::reject_follower_writes,
+        ));
+        // Over every route: object bytes for other servers are under the
+        // silo module, not under /cluster.
+        app = app.layer(middleware::from_fn_with_state(
+            tls_mode,
+            crate::cluster::refuse_plain_peers,
         ));
     }
 
