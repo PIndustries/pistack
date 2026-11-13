@@ -20,6 +20,8 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **At most three voters.** Further servers are learners. Two servers give one voter and one learner, with no failover.
 - **Removing a server needs a leader.** When the majority of voters is gone there is no leader, and the dead servers cannot be removed.
 - **Removal does not revoke secrets.** A removed server's store still holds the member key. The others refuse it by the id it states.
+- **A live migration does not survive a change of leader.** If the leader restarts or is replaced before the source host has the command, the machine stays `updating` with the message `migrating <host>` and is not migrated. Machine start, stop and delete and volume attach and detach are carried over; see [Agents and hosts](Agents-and-hosts).
+- **A request in flight fails when the leader changes.** `pi pod exec`, pod logs, and a volume attach or detach that was waiting for the host return an error. The attach is finished by the new leader. A detach is not: the volume stays attached until you detach it again, which is safe to repeat.
 - **Rejoining a server that fell behind is manual.** See [Running a cluster](Running-a-cluster).
 - **Restore brings back one server.** `pistack store restore` puts a backup in place and that server becomes the only member. The other servers are emptied and joined again by hand. See [Running a cluster](Running-a-cluster).
 - **Restore rolls back the store only.** Machines and volumes made after the backup are unknown to the restored store, and deleted ones are back in it. What the control plane does about the difference with the hosts has not been tested.
