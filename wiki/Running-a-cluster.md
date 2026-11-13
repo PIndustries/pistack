@@ -18,26 +18,89 @@ After the first start, `--init` is no longer needed. A server that finds an exis
 
 `--tls-listen ADDR` adds an HTTPS listener next to the plain one. The address must be specific, not `0.0.0.0`. The certificate is issued by the cloud CA and kept in `<data_dir>/tls`. Clients do not have that CA in their trust store, so `pi` needs `--insecure` to use it today.
 
-Each server writes the address of its HTTPS listener into its member record, as `agent_api`. That is the address agents on HTTPS are given for it, in the list of servers and when a follower names the leader. `--agent-url` overrides it. A server restarted with a different `--tls-listen` has the record corrected within a few seconds, and one restarted without it has the address removed.
+The certificate is valid for the IP address in `--tls-listen`, for the name `pistack`, and for the host in `--agent-url` when that is given. A server started with another `--tls-listen` or `--agent-url` than its certificate covers issues itself a new one. Files in `<data_dir>/tls` that the cloud CA did not issue are yours and are used as they are; the server warns that other servers and agents will not accept them.
+
+Each server writes the address of its HTTPS listener into its member record, as `agent_api`. That is the address agents on HTTPS are given for it, in the list of servers and when a follower names the leader. It is also where the other servers call it; see [TLS between servers](#tls-between-servers). So the address has to reach that one server, not a balancer in front of several. `--agent-url` overrides it. A server restarted with a different `--tls-listen` has the record corrected within a few seconds, and one restarted without it has the address removed.
 
 Until this is finished, put the API on a private network.
 
 ## Adding servers
 
+On a machine that can reach the leader's API:
+
 ```sh
 pi join-token create server-2
-PISTACK_JOIN_TOKEN=pij_... pistack --data-dir /var/lib/pistack server --join http://10.0.0.11:8443 --listen 10.0.0.12:8443
 ```
 
-A new server needs a join token, in `PISTACK_JOIN_TOKEN`, to download the snapshot and to join. It needs it only for that first start: once it holds the store it is a member, and the token can expire. A server found by discovery needs the token too.
+```text
+join-token "server-2" created (jtok-2e121e53)
+token (shown once): pij_...
+ca sha256: c5a3027c1ff3f7d461248742f1a09d3ee039bceadaacf9f70ef2cb8f2117b5eb
+```
 
-`--join URL` names any reachable address of the current leader. The new server downloads a snapshot of the store, registers as a member, and starts replicating. Only the leader serves joins; another server answers `409`.
+On the new server:
 
-With neither `--init` nor `--join`, a server with an empty data directory tries discovery, but only when `--listen` is a private IPv4 address. It probes every address in its /24 on UDP port 18445. If no cluster answers it founds one. If exactly one answers it joins it. If more than one answers it stops and asks for `--join`. With `--listen 0.0.0.0:8443` (the default) there is no discovery and the server exits, asking for `--init` or `--join`.
+```sh
+PISTACK_JOIN_TOKEN=pij_... \
+PISTACK_JOIN_CA_SHA256=c5a3027c1ff3f7d461248742f1a09d3ee039bceadaacf9f70ef2cb8f2117b5eb \
+pistack --data-dir /var/lib/pistack server --join https://10.0.0.11:8444 \
+  --listen 10.0.0.12:8443 --tls-listen 10.0.0.12:8444
+```
 
-Cluster traffic between servers uses the same API port, under `/cluster`. Those routes hand out the whole store, so they answer only a member or a server holding a valid join token. Members prove themselves with a key derived from the token signing secret, which is in every member's store and in every snapshot; nothing has to be handed to them and it does not expire. Each server also states its id on these calls, which is how one that was removed is refused. A server that is refused says so and names `PISTACK_JOIN_TOKEN`.
+`--join URL` names the leader. Give the address of its `--tls-listen`. The new server downloads a snapshot of the store, registers as a member, and starts replicating. Only the leader serves joins; another server answers `409`.
+
+The snapshot is the whole store, secrets included, and the join token lets its holder download it. A new server has no store, so it has nothing of the cloud to check the leader with. That is what the second line `pi` prints is for: the SHA-256 of the cloud's root CA certificate. The new server connects only to a server that presents that CA and a certificate from it that is valid for the address in `--join`, and sends the token only then. The fingerprint is not a secret. It is the same for every token of one cloud; `pi join-token create -o json` has it as `ca_sha256`.
+
+What the new server does with each combination:
+
+| `--join` address | `PISTACK_JOIN_CA_SHA256` | Result |
+| --- | --- | --- |
+| `https://` | set | Joins, if the leader's certificate chains to that CA. |
+| `https://` | not set | Refused before anything is sent. `--insecure-join` does not change this. |
+| `http://` | not set | Refused, unless `--insecure-join` is given. |
+| `http://` | set | Refused: a fingerprint cannot be checked over plain HTTP. |
+
+`--insecure-join` (or `PISTACK_INSECURE_JOIN=true`) accepts a first download over plain HTTP. The token and the store then cross the network in the clear, and anything that can answer on that address can hand the new server a store of its own making. Use it on a network you trust, or for a leader that has no TLS listener.
+
+```sh
+PISTACK_JOIN_TOKEN=pij_... pistack --data-dir /var/lib/pistack server --join http://10.0.0.11:8443 --insecure-join --listen 10.0.0.12:8443
+```
+
+The token, the fingerprint and `--insecure-join` matter for that first start only. Once the server holds the store it is a member, the token can expire, and it checks the other servers against the CA in the store. After a join with a fingerprint the server also checks that the store it downloaded holds that CA.
+
+With neither `--init` nor `--join`, a server with an empty data directory tries discovery, but only when `--listen` is a private IPv4 address. It probes every address in its /24 on UDP port 18445. If no cluster answers it founds one. If exactly one answers it joins it. If more than one answers it stops and asks for `--join`. With `--listen 0.0.0.0:8443` (the default) there is no discovery and the server exits, asking for `--init` or `--join`. A server found by discovery needs the token too. Discovery announces the plain API address, so a join by discovery is a plain HTTP join and needs `--insecure-join`.
+
+The routes servers call on each other, under `/cluster`, hand out the whole store, so they answer only a member or a server holding a valid join token. Members prove themselves with a key derived from the token signing secret, which is in every member's store and in every snapshot; nothing has to be handed to them and it does not expire. Each server also states its id on these calls, which is how one that was removed is refused. A server that is refused says so and names `PISTACK_JOIN_TOKEN`.
 
 `PISTACK_REQUIRE_JOIN=0` opens the routes to anything that reaches the port. Servers older than this check send no key, so replacing them one at a time stops replication between old and new; set `PISTACK_REQUIRE_JOIN=0` on every server for that one upgrade, then take it out.
+
+## TLS between servers
+
+Servers call each other for the replication log, the status, votes, joins and snapshots (`/cluster`), and for object bytes (`/silo/peer`). The routes are on both listeners.
+
+A call to a server whose member record has an HTTPS address goes there. The caller checks the certificate against the cloud CA in its own store, not against the system's certificates, and checks that it is valid for the address called. The member key is sent as before, inside the TLS connection. A call to a server with no HTTPS address goes to its API address over plain HTTP.
+
+`PISTACK_CLUSTER_TLS` decides what happens when TLS is not possible.
+
+| Value | Calling another server | Being called |
+| --- | --- | --- |
+| `preferred` (default) | TLS when the member has an HTTPS address. If that connection cannot be made or the certificate does not check out, the call is sent again over plain HTTP, a warning is logged, and TLS is tried again after a minute. A member with no HTTPS address is called over plain HTTP. | Answers on both listeners. |
+| `required` | TLS only. A member with no HTTPS address is not called at all, and a failed TLS connection is an error. | Refuses `/cluster/*` and `/silo/peer/*` on the plain listener with `403`. |
+
+A server with `PISTACK_CLUSTER_TLS=required` needs `--tls-listen` and does not start without it. Any other value than the two is refused at start.
+
+`required` does not close `GET /cluster` and `pi server remove` to an administrator on the plain listener: they are refused there only when the caller presents a member key or a join token. The rest of the API is not affected by this setting.
+
+`preferred` protects against someone who only listens, and only for the calls that went over TLS. Someone who can block the HTTPS port makes the servers fall back to plain HTTP. `required` is the setting that holds against that.
+
+### Turning it on in a running cluster
+
+1. Replace the binary on every server, one at a time, leaving `PISTACK_CLUSTER_TLS` unset. Old and new servers keep replicating: a new server calls an old one over TLS when its record has an HTTPS address, since old servers answer `/cluster` there too, and old servers go on calling over plain HTTP, which a new server in `preferred` accepts.
+2. Give every server `--tls-listen` if it does not have it, restarting one at a time. `pi cluster status` shows an `AGENT API` for each when that is done.
+3. Look for `TLS to this server failed; calling it over plain HTTP for now` in the logs. It names the address and the reason. Typical reasons are a firewall that does not pass the HTTPS port between servers, and certificate files in `<data_dir>/tls` that the cloud CA did not issue.
+4. Set `PISTACK_CLUSTER_TLS=required` on every server and restart them one at a time, followers first. A server already on `required` and one still on `preferred` talk over TLS in both directions, so the cluster keeps a leader throughout.
+
+A new server joined after that needs `--tls-listen` from its first start.
 
 `GET /cluster` is the one cluster route that also answers a cloud admin's token, so you can see what a server believes. `pi cluster status` prints it:
 
@@ -174,7 +237,8 @@ The procedure by hand:
 ```sh
 # on the server that logged the message, after stopping pistack
 mv /var/lib/pistack/state.redb /var/lib/pistack/state.redb.old
-PISTACK_JOIN_TOKEN=pij_... pistack --data-dir /var/lib/pistack server --join http://10.0.0.12:8443 --listen 10.0.0.11:8443
+PISTACK_JOIN_TOKEN=pij_... PISTACK_JOIN_CA_SHA256=... pistack --data-dir /var/lib/pistack server \
+  --join https://10.0.0.12:8444 --listen 10.0.0.11:8443 --tls-listen 10.0.0.11:8444
 ```
 
 Leave `node.id` in place so the server keeps its member identity. Done by hand it needs a join token, comes back as a learner and is promoted again when it has caught up.
@@ -194,7 +258,7 @@ A removal that would leave too few voters answering to form a majority is refuse
 
 To replace a server that is gone for good, remove it and then add a new one as in [Adding servers](#adding-servers). After one of three voters is removed there are two, and both must be up for a write to be confirmed. That lasts until the new server has caught up and been promoted, so do the two steps together.
 
-The other servers refuse a removed server from then on, and it logs that it was removed. It does not come back by being restarted. To bring the same machine back, stop it, move `state.redb` aside and start it with `--join` and a join token, as for a new server. The token is needed even with `PISTACK_REQUIRE_JOIN=0`.
+The other servers refuse a removed server from then on, and it logs that it was removed. It does not come back by being restarted. To bring the same machine back, stop it, move `state.redb` aside and start it with `--join`, a join token and the CA fingerprint, as for a new server. The token is needed even with `PISTACK_REQUIRE_JOIN=0`.
 
 Two things removal does not do. It needs a leader: when the majority of voters is gone there is no leader, and the dead servers cannot be removed until enough of them return. And it does not take back what the removed server holds. Its `state.redb` still has the cluster's secrets, including the key members prove themselves with, and the others tell it apart only by the id it states. Destroy that file if the machine leaves your hands.
 
@@ -233,7 +297,7 @@ What a restore does not put back:
 - **Other servers.** Restore one server and start it. On every other server, stop `pistack`, empty the data directory or move `state.redb` aside, and start it with `--join` as a new server. Do this before they can reach the restored server: a server still running on its old store holds writes from after the backup and the same cluster key. The restored server raises the term so that such a server is told its log has diverged. It then asks for a snapshot and is refused, because the restored member list does not name it. This has not been tried on a real cluster.
 - **Anything written after the backup.** Machines, volumes and addresses created since are unknown to the restored store, and ones deleted since are back in it. What is running on the hosts is not rolled back with it, and what the control plane then does about the difference has not been tested.
 - **The root key in Vault.** With the default `software` backend the root key is in the backup. With the `vault` backend the backup holds the wrapped key and the server needs the same Vault settings and a Transit key version that can still unwrap it. `store restore` prints which of the two the backup holds; run `pistack keep status` to check before starting.
-- **Files outside the store.** `tls/`, `agent/` and the module directories are not touched. A certificate in `tls/` is reused as it is. If the cloud CA was made after the backup was taken, remove `tls/` so the server issues a new one, and enroll the agents again.
+- **Files outside the store.** `tls/`, `agent/` and the module directories are not touched. A certificate in `tls/` that the restored cloud CA did not issue is reused as it is, with a warning. If the cloud CA was made after the backup was taken, remove `tls/` so the server issues a new one, and enroll the agents again.
 
 ## Upgrades
 
