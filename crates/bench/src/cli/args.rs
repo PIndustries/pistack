@@ -88,6 +88,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: QuotaCmd,
     },
+    /// The audit log: who did what, from where, and how it ended (admin).
+    Audit {
+        #[command(subcommand)]
+        cmd: AuditCmd,
+    },
     /// Users and service accounts.
     User {
         #[command(subcommand)]
@@ -693,6 +698,50 @@ pub struct HostLabelArgs {
     /// Drop every label that is not given here.
     #[arg(long)]
     pub replace: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditCmd {
+    /// List audit records, newest first.
+    #[command(alias = "ls")]
+    List(AuditListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AuditListArgs {
+    /// Records from this time on: an RFC 3339 time, or an age such as 30m, 2h or 7d.
+    #[arg(long, value_name = "TIME")]
+    pub since: Option<String>,
+    /// Records before this time, given like --since.
+    #[arg(long, value_name = "TIME")]
+    pub until: Option<String>,
+    /// Principal name or id.
+    #[arg(long, value_name = "WHO")]
+    pub principal: Option<String>,
+    /// Project name or id of the token that made the request.
+    #[arg(long = "in-project", value_name = "PROJECT")]
+    pub in_project: Option<String>,
+    /// Action: create, update, delete, login, drain, update_quotas, ...
+    #[arg(long)]
+    pub action: Option<String>,
+    /// Resource kind as in the path: machines, bindings, hosts, ...
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Resource id or name, as the request gave it.
+    #[arg(long, value_name = "ID")]
+    pub resource: Option<String>,
+    /// `success`, `failure`, or one status code such as 403.
+    #[arg(long)]
+    pub outcome: Option<String>,
+    /// Most records to print.
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
+    /// Continue after this record id (the last one of the page before).
+    #[arg(long, value_name = "ID")]
+    pub after: Option<String>,
+    /// Oldest first instead of newest first.
+    #[arg(long)]
+    pub oldest_first: bool,
 }
 
 #[derive(Subcommand, Debug)]
