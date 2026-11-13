@@ -265,14 +265,19 @@ impl Client {
         meta.description = req.description;
         meta.labels = req.labels;
         meta.annotations = req.annotations;
-        Ok(self.images().create(Image {
+        let project = meta.project.clone();
+        let _admission = gate::quota::admission();
+        crate::usage::admit(&self.store, project.as_ref(), 1, 0)?;
+        let img = self.images().create(Image {
             meta,
             spec: req.spec,
             status: ImageStatus {
                 phase: Phase::Pending,
                 ..Default::default()
             },
-        })?)
+        })?;
+        crate::usage::mirror(&self.store, project.as_ref());
+        Ok(img)
     }
 
     pub fn update(
@@ -325,6 +330,7 @@ impl Client {
             }
         }
         self.images().delete(id)?;
+        crate::usage::refresh(&self.store, img.meta.project.as_ref());
         if let Some(r) = &img.status.backing_ref {
             self.release_blob(r).await?;
         }
@@ -350,6 +356,14 @@ impl Client {
     /// the result, rejects anything with a backing file.
     pub async fn upload(&self, id: &Id, data: ImageData) -> ApiResult<Image> {
         let col = self.images();
+        {
+            // The size is not known yet. A project with no room for even
+            // one byte is refused here, before the body is read; the real
+            // check comes once the bytes are stored.
+            let project = col.get(id)?.meta.project;
+            let _admission = gate::quota::admission();
+            crate::usage::admit(&self.store, project.as_ref(), 0, 1)?;
+        }
         let img = col.modify(id, |i| match i.status.phase {
             Phase::Pending | Phase::Error => {
                 i.status.phase = Phase::Creating;
@@ -405,7 +419,8 @@ impl Client {
             .local_path(&stored.reference)
             .filter(|p| p.is_file())
             .map(|p| p.to_string_lossy().into_owned());
-        Ok(col.modify(id, |i| {
+        let project = img.meta.project.as_ref();
+        let ready = |i: &mut Image| {
             i.status.phase = Phase::Ready;
             i.status.size_bytes = Some(stored.size);
             i.status.sha256 = Some(stored.sha256.clone());
@@ -436,7 +451,26 @@ impl Client {
                 ),
             }
             Ok(())
-        })?)
+        };
+        // The image takes its size in the same locked step that checks it.
+        let admitted = {
+            let _admission = gate::quota::admission();
+            match crate::usage::admit(&self.store, project, 0, stored.size) {
+                Ok(()) => {
+                    let img = col.modify(id, ready)?;
+                    crate::usage::mirror(&self.store, project);
+                    Ok(img)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        match admitted {
+            Ok(img) => Ok(img),
+            Err(e) => {
+                self.release_blob(&stored.reference).await?;
+                self.fail(id, "quota", e).await
+            }
+        }
     }
 
     async fn fail(&self, id: &Id, op: &str, e: ApiError) -> ApiResult<Image> {

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+gate.workspace = true
 silo.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
