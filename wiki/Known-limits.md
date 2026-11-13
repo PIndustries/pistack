@@ -30,6 +30,9 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Only the store is replicated.** Images, local volumes, objects and shares are files on one server's disk.
 - **The config file is mostly not applied.** Only `[modules.silo]` and `[modules.keep]` are read.
 - **No watch API.** Clients poll.
+- **Metrics have no history.** A server keeps the last 60 points of each series in memory, for at most an hour, and loses them when it restarts. History needs a Prometheus server scraping `/metrics`. See [Metrics and alarms](Metrics-and-alarms).
+- **Host and machine metrics are on the leader only.** Agents report to the leader, so after a failover the new leader starts with none and fills up within a heartbeat or two.
+- **Alarms fire on the first sample and tell nobody.** `for_seconds` is stored and ignored, and there are no notifications or webhooks.
 - **The audit log is for cloud admins only, and it is not complete.** A project member cannot read their own project's records. Ordinary reads, object uploads and a control-plane server joining are not recorded, and the client address is whatever connected to the server, so a proxy hides the real one. See [Identity and access](Identity-and-access#audit).
 - **A pod is not refused by a quota.** The machine behind a pod counts towards its project's `machines`, `vcpus`, `memory_mib` and `disk_gib`, but the pod controller creates it without checking the limits.
 - **Quota usage is shown from the last change.** The number `pi quota show` prints for a resource is written when something of that kind is created or deleted in the project. The check that refuses a request always counts the records.
@@ -46,7 +49,8 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **A machine with a local or LVM volume is not evacuated.** The volume was on the dead host.
 - **Pods pinned to a host by a volume are not drained or evacuated.**
 - **The web console has no host controls.** Label, disable, drain and evacuate are in `pi` and the API only.
-- **Free capacity is bookkeeping.** It is the reported total minus what was placed, not a measurement.
+- **Free capacity is bookkeeping.** It is the reported total minus what was placed, not a measurement. What a host really uses is reported as metrics and does not feed the scheduler.
+- **Only libvirt machines report usage.** Containers, cloud-hypervisor guests and bare metal have no CPU, memory, disk or network series.
 - **Container images are not pulled from registries.** An OCI image has to be uploaded as a tarball.
 
 ## Storage
@@ -74,7 +78,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 ## CLI
 
-- **No commands for** DNS, load balancers, secrets and certificates, buckets, shares, volume backups, or metrics. Use `pi api`.
+- **No commands for** DNS, load balancers, secrets and certificates, buckets, shares, volume backups, or alarms. Use `pi api`.
 - **`--project` does not re-scope a token.** A token's project is fixed at login.
 - **`pi machine list --all` does not cross projects** for a token scoped to a project.
 - **Dev mode creates resources with no project** when no token is sent. They are invisible after you log in.

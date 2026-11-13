@@ -117,6 +117,14 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 
 The leader enforces both every five minutes. See [Identity and access](Identity-and-access#audit).
 
+### Metrics
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_METRICS_TOKEN` | none | A bearer token that may read `/metrics` and nothing else, for a Prometheus server. At least 16 characters; a shorter one is ignored with a warning. Without it `/metrics` takes a cloud admin's token only. |
+
+See [Metrics and alarms](Metrics-and-alarms).
+
 ### Cluster and agent transport
 
 | Variable | Default | Meaning |

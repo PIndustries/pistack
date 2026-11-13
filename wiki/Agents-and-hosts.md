@@ -70,7 +70,7 @@ Because the name is kept in the file, renaming the machine does not change the h
 
 ## What the host reports
 
-At registration the agent reports the node name, vCPUs, memory, free disk, its runtimes and its underlay address. It then sends a heartbeat every 15 seconds with the machines it runs.
+At registration the agent reports the node name, vCPUs, memory, free disk, its runtimes and its underlay address. It then sends a heartbeat every 15 seconds with the machines it runs and what the host and those machines are using. See [Metrics and alarms](Metrics-and-alarms).
 
 ```sh
 pi host list
