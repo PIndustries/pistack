@@ -231,6 +231,7 @@ pi machine reboot <NAME>
 | `machine create` | `--ssh-key <KEY>` | SSH public key (repeatable); `@file` reads a file |
 | `machine create` | `--user-data <USER_DATA>` | cloud-init user data; `@file` reads a file |
 | `machine create` | `--host-selector <K=V>` | Host selector `key=value` (repeatable) |
+| `machine create` | `--zone <ZONE>` | Availability zone: only hosts labelled `zone=<ZONE>` |
 | `machine create` | `--wait` | Wait until the machine is ready (or failed) |
 | `machine start` | `--wait` |  |
 | `machine stop` | `--wait` |  |
@@ -286,7 +287,24 @@ Hosts (admin).
 ```text
 pi host list
 pi host show <NAME>
+pi host label <NAME> [K=V]...
+pi host disable <NAME>
+pi host enable <NAME>
+pi host drain <NAME>
+pi host evacuate <NAME>
 ```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `host label` | `[K=V]...` | Labels to set, `key=value` |
+| `host label` | `--remove <KEY>` | Label key to remove (repeatable) |
+| `host label` | `--replace` | Drop every label that is not given here |
+| `host disable` | `--reason <REASON>` | Why, shown by `pi host show` |
+| `host drain` | `--reason <REASON>` | Why, shown by `pi host show` |
+| `host evacuate` | `--rebuild-from-image` | Accept that every evacuated machine loses its root disk and starts again from its image. Without it no machine is moved |
+| `host evacuate` | `--confirm-dead` | The host is disabled but may still be reporting, and you know it is dead. If it is not, its machines will run twice until it reports |
+
+`host disable` stops new placements; the machines on the host keep running. `host drain` disables the host and live-migrates what it can. `host evacuate` is for a host that is down. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 
 ## pi cluster
 

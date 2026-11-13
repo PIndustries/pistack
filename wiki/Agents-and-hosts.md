@@ -78,19 +78,123 @@ pi host show agent1
 ```
 
 ```text
-NAME    ID             PHASE  NODE    VCPUS  FREE-VCPUS  MEMORY-MIB  FREE-MIB  DRIVERS  LAST-SEEN
-agent1  host-b35f1f72  ready  agent1  14     14          0           0         mock     2026-11-12T05:18:49.601670Z
+NAME    ID             PHASE  SCHEDULING  NODE    VCPUS  FREE-VCPUS  MEMORY-MIB  FREE-MIB  DRIVERS  ZONE  LAST-SEEN
+agent1  host-b35f1f72  ready  enabled     agent1  14     14          0           0         mock           2026-11-12T05:18:49.601670Z
 ```
 
 That output is from an agent on a Mac, which is why it shows the mock driver and no memory. The `DRIVERS` column lists the host's capabilities and the runtimes the agent selected. Free capacity is the reported total minus the sizes of the machines placed there; it is not measured on the host.
 
-A host that has not reported for 30 seconds goes to phase `error` with the message `no report for 30s`, and nothing new is placed on it. It returns to `ready` on its next report. Machines already on it are left alone.
+A host that has not reported for 30 seconds goes to phase `error` with the message `no report for 30s`, and nothing new is placed on it. It returns to `ready` on its next report. Machines already on it are left alone until an admin evacuates the host; see [Evacuate](#evacuate-a-dead-host).
 
 The underlay address is the address other hosts use to reach this one for overlay networking. The agent takes it from `PISTACK_UNDERLAY_IP`, or else from the source address of the route to the server. It must be a private address (10/8, 172.16/12, 192.168/16 or 100.64/10). A machine that names a network is only placed on a host that reported one.
 
-Hosts cannot be labelled, edited or removed through the API today. A machine's `--host-selector` therefore only matches the labels the server sets itself.
-
 The agent reads memory from `/proc/meminfo`. On a system without it the host reports 0 MiB and nothing fits.
+
+## Host maintenance
+
+Everything in this section needs a cloud admin. An `admin` of one project is refused.
+
+### Labels and zones
+
+```sh
+pi host label agent1 zone=west rack=r2
+pi host label agent1 --remove rack
+pi host label agent1 --replace zone=east
+```
+
+A label is a `key=value` pair on a host. Keys and values are 1 to 63 characters of letters, digits, `.`, `-`, `_` and `/`. `--remove` takes one label off. `--replace` drops every label not named on the command line.
+
+Labels that start with `pistack.io/` belong to PiStack. You cannot set them, and `--replace` keeps them.
+
+A machine's `--host-selector key=value` only matches a host that has that label.
+
+The label `zone` is the availability zone. `pi machine create --zone west` places the machine only on a host labelled `zone=west`. A host with no `zone` label is in no zone. A machine that asks for a zone no host has stays `pending` and says so.
+
+The API call is `PUT /compute/hosts/{id}/labels` with `{"labels": {...}}`. It replaces the whole set.
+
+### Disable and enable
+
+```sh
+pi host disable agent1 --reason "replacing a fan"
+pi host enable agent1
+```
+
+A disabled host gets no new machines. The machines on it keep running, and you can still stop, start, reboot and delete them. The host stays `ready`.
+
+`pi host list` shows `disabled` and the reason in the `SCHEDULING` column. `pi host show` shows `spec.disabled` and `spec.disabled_reason`.
+
+Disabling is the operator's setting. An agent restart does not clear it.
+
+### Drain
+
+```sh
+pi host drain agent1 --reason "kernel update"
+```
+
+```text
+host "agent1" disabled
+machine "web" migrating to agent2
+machine "cache" not moved: is a container; only a virtual machine can be live-migrated
+2 still on host "agent1": 1 migrating, 1 not moved. Run the command again to check.
+```
+
+Drain disables the host and then live-migrates its machines to other hosts. The scheduler picks each destination, so selectors, zones and sizes still apply.
+
+Drain never stops a machine. A machine it cannot move stays where it is, running, and is listed with the reason. These are not moved:
+
+- containers, pods and bare metal
+- a machine that is powered off or not `ready`
+- any machine when the host has no libvirt runtime
+- a machine no other host can take
+
+A migration takes time. The machine leaves the list when its new host reports it. Run the command again to see what is still on the host. Running it again is always safe: it does not start a second migration for a machine that is already moving.
+
+When a migration fails, the machine goes to phase `error` with the message from libvirt. It is still running on the old host.
+
+Live migration does not copy disks. The destination host must already see the machine's disk at the same path.
+
+When the work is done, `pi host enable agent1` puts the host back.
+
+### Evacuate a dead host
+
+```sh
+pi host evacuate agent1 --rebuild-from-image
+```
+
+```text
+WARNING: ROOT DISKS ARE LOST. The machines below start on other hosts from their images. What was on their root disks stayed on host "agent1" and is deleted when that host reports again.
+machine "web" evacuated: root disk lost, starts from image ubuntu-24.04; volumes plugged back in when it runs: blocks
+machine "db" skipped: volume scratch is on local storage on this host and cannot follow the machine
+1 evacuated, 1 skipped
+```
+
+Evacuate is for a host that is gone. It gives the host's machines back to the scheduler, which starts them on other hosts. Drain is for a host that works.
+
+**An evacuated machine loses its root disk.** The root disk is a file on the host. Nothing can copy it off a dead host. The machine starts again from its image. It keeps its name, its id and its ports on project networks, with their addresses. Anything written to the root disk is gone.
+
+Because of that, no machine is evacuated unless you pass `--rebuild-from-image`. Without the flag the command only lists what it would have to rebuild.
+
+What happens to volumes:
+
+- A volume on shared storage (an `rbd` volume type) follows the machine. It is plugged into the machine again once the machine runs on its new host.
+- A volume on `local` or `lvm` storage lived on the dead host. A machine with one is skipped and named.
+
+These are also skipped: bare metal machines, pods that are pinned to the host by their volumes, and machines that are being deleted or live-migrated.
+
+Evacuate only acts on:
+
+- a host in phase `error`, which means it stopped reporting, or
+- a disabled host, when you add `--confirm-dead`.
+
+It refuses a host that is up.
+
+**PiStack cannot power off a host.** Evacuate trusts you that the machines there are not running. If the host is only cut off from the control plane, its machines keep running there while new copies start elsewhere. Two copies then use the same addresses, and both write to any shared volume. Make sure the host is off before you evacuate it.
+
+When the host comes back, its agent still has the old copies. Each heartbeat reports them, and the control plane tells the agent to delete every machine that was evacuated off it. That removes the old root disks too. If you need data from an old root disk, copy it off the host before you start the agent there.
+
+A machine that was evacuated has the condition `Evacuated` and the annotation `pistack.io/evacuated-from`.
+
+Running the command again is safe. It only sees the machines that were skipped the first time.
 
 ## Runtimes
 
