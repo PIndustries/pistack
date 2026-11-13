@@ -353,7 +353,7 @@ mod tests {
 
             // A server with an id the backup never saw starts on it and leads.
             let LocalRole::Ready(ready) =
-                establish_local(&store, "fresh", "http://10.0.0.9:8443", true).unwrap()
+                establish_local(&store, "fresh", "http://10.0.0.9:8443", None, true).unwrap()
             else {
                 panic!("the restored store wants to join somebody");
             };
