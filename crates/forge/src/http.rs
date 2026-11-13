@@ -376,12 +376,10 @@ async fn create_machine(
     // change what the scheduler looks up.
     spec.size = size.meta.name.clone();
     spec.restarts = 0;
-    crate::usage::admit_create(&s.store, scope.project.as_ref())?;
     let mut m = new_machine(body.name, scope.project.clone(), spec);
     m.meta.description = body.description;
     m.meta.labels = body.labels;
-    let m = machines(&s).create(m)?;
-    crate::usage::note_create(&s.store, m.meta.project.as_ref());
+    let m = crate::usage::create(&s.store, m, &size.spec.resources)?;
     Ok(created(m))
 }
 
@@ -425,6 +423,25 @@ async fn update_machine(
         spec.size = size.meta.name.clone();
         // Reboot requests are made through the action endpoint, never by PUT.
         spec.restarts = m.spec.restarts;
+        if spec.size != m.spec.size {
+            // The only call that changes a machine's size. A size that is
+            // gone counted as nothing, so the new one is charged in full.
+            let from = sizes(&s)
+                .resolve(None, &m.spec.size)
+                .map(|old| old.spec.resources)
+                .unwrap_or_default();
+            let project = m.meta.project.clone();
+            m.spec = spec;
+            let write = || Ok(machines(&s).update(m, expected)?);
+            let m = crate::usage::resize(
+                &s.store,
+                project.as_ref(),
+                &from,
+                &size.spec.resources,
+                write,
+            )?;
+            return Ok(Json(m));
+        }
         m.spec = spec;
     }
     Ok(Json(machines(&s).update(m, expected)?))
