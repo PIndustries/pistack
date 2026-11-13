@@ -417,16 +417,10 @@ impl Reconciler {
                     .await?;
                     return Ok(());
                 };
-                let named_network = m.spec.networks.iter().any(|n| !n.trim().is_empty());
                 let pinned = pinned_hosts(&m, hosts);
                 let candidates = pinned.as_deref().unwrap_or(hosts);
-                let decided = if named_network && crate::ovn::enabled() {
-                    scheduler::place_on_ovn(&m.spec, &size, candidates, alloc, self.strategy)
-                } else if named_network {
-                    scheduler::place_on_segment(&m.spec, &size, candidates, alloc, self.strategy)
-                } else {
-                    scheduler::place(&m.spec, &size, candidates, alloc, self.strategy)
-                };
+                let decided =
+                    scheduler::place_networked(&m.spec, &size, candidates, alloc, self.strategy);
                 let host = match decided {
                     Ok(h) => h,
                     Err(e) => {

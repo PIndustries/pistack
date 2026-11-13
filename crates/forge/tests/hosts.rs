@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Host maintenance through the router: an admin labels, disables and
-//! enables hosts, and the scheduler follows.
+//! Host maintenance through the router: an admin labels, disables, enables
+//! and drains hosts, and the scheduler follows.
 
 use axum::{
     body::Body,
     http::{header, Request, StatusCode},
     Router,
 };
+use forge::maintain::DrainReport;
 use forge::{new_host, DriverRegistry, Forge, Host, Machine, MockDriver};
 use http_body_util::BodyExt;
+use pistack_rpc::proto::{CommandKind, CommandResult, Heartbeat, MachineReport, MigrateRequest};
+use pistack_rpc::{CommandQueue, QueueConfig};
 use pistack_store::Store;
 use pistack_types::{kind, Caller, Id, Module, ModuleContext, Phase, Resources};
 use serde::de::DeserializeOwned;
@@ -36,6 +39,11 @@ impl Drop for Harness {
 
 /// A control plane with no hosts. Requests need a caller.
 async fn harness() -> Harness {
+    harness_on(None).await
+}
+
+/// The same, with the agent transport when `queue` is given.
+async fn harness_on(queue: Option<CommandQueue>) -> Harness {
     let store = Store::in_memory().unwrap();
     let shutdown = CancellationToken::new();
     let ctx = ModuleContext {
@@ -47,7 +55,10 @@ async fn harness() -> Harness {
         leadership: pistack_types::Leadership::always(),
     };
     let drivers = Arc::new(DriverRegistry::new());
-    let forge = Forge::with_registry(drivers.clone());
+    let forge = match queue {
+        Some(queue) => Forge::with_queue(drivers.clone(), queue),
+        None => Forge::with_registry(drivers.clone()),
+    };
     let app = forge.router(ctx.clone());
     Forge::seed_sizes(&store).unwrap();
     forge.start(ctx).await.unwrap();
@@ -62,24 +73,33 @@ async fn harness() -> Harness {
 impl Harness {
     /// A ready host served by a mock driver in this process.
     fn add_host(&self, name: &str) -> (Host, Arc<MockDriver>) {
+        self.add_host_with(name, &["mock"], None)
+    }
+
+    /// The same, advertising `drivers` and an underlay address. The mock
+    /// still does the work, so a host can claim libvirt.
+    fn add_host_with(
+        &self,
+        name: &str,
+        drivers: &[&str],
+        underlay: Option<&str>,
+    ) -> (Host, Arc<MockDriver>) {
         let mut labels = BTreeMap::new();
         labels.insert("pistack.io/agent".to_owned(), "true".to_owned());
-        let host = self
-            .store
-            .collection::<Host>()
-            .create(new_host(
-                name,
-                name,
-                Resources {
-                    vcpus: 8,
-                    memory_mib: 16384,
-                    disk_gib: 200,
-                    gpus: 0,
-                },
-                vec!["mock".into()],
-                labels,
-            ))
-            .unwrap();
+        let mut host = new_host(
+            name,
+            name,
+            Resources {
+                vcpus: 8,
+                memory_mib: 16384,
+                disk_gib: 200,
+                gpus: 0,
+            },
+            drivers.iter().map(|d| d.to_string()).collect(),
+            labels,
+        );
+        host.spec.underlay_ip = underlay.map(str::to_owned);
+        let host = self.store.collection::<Host>().create(host).unwrap();
         let driver = Arc::new(MockDriver::new());
         self.drivers
             .register_local(host.meta.id.clone(), driver.clone());
@@ -440,4 +460,169 @@ async fn a_disabled_host_keeps_its_machines_and_takes_no_new_ones() {
     assert!(!host.spec.disabled);
     assert!(host.spec.disabled_reason.is_empty());
     assert_eq!(h.ready_on(&waiting.meta.id).await, a.meta.id);
+}
+
+fn names(left: &[forge::maintain::Left]) -> Vec<(&str, &str)> {
+    left.iter()
+        .map(|l| (l.name.as_str(), l.reason.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn drain_migrates_what_it_can_and_reports_the_rest() {
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(30),
+        ..QueueConfig::default()
+    });
+    let h = harness_on(Some(queue.clone())).await;
+    let vm_host = ["kvm", "libvirt", "youki"];
+    let (src, src_driver) = h.add_host_with("src", &vm_host, Some("10.1.0.1"));
+    let (dst, _) = h.add_host_with("dst", &vm_host, Some("10.1.0.2"));
+
+    // Everything starts on src: dst is closed while the machines are made.
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/dst/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = raw(
+        &h.app,
+        &admin(),
+        "PUT",
+        "/hosts/src/labels",
+        Some(json!({"labels": {"rack": "r1"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let web = h.machine("web", vm(json!({}))).await;
+    let off = h.machine("off", vm(json!({}))).await;
+    let pod = h.machine("pod", vm(json!({"kind": "container"}))).await;
+    let tied = h
+        .machine("tied", vm(json!({"host_selector": {"rack": "r1"}})))
+        .await;
+    for m in [&web, &off, &pod, &tied] {
+        assert_eq!(h.ready_on(&m.meta.id).await, src.meta.id);
+    }
+    let (st, _) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        &format!("/machines/{}/stop", off.meta.id),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    h.wait(&off.meta.id, |m| m.status.power == forge::PowerState::Off)
+        .await;
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/dst/enable", None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = raw(&h.app, &project_admin(), "POST", "/hosts/src/drain", None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(queue.pending_count(), 0);
+
+    let (st, report) =
+        call::<DrainReport>(&h.app, &admin(), "POST", "/hosts/src/drain", None).await;
+    assert_eq!(st, StatusCode::OK);
+    // Draining disables the host and says why.
+    assert!(report.host.spec.disabled);
+    assert_eq!(report.host.spec.disabled_reason, "draining");
+    // The running VM is on its way to the other host.
+    assert_eq!(report.migrating.len(), 1, "{report:?}");
+    assert_eq!(report.migrating[0].id, web.meta.id);
+    assert_eq!(report.migrating[0].to, dst.meta.id);
+    assert_eq!(report.migrating[0].to_name, "dst");
+    // The rest are named with the reason, in id order.
+    let left = names(&report.not_moved);
+    assert_eq!(left.len(), 3, "{left:?}");
+    assert_eq!(left[0].0, "off");
+    assert!(left[0].1.contains("powered off"), "{left:?}");
+    assert_eq!(left[1].0, "pod");
+    assert!(left[1].1.contains("container"), "{left:?}");
+    assert_eq!(left[2].0, "tied");
+    assert!(left[2].1.contains("selector"), "{left:?}");
+
+    // One migrate command went to the source host's agent.
+    let cmds = queue.next("src", Duration::from_secs(1), 8).await;
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].kind, CommandKind::MigrateMachine);
+    let req: MigrateRequest = serde_json::from_value(cmds[0].payload.clone()).unwrap();
+    assert_eq!(req.id, web.meta.id);
+    assert_eq!(req.dest, "qemu+ssh://10.1.0.2/system");
+
+    // Running it again starts nothing new and gives the same account.
+    let (st, again) = call::<DrainReport>(&h.app, &admin(), "POST", "/hosts/src/drain", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(again.migrating, report.migrating);
+    assert_eq!(again.not_moved, report.not_moved);
+    assert!(queue
+        .next("src", Duration::from_millis(100), 8)
+        .await
+        .is_empty());
+
+    // The agent finishes and the destination reports the machine.
+    queue.ack("src", CommandResult::ok(cmds[0].id)).unwrap();
+    forge::Registrar::new(h.store.clone(), h.drivers.clone(), queue.clone())
+        .on_heartbeat(&Heartbeat {
+            node_name: "dst".into(),
+            resources_free: Default::default(),
+            machines: vec![MachineReport {
+                id: web.meta.id.clone(),
+                phase: Phase::Ready,
+                message: String::new(),
+                resources: None,
+                addresses: vec![],
+                power: Some(pistack_rpc::proto::PowerState::On),
+                probes: vec![],
+            }],
+            at: chrono::Utc::now(),
+            ovn: None,
+        })
+        .unwrap();
+    let moved = h
+        .wait(&web.meta.id, |m| m.status.phase == Phase::Ready)
+        .await;
+    assert_eq!(moved.status.host.as_ref(), Some(&dst.meta.id));
+
+    // A third run has nothing to migrate. What could not move was not
+    // stopped: it is still on the host, in the state it was in.
+    let (_, last) = call::<DrainReport>(&h.app, &admin(), "POST", "/hosts/src/drain", None).await;
+    assert!(last.migrating.is_empty(), "{last:?}");
+    assert_eq!(last.not_moved, report.not_moved);
+    for m in [&pod, &tied] {
+        let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
+        assert_eq!(m.status.phase, Phase::Ready);
+        assert_eq!(m.status.power, forge::PowerState::On);
+        assert_eq!(m.status.host.as_ref(), Some(&src.meta.id));
+    }
+    assert_eq!(src_driver.len(), 4);
+    // A reason given later replaces the default one.
+    let (_, named) = call::<DrainReport>(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/src/drain",
+        Some(json!({"reason": "kernel update"})),
+    )
+    .await;
+    assert_eq!(named.host.spec.disabled_reason, "kernel update");
+}
+
+#[tokio::test]
+async fn drain_without_live_migration_moves_nothing_and_says_so() {
+    // Dev mode shape: mock hosts and no agent transport.
+    let h = harness().await;
+    let (a, a_driver) = h.add_host("a");
+    let m = h.machine("only", vm(json!({}))).await;
+    assert_eq!(h.ready_on(&m.meta.id).await, a.meta.id);
+    h.add_host("b");
+
+    let (st, report) = call::<DrainReport>(&h.app, &admin(), "POST", "/hosts/a/drain", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(report.host.spec.disabled);
+    assert!(report.migrating.is_empty());
+    let left = names(&report.not_moved);
+    assert_eq!(left.len(), 1);
+    assert!(left[0].1.contains("libvirt"), "{left:?}");
+    let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
+    assert_eq!(m.status.phase, Phase::Ready);
+    assert_eq!(m.status.host.as_ref(), Some(&a.meta.id));
+    assert_eq!(a_driver.len(), 1);
 }

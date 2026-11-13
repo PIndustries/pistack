@@ -9,6 +9,7 @@
 //! the resource as stored and the client polls `status.phase`.
 //! Live migration is the exception: it enqueues on the source node and only
 //! then records the destination on `status`, so port binding can follow.
+//! Draining a host starts live migrations the same way.
 //!
 //! Project scoping reads `pistack_types::Caller` from request extensions
 //! when the gateway's auth layer attached one. With no `Caller` the request
@@ -42,6 +43,8 @@ pub struct AppState {
     pub dev_admin: bool,
     /// Agent transport. Absent in dev mode; live migration is refused then.
     pub queue: Option<CommandQueue>,
+    /// How a drain picks destinations. The reconciler's own strategy.
+    pub strategy: crate::scheduler::Strategy,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -63,6 +66,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/{id}/labels", put(set_host_labels))
         .route("/hosts/{id}/disable", post(disable_host))
         .route("/hosts/{id}/enable", post(enable_host))
+        .route("/hosts/{id}/drain", post(drain_host))
         .route("/sizes", get(list_sizes).post(create_size))
         .route(
             "/sizes/{id}",
@@ -696,6 +700,30 @@ async fn enable_host(
     Ok(Json(host))
 }
 
+/// Disable the host, then live-migrate what can be live-migrated. What
+/// cannot is reported and left running. Calling it again is how an operator
+/// sees what is still there.
+async fn drain_host(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<crate::maintain::DrainReport>> {
+    scope.require_admin()?;
+    let body: DisableHost = optional_body(&body)?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let reason =
+        clean_reason(body.reason)?.or_else(|| (!host.spec.disabled).then(|| "draining".to_owned()));
+    let host = set_disabled(&s, &host.meta.id, reason)?;
+    let (migrating, not_moved) =
+        crate::maintain::drain(&s.store, s.queue.as_ref(), s.strategy, &host)?;
+    Ok(Json(crate::maintain::DrainReport {
+        host,
+        migrating,
+        not_moved,
+    }))
+}
+
 // ---- sizes -------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -905,6 +933,7 @@ mod tests {
             drivers: Arc::new(DriverRegistry::new()),
             dev_admin: true,
             queue: Some(queue.clone()),
+            strategy: Default::default(),
         });
 
         async fn post(app: &axum::Router, path: &str, host: &str) -> (StatusCode, Vec<u8>) {
