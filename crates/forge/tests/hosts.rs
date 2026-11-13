@@ -955,3 +955,46 @@ async fn a_disabled_host_is_evacuated_only_when_confirmed_dead() {
     let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
     assert!(m.status.message.is_empty(), "{}", m.status.message);
 }
+
+#[tokio::test]
+async fn a_host_shows_when_its_agent_certificate_expires() {
+    let h = harness().await;
+    h.add_host("a");
+    h.add_host("b");
+    let keep = keep::Client::open(&h.store).unwrap();
+    let serial = |pki: &keep::Pki| {
+        keep::ca::serial_from_der(&keep::ca::pem_to_der(&pki.cert_pem).unwrap()).unwrap()
+    };
+    let first = serial(&keep.issue_client_cert("a").unwrap());
+    let record = keep.managed_certificate(first).unwrap().unwrap();
+
+    let (st, host) = call::<Host>(&h.app, &admin(), "GET", "/hosts/a", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(host.status.cert_expires.is_some());
+    assert_eq!(host.status.cert_expires, record.status.not_after);
+    // A host that never enrolled has none, and the field is left out.
+    let (_, body) = raw(&h.app, &admin(), "GET", "/hosts/b", None).await;
+    let body = String::from_utf8(body).unwrap();
+    assert!(!body.contains("cert_expires"), "{body}");
+
+    let (_, page) =
+        call::<pistack_types::Page<Host>>(&h.app, &admin(), "GET", "/hosts", None).await;
+    let of = |name: &str| {
+        page.items
+            .iter()
+            .find(|x| x.meta.name == name)
+            .unwrap()
+            .status
+            .cert_expires
+    };
+    assert_eq!(of("a"), record.status.not_after);
+    assert_eq!(of("b"), None);
+
+    // The date is read from keep each time and never written to the host.
+    let stored = h.store.collection::<Host>().resolve(None, "a").unwrap();
+    assert_eq!(stored.status.cert_expires, None);
+    // Revoked with nothing newer: the host has no certificate to show.
+    keep.revoke_certificate(&record.meta.id).unwrap();
+    let (_, host) = call::<Host>(&h.app, &admin(), "GET", "/hosts/a", None).await;
+    assert_eq!(host.status.cert_expires, None);
+}

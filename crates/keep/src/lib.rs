@@ -40,7 +40,9 @@
 //! leadership split.
 //!
 //! Background work (`sweep.rs`): the leader deletes join tokens that have
-//! been expired or used up for `join_token_grace_secs` (default 7 days).
+//! been expired or used up for `join_token_grace_secs` (default 7 days),
+//! and warns about an agent or server certificate that is past its renewal
+//! point and has not been renewed.
 //!
 //! HTTP lives under the `secrets` prefix; see `api.rs`.
 
@@ -69,7 +71,7 @@ use std::sync::OnceLock;
 pub use access_key::{AccessKey, AccessKeyCredential, CreatedAccessKey};
 pub use backend::KeyBackend;
 pub use ca::{Ca, Issued};
-pub use client::{managed_cert_role, Client};
+pub use client::{agent_cert_expiry, managed_cert_role, Client};
 pub use crypto::{RootKey, Sealed};
 pub use error::{KeepError, Result};
 pub use join::{

@@ -606,7 +606,27 @@ async fn list_hosts(
     List(q): List,
 ) -> ApiResult<Json<Page<Host>>> {
     scope.require_admin()?;
-    Ok(Json(paginate(hosts(&s).list(None)?, &q)))
+    let mut all = hosts(&s).list(None)?;
+    let certs = agent_certs(&s);
+    for h in &mut all {
+        h.status.cert_expires = keep::agent_cert_expiry(&certs, &h.spec.node_name);
+    }
+    Ok(Json(paginate(all, &q)))
+}
+
+/// The certificates a host's expiry is read from. A list that cannot be
+/// read leaves the column empty and does not fail the request.
+fn agent_certs(s: &AppState) -> Vec<keep::Certificate> {
+    s.store
+        .collection::<keep::Certificate>()
+        .list(None)
+        .unwrap_or_default()
+}
+
+/// `host` as the API shows it: with its certificate's expiry.
+fn shown(s: &AppState, mut host: Host) -> Host {
+    host.status.cert_expires = keep::agent_cert_expiry(&agent_certs(s), &host.spec.node_name);
+    host
 }
 
 async fn get_host(
@@ -615,7 +635,7 @@ async fn get_host(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Host>> {
     scope.require_admin()?;
-    Ok(Json(hosts(&s).resolve(None, &id)?))
+    Ok(Json(shown(&s, hosts(&s).resolve(None, &id)?)))
 }
 
 /// What the host is using now, as its agent last reported it.

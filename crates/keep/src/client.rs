@@ -641,6 +641,23 @@ pub fn managed_cert_role(c: &Certificate) -> Option<&'static str> {
     })
 }
 
+/// When the agent certificate of `node` expires: the newest one issued for
+/// that name that is not revoked. `None` for a host with no certificate.
+pub fn agent_cert_expiry(
+    certs: &[Certificate],
+    node: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    certs
+        .iter()
+        .filter(|c| {
+            managed_cert_role(c) == Some(ROLE_AGENT)
+                && c.spec.common_name == node
+                && !c.status.revoked
+        })
+        .max_by_key(|c| c.status.serial)
+        .and_then(|c| c.status.not_after)
+}
+
 fn sanitize(cn: &str) -> String {
     let s: String = cn
         .chars()
@@ -753,6 +770,10 @@ mod tests {
         assert_eq!(rec.spec.common_name, "n1");
         assert_eq!(rec.spec.usage, CertUsage::Client);
         assert_eq!(managed_cert_role(&rec), Some(ROLE_AGENT));
+        // What the host list shows is the new one's last day.
+        let all = c.list_certificates(None).unwrap();
+        assert_eq!(agent_cert_expiry(&all, "n1"), rec.status.not_after);
+        assert_eq!(agent_cert_expiry(&all, "n9"), None);
         // Both verify: the old one is kept until the new one works.
         assert_eq!(
             c.managed_certificate(old)

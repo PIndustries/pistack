@@ -137,6 +137,11 @@ pub struct HostStatus {
     /// network only where this says ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ovn: Option<pistack_rpc::OvnReport>,
+    /// When the agent's client certificate expires. Not stored: the host
+    /// routes fill it in from keep's certificate records on every read.
+    /// None for a host that never enrolled (the dev-mode local host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_expires: Option<DateTime<Utc>>,
 }
 
 impl HostStatus {
