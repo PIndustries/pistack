@@ -36,6 +36,7 @@ Done
 - Quota per project on machines, vCPUs, RAM and root disk
 - cloud-init user data and SSH keys on libvirt
 - Metadata service, EC2 layout, on overlay and hostnat
+- Metadata service on OVN, through a namespace per network on each host: written and unit-tested, not yet run on hosts
 - Live migration on libvirt (no CLI)
 - Scheduler: host filters, label selector, spread weights
 - Per-host resource accounting; a host that misses heartbeats is marked down
@@ -59,7 +60,6 @@ Partial
 - Root disk: one copy-on-write disk on libvirt; no extra ephemeral or swap disks
 - GPU: in sizes and the scheduler; hosts always report zero and there is no passthrough
 - Bare metal: power and PXE boot; does not write an image, no inspection or enrollment
-- Metadata service on OVN: no path from the guest
 
 Missing
 - Resize
@@ -344,5 +344,5 @@ Missing
 
 1. Merge and prove PRs 109 and 110 on real Ceph and LVM. Fix what the three-server run found. Cut the first build.
 2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, evacuation.
-3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, metadata on OVN, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
+3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
 4. Long tail, on request: GPU and passthrough, UEFI and vTPM, bare metal deploy, trunks, QoS, VPN, BGP, DNSSEC, erasure coding, regions, billing.
