@@ -80,6 +80,15 @@ pub struct NetworkSpec {
     pub external: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_domain: Option<String>,
+    /// Give every machine that has an IPv4 a floating IP from this network
+    /// without being asked. Off unless set. Only an external network can
+    /// carry it, and only one network in the cloud at a time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_floating_ip: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_mtu() -> u16 {
@@ -93,6 +102,7 @@ impl Default for NetworkSpec {
             mtu: default_mtu(),
             external: false,
             dns_domain: None,
+            auto_floating_ip: false,
         }
     }
 }

@@ -160,6 +160,9 @@ impl Client {
     pub fn create_network(&self, mut meta: Meta, spec: NetworkSpec) -> ApiResult<Network> {
         meta.id = Id::new(kind::NETWORK);
         validate_network(&spec)?;
+        if spec.auto_floating_ip {
+            self.only_auto_fip_network(&meta.id)?;
+        }
         let net = Network {
             meta,
             spec,
@@ -187,7 +190,28 @@ impl Client {
         if next.spec.kind != cur.spec.kind {
             return Err(ApiError::bad_request("network kind is immutable"));
         }
+        if next.spec.auto_floating_ip && !cur.spec.auto_floating_ip {
+            self.only_auto_fip_network(id)?;
+        }
         self.networks().update(next, expected).map_err(store_err)
+    }
+
+    /// Refuse to mark a second network for automatic floating IPs: which
+    /// pool a machine draws from must not depend on the order of two ids.
+    fn only_auto_fip_network(&self, id: &Id) -> ApiResult<()> {
+        let other = self
+            .networks()
+            .list(None)
+            .map_err(store_err)?
+            .into_iter()
+            .find(|n| n.spec.auto_floating_ip && &n.meta.id != id);
+        match other {
+            Some(n) => Err(ApiError::conflict(format!(
+                "network '{}' ({}) already gives out automatic floating ips; turn it off there first",
+                n.meta.name, n.meta.id
+            ))),
+            None => Ok(()),
+        }
     }
 
     pub fn delete_network(&self, id: &Id) -> ApiResult<Network> {
@@ -1242,6 +1266,11 @@ fn validate_network(spec: &NetworkSpec) -> ApiResult<()> {
         if physnet.is_empty() {
             return Err(ApiError::bad_request("provider network needs a physnet"));
         }
+    }
+    if spec.auto_floating_ip && !spec.external {
+        return Err(ApiError::bad_request(
+            "auto_floating_ip needs an external network",
+        ));
     }
     Ok(())
 }
