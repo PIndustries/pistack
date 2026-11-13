@@ -754,17 +754,21 @@ impl Store {
     }
 
     /// Apply follower entries. Recording is off for the duration, then restored.
-    /// Each entry's index must be one past the commit index. Each entry is
-    /// applied, kept as a log row with its original term, and committed in
-    /// one transaction, so a follower that later leads can serve it and votes
-    /// compare real terms. A gap leaves earlier entries applied and returns
-    /// `StoreError::Conflict`.
+    /// Each entry's index must be one past the one before it. Each entry is
+    /// applied and kept as a log row with its original term, so a follower
+    /// that later leads can serve it and votes compare real terms. The
+    /// entries are committed together: a gap applies none of them and
+    /// returns `StoreError::Conflict`.
     pub fn apply_entries(&self, entries: &[LogEntry]) -> Result<()> {
         let prev = self.backend.record_log();
         self.set_record_log(false);
         self.backend.set_applying(true);
+        // The whole page goes in one commit. A commit per entry costs a disk
+        // sync each, the same price the leader paid to write it, so a
+        // follower that fell behind a busy leader never caught up.
         let result = (|| {
             let mut have = self.commit_index()?;
+            let mut ops: Vec<Op> = Vec::new();
             for entry in entries {
                 if entry.index != have + 1 {
                     return Err(StoreError::Conflict(format!(
@@ -772,21 +776,23 @@ impl Store {
                         entry.index
                     )));
                 }
-                let mut ops: Vec<Op> = entry.ops.iter().map(op_from_log).collect();
+                ops.extend(entry.ops.iter().map(op_from_log));
                 ops.push(Op::Put {
                     table: "meta".into(),
                     key: log_key(entry.index),
                     value: serde_json::to_vec(entry)?,
                 });
-                ops.push(Op::Put {
-                    table: "meta".into(),
-                    key: "cluster_commit".into(),
-                    value: serde_json::to_vec(&entry.index)?,
-                });
-                self.backend.batch(ops)?;
                 have = entry.index;
             }
-            Ok(())
+            if ops.is_empty() {
+                return Ok(());
+            }
+            ops.push(Op::Put {
+                table: "meta".into(),
+                key: "cluster_commit".into(),
+                value: serde_json::to_vec(&have)?,
+            });
+            self.backend.batch(ops)
         })();
         self.backend.set_applying(false);
         self.set_record_log(prev);
@@ -1331,6 +1337,43 @@ mod tests {
         assert_eq!(b.log_term_at(1).unwrap(), Some(log[0].term));
         assert_eq!(b.log_term_at(2).unwrap(), None);
         assert_eq!(b.commit_index().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_page_is_applied_in_order_and_all_or_nothing() {
+        let put = |index: u64, value: &str| LogEntry {
+            index,
+            term: 2,
+            ops: vec![LogOp {
+                table: "meta".into(),
+                key: "cluster_id".into(),
+                value: Some(serde_json::to_vec(value).unwrap()),
+            }],
+        };
+        let store = Store::in_memory().unwrap();
+        let page = [put(1, "first"), put(2, "second"), put(3, "third")];
+        store.apply_entries(&page).unwrap();
+        assert_eq!(
+            store.get_meta::<String>("cluster_id").unwrap().as_deref(),
+            Some("third"),
+            "a later entry in the page wins"
+        );
+        assert_eq!(store.commit_index().unwrap(), 3);
+        assert_eq!(store.read_log(0, 10).unwrap(), page);
+
+        // Entry 6 is missing: 4 and 5 are not applied either.
+        let holed = [put(4, "fourth"), put(5, "fifth"), put(7, "seventh")];
+        let err = store.apply_entries(&holed).unwrap_err();
+        assert!(err.to_string().contains("gap"), "{err}");
+        assert_eq!(store.commit_index().unwrap(), 3);
+        assert_eq!(
+            store.get_meta::<String>("cluster_id").unwrap().as_deref(),
+            Some("third")
+        );
+        assert_eq!(store.read_log(3, 10).unwrap(), []);
+
+        store.apply_entries(&[]).unwrap();
+        assert_eq!(store.commit_index().unwrap(), 3);
     }
 
     #[test]
