@@ -102,10 +102,13 @@ impl Client {
                 phase: Phase::Ready,
             },
         };
-        self.store
-            .collection::<Bucket>()
-            .create(bucket)
-            .map_err(Into::into)
+        let project = bucket.meta.project.clone();
+        crate::usage::admitted(&self.store, project.as_ref(), || {
+            self.store
+                .collection::<Bucket>()
+                .create(bucket)
+                .map_err(Into::into)
+        })
     }
 
     pub fn get_bucket(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Bucket> {
@@ -134,10 +137,9 @@ impl Client {
         for obj in self.objects_for_bucket(&bucket)? {
             self.store.collection::<Object>().delete(&obj.meta.id)?;
         }
-        self.store
-            .collection::<Bucket>()
-            .delete(id)
-            .map_err(Into::into)
+        let bucket = self.store.collection::<Bucket>().delete(id)?;
+        crate::usage::released(&self.store, bucket.meta.project.as_ref());
+        Ok(bucket)
     }
 
     /// Path of the current bytes for `key`, after the key is checked.

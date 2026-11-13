@@ -40,6 +40,7 @@
 //! * [`copy`] — UploadPartCopy source/range/conditional helpers.
 //! * [`delimiter`] — shared ListObjectsV2 / ListMultipartUploads delimiter helpers.
 //! * [`chunked`] — aws-chunked body decode (signed chunks and trailers).
+//! * [`usage`] — the project's `buckets` quota.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -58,6 +59,7 @@ pub mod replica;
 pub mod s3;
 pub mod sigv4;
 pub mod types;
+pub mod usage;
 
 pub use client::Client;
 pub use replica::Peers;
