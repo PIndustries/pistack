@@ -649,6 +649,7 @@ async fn version(ctx: &Ctx, io: &mut Io<'_>) -> CliResult<()> {
                 "server": server.as_ref().map(|s| json!({
                     "version": str_at(s, "/version"),
                     "url": str_at(s, "/public_url"),
+                    "store_schema": s.pointer("/store_schema").cloned().unwrap_or(Value::Null),
                     "dev_mode": s.pointer("/dev_mode").cloned().unwrap_or(Value::Null),
                 })),
             });
@@ -663,9 +664,14 @@ async fn version(ctx: &Ctx, io: &mut Io<'_>) -> CliResult<()> {
                     } else {
                         ""
                     };
+                    // Servers before the schema marker do not report one.
+                    let schema = match s.pointer("/store_schema").and_then(Value::as_u64) {
+                        Some(v) => format!(", store schema {v}"),
+                        None => String::new(),
+                    };
                     writeln!(
                         io.stdout,
-                        "pistack {} at {}{dev}",
+                        "pistack {} at {}{dev}{schema}",
                         str_at(&s, "/version"),
                         str_at(&s, "/public_url")
                     )?;

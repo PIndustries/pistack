@@ -39,6 +39,8 @@ use tower_http::{
 struct Discovery {
     name: &'static str,
     version: &'static str,
+    /// Schema version of this server's store.
+    store_schema: u32,
     public_url: String,
     dev_mode: bool,
     modules: Vec<ModuleEntry>,
@@ -92,6 +94,9 @@ pub fn build(
     let discovery = Discovery {
         name: "pistack",
         version: env!("CARGO_PKG_VERSION"),
+        store_schema: store
+            .schema_version()
+            .unwrap_or(pistack_store::SCHEMA_VERSION),
         public_url: ctx.public_url.clone(),
         dev_mode: dev,
         modules: entries,
