@@ -391,6 +391,7 @@ const VIEWS = {
       ["Phase", i => i.status && i.status.phase],
       ["Type", i => i.spec && i.spec.kind && i.spec.kind.type],
       ["External", i => i.spec && String(!!i.spec.external)],
+      ["Auto floating IP", i => i.spec && String(!!i.spec.auto_floating_ip)],
     ],
   },
   subnets: {
@@ -1075,7 +1076,7 @@ function createForm() {
     const netRow = el("div"); netRow.className = "row";
     netRow.append(field("Network", network), field("Security group", group));
     form.append(row, netRow, field("SSH public key", key), field("User data", userData));
-    form.append(el("p", "When the guest gets an address, the fleet pool gives it a floating IP and the auto DNS zone publishes its name.", "sub"));
+    form.append(el("p", "A machine gets no floating IP on its own. If an admin has marked an external network for automatic floating IPs, the guest gets one from it when it has an address, and the auto DNS zone publishes its name.", "sub"));
     form.append(el("p", "Name a network to boot on that project's bridge. A router on that network NATs the guest. The address on the port is the address the guest uses.", "sub"));
     const go = el("button", "Create machine"); go.className = "primary"; go.type = "submit";
     form.append(go);

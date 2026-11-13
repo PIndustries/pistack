@@ -1819,10 +1819,28 @@ async fn network(ctx: &Ctx, cmd: NetworkCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "kind": kind_v,
                 "mtu": a.mtu,
                 "external": a.external,
+                "auto_floating_ip": a.auto_floating_ip,
                 "dns_domain": opt(a.dns_domain),
             });
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, false).await.map(|_| ())
+        }
+        NetworkCmd::Set(a) => {
+            // The update replaces the spec, so send back what is there.
+            let c = ctx.client()?;
+            let path = k.item_path(&a.name);
+            let cur = c.get_value(&path).await?;
+            let mut spec = cur.get("spec").cloned().unwrap_or_else(|| json!({}));
+            if let Some(fields) = spec.as_object_mut() {
+                fields.insert("auto_floating_ip".into(), json!(a.auto_floating_ip));
+            }
+            let body = json!({ "spec": spec });
+            let revision = cur.get("revision").map(|r| r.to_string());
+            let v = match revision {
+                Some(rev) => c.put_if_match(&path, &body, &rev).await?,
+                None => c.put(&path, &body).await?,
+            };
+            report(ctx, io, k, &v, "updated")
         }
     }
 }

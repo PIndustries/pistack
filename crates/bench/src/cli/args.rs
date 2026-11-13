@@ -800,10 +800,29 @@ pub struct NetworkCreate {
     /// External network: routers get gateways and floating IPs here.
     #[arg(long)]
     pub external: bool,
+    /// Give every machine a floating IP from this network without being
+    /// asked. Admin only; needs --external; one network at a time.
+    #[arg(long, requires = "external")]
+    pub auto_floating_ip: bool,
     #[arg(long)]
     pub dns_domain: Option<String>,
 }
-crud!(NetworkCmd, NetworkCreate);
+
+#[derive(Args, Debug)]
+pub struct NetworkSet {
+    /// Name or id.
+    pub name: String,
+    /// Turn automatic floating IPs from this external network on or off.
+    /// Turning it off leaves the floating IPs already given in place.
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set, required = true)]
+    pub auto_floating_ip: bool,
+}
+crud!(
+    NetworkCmd,
+    NetworkCreate,
+    /// Change a setting of a network.
+    Set(NetworkSet)
+);
 
 #[derive(Args, Debug)]
 pub struct SubnetCreate {
