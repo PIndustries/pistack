@@ -372,6 +372,21 @@ async fn provider_failure_lands_in_status_and_retries() {
         .wait_lb(&lb.meta.id, |b| b.status.phase == Phase::Error)
         .await;
     assert_eq!(lb.status.message, "ovn unreachable");
+    // The failure is written once. Its own event must not start another
+    // attempt, or a broken balancer writes its status without end.
+    let event = pistack_types::Event {
+        kind: kind::BALANCER.to_owned(),
+        id: lb.meta.id.clone(),
+        project: lb.meta.project.clone(),
+        action: pistack_types::EventAction::Updated,
+        revision: lb.meta.revision,
+        at: lb.meta.updated_at,
+    };
+    for _ in 0..3 {
+        h.client.handle_event(&event).await;
+    }
+    let settled = h.client.balancers().get(&lb.meta.id).unwrap();
+    assert_eq!(settled.meta.revision, lb.meta.revision);
     h.provider.set_failure(None);
     h.client.reconcile_pending().await;
     let lb = h
