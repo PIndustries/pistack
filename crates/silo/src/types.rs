@@ -47,6 +47,10 @@ pub struct SiloConfig {
     /// [`crate::replica::REPLICATE_INTERVAL_SECS`]). `0` turns the pull
     /// off; a read still fetches what it needs.
     pub replicate_interval_secs: u64,
+    /// Servers that must hold an object's bytes before a put is answered
+    /// (default [`crate::replica::PUT_COPIES`]). `1` answers as soon as
+    /// this server has them. A cluster of one server never waits.
+    pub put_copies: u32,
 }
 
 impl Default for SiloConfig {
@@ -56,6 +60,7 @@ impl Default for SiloConfig {
             multipart_ttl_secs: MULTIPART_TTL_SECS,
             region: DEFAULT_REGION.to_owned(),
             replicate_interval_secs: crate::replica::REPLICATE_INTERVAL_SECS,
+            put_copies: crate::replica::PUT_COPIES,
         }
     }
 }
@@ -76,6 +81,9 @@ impl SiloConfig {
         }
         if self.region.trim().is_empty() {
             return Err(invalid("region must not be empty"));
+        }
+        if self.put_copies == 0 {
+            return Err(invalid("put_copies must be 1 or more"));
         }
         Ok(())
     }

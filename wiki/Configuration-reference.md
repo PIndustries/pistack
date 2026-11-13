@@ -72,6 +72,8 @@ Only two sections are read today:
 max_object_bytes = 5368709120     # largest single PUT, default 5 GiB
 multipart_ttl_secs = 604800       # unfinished multipart uploads are removed after this, default 7 days
 region = "pistack"                # region accepted in SigV4 signatures
+replicate_interval_secs = 60      # each server pulls the object bytes it lacks this often; 0 turns it off
+put_copies = 2                    # servers that hold the bytes before a put is answered; 1 does not wait
 
 [modules.keep]
 max_secrets_per_project = 1000

@@ -288,3 +288,120 @@ async fn the_peer_route_serves_bytes_by_checksum_and_nothing_else() {
     assert_eq!(resp.status().as_u16(), 404);
     assert!(!p.b_dir.path().join(id.to_string()).exists());
 }
+
+/// Two servers that both listen and name each other as the only peer.
+/// `a` takes the puts, as the leader does.
+struct Both {
+    a: Client,
+    store: Store,
+    _a_dir: tempfile::TempDir,
+    b_dir: tempfile::TempDir,
+}
+
+async fn both() -> Both {
+    let store = Store::in_memory().unwrap();
+    store
+        .put_meta(gate::token::META_JWT_SECRET, &"c2VjcmV0".to_owned())
+        .unwrap();
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = |l: &tokio::net::TcpListener| {
+        Peers::fixed(vec![format!("http://{}", l.local_addr().unwrap())])
+            .with_key_from(store.clone())
+    };
+    let a = Client::new(store.clone(), a_dir.path()).with_peers(peer(&b_listener));
+    let b = Client::new(store.clone(), b_dir.path()).with_peers(peer(&a_listener));
+    for (listener, client) in [(a_listener, a.clone()), (b_listener, b)] {
+        let app = Router::new().nest("/silo", silo::http::router(client));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+    }
+    Both {
+        a,
+        store,
+        _a_dir: a_dir,
+        b_dir,
+    }
+}
+
+#[tokio::test]
+async fn a_put_is_answered_once_another_server_holds_the_bytes() {
+    let p = both().await;
+    let id = bucket(&p.a, "data", false);
+    p.a.put_object(&id, "report.txt", b"first", None)
+        .await
+        .unwrap();
+
+    // A client over B's directory with nobody to ask: what is on B's disk.
+    let b_disk = Client::new(p.store.clone(), p.b_dir.path());
+    assert_eq!(read(&b_disk, &id, "report.txt").await, b"first");
+
+    // An overwrite is copied too, not left as the old bytes.
+    p.a.put_object(&id, "report.txt", b"second, longer", None)
+        .await
+        .unwrap();
+    assert_eq!(read(&b_disk, &id, "report.txt").await, b"second, longer");
+}
+
+#[tokio::test]
+async fn a_put_no_other_server_copies_is_unavailable_and_kept() {
+    let store = Store::in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // A port nothing listens on.
+    let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", gone.local_addr().unwrap());
+    drop(gone);
+    let a = Client::new(store.clone(), dir.path()).with_peers(Peers::fixed(vec![url]));
+    let id = bucket(&a, "data", false);
+
+    let err = a.put_object(&id, "k", b"bytes", None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(
+        err.message.contains("stored on this server only"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("0 of 1"), "{}", err.message);
+    // The object is there all the same.
+    assert_eq!(read(&a, &id, "k").await, b"bytes");
+
+    // One copy asked for: nobody is waited on.
+    let alone = a.clone().with_put_copies(1);
+    alone.put_object(&id, "k2", b"bytes", None).await.unwrap();
+
+    // No peers at all, as in a cluster of one server.
+    let single = Client::new(store, dir.path()).with_peers(Peers::fixed(Vec::new()));
+    single.put_object(&id, "k3", b"bytes", None).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pull_for_a_record_that_never_arrives_is_refused() {
+    let p = pair().await;
+    let key = keep::peer::peer_key(p.a.store()).unwrap();
+    let object = Id::new(<silo::ObjectSpec as pistack_types::Spec>::KIND);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/silo/peer/pull/{object}/{}",
+            p.url,
+            "0".repeat(64)
+        ))
+        .header(keep::peer::PEER_HEADER, &key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/silo/peer/pull/{object}/{}",
+            p.url,
+            "0".repeat(64)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}

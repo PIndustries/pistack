@@ -38,6 +38,8 @@ pub struct Client {
     min_part_bytes: usize,
     /// Other servers to ask for bytes this one lacks.
     peers: Option<crate::replica::Peers>,
+    /// Servers that must hold an object's bytes before a put is answered.
+    put_copies: u32,
 }
 
 impl Client {
@@ -48,7 +50,17 @@ impl Client {
             max_object_bytes: MAX_OBJECT_BYTES,
             min_part_bytes: MIN_PART_BYTES,
             peers: None,
+            put_copies: crate::replica::PUT_COPIES,
         }
+    }
+
+    /// How many servers must hold an object's bytes before a put is
+    /// answered: `1` is this server alone, `2` (the default) waits for one
+    /// peer to take a copy. It has no effect on a client with no peers, or
+    /// in a cluster of one server.
+    pub fn with_put_copies(mut self, copies: u32) -> Self {
+        self.put_copies = copies.max(1);
+        self
     }
 
     /// Fetch bytes this server lacks from `peers` when an object is read.
@@ -197,7 +209,52 @@ impl Client {
     }
 
     /// [`put_object_stream`] with an optional declared payload SHA-256.
+    ///
+    /// When the cluster has another server, the put is answered only after
+    /// one of them holds the bytes too (see [`Self::with_put_copies`]). If
+    /// none takes a copy the answer is `unavailable`, and the object is
+    /// still stored here: read before retrying.
     pub async fn put_object_stream_sha<S, E>(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+        body: S,
+        content_length: Option<u64>,
+        content_type: Option<String>,
+        expected_sha256: Option<&str>,
+    ) -> ApiResult<Object>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send,
+        E: IntoBodyReadErr + Send + 'static,
+    {
+        let obj = self
+            .put_here(
+                bucket_id,
+                key,
+                body,
+                content_length,
+                content_type,
+                expected_sha256,
+            )
+            .await?;
+        self.second_copy(&obj).await?;
+        Ok(obj)
+    }
+
+    /// Wait until enough other servers hold `obj`'s bytes.
+    async fn second_copy(&self, obj: &Object) -> ApiResult<()> {
+        let Some(peers) = &self.peers else {
+            return Ok(());
+        };
+        let wanted = self.put_copies.saturating_sub(1) as usize;
+        if wanted == 0 {
+            return Ok(());
+        }
+        peers.push(obj, wanted).await
+    }
+
+    /// Write the object on this server and record it.
+    async fn put_here<S, E>(
         &self,
         bucket_id: &Id,
         key: &str,
