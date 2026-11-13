@@ -120,13 +120,37 @@ pub fn build(
         app = app.merge(crate::cluster::admin_router(handle.clone()));
     }
 
+    // What `/metrics` serves. The same figures are recorded on a timer so
+    // alarms can watch them.
+    let scrape = crate::metrics::Scrape {
+        verifier: verifier.clone(),
+        token: crate::metrics::scrape_token(
+            std::env::var(crate::metrics::SCRAPE_TOKEN_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        dev,
+        gauge: gauge::Gauge.client(store.clone()),
+        control: std::sync::Arc::new(crate::metrics::ControlPlane::new(
+            cluster.clone(),
+            asm.queue.clone(),
+            store.clone(),
+            cluster.as_ref().map(|handle| handle.db_path.clone()),
+        )),
+    };
+    crate::metrics::spawn(
+        scrape.control.clone(),
+        scrape.gauge.clone(),
+        ctx.shutdown.clone(),
+    );
+
     app = guarded(app, store);
 
     if let Some(handle) = cluster {
         app = app.merge(crate::cluster::router(handle.clone()));
         app = app.layer(middleware::from_fn_with_state(
             handle.clone(),
-            audited_reads_at_leader,
+            reads_at_leader,
         ));
         app = app.layer(middleware::from_fn_with_state(
             handle,
@@ -137,24 +161,32 @@ pub fn build(
     if dev {
         app = app.layer(middleware::from_fn(dev_admin));
     }
-    app.layer(middleware::from_fn_with_state(
-        verifier,
-        gate::attach_caller,
-    ))
-    .layer(PropagateRequestIdLayer::x_request_id())
-    .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-    .layer(
-        TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
-            // Path only. The console ticket is a query parameter and must not be logged.
-            tracing::debug_span!(
-                "request",
-                method = %request.method(),
-                path = %request.uri().path(),
-                version = ?request.version(),
-            )
-        }),
-    )
-    .layer(cors_layer(std::env::var(CORS_ORIGINS_ENV).ok().as_deref()))
+    let app = app
+        .layer(middleware::from_fn_with_state(
+            verifier,
+            gate::attach_caller,
+        ))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
+                // Path only. The console ticket is a query parameter and must not be logged.
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            }),
+        )
+        .layer(cors_layer(std::env::var(CORS_ORIGINS_ENV).ok().as_deref()));
+
+    // Outside the layers above: a scraper's token is not a gate token, so
+    // `attach_caller` would refuse it. The route checks for itself.
+    Router::new()
+        .route("/metrics", get(crate::metrics::scrape))
+        .with_state(scrape)
+        .merge(app)
 }
 
 /// Comma-separated origins allowed to call the API from a browser page
@@ -284,10 +316,18 @@ async fn note_client(mut req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// A read that is audited is answered by the leader only. A follower cannot
-/// write the record, and a secret must not be read without one, so it sends
-/// the client to the leader the way it does for a write.
-async fn audited_reads_at_leader(
+/// What a machine or a host is using is known where the agents report,
+/// which is the leader. A follower would answer with nothing.
+fn usage_read(path: &str) -> bool {
+    let s: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    matches!(s.as_slice(), ["compute", "machines" | "hosts", _, "stats"])
+}
+
+/// Two kinds of read are answered by the leader only, and a follower sends
+/// the client there the way it does for a write. A read that is audited: a
+/// follower cannot write the record, and a secret must not be read without
+/// one. And current usage, which only the leader has.
+async fn reads_at_leader(
     axum::extract::State(handle): axum::extract::State<
         std::sync::Arc<crate::cluster::ClusterHandle>,
     >,
@@ -295,9 +335,10 @@ async fn audited_reads_at_leader(
     next: Next,
 ) -> Response {
     let leading = handle.leader.load(std::sync::atomic::Ordering::Acquire);
+    let path = req.uri().path();
     if leading
         || req.method() != axum::http::Method::GET
-        || !gate::audit::audited_read(req.uri().path())
+        || !(gate::audit::audited_read(path) || usage_read(path))
     {
         return next.run(req).await;
     }
@@ -656,7 +697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_follower_sends_an_audited_read_to_the_leader() {
+    async fn a_follower_sends_an_audited_read_and_a_usage_read_to_the_leader() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
         let leadership = pistack_types::Leadership::new(false);
@@ -681,7 +722,7 @@ mod tests {
             .fallback(|| async { "ok" })
             .layer(middleware::from_fn_with_state(
                 handle.clone(),
-                super::audited_reads_at_leader,
+                super::reads_at_leader,
             ));
         let secret = "/secrets/secrets/db/payload";
         let response = app
@@ -699,10 +740,18 @@ mod tests {
             status(&app, "GET", "/secrets/secrets/db").await,
             StatusCode::OK
         );
+        // Usage is only known where the agents report.
+        for path in ["/compute/machines/web/stats", "/compute/hosts/h1/stats"] {
+            assert_eq!(status(&app, "GET", path).await, StatusCode::CONFLICT);
+        }
         handle
             .leader
             .store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(status(&app, "GET", secret).await, StatusCode::OK);
+        assert_eq!(
+            status(&app, "GET", "/compute/machines/web/stats").await,
+            StatusCode::OK
+        );
     }
 
     /// A server holding one ready image, with the agent transport on a real
