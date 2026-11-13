@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use bench::cli::{self, Io};
@@ -67,6 +67,23 @@ async fn set_labels(
     Json(host.clone())
 }
 
+async fn create_machine(
+    State(m): State<Mock>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    m.writes
+        .lock()
+        .unwrap()
+        .push(("/compute/machines".into(), body.clone()));
+    let v = json!({
+        "id": "mach-0199a5e0-aaaa-7000-8000-000000000002",
+        "name": body["name"],
+        "spec": body["spec"],
+        "status": {"phase": "pending"},
+    });
+    (StatusCode::CREATED, Json(v)).into_response()
+}
+
 async fn serve() -> (String, Mock) {
     let mock = Mock {
         host: Arc::new(Mutex::new(json!({
@@ -79,6 +96,7 @@ async fn serve() -> (String, Mock) {
         writes: Default::default(),
     };
     let app = Router::new()
+        .route("/compute/machines", post(create_machine))
         .route("/compute/hosts", get(list))
         .route("/compute/hosts/{id}", get(show))
         .route("/compute/hosts/{id}/labels", put(set_labels))
@@ -157,4 +175,29 @@ async fn host_label_merges_removes_and_replaces() {
     let r = pi(&url, &["host", "label", "rack1", "zone"]).await;
     assert_ne!(r.code, 0);
     assert!(r.err.contains("key=value"), "{}", r.err);
+}
+
+#[tokio::test]
+async fn machine_create_sends_the_zone() {
+    let (url, mock) = serve().await;
+    let r = pi(
+        &url,
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "ubuntu", "--zone", "west",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(mock.last_write().1["spec"]["zone"], "west");
+
+    // Without the flag the field is left out, not sent empty.
+    let r = pi(
+        &url,
+        &[
+            "machine", "create", "db", "--size", "s.1x1", "--image", "ubuntu",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(mock.last_write().1["spec"].get("zone").is_none());
 }

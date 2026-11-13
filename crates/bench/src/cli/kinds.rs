@@ -336,6 +336,7 @@ pub static KINDS: &[KindDef] = &[
         ],
         wide: &[
             col!("HOST", short "/status/host"),
+            col!("ZONE", "/spec/zone"),
             col!("NETWORKS", list "/spec/networks"),
             col!("MESSAGE", "/status/message"),
             col!("FULL-ID", full_id),

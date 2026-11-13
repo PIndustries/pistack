@@ -1204,6 +1204,7 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "ssh_keys": keys,
                 "user_data": user_data,
                 "host_selector": Value::Object(parse_kv(&a.host_selector, "--host-selector")?),
+                "zone": opt(a.zone),
             });
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, a.wait).await.map(|_| ())
