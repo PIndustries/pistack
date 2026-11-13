@@ -1354,6 +1354,63 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             }
             Ok(())
         }
+        HostCmd::Evacuate(a) => {
+            let c = ctx.client()?;
+            let path = format!("{}/evacuate", k.item_path(&a.name));
+            let body = json!({
+                "confirm_dead": a.confirm_dead,
+                "rebuild_from_image": a.rebuild_from_image,
+            });
+            let v = c.post(&path, &body).await?;
+            if !matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+                print_one(io.stdout, ctx.fmt, &v)?;
+                return Ok(());
+            }
+            let host = str_at(&v, "/host/name");
+            let list = |ptr: &str| v.pointer(ptr).and_then(Value::as_array).cloned();
+            let evacuated = list("/evacuated").unwrap_or_default();
+            let skipped = list("/skipped").unwrap_or_default();
+            if !evacuated.is_empty() {
+                writeln!(
+                    io.stdout,
+                    "WARNING: ROOT DISKS ARE LOST. The machines below start on other hosts from \
+                     their images. What was on their root disks stayed on host \"{host}\" and is \
+                     deleted when that host reports again."
+                )?;
+            }
+            for m in &evacuated {
+                let volumes = m
+                    .pointer("/volumes")
+                    .and_then(Value::as_array)
+                    .map(|a| output::join(a))
+                    .unwrap_or_default();
+                let volumes = match volumes.as_str() {
+                    "" => String::new(),
+                    names => format!("; volumes plugged back in when it runs: {names}"),
+                };
+                writeln!(
+                    io.stdout,
+                    "machine \"{}\" evacuated: root disk lost, starts from image {}{volumes}",
+                    str_at(m, "/name"),
+                    str_at(m, "/rebuilt_from")
+                )?;
+            }
+            for m in &skipped {
+                writeln!(
+                    io.stdout,
+                    "machine \"{}\" skipped: {}",
+                    str_at(m, "/name"),
+                    str_at(m, "/reason")
+                )?;
+            }
+            writeln!(
+                io.stdout,
+                "{} evacuated, {} skipped",
+                evacuated.len(),
+                skipped.len()
+            )?;
+            Ok(())
+        }
         HostCmd::Enable(a) => {
             let c = ctx.client()?;
             let path = format!("{}/enable", k.item_path(&a.name));

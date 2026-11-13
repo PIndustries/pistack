@@ -614,6 +614,26 @@ pub enum HostCmd {
     /// Machines that cannot be moved are listed and left running.
     /// Run it again to see what is still on the host.
     Drain(HostDisableArgs),
+    /// Start the machines of a dead host on other hosts.
+    ///
+    /// Only for a host that is down, or a disabled host you confirm is
+    /// dead. The machines' root disks were on that host and are NOT moved:
+    /// each machine starts again from its image.
+    Evacuate(HostEvacuateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct HostEvacuateArgs {
+    /// Name or id.
+    pub name: String,
+    /// Accept that every evacuated machine loses its root disk and starts
+    /// again from its image. Without it no machine is moved.
+    #[arg(long)]
+    pub rebuild_from_image: bool,
+    /// The host is disabled but may still be reporting, and you know it is
+    /// dead. If it is not, its machines will run twice until it reports.
+    #[arg(long)]
+    pub confirm_dead: bool,
 }
 
 #[derive(Args, Debug)]
