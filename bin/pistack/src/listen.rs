@@ -200,11 +200,7 @@ pub async fn bind_listeners(
             leadership: spec.leadership,
             node_id: spec.node_id,
             cert,
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            net: keep::peer::PeerNet::from_env(spec.store.clone()),
         });
         let acceptor = TlsAcceptor::from(Arc::new(cfg));
         let tcp = TcpListener::bind(addr)
@@ -247,7 +243,7 @@ struct CertRenewal {
     leadership: Leadership,
     node_id: String,
     cert: Arc<keep::tls::ServerCert>,
-    http: reqwest::Client,
+    net: keep::peer::PeerNet,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -336,24 +332,32 @@ impl CertRenewal {
     /// Have the leader renew it. This server proves it is a member with
     /// the peer key, as on every other call between servers.
     async fn ask_leader(&self, cert_pem: &str, csr_pem: &str) -> anyhow::Result<keep::Pki> {
-        let leader = crate::cluster::leader_hint(&self.store, &self.node_id)?
+        let (leader, leader_tls) = crate::cluster::leader_addresses(&self.store, &self.node_id)?
             .context("no leader is known to ask for a certificate")?;
         let key =
             crate::cluster::peer_key(&self.store).context("this server has no peer key yet")?;
-        let url = format!(
-            "{}/secrets/peer/renew-certificate",
-            leader.trim_end_matches('/')
-        );
+        let body = keep::api::PeerRenew {
+            cert_pem: cert_pem.to_owned(),
+            csr_pem: csr_pem.to_owned(),
+        };
+        // As every call between servers: to the leader's TLS listener,
+        // checked against the cloud CA, when it has one.
         let resp = self
-            .http
-            .post(&url)
-            .header(crate::cluster::PEER_HEADER, key)
-            .json(&keep::api::PeerRenew {
-                cert_pem: cert_pem.to_owned(),
-                csr_pem: csr_pem.to_owned(),
-            })
-            .send()
+            .net
+            .send(
+                &leader,
+                leader_tls.as_deref(),
+                std::time::Duration::from_secs(5),
+                |client, base| {
+                    client
+                        .post(format!("{base}/secrets/peer/renew-certificate"))
+                        .header(crate::cluster::PEER_HEADER, &key)
+                        .json(&body)
+                        .timeout(std::time::Duration::from_secs(30))
+                },
+            )
             .await
+            .map_err(anyhow::Error::msg)
             .with_context(|| format!("asking the leader at {leader}"))?;
         let status = resp.status();
         if !status.is_success() {
