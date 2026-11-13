@@ -575,6 +575,10 @@ pub struct MachineCreate {
     /// Volume (repeatable).
     #[arg(long = "volume", value_name = "VOLUME")]
     pub volumes: Vec<String>,
+    /// Place the machine where this volume can attach (repeatable).
+    /// Nothing is attached; use `pi volume attach` once it runs.
+    #[arg(long = "near-volume", value_name = "VOLUME")]
+    pub near_volumes: Vec<String>,
     #[arg(long, value_enum, default_value_t = MachineKind::Vm)]
     pub kind: MachineKind,
     /// SSH public key (repeatable); `@file` reads a file.

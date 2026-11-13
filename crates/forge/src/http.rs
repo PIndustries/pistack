@@ -327,7 +327,8 @@ fn refuse_volumes(volumes: &[String]) -> ApiResult<()> {
     }
     Err(ApiError::unprocessable(
         "spec.volumes is not supported: a machine does not attach volumes when it starts. \
-         Create the machine without them, then attach each one with \
+         Create the machine without them (`--near-volume` places it where a \
+         volume can attach), then attach each one with \
          `pi volume attach <volume> --machine <machine>`",
     ))
 }

@@ -34,6 +34,7 @@ pub mod scheduler;
 pub mod stats;
 pub mod types;
 mod usage;
+mod volumes;
 
 pub use agent_driver::{Registrar, RpcDriver};
 pub use driver::{

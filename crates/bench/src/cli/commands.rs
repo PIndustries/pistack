@@ -1489,6 +1489,7 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "image": a.image,
                 "networks": a.networks,
                 "volumes": a.volumes,
+                "near_volumes": a.near_volumes,
                 "ssh_keys": keys,
                 "user_data": user_data,
                 "host_selector": Value::Object(parse_kv(&a.host_selector, "--host-selector")?),
