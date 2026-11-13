@@ -152,6 +152,9 @@ mod tests {
             29
         );
         assert!(text.contains("Needs attention"));
+        assert!(text.contains("Control plane"));
+        assert!(text.contains("Recent activity"));
+        assert!(text.contains("/gauge/samples"));
         assert!(!text.contains("10.66.66."));
         assert!(!text.contains("pistack0"));
         assert!(!text.to_ascii_lowercase().contains("ovn"));

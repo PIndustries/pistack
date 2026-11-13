@@ -253,6 +253,59 @@
   .panel table { border: 0; border-radius: 0; }
   .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 0 1.2rem; }
 
+  /* Machine page and overview: header, tabs, charts, activity. */
+  .crumb { background: none; border: 0; padding: 0; color: var(--muted); font-size: 0.86rem; cursor: pointer; }
+  .crumb:hover:not(:disabled) { color: var(--text); border-color: transparent; }
+  .mhead { display: flex; align-items: flex-start; gap: 1rem; flex-wrap: wrap; margin: 0.5rem 0 1.1rem; }
+  .mhead .who { flex: 1; min-width: 14rem; }
+  .mhead h2 { font-size: 1.55rem; display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
+  .mhead .meta { color: var(--muted); margin: 0.35rem 0 0; font-size: 0.88rem; }
+  .mhead .meta b { color: var(--text); font-weight: 500; }
+  .mhead .acts { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.16rem 0.6rem; border-radius: 999px; border: 1px solid var(--line-strong); font-size: 0.74rem; font-weight: 600; letter-spacing: 0.02em; text-transform: lowercase; color: var(--muted); }
+  .pill::before { content: ""; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: currentColor; }
+  .pill.ready, .pill.on, .pill.running, .pill.leader { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 9%, transparent); }
+  .pill.error, .pill.failed, .pill.off { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: var(--bad-bg); }
+  .pill.pending, .pill.creating, .pill.deleting, .pill.updating { color: var(--wait); border-color: color-mix(in srgb, var(--wait) 40%, transparent); }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.8rem; margin: 0 0 1.2rem; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0.85rem 1rem 0.7rem; min-width: 0; }
+  .chart .label { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .chart .now { font-size: 1.3rem; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin: 0.15rem 0 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chart .now small { font-size: 0.8rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .chart .foot { color: var(--muted); font-size: 0.74rem; min-height: 1.1em; display: flex; gap: 0.8rem; flex-wrap: wrap; }
+  .chart .foot i { font-style: normal; display: inline-flex; align-items: center; gap: 0.3rem; }
+  .chart .foot i::before { content: ""; width: 0.6rem; height: 2px; background: var(--accent); }
+  .chart .foot i.b::before { background: var(--wait); }
+  .chart svg { display: block; width: 100%; height: 64px; margin: 0.35rem 0 0.3rem; overflow: visible; }
+  .chart svg .area { fill: var(--accent); opacity: 0.13; stroke: none; }
+  .chart svg .ln { fill: none; stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+  .chart svg .ln.b { stroke: var(--wait); }
+  .chart svg .base { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .chart .none { height: 64px; margin: 0.35rem 0 0.3rem; display: grid; place-items: center; color: var(--muted); font-size: 0.8rem; border: 1px dashed var(--line); border-radius: 8px; text-align: center; padding: 0 0.5rem; }
+  .tabs { display: flex; gap: 0.2rem; border-bottom: 1px solid var(--line); margin: 0 0 1rem; overflow-x: auto; }
+  .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 0.55rem 0.85rem; color: var(--muted); font-weight: 550; white-space: nowrap; }
+  .tabs button:hover:not(:disabled) { color: var(--text); border-color: transparent; border-bottom-color: var(--line-strong); }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0 2rem; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0.6rem 1.1rem; }
+  .kv p { display: flex; gap: 1rem; margin: 0; padding: 0.5rem 0; border-bottom: 1px solid var(--line); min-width: 0; }
+  .kv .k { color: var(--muted); flex: 0 0 8.5rem; }
+  .kv .v { min-width: 0; overflow-wrap: anywhere; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86em; }
+  .strip { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0.7rem 0.9rem; margin: 0.8rem 0 1.2rem; }
+  .strip .name { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 0.4rem; }
+  .strip .srv { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0.65rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.84rem; }
+  .strip .facts.bad { color: var(--bad); }
+  .strip .facts { margin-left: auto; color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .feed { list-style: none; margin: 0; padding: 0; }
+  .feed li { display: flex; gap: 0.8rem; align-items: baseline; padding: 0.6rem 1rem; border-bottom: 1px solid var(--line); min-width: 0; }
+  .feed li:last-child { border-bottom: 0; }
+  .feed .when { color: var(--muted); flex: 0 0 4.6rem; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .feed .what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed .what b { font-weight: 600; }
+  .feed .code { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .feed li.bad .code, .feed li.bad .what { color: var(--bad); }
+  #view > h3:first-of-type { margin-top: 0; }
+
   @media (max-width: 860px) {
     #login:not([hidden]) { padding: 1rem; }
     #shell:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
@@ -1909,6 +1962,162 @@ function line(k, v, phase) {
   return p;
 }
 
+// ---- usage charts, times and sizes ----------------------------------------
+
+function shortId(id) {
+  const m = /^([a-z]+)-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{4}([0-9a-f]{8})$/.exec(String(id || ""));
+  return m ? m[1] + "-" + m[2] : String(id || "");
+}
+// Long ids inside a message, cut to the short form pi prints.
+function shortIds(text) {
+  return String(text || "").replace(/\b([a-z]+)-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{4}([0-9a-f]{8})\b/g, "$1-$2");
+}
+function ago(ts) {
+  const t = Date.parse(ts);
+  if (!t) return "";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 172800) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 || n >= 100 ? Math.round(n) : Math.round(n * 10) / 10) + " " + units[i];
+}
+function fmtNum(n) {
+  n = Number(n) || 0;
+  return n >= 100 ? String(Math.round(n)) : n >= 10 ? String(Math.round(n * 10) / 10) : String(Math.round(n * 100) / 100);
+}
+
+// A series key is `name{label="value",...}`.
+function parseSeries(key) {
+  const i = key.indexOf("{");
+  const out = { name: i < 0 ? key : key.slice(0, i), labels: {} };
+  if (i >= 0) {
+    const re = /(\w+)="((?:[^"\\]|\\.)*)"/g;
+    let m;
+    while ((m = re.exec(key.slice(i)))) out.labels[m[1]] = m[2];
+  }
+  return out;
+}
+// The server keeps the last points of every series. One read serves every
+// chart on the page for a while.
+let sampleCache = { at: 0, rows: [] };
+async function usageSamples() {
+  if (Date.now() - sampleCache.at < 15000) return sampleCache.rows;
+  const raw = await api("GET", "/gauge/samples");
+  const rows = (Array.isArray(raw) ? raw : itemsOf(raw)).map((s) => {
+    const k = parseSeries(s.metric);
+    return { key: s.metric, name: k.name, labels: k.labels, t: Date.parse(s.timestamp), v: Number(s.value) };
+  }).filter(r => r.t);
+  sampleCache = { at: Date.now(), rows };
+  return rows;
+}
+// Points of every series called `name` that `keep` accepts, by series.
+function seriesOf(rows, name, keep) {
+  const by = new Map();
+  for (const r of rows) {
+    if (r.name !== name || (keep && !keep(r.labels))) continue;
+    if (!by.has(r.key)) by.set(r.key, []);
+    by.get(r.key).push({ t: r.t, v: r.v });
+  }
+  for (const pts of by.values()) pts.sort((a, b) => a.t - b.t);
+  return [...by.values()];
+}
+// A counter's points as a rate per second. A counter that went down was
+// reset, and that step is left out.
+function asRate(pts) {
+  const out = [];
+  for (let i = 1; i < pts.length; i++) {
+    const dt = (pts[i].t - pts[i - 1].t) / 1000;
+    const dv = pts[i].v - pts[i - 1].v;
+    if (dt > 0 && dv >= 0) out.push({ t: pts[i].t, v: dv / dt });
+  }
+  return out;
+}
+// Several series added up, in steps of fifteen seconds.
+function sumSeries(list) {
+  const STEP = 15000;
+  const buckets = new Map();
+  list.forEach((pts, idx) => {
+    for (const p of pts) {
+      const b = Math.round(p.t / STEP) * STEP;
+      if (!buckets.has(b)) buckets.set(b, new Map());
+      buckets.get(b).set(idx, p.v);
+    }
+  });
+  return [...buckets.entries()].sort((a, b) => a[0] - b[0])
+    .map(([t, vals]) => ({ t, v: [...vals.values()].reduce((n, v) => n + v, 0) }));
+}
+function lastOf(pts) { return pts.length ? pts[pts.length - 1].v : null; }
+
+function svgEl(tag, attrs) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+// One or two lines over the same span of time. The first gets an area.
+function sparkline(lines, ceiling) {
+  const W = 300, H = 64;
+  const all = lines.flat();
+  if (all.length < 2) return null;
+  const t0 = Math.min(...all.map(p => p.t));
+  const t1 = Math.max(...all.map(p => p.t));
+  const top = Math.max(ceiling || 0, ...all.map(p => p.v)) || 1;
+  const x = t => (t1 === t0 ? W : (t - t0) / (t1 - t0) * W);
+  const y = v => H - 1 - (v / top) * (H - 5);
+  const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", role: "img" });
+  svg.append(svgEl("line", { class: "base", x1: 0, x2: W, y1: H - 0.5, y2: H - 0.5 }));
+  lines.forEach((pts, idx) => {
+    if (pts.length < 2) return;
+    const d = pts.map((p, i) => (i ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
+    if (idx === 0) {
+      svg.append(svgEl("path", { class: "area", d: d + " L" + x(pts[pts.length - 1].t).toFixed(1) + " " + H + " L" + x(pts[0].t).toFixed(1) + " " + H + " Z" }));
+    }
+    svg.append(svgEl("path", { class: idx ? "ln b" : "ln", d }));
+  });
+  return svg;
+}
+// A card with a name, the value now and the line behind it. `draw` is
+// called again whenever there are new points.
+function chartCard(label) {
+  const node = el("div", null, "chart");
+  const now = el("div", "", "now");
+  const plot = el("div");
+  const foot = el("div", "", "foot");
+  node.append(el("div", label, "label"), now, plot, foot);
+  return {
+    node,
+    draw(value, unit, lines, opts) {
+      opts = opts || {};
+      now.replaceChildren(value === null || value === undefined ? "—" : String(value));
+      if (unit) { now.append(" "); now.append(el("small", unit)); }
+      const svg = sparkline(lines, opts.ceiling);
+      if (svg) { svg.setAttribute("aria-label", label + ", last minutes"); plot.replaceChildren(svg); }
+      else plot.replaceChildren(el("div", opts.empty || "No samples yet", "none"));
+      foot.replaceChildren();
+      for (const [i, text] of (opts.legend || []).entries()) foot.append(el("i", text, i ? "b" : ""));
+      if (opts.note) foot.append(el("span", opts.note));
+    },
+  };
+}
+function pill(text) {
+  const t = String(text || "unknown").toLowerCase();
+  return el("span", t, "pill " + t.replace(/[^a-z]/g, ""));
+}
+function kvLine(k, v, mono) {
+  const p = el("p");
+  p.append(el("span", k, "k"));
+  const val = el("span", null, mono ? "v mono" : "v");
+  if (v instanceof Node) val.append(v); else val.textContent = show(v);
+  p.append(val);
+  return p;
+}
+
 function openConsole(card, id) {
   if (card.querySelector("canvas.screen")) return;
   const status = el("p", "Connecting", "sub");
@@ -2190,16 +2399,15 @@ function openConsole(card, id) {
   }).catch((e) => { status.textContent = e.message; });
 }
 
+// The tab last opened on a machine page, kept while moving between machines.
+let machineTab = "details";
+
 async function renderMachine(id, gen) {
   const root = document.getElementById("view");
   root.replaceChildren();
-  const tools = el("div"); tools.className = "tools";
-  const back = el("button", "Back"); back.type = "button";
+  const back = el("button", "← Machines", "crumb"); back.type = "button";
   back.addEventListener("click", () => { openMachine = null; render(); });
-  const refresh = el("button", "Refresh"); refresh.type = "button";
-  refresh.addEventListener("click", () => render());
-  tools.append(back, el("h2", "Machine"), refresh);
-  root.append(tools);
+  root.append(back);
   let machine;
   try {
     machine = await api("GET", "/compute/machines/" + encodeURIComponent(id));
@@ -2209,88 +2417,264 @@ async function renderMachine(id, gen) {
     return;
   }
   if (gen !== renderGen) return;
-  let fips = [];
-  let vols = [];
-  const problems = [];
-  try {
-    fips = itemsOf(await api("GET", "/network/floating-ips"));
-  } catch (e) { problems.push(e.message); }
+  // Everything else is extra: the page is drawn with whatever answered.
+  const quiet = (p) => p.catch(() => null);
+  // The log names a machine the way the request did: by name, or by id.
+  const audit = (who) => api("GET", "/identity/audit?order=desc&limit=25&resource=" + encodeURIComponent(who));
+  const [fipPage, volPage, hostPage, samples, auditPage, auditById] = await Promise.all([
+    quiet(api("GET", "/network/floating-ips")),
+    quiet(api("GET", "/volume/volumes")),
+    quiet(api("GET", "/compute/hosts")),
+    quiet(usageSamples()),
+    quiet(audit(machine.name)),
+    quiet(audit(machine.id)),
+  ]);
   if (gen !== renderGen) return;
-  try {
-    const all = itemsOf(await api("GET", "/volume/volumes"));
-    vols = all.filter(v => v.status && String(v.status.attached_to || "") === String(machine.id));
-  } catch (e) { problems.push(e.message); }
-  if (gen !== renderGen) return;
-  if (problems.length) setErr(problems.join(" "));
-  const card = el("div"); card.className = "detail";
-  const addrs = ((machine.status && machine.status.addresses) || []).join(", ");
-  card.append(
-    line("Name", machine.name),
-    line("ID", machine.id),
-    line("Phase", machine.status && machine.status.phase, true),
-    line("Power", machine.status && machine.status.power, true),
-    line("Size", machine.spec && machine.spec.size),
-    line("Image", machine.spec && machine.spec.image),
-    line("Private addresses", addrs),
-  );
-  const matched = matchingFips(machine, fips);
-  if (!matched.length) {
-    card.append(line("Floating IP", ""), line("Fixed IP", ""));
-  } else {
-    for (const f of matched) {
-      card.append(line("Floating IP", f.spec && f.spec.address));
-      card.append(line("Fixed IP", f.status && f.status.fixed_ip));
-    }
-  }
-  card.append(el("h3", "Volumes"));
-  card.append(simpleTable([
-    ["Name", v => v.name],
-    ["GiB", v => v.spec && v.spec.size_gib],
-    ["Device", v => v.status && v.status.device],
-  ], vols));
-  const actions = el("div"); actions.className = "tools";
-  const screen = el("button", "Console"); screen.type = "button";
-  screen.addEventListener("click", () => { openConsole(card, machine.id); });
-  const reboot = el("button", "Reboot"); reboot.type = "button";
-  const start = el("button", "Start"); start.type = "button"; start.className = "primary";
-  const stop = el("button", "Stop"); stop.type = "button";
-  const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
+  const fips = fipPage ? itemsOf(fipPage) : [];
+  const vols = (volPage ? itemsOf(volPage) : [])
+    .filter(v => v.status && String(v.status.attached_to || "") === String(machine.id));
+  const hosts = hostPage ? itemsOf(hostPage) : [];
+  const st = machine.status || {};
+  const spec = machine.spec || {};
+  const host = hosts.find(h => h.id === st.host);
+  const hostName = host ? host.name : shortId(st.host);
+  const power = String(st.power || "").toLowerCase();
   const mid = encodeURIComponent(machine.id);
-  reboot.addEventListener("click", async () => {
-    setErr("");
-    try { await api("POST", "/compute/machines/" + mid + "/reboot"); await render(); }
-    catch (e) { setErr(e.message); }
-  });
-  start.addEventListener("click", async () => {
-    setErr("");
-    try { await api("POST", "/compute/machines/" + mid + "/start"); await render(); }
-    catch (e) { setErr(e.message); }
-  });
-  stop.addEventListener("click", async () => {
-    setErr("");
-    try { await api("POST", "/compute/machines/" + mid + "/stop"); await render(); }
-    catch (e) { setErr(e.message); }
-  });
-  del.addEventListener("click", async () => {
-    if (!confirm("Delete " + machine.name + "?")) return;
-    setErr("");
-    try {
-      await api("DELETE", "/compute/machines/" + mid);
-      openMachine = null;
-      await render();
-    } catch (e) { setErr(e.message); }
-  });
-  actions.append(screen, reboot, start, stop, del);
-  card.append(actions);
-  root.append(card);
-  const phase = machine.status && machine.status.phase;
-  if (["pending", "creating", "deleting"].includes(phase)) {
+
+  // ---- header ----
+  const head = el("div", null, "mhead");
+  const who = el("div", null, "who");
+  const title = el("h2", machine.name);
+  title.append(pill(st.phase));
+  if (power) title.append(pill(power));
+  const meta = el("p", null, "meta");
+  const bits = [spec.kind, spec.size, spec.image, hostName ? "on " + hostName : "", "created " + ago(machine.created_at)]
+    .filter(Boolean);
+  bits.forEach((b, i) => { if (i) meta.append(" · "); meta.append(i < 3 ? el("b", b) : b); });
+  who.append(title, meta);
+  const acts = el("div", null, "acts");
+  const act = (label, cls, path, method, after) => {
+    const b = el("button", label, cls || ""); b.type = "button";
+    b.addEventListener("click", async () => {
+      if (method === "DELETE" && !confirm("Delete " + machine.name + "? Its root disk is removed.")) return;
+      setErr("");
+      b.disabled = true;
+      try {
+        await api(method || "POST", "/compute/machines/" + mid + (path || ""));
+        if (after) after();
+        await render();
+      } catch (e) { b.disabled = false; setErr(e.message); }
+    });
+    return b;
+  };
+  const start = act("Start", "primary", "/start");
+  const stop = act("Stop", "", "/stop");
+  const reboot = act("Reboot", "", "/reboot");
+  const del = act("Delete", "danger", "", "DELETE", () => { openMachine = null; });
+  // Only what makes sense for the state it is in.
+  start.hidden = power === "on";
+  stop.hidden = power !== "on";
+  reboot.disabled = power !== "on";
+  acts.append(start, stop, reboot, del);
+  head.append(who, acts);
+  root.append(head);
+  if (st.message && ["error", "failed"].includes(String(st.phase).toLowerCase())) {
+    root.append(el("p", shortIds(st.message), "once"));
+  }
+
+  // ---- usage ----
+  const mine = (l) => l.machine === machine.id;
+  const rows = samples || [];
+  const hist = {
+    cpu: sumSeries(seriesOf(rows, "pistack_machine_cpu_usage_cores", mine)),
+    mem: sumSeries(seriesOf(rows, "pistack_machine_memory_bytes", mine)),
+    memMax: lastOf(sumSeries(seriesOf(rows, "pistack_machine_memory_assigned_bytes", mine))),
+    dr: sumSeries(seriesOf(rows, "pistack_machine_disk_read_bytes_total", mine).map(asRate)),
+    dw: sumSeries(seriesOf(rows, "pistack_machine_disk_written_bytes_total", mine).map(asRate)),
+    rx: sumSeries(seriesOf(rows, "pistack_machine_network_receive_bytes_total", mine).map(asRate)),
+    tx: sumSeries(seriesOf(rows, "pistack_machine_network_transmit_bytes_total", mine).map(asRate)),
+  };
+  const cards = {
+    cpu: chartCard("CPU"),
+    mem: chartCard("Memory"),
+    disk: chartCard("Disk"),
+    net: chartCard("Network"),
+  };
+  const charts = el("div", null, "charts");
+  charts.append(cards.cpu.node, cards.mem.node, cards.disk.node, cards.net.node);
+  root.append(charts);
+  const none = samples === null
+    ? "Usage could not be read"
+    : power === "on" ? "No usage reported for this machine yet" : "The machine is off";
+  const drawCharts = () => {
+    const cpu = lastOf(hist.cpu);
+    cards.cpu.draw(cpu === null ? null : fmtNum(cpu), cpu === null ? "" : "cores", [hist.cpu], { empty: none });
+    const mem = lastOf(hist.mem);
+    cards.mem.draw(mem === null ? null : fmtBytes(mem), hist.memMax ? "of " + fmtBytes(hist.memMax) : "",
+      [hist.mem], { ceiling: hist.memMax || 0, empty: none });
+    const dr = lastOf(hist.dr), dw = lastOf(hist.dw);
+    cards.disk.draw(dw === null ? null : fmtBytes(dw) + "/s", dw === null ? "" : "written", [hist.dw, hist.dr],
+      { empty: none, legend: dw === null ? [] : ["write", "read " + fmtBytes(dr || 0) + "/s"] });
+    const rx = lastOf(hist.rx), tx = lastOf(hist.tx);
+    cards.net.draw(rx === null ? null : fmtBytes(rx) + "/s", rx === null ? "" : "in", [hist.rx, hist.tx],
+      { empty: none, legend: rx === null ? [] : ["in", "out " + fmtBytes(tx || 0) + "/s"] });
+  };
+  drawCharts();
+
+  // ---- tabs ----
+  const tabs = el("div", null, "tabs");
+  tabs.setAttribute("role", "tablist");
+  const pane = el("div");
+  const panes = {
+    details() {
+      const kv = el("div", null, "kv");
+      kv.append(
+        kvLine("Name", machine.name),
+        kvLine("ID", machine.id, true),
+        kvLine("Project", shortId(machine.project), true),
+        kvLine("Host", hostName),
+        kvLine("Kind", spec.kind),
+        kvLine("Size", spec.size),
+        kvLine("Image", spec.image),
+        kvLine("Created", machine.created_at ? new Date(machine.created_at).toLocaleString() : ""),
+        kvLine("Restarts", st.restarts),
+        kvLine("SSH keys", (spec.ssh_keys || []).length || "none"),
+      );
+      pane.append(kv);
+      const conds = st.conditions || [];
+      if (conds.length) {
+        pane.append(el("h3", "Conditions"));
+        const t = simpleTable([
+          ["Condition", c => c.type],
+          ["State", c => (c.status ? "yes" : "no")],
+          ["Reason", c => c.reason],
+          ["Since", c => ago(c.last_transition)],
+          ["Message", c => (c.status ? "" : shortIds(c.message))],
+        ], conds);
+        t.className = "wrap";
+        const wrap = el("div", null, "panel");
+        wrap.append(t);
+        pane.append(wrap);
+      }
+    },
+    networking() {
+      const kv = el("div", null, "kv");
+      kv.append(
+        kvLine("Networks", (spec.networks || []).join(", ")),
+        kvLine("Private addresses", (st.addresses || []).join(", "), true),
+        kvLine("Security groups", (spec.security_groups || []).join(", ") || "the project's default group"),
+      );
+      pane.append(kv);
+      pane.append(el("h3", "Floating IPs"));
+      const wrap = el("div", null, "panel");
+      wrap.append(simpleTable([
+        ["Address", f => f.spec && f.spec.address],
+        ["Reaches", f => f.status && f.status.fixed_ip],
+        ["Phase", f => f.status && f.status.phase],
+      ], matchingFips(machine, fips)));
+      pane.append(wrap);
+    },
+    volumes() {
+      const wrap = el("div", null, "panel");
+      wrap.append(simpleTable([
+        ["Name", v => v.name],
+        ["GiB", v => v.spec && v.spec.size_gib],
+        ["Device", v => v.status && v.status.device],
+        ["Phase", v => v.status && v.status.phase],
+      ], vols));
+      pane.append(wrap);
+      pane.append(el("p", "Attach a volume from the Volumes page. It shows up in the guest as a virtio disk.", "sub"));
+    },
+    console() {
+      const card = el("div", null, "detail");
+      card.style.width = "100%";
+      pane.append(card);
+      if (power === "on") openConsole(card, machine.id);
+      else card.append(el("p", "The machine is off. Start it to open its console.", "sub"));
+    },
+    activity() {
+      const wrap = el("div", null, "panel");
+      if (auditPage === null) wrap.append(el("p", "The record of who did what is kept for cloud admins."));
+      else {
+        const seen = new Set();
+        const records = [...itemsOf(auditPage), ...(auditById ? itemsOf(auditById) : [])]
+          .filter(r => !seen.has(r.id) && seen.add(r.id))
+          .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+        wrap.append(activityFeed(records, "Nothing is recorded for this machine."));
+      }
+      pane.append(wrap);
+    },
+  };
+  const names = { details: "Details", networking: "Networking", volumes: "Volumes (" + vols.length + ")", console: "Console", activity: "Activity" };
+  if (!panes[machineTab]) machineTab = "details";
+  const select = (key) => {
+    machineTab = key;
+    for (const b of tabs.children) b.setAttribute("aria-selected", String(b.dataset.tab === key));
+    pane.replaceChildren();
+    panes[key]();
+  };
+  for (const key of Object.keys(panes)) {
+    const b = el("button", names[key]); b.type = "button";
+    b.dataset.tab = key;
+    b.setAttribute("role", "tab");
+    b.addEventListener("click", () => select(key));
+    tabs.append(b);
+  }
+  root.append(tabs, pane);
+  select(machineTab);
+
+  // ---- keeping it current ----
+  const phase = String(st.phase || "").toLowerCase();
+  if (["pending", "creating", "deleting", "updating"].includes(phase)) {
     timer = setInterval(() => {
-      const viewEl = document.getElementById("view");
-      if (viewEl.contains(document.activeElement)) return;
+      if (machineTab === "console" || root.contains(document.activeElement)) return;
       render();
     }, 3000);
+    return;
   }
+  // New points for the charts, without drawing the page again.
+  const push = (list, t, v) => {
+    if (v === null || (list.length && list[list.length - 1].t >= t)) return;
+    list.push({ t, v });
+    if (list.length > 120) list.shift();
+  };
+  timer = setInterval(async () => {
+    if (document.hidden) return;
+    let report;
+    try { report = await api("GET", "/compute/machines/" + mid + "/stats"); } catch (e) { return; }
+    if (gen !== renderGen) return;
+    const series = (report && report.series) || [];
+    const add = (name, field) => {
+      const hits = series.filter(s => s.metric === name && s[field] !== undefined && s[field] !== null);
+      if (!hits.length) return [0, null];
+      return [Math.max(...hits.map(s => Date.parse(s.timestamp) || 0)), hits.reduce((n, s) => n + Number(s[field]), 0)];
+    };
+    const feed = (list, name, field) => { const [t, v] = add(name, field); push(list, t, v); };
+    feed(hist.cpu, "pistack_machine_cpu_usage_cores", "value");
+    feed(hist.mem, "pistack_machine_memory_bytes", "value");
+    feed(hist.dr, "pistack_machine_disk_read_bytes_total", "rate");
+    feed(hist.dw, "pistack_machine_disk_written_bytes_total", "rate");
+    feed(hist.rx, "pistack_machine_network_receive_bytes_total", "rate");
+    feed(hist.tx, "pistack_machine_network_transmit_bytes_total", "rate");
+    drawCharts();
+  }, 10000);
+}
+
+// What was done, newest first, from the audit log.
+function activityFeed(records, empty) {
+  if (!records.length) return el("p", empty || "Nothing recorded yet.");
+  const ul = el("ul", null, "feed");
+  for (const r of records) {
+    const s = r.spec || {};
+    const li = el("li", null, s.status >= 400 ? "bad" : "");
+    const what = el("span", null, "what");
+    what.append(el("b", s.principal || "someone"), " " + (s.action || String(s.method || "").toLowerCase()) +
+      (s.kind ? " " + s.kind : "") + (s.resource ? " " + shortId(s.resource) : ""));
+    what.title = (s.method || "") + " " + (s.path || "");
+    li.append(el("span", ago(r.created_at), "when"), what, el("span", String(s.status || ""), "code"));
+    ul.append(li);
+  }
+  return ul;
 }
 
 async function renderDns(root, gen) {
@@ -2394,6 +2778,14 @@ async function renderOverview(root, gen) {
     try { got[v] = itemsOf(await api("GET", VIEWS[v].path)); }
     catch (e) { got[v] = []; failed.push(VIEWS[v].title); }
   }));
+  // Extras that only some callers may read. The page is whole without them.
+  const quiet = (p) => p.catch(() => null);
+  const [cluster, samples, auditPage, info] = await Promise.all([
+    quiet(api("GET", "/cluster")),
+    quiet(usageSamples()),
+    quiet(api("GET", "/identity/audit?order=desc&limit=8")),
+    quiet(api("GET", "/", undefined, false)),
+  ]);
   if (gen !== renderGen) return;
   for (const v of wanted) if (!failed.includes(VIEWS[v].title)) setCount(v, got[v].length);
   if (failed.length === wanted.length) { setErr("The server did not answer. Is it still running?"); return; }
@@ -2433,6 +2825,49 @@ async function renderOverview(root, gen) {
   );
   root.append(tiles);
 
+  // The servers that run this cloud, as the one answering sees them.
+  if (cluster && Array.isArray(cluster.members)) {
+    const strip = el("div", null, "strip");
+    strip.append(el("span", "Control plane", "name"));
+    const voters = cluster.members.filter(m => String(m.role).toLowerCase() === "voter");
+    for (const m of cluster.members) {
+      const srv = el("span", null, "srv");
+      srv.append(String(m.api || "").replace(/^https?:\/\//, ""));
+      const leads = m.id === cluster.leader_id;
+      srv.append(pill(leads ? "leader" : String(m.role || "").toLowerCase()));
+      srv.title = m.id;
+      strip.append(srv);
+    }
+    const facts = [voters.length + (voters.length === 1 ? " voter" : " voters")];
+    if (!cluster.leader_id) facts.unshift("no leader");
+    if (cluster.commit !== undefined) facts.push("entry " + cluster.commit);
+    if (info && info.version) facts.push("build " + info.version);
+    strip.append(el("span", facts.join(" · "), cluster.leader_id ? "facts" : "facts bad"));
+    root.append(strip);
+  }
+
+  // The last minutes, added up across hosts and machines.
+  if (samples !== null) {
+    const rows = samples;
+    const load = sumSeries(seriesOf(rows, "pistack_host_load1"));
+    const memUsed = sumSeries(seriesOf(rows, "pistack_host_memory_used_bytes"));
+    const memTotal = lastOf(sumSeries(seriesOf(rows, "pistack_host_memory_total_bytes")));
+    const cores = sumSeries(seriesOf(rows, "pistack_machine_cpu_usage_cores"));
+    const rx = sumSeries(seriesOf(rows, "pistack_machine_network_receive_bytes_total").map(asRate));
+    const tx = sumSeries(seriesOf(rows, "pistack_machine_network_transmit_bytes_total").map(asRate));
+    const empty = "No samples on this server. The leader keeps them.";
+    const charts = el("div", null, "charts");
+    const c1 = chartCard("Host load"), c2 = chartCard("Host memory"), c3 = chartCard("Machine CPU"), c4 = chartCard("Machine network");
+    charts.append(c1.node, c2.node, c3.node, c4.node);
+    const v1 = lastOf(load), v2 = lastOf(memUsed), v3 = lastOf(cores), v4 = lastOf(rx);
+    c1.draw(v1 === null ? null : fmtNum(v1), v1 === null ? "" : "across " + ready.length + (ready.length === 1 ? " host" : " hosts"), [load], { empty });
+    c2.draw(v2 === null ? null : fmtBytes(v2), memTotal ? "of " + fmtBytes(memTotal) : "", [memUsed], { ceiling: memTotal || 0, empty });
+    c3.draw(v3 === null ? null : fmtNum(v3), v3 === null ? "" : "cores busy", [cores], { empty });
+    c4.draw(v4 === null ? null : fmtBytes(v4) + "/s", v4 === null ? "" : "in", [rx, tx],
+      { empty, legend: v4 === null ? [] : ["in", "out " + fmtBytes(lastOf(tx) || 0) + "/s"] });
+    root.append(charts);
+  }
+
   // Anything that is not healthy, across what was fetched.
   const trouble = [];
   for (const v of wanted) {
@@ -2452,7 +2887,7 @@ async function renderOverview(root, gen) {
       ["Kind", r => VIEWS[r.view].title],
       ["Name", r => r.item.name],
       ["Phase", r => r.item.status && r.item.status.phase],
-      ["Message", r => String((r.item.status && r.item.status.message) || "").slice(0, 160)],
+      ["Message", r => shortIds((r.item.status && r.item.status.message) || "").slice(0, 160)],
     ], trouble.slice(0, 12));
     t.className = "wrap";
     [...t.querySelectorAll("tbody tr")].forEach((tr, idx) => {
@@ -2495,6 +2930,13 @@ async function renderOverview(root, gen) {
   right.append(hp);
   split.append(left, right);
   root.append(split);
+
+  if (auditPage !== null) {
+    root.append(el("h3", "Recent activity"));
+    const ap = el("div", null, "panel");
+    ap.append(activityFeed(itemsOf(auditPage)));
+    root.append(ap);
+  }
   if (failed.length) setErr("Could not read: " + failed.join(", ") + ".");
 }
 
