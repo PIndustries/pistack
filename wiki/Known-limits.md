@@ -72,7 +72,14 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **The default backend is `mock`.** A server started without `PISTACK_FABRIC_BACKEND` configures nothing on any host and reports success.
 - **`hostnat` is single-host and IPv4 only.** Its helper needs five environment variables passed through `sudo`, and the repository ships no sudoers configuration for that.
 - **`overlay` puts each project router on one host.** There is no redundancy for it. Instance metadata is redirected to a port only the server listens on, so it does not appear to work on hosts that run only an agent.
-- **`ovn` is half built.** The northbound database is written. PiStack does not set up `ovn-controller` on hosts, virtual machines under libvirt are not plugged into OVN, and there is no metadata service or OVN load balancer.
+- **`ovn` has no load balancer of its own**, and PiStack does not install Open vSwitch or `ovn-controller` on hosts.
+- **Metadata on OVN has not been run on hosts.** It is tested against stand-ins for `ip`, `ovs-vsctl` and the northbound database. [Networking](Networking) has the check to run on a lab.
+- **Metadata on OVN needs a root agent and a leader.** An agent that is not root serves none. With no leader the guest gets `503`; the other backends read the server's local copy.
+- **Metadata on OVN relies on the guest taking an on-link route from DHCP** (option 121, router `0.0.0.0`). A guest with a static address, or a DHCP client that ignores the option, has no route to it. Guests that were running before the upgrade get the route at their next lease renewal.
+- **Metadata on OVN tells guests apart by network and source address.** Port security, on by default, is what stops a guest from sending with another guest's address. Turn it off on a port and that protection is gone for the guests that share its network and host.
+- **Metadata on OVN is as open as the agent transport.** With client certificates, a host can read metadata only for the guests placed on it. With `PISTACK_RPC_INSECURE=1` anything that reaches the API port can ask for any guest's metadata, the secrets named on it included, as it can already register as a host.
+- **Metadata requests are not rate limited.** One host serves at most 64 at a time per network; each one is a call to the leader.
+- **A machine that is live-migrated has no metadata on the new host until that host's next heartbeat**, up to 15 seconds.
 - **Automatic floating IPs come from one network for the whole cloud.** There is no pool per project, and the setting cannot be limited to some projects other than by labelling the ones that opt out.
 - **An automatic floating IP does not follow a machine to a new address.** It stays on the port it was first given. Delete it and the next pass creates one for the new address.
 - **Floating IPs given before the setting existed are not removed.** After an upgrade they stay until you delete them or their machine.

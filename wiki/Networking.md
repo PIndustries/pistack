@@ -113,7 +113,7 @@ On every host:
 
 The helper keeps its state in `/var/lib/pistack/overlay`.
 
-Instance metadata (`169.254.169.254`) is redirected to port 18880 on the host's loopback, where the server's metadata service listens. On a host that does not also run a server nothing listens there, so metadata does not work on agent-only hosts as far as the code shows.
+Instance metadata (`169.254.169.254`) is redirected to port 18880 on the host's loopback, where the server's metadata service listens. On a host that does not also run a server nothing listens there, so metadata does not work on agent-only hosts as far as the code shows. The guest is recognised by its source address alone, so two networks with the same subnet are not told apart here; OVN, below, does tell them apart.
 
 ## ovn
 
@@ -126,8 +126,8 @@ The server writes OVN's northbound database directly. It does not run `ovn-nbctl
 
 What the server creates:
 
-- a logical switch per network, with a `localnet` port for provider networks,
-- DHCP options per subnet,
+- a logical switch per network, with a `localnet` port for provider networks and a `localport` for metadata,
+- DHCP options per subnet, with an on-link route to the metadata address,
 - a switch port per port, with port security,
 - logical routers with a gateway port, a default route and SNAT,
 - port groups and ACLs for security groups, with a default drop,
@@ -140,12 +140,64 @@ What you have to provide:
 - OVN central (northbound and southbound databases, `ovn-northd`) reachable from the leader.
 - Open vSwitch and `ovn-controller` on every host, registered as a chassis with its encapsulation address. PiStack does not set this up.
 
-What is missing on the host side:
+On the host, the agent plugs pod interfaces into `br-int` with `ovs-vsctl`, and libvirt plugs a virtual machine's interface as an Open vSwitch port.
 
-- The agent plugs pod interfaces into `br-int` with `ovs-vsctl`. The libvirt runtime does not, so virtual machines are not attached to OVN ports yet.
-- There is no metadata service on this backend.
+### Metadata on OVN
 
-Treat `ovn` as work in progress. The northbound side is in place; the host side is not.
+A guest on an OVN network asks `http://169.254.169.254/` as on the other backends. The path there is different, because OVN gives a guest no way to an address on its host.
+
+- Every logical switch has a port named `pimeta-<network uuid>` of type `localport` that holds `169.254.169.254`. A localport exists on every host, and its traffic never crosses a tunnel, so each host answers the guests it runs.
+- DHCP gives the guest an on-link route to `169.254.169.254/32` (option 121 with router `0.0.0.0`). The default route is repeated in that option, because a client that is given option 121 ignores the router option. A pod takes no lease; the agent adds the same route when it plugs the pod.
+- On each host, for each network that has a guest there, the agent keeps a network namespace named like the port, a veth pair from `br-int` into it, and a listener on `169.254.169.254:80` inside the namespace. Nothing listens on an address of the host.
+- The agent passes the request on to the server over its own connection, the one it uses for everything else. It says which network the namespace belongs to and which address the connection came from. The server answers only when a machine placed on that host holds that address on that network. Nothing the guest sends is trusted: its headers are not read, and only the path is passed on. Two projects with the same subnet get their own answers.
+- The agent looks at every heartbeat and before it starts a machine. A network that lost its last guest on the host loses the namespace, the port on `br-int` and the listener. Namespaces left by an agent that was restarted are adopted or removed the same way.
+- A security group cannot cut a guest off from metadata: the port group every secured port joins allows TCP port 80 to `169.254.169.254`.
+
+What it needs:
+
+- The agent runs as root, as the packaged unit does. It creates namespaces and opens a socket inside each. An agent that is not root logs once that guests on OVN networks get no metadata from that host.
+- A leader. The agent asks the leader, so while the cluster has none the guest gets `503`.
+- A guest that was running before the server was upgraded learns the route when it renews its lease, at the latest six hours later, or at once with `networkctl renew <interface>` or a reboot.
+
+A virtual machine still gets its name, keys and user data from the seed disk at first boot and does not depend on this. Metadata is what serves secrets (`/latest/meta-data/secrets/<name>`), the floating IP (`/latest/meta-data/public-ipv4`) and anything in the guest that asks the address.
+
+This path is tested against stand-ins for `ip`, `ovs-vsctl` and the northbound database, not on hosts. To check it on a lab with two OVN hosts, as an admin:
+
+```sh
+pi host label <host-a> metacheck=a
+pi host label <host-b> metacheck=b
+pi network create meta-check
+pi subnet create meta-check4 --network meta-check --cidr 10.77.0.0/24
+pi machine create mc-a --image ubuntu-24.04 --size s.1x1 --network meta-check \
+    --ssh-key @$HOME/.ssh/id_ed25519.pub --host-selector metacheck=a --wait
+pi machine create mc-b --image ubuntu-24.04 --size s.1x1 --network meta-check \
+    --ssh-key @$HOME/.ssh/id_ed25519.pub --host-selector metacheck=b --wait
+```
+
+Use an image and a size you have. Then, on each host, with `<uuid>` the network id from `pi network show meta-check` without its `net-` prefix:
+
+```sh
+ip netns list | grep pimeta-<uuid>                      # the namespace is there
+ip netns exec pimeta-<uuid> ip -4 addr show meta0       # 169.254.169.254/32
+ip netns exec pimeta-<uuid> ip route                    # 10.77.0.0/24 dev meta0
+ip netns exec pimeta-<uuid> ss -ltn                     # 169.254.169.254:80
+ovs-vsctl --columns=name,external_ids find Interface external_ids:iface-id=pimeta-<uuid>
+ovn-sbctl --columns=logical_port,type find Port_Binding logical_port=pimeta-<uuid>   # type localport
+ss -ltn | grep 169.254.169.254                          # nothing: the host itself does not listen
+```
+
+and in each guest:
+
+```sh
+ip route get 169.254.169.254                 # dev <nic>, no "via"
+curl -s http://169.254.169.254/latest/meta-data/hostname      # mc-a in mc-a, mc-b in mc-b
+curl -s http://169.254.169.254/latest/meta-data/local-ipv4    # the guest's own 10.77.0.x
+curl -s http://169.254.169.254/latest/meta-data/public-keys/0/openssh-key   # the key given above
+curl -s -H 'X-Forwarded-For: <address of the other guest>' \
+    http://169.254.169.254/latest/meta-data/hostname          # still this guest's own name
+```
+
+Delete `mc-a`, wait one heartbeat (15 seconds unless configured otherwise), and `ip netns list` on host a no longer shows the namespace while host b still serves `mc-b`. If `ip route get` in the guest shows `via` the gateway, the guest did not take the on-link route; `ip route` and the DHCP client's log say what it was given.
 
 ## Load balancers
 
