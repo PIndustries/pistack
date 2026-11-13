@@ -519,6 +519,9 @@ impl Registrar {
     /// Consume agent events until `shutdown`.
     pub async fn run(self, shutdown: CancellationToken) {
         let mut rx = self.queue.subscribe_agent_events();
+        // An agent may have said hello to the queue before this started
+        // listening, as one does when it reaches a new leader first.
+        self.resync();
         loop {
             let ev = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -549,9 +552,17 @@ impl Registrar {
         }
     }
 
-    /// After a lag, treat every node the queue knows as freshly announced.
+    /// Treat every node that said hello to the queue a moment ago as
+    /// freshly announced: those are the hellos that may have been missed.
+    /// An older hello is left alone. Its host is registered already, and
+    /// the node may have gone since; announcing it again would mark a dead
+    /// host ready.
     fn resync(&self) {
+        let recent = Utc::now() - crate::reconcile::HOST_STALE_AFTER;
         for n in self.queue.nodes() {
+            if n.last_hello.is_none_or(|at| at < recent) {
+                continue;
+            }
             let hello = AgentHello {
                 node_name: n.name,
                 capabilities: n.capabilities,
@@ -1166,6 +1177,37 @@ mod tests {
         reg.resync();
         let kept = store.collection::<Host>().get(&host.meta.id).unwrap();
         assert_eq!(kept.spec.underlay_ip.as_deref(), Some("192.168.5.9"));
+    }
+
+    #[tokio::test]
+    async fn a_hello_from_before_the_registrar_listened_is_registered() {
+        let store = Store::in_memory().unwrap();
+        let drivers = Arc::new(DriverRegistry::new());
+        let queue = CommandQueue::default();
+        queue.hello(&hello("early"));
+        // A node that has only polled has announced nothing to register.
+        let _ = queue.next("silent", std::time::Duration::ZERO, 1).await;
+        let stop = CancellationToken::new();
+        let registrar = Registrar::new(store.clone(), drivers, queue);
+        let run = tokio::spawn(registrar.run(stop.clone()));
+        let nodes = || -> Vec<String> {
+            store
+                .collection::<Host>()
+                .list(None)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.spec.node_name.clone())
+                .collect()
+        };
+        for _ in 0..100 {
+            if !nodes().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        stop.cancel();
+        run.await.unwrap();
+        assert_eq!(nodes(), vec!["early"]);
     }
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
