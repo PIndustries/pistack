@@ -10,9 +10,10 @@
 //! compiled in rustls refuses to pick a default.
 
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::error::{KeepError, Result};
 
@@ -74,6 +75,70 @@ pub fn server_config(pki: &Pki) -> Result<ServerConfig> {
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// The certificate a TLS listener presents, replaceable while it serves.
+/// Connections already open keep the certificate they were made with; the
+/// next handshake gets the new one.
+#[derive(Debug)]
+pub struct ServerCert {
+    current: RwLock<Arc<CertifiedKey>>,
+}
+
+impl ServerCert {
+    pub fn new(pki: &Pki) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            current: RwLock::new(Arc::new(certified(pki)?)),
+        }))
+    }
+
+    /// Present `pki` from the next handshake on. Nothing changes when the
+    /// certificate and key do not load or do not belong together.
+    pub fn replace(&self, pki: &Pki) -> Result<()> {
+        let next = Arc::new(certified(pki)?);
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
+    }
+}
+
+impl ResolvesServerCert for ServerCert {
+    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(
+            self.current
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+}
+
+fn certified(pki: &Pki) -> Result<CertifiedKey> {
+    let mut chain = certs_from_pem(&pki.cert_pem)?;
+    chain.extend(certs_from_pem(&pki.ca_pem)?);
+    let key = provider()
+        .key_provider
+        .load_private_key(key_from_pem(&pki.key_pem)?)
+        .map_err(|e| KeepError::Tls(format!("bad private key: {e}")))?;
+    let certified = CertifiedKey::new(chain, key);
+    certified
+        .keys_match()
+        .map_err(|e| KeepError::Tls(format!("certificate and key do not match: {e}")))?;
+    Ok(certified)
+}
+
+/// [`server_config_http`] presenting whatever `cert` holds at each
+/// handshake. Client certificates are checked against `ca_pem`.
+pub fn server_config_http_reloadable(ca_pem: &str, cert: Arc<ServerCert>) -> Result<ServerConfig> {
+    let verifier = WebPkiClientVerifier::builder_with_provider(roots_from_pem(ca_pem)?, provider())
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| KeepError::Tls(format!("client verifier: {e}")))?;
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(cert);
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(cfg)
 }
 

@@ -5860,6 +5860,8 @@ mod tests {
                 data_dir: dirs[n].path().to_path_buf(),
                 store: stores[n].clone(),
                 names: Vec::new(),
+                leadership: pistack_types::Leadership::always(),
+                node_id: format!("srv-{n}"),
             };
             let listeners = crate::listen::bind_listeners(app, "127.0.0.1:0", Some(tls))
                 .await
