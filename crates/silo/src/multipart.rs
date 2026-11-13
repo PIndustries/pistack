@@ -10,7 +10,8 @@
 //!
 //! Staging is plain files on disk, never store records, so an unfinished
 //! upload is not an object: it does not show up in object listings or
-//! object sizes.
+//! object sizes. [`crate::staging`] copies it to the other control-plane
+//! servers.
 
 use crate::client::Client;
 use crate::types::*;
@@ -91,11 +92,11 @@ pub struct CompletedPart {
 }
 
 impl Client {
-    fn uploads_root(&self, bucket: &Id) -> PathBuf {
+    pub(crate) fn uploads_root(&self, bucket: &Id) -> PathBuf {
         self.root().join(bucket.to_string()).join(".uploads")
     }
 
-    fn upload_dir(&self, bucket: &Id, upload_id: &str) -> ApiResult<PathBuf> {
+    pub(crate) fn upload_dir(&self, bucket: &Id, upload_id: &str) -> ApiResult<PathBuf> {
         validate_upload_id(upload_id)?;
         Ok(self.uploads_root(bucket).join(upload_id))
     }
@@ -122,6 +123,7 @@ impl Client {
         let bytes = serde_json::to_vec_pretty(&meta)
             .map_err(|e| ApiError::internal(format!("silo multipart meta: {e}")))?;
         tokio::fs::write(&meta_path, bytes).await.map_err(io_err)?;
+        self.push_staged(bucket_id, &upload_id, None, 0).await?;
         Ok(upload_id)
     }
 
@@ -181,6 +183,12 @@ impl Client {
         tokio::fs::write(&etag_path, written.md5.as_bytes())
             .await
             .map_err(io_err)?;
+        let size = tokio::fs::metadata(&part_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.push_staged(bucket_id, upload_id, Some(part_number), size)
+            .await?;
         Ok(written.md5)
     }
 
@@ -485,8 +493,11 @@ impl Client {
         Ok(meta)
     }
 
+    /// The upload is over. The mark is written first so no other server
+    /// hands the staging back.
     async fn remove_upload_dir(&self, bucket_id: &Id, upload_id: &str) -> ApiResult<()> {
         let dir = self.upload_dir(bucket_id, upload_id)?;
+        self.mark_upload_done(bucket_id, upload_id).await?;
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -606,7 +617,7 @@ fn normalize_etag(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn validate_upload_id(id: &str) -> ApiResult<()> {
+pub(crate) fn validate_upload_id(id: &str) -> ApiResult<()> {
     if id.is_empty() || id.len() > 128 || id.contains('/') || id.contains('\\') || id.contains("..")
     {
         return Err(s3_err("NoSuchUpload", "invalid upload id"));

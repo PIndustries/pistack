@@ -100,8 +100,12 @@ impl ImageStore for SiloStore {
         let bucket_id = self.ensure_bucket()?;
         let ctype = || Some("application/octet-stream".to_owned());
         let staging = format!("staging/{}", uuid::Uuid::now_v7());
+        // The staged object lives for the length of this call. Only the
+        // checksum object is worth a second server's disk.
         let staged = self
             .client
+            .clone()
+            .with_put_copies(1)
             .put_object_stream(
                 &bucket_id,
                 &staging,

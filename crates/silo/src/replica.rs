@@ -28,11 +28,13 @@
 //! stale and is fetched again. A file with no marker predates this module
 //! and was written by the only server there was, so it is trusted.
 //!
-//! What this does not do: a put is acknowledged before any other server
-//! has the bytes, so losing the leader within one pull interval of a put
-//! loses that object's bytes while its record survives. Reads of it then
-//! fail with `unavailable`. Multipart staging is not copied; an upload in
-//! flight when the leader changes has to start again.
+//! * **Copy before the answer.** A put is answered only after one other
+//!   server holds the bytes: the server that took it calls
+//!   `POST /silo/peer/pull/{object-id}/{sha256}` on each peer in turn and
+//!   the first one that answers has fetched and checked them. See
+//!   [`Peers::push`]. `[modules.silo] put_copies = 1` turns the wait off.
+//!
+//! Multipart staging is copied by [`crate::staging`].
 
 use crate::client::Client;
 use crate::types::{Bucket, Object};
@@ -54,6 +56,18 @@ pub const REPLICATE_INTERVAL_SECS: u64 = 60;
 /// for a deleted one.
 pub const PRUNE_GRACE: Duration = Duration::from_secs(15 * 60);
 
+/// Servers that hold an object's bytes before a put is answered, when
+/// the config does not say.
+pub const PUT_COPIES: u32 = 2;
+
+/// How long a peer asked to pull waits for the object's record to reach
+/// it through the log before it gives up.
+pub const RECORD_WAIT: Duration = Duration::from_secs(5);
+
+/// A peer asked to pull is given this long, plus a second for each
+/// mebibyte, before the next one is tried.
+const PUSH_BASE: Duration = Duration::from_secs(30);
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A peer that sends nothing for this long is given up on. There is no
 /// limit on the whole transfer: a 5 GiB object takes as long as it takes.
@@ -70,6 +84,10 @@ struct Member {
     #[serde(default)]
     agent_api: Option<String>,
 }
+
+/// One other server: its API address and, when it has one, its TLS
+/// address.
+pub(crate) type Target = (String, Option<String>);
 
 /// The other control-plane servers, as a source of object bytes.
 #[derive(Clone)]
@@ -138,7 +156,7 @@ impl Peers {
 
     /// Each server to ask, the leader first: its API address and, when it
     /// has one, its TLS address.
-    fn targets(&self) -> Vec<(String, Option<String>)> {
+    pub(crate) fn targets(&self) -> Vec<Target> {
         match &self.source {
             Source::Fixed(urls) => urls.iter().map(|url| (url.clone(), None)).collect(),
             Source::Cluster { store, me } => {
@@ -153,6 +171,85 @@ impl Peers {
                 others.into_iter().map(|m| (m.api, m.agent_api)).collect()
             }
         }
+    }
+
+    /// Have `wanted` other servers fetch the bytes of `obj` from this one.
+    ///
+    /// Each peer is asked in turn and answers once it holds bytes that
+    /// match the checksum. Ok when there is no peer to ask: a cluster of
+    /// one server has nowhere to put a second copy. `unavailable` when
+    /// fewer than `wanted` took it and there were peers to ask.
+    pub async fn push(&self, obj: &Object, wanted: usize) -> ApiResult<()> {
+        let urls = self.targets();
+        let wanted = wanted.min(urls.len());
+        let wait = push_wait(obj.status.size_bytes);
+        let mut taken = 0;
+        let mut last = String::new();
+        for to in &urls {
+            if taken >= wanted {
+                break;
+            }
+            let path = format!("/silo/peer/pull/{}/{}", obj.meta.id, obj.status.sha256);
+            match self.post(to, &path, wait).await {
+                Ok(()) => taken += 1,
+                Err(e) => last = format!("{}: {e}", to.0),
+            }
+        }
+        if taken >= wanted {
+            return Ok(());
+        }
+        tracing::warn!(object = %obj.meta.id, key = %obj.spec.key, %last, "silo: no second copy of a put");
+        Err(ApiError::unavailable(format!(
+            "object '{}' is stored on this server only: {} of {} other server(s) took a copy (last: {last}). \
+             It is copied in the background; read before retrying",
+            obj.spec.key,
+            taken,
+            urls.len()
+        )))
+    }
+
+    /// POST `path` to a peer with the peer key and wait up to `wait` for
+    /// it to say it is done.
+    pub(crate) async fn post(&self, to: &Target, path: &str, wait: Duration) -> Result<(), String> {
+        let sent = self.send(to, |client, base| client.post(format!("{base}{path}")));
+        match tokio::time::timeout(wait, sent).await {
+            Ok(Ok(resp)) if resp.status().is_success() => Ok(()),
+            Ok(Ok(resp)) => Err(format!("status {}", resp.status().as_u16())),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(format!("no answer in {}s", wait.as_secs())),
+        }
+    }
+
+    /// GET `path` from a peer with the peer key. An answer that is not a
+    /// success is an error.
+    pub(crate) async fn get(&self, to: &Target, path: &str) -> Result<reqwest::Response, String> {
+        let sent = self.send(to, |client, base| client.get(format!("{base}{path}")));
+        let resp = tokio::time::timeout(STALL, sent)
+            .await
+            .map_err(|_| "no answer".to_owned())??;
+        if !resp.status().is_success() {
+            return Err(format!("status {}", resp.status().as_u16()));
+        }
+        Ok(resp)
+    }
+
+    /// Send one request to a peer the way every call between servers
+    /// goes: at its TLS listener when it has one, with the peer key.
+    async fn send(
+        &self,
+        (api, tls): &Target,
+        request: impl Fn(reqwest::Client, &str) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        let key = self.peer_key();
+        self.net
+            .send(api, tls.as_deref(), CONNECT_TIMEOUT, |client, base| {
+                let req = request(client, base.trim_end_matches('/'));
+                match &key {
+                    Some(key) => req.header(keep::peer::PEER_HEADER, key),
+                    None => req,
+                }
+            })
+            .await
     }
 
     /// Download the bytes with checksum `sha256` to `dest`.
@@ -249,6 +346,11 @@ impl Peers {
         guard.disarm();
         Ok(())
     }
+}
+
+/// How long a peer asked to copy `size` bytes is given.
+pub(crate) fn push_wait(size: u64) -> Duration {
+    PUSH_BASE + Duration::from_secs(size / (1024 * 1024))
 }
 
 /// This server's member id, from `<data_dir>/node.id`.
@@ -476,6 +578,15 @@ pub async fn run(
             ),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "silo: syncing object bytes failed"),
+        }
+        match crate::staging::sync(&client).await {
+            Ok(report) if report != crate::staging::StagedReport::default() => tracing::info!(
+                fetched = report.fetched,
+                removed = report.removed,
+                "silo: multipart staging synced with the other servers"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "silo: syncing multipart staging failed"),
         }
     }
 }

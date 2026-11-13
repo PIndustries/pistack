@@ -288,3 +288,291 @@ async fn the_peer_route_serves_bytes_by_checksum_and_nothing_else() {
     assert_eq!(resp.status().as_u16(), 404);
     assert!(!p.b_dir.path().join(id.to_string()).exists());
 }
+
+/// Two servers that both listen and name each other as the only peer.
+/// `a` takes the puts, as the leader does.
+struct Both {
+    a: Client,
+    b: Client,
+    store: Store,
+    a_dir: tempfile::TempDir,
+    b_dir: tempfile::TempDir,
+}
+
+async fn both() -> Both {
+    let store = Store::in_memory().unwrap();
+    store
+        .put_meta(gate::token::META_JWT_SECRET, &"c2VjcmV0".to_owned())
+        .unwrap();
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = |l: &tokio::net::TcpListener| {
+        Peers::fixed(vec![format!("http://{}", l.local_addr().unwrap())])
+            .with_key_from(store.clone())
+    };
+    let a = Client::new(store.clone(), a_dir.path())
+        .with_min_part_bytes(1)
+        .with_peers(peer(&b_listener));
+    let b = Client::new(store.clone(), b_dir.path())
+        .with_min_part_bytes(1)
+        .with_peers(peer(&a_listener));
+    for (listener, client) in [(a_listener, a.clone()), (b_listener, b.clone())] {
+        let app = Router::new().nest("/silo", silo::http::router(client));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+    }
+    Both {
+        a,
+        b,
+        store,
+        a_dir,
+        b_dir,
+    }
+}
+
+#[tokio::test]
+async fn a_put_is_answered_once_another_server_holds_the_bytes() {
+    let p = both().await;
+    let id = bucket(&p.a, "data", false);
+    p.a.put_object(&id, "report.txt", b"first", None)
+        .await
+        .unwrap();
+
+    // A client over B's directory with nobody to ask: what is on B's disk.
+    let b_disk = Client::new(p.store.clone(), p.b_dir.path());
+    assert_eq!(read(&b_disk, &id, "report.txt").await, b"first");
+
+    // An overwrite is copied too, not left as the old bytes.
+    p.a.put_object(&id, "report.txt", b"second, longer", None)
+        .await
+        .unwrap();
+    assert_eq!(read(&b_disk, &id, "report.txt").await, b"second, longer");
+}
+
+#[tokio::test]
+async fn a_put_no_other_server_copies_is_unavailable_and_kept() {
+    let store = Store::in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // A port nothing listens on.
+    let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", gone.local_addr().unwrap());
+    drop(gone);
+    let a = Client::new(store.clone(), dir.path()).with_peers(Peers::fixed(vec![url]));
+    let id = bucket(&a, "data", false);
+
+    let err = a.put_object(&id, "k", b"bytes", None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(
+        err.message.contains("stored on this server only"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("0 of 1"), "{}", err.message);
+    // The object is there all the same.
+    assert_eq!(read(&a, &id, "k").await, b"bytes");
+
+    // One copy asked for: nobody is waited on.
+    let alone = a.clone().with_put_copies(1);
+    alone.put_object(&id, "k2", b"bytes", None).await.unwrap();
+
+    // No peers at all, as in a cluster of one server.
+    let single = Client::new(store, dir.path()).with_peers(Peers::fixed(Vec::new()));
+    single.put_object(&id, "k3", b"bytes", None).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pull_for_a_record_that_never_arrives_is_refused() {
+    let p = pair().await;
+    let key = keep::peer::peer_key(p.a.store()).unwrap();
+    let object = Id::new(<silo::ObjectSpec as pistack_types::Spec>::KIND);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/silo/peer/pull/{object}/{}",
+            p.url,
+            "0".repeat(64)
+        ))
+        .header(keep::peer::PEER_HEADER, &key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/silo/peer/pull/{object}/{}",
+            p.url,
+            "0".repeat(64)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+async fn part(
+    c: &Client,
+    bucket: &Id,
+    key: &str,
+    upload: &str,
+    n: u32,
+    body: &'static str,
+) -> String {
+    let stream =
+        futures::stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(body)) });
+    c.upload_part(
+        bucket,
+        key,
+        upload,
+        n,
+        stream,
+        Some(body.len() as u64),
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+fn staged_dir(dir: &tempfile::TempDir, bucket: &Id, upload: &str) -> std::path::PathBuf {
+    dir.path()
+        .join(bucket.to_string())
+        .join(".uploads")
+        .join(upload)
+}
+
+#[tokio::test]
+async fn an_upload_in_flight_is_finished_on_another_server() {
+    let p = both().await;
+    let id = bucket(&p.a, "data", false);
+    let upload =
+        p.a.create_multipart_upload(&id, "big.bin", None)
+            .await
+            .unwrap();
+    let one = part(&p.a, &id, "big.bin", &upload, 1, "hello ").await;
+    let two = part(&p.a, &id, "big.bin", &upload, 2, "world").await;
+
+    // Both parts were on B before each UploadPart returned.
+    let on_b = staged_dir(&p.b_dir, &id, &upload);
+    assert_eq!(std::fs::read(on_b.join("part-1")).unwrap(), b"hello ");
+    assert_eq!(std::fs::read(on_b.join("part-2")).unwrap(), b"world");
+
+    // A is no longer the leader; the client completes against B.
+    let parts = vec![
+        silo::multipart::CompletedPart {
+            part_number: 1,
+            etag: one,
+        },
+        silo::multipart::CompletedPart {
+            part_number: 2,
+            etag: two,
+        },
+    ];
+    p.b.complete_multipart_upload(&id, "big.bin", &upload, &parts)
+        .await
+        .unwrap();
+    assert_eq!(read(&p.b, &id, "big.bin").await, b"hello world");
+    assert!(!on_b.exists());
+
+    // A hears the upload is over and drops its staging; B does not take
+    // it back from A in the meantime.
+    assert_eq!(silo::staging::sync(&p.b).await.unwrap().fetched, 0);
+    assert!(!on_b.exists());
+    let report = silo::staging::sync(&p.a).await.unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(!staged_dir(&p.a_dir, &id, &upload).exists());
+}
+
+#[tokio::test]
+async fn an_aborted_upload_is_removed_everywhere_and_stays_gone() {
+    let p = both().await;
+    let id = bucket(&p.a, "data", false);
+    let upload = p.a.create_multipart_upload(&id, "k", None).await.unwrap();
+    part(&p.a, &id, "k", &upload, 1, "bytes").await;
+    let on_b = staged_dir(&p.b_dir, &id, &upload);
+    assert!(on_b.join("part-1").exists());
+
+    p.a.abort_multipart_upload(&id, "k", &upload).await.unwrap();
+    // B still stages it, and A must not copy it back.
+    assert_eq!(
+        silo::staging::sync(&p.a).await.unwrap(),
+        silo::staging::StagedReport::default()
+    );
+    assert!(!staged_dir(&p.a_dir, &id, &upload).exists());
+
+    assert_eq!(silo::staging::sync(&p.b).await.unwrap().removed, 1);
+    assert!(!on_b.exists());
+}
+
+#[tokio::test]
+async fn the_part_written_later_wins() {
+    let p = both().await;
+    let id = bucket(&p.a, "data", false);
+    let upload = p.a.create_multipart_upload(&id, "k", None).await.unwrap();
+    part(&p.a, &id, "k", &upload, 1, "old").await;
+    let on_b = staged_dir(&p.b_dir, &id, &upload).join("part-1");
+    assert_eq!(std::fs::read(&on_b).unwrap(), b"old");
+
+    // The same part again, taken by A without telling B.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let quiet = p.a.clone().with_put_copies(1);
+    part(&quiet, &id, "k", &upload, 1, "newer").await;
+    assert_eq!(std::fs::read(&on_b).unwrap(), b"old");
+
+    // A does not go back to B's older bytes; B takes A's.
+    assert_eq!(silo::staging::sync(&p.a).await.unwrap().fetched, 0);
+    assert_eq!(silo::staging::sync(&p.b).await.unwrap().fetched, 1);
+    assert_eq!(std::fs::read(&on_b).unwrap(), b"newer");
+    let on_a = staged_dir(&p.a_dir, &id, &upload).join("part-1");
+    assert_eq!(std::fs::read(on_a).unwrap(), b"newer");
+    assert_eq!(silo::staging::sync(&p.b).await.unwrap().fetched, 0);
+}
+
+#[tokio::test]
+async fn a_part_no_other_server_copies_is_unavailable() {
+    let store = Store::in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", gone.local_addr().unwrap());
+    drop(gone);
+    let a = Client::new(store, dir.path()).with_peers(Peers::fixed(vec![url]));
+    let id = bucket(&a, "data", false);
+
+    let err = a.create_multipart_upload(&id, "k", None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(
+        err.message.contains("stored on this server only"),
+        "{}",
+        err.message
+    );
+
+    let alone = a.clone().with_put_copies(1);
+    let upload = alone.create_multipart_upload(&id, "k", None).await.unwrap();
+    part(&alone, &id, "k", &upload, 1, "bytes").await;
+    let stream =
+        futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from("bytes")) });
+    let err = a
+        .upload_part(&id, "k", &upload, 2, stream, Some(5), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(err.message.contains("part 2"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn staging_is_listed_only_for_a_member() {
+    let p = both().await;
+    let id = bucket(&p.a, "data", false);
+    let upload = p.a.create_multipart_upload(&id, "k", None).await.unwrap();
+    part(&p.a, &id, "k", &upload, 1, "bytes").await;
+    let a_url = p.b.peers().unwrap().urls().remove(0);
+    for path in [
+        "/silo/peer/uploads".to_owned(),
+        format!("/silo/peer/uploads/{id}/{upload}"),
+        format!("/silo/peer/uploads/{id}/{upload}/1"),
+    ] {
+        let resp = reqwest::get(format!("{a_url}{path}")).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "{path}");
+    }
+}

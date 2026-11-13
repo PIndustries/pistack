@@ -58,6 +58,7 @@ pub mod multipart;
 pub mod replica;
 pub mod s3;
 pub mod sigv4;
+pub mod staging;
 pub mod types;
 pub mod usage;
 
@@ -100,6 +101,7 @@ impl Silo {
         Client::new(store.clone(), Self::data_root())
             .with_max_object_bytes(self.config.max_object_bytes)
             .with_peers(Peers::from_cluster(store))
+            .with_put_copies(self.config.put_copies)
     }
 }
 

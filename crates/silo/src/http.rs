@@ -102,6 +102,19 @@ pub fn router_with(client: Client, keep: Option<keep::Client>, region: String) -
 
     let peer = Router::new()
         .route("/peer/blobs/{bucket}/{sha256}", get(peer_blob))
+        .route(
+            "/peer/pull/{object}/{sha256}",
+            axum::routing::post(peer_pull),
+        )
+        .route("/peer/uploads", get(peer_uploads))
+        .route(
+            "/peer/uploads/{bucket}/{upload}",
+            get(peer_upload).post(peer_upload_pull),
+        )
+        .route(
+            "/peer/uploads/{bucket}/{upload}/{part}",
+            get(peer_part).post(peer_part_pull),
+        )
         .with_state(state.clone());
 
     Router::new()
@@ -151,6 +164,109 @@ async fn peer_blob(
         headers.insert(header::CONTENT_LENGTH, len);
     }
     Ok(resp)
+}
+
+/// Fetch an object's bytes because the server that took the put asked.
+///
+/// The record travels through the cluster log and may arrive a moment
+/// after this request, so wait for it. Answers once this server holds
+/// bytes that match the checksum.
+async fn peer_pull(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Path((object, sha256)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let required = std::env::var(pistack_rpc::REQUIRE_JOIN_ENV).ok();
+    authorize_peer(c.store(), &headers, required.as_deref())?;
+    let id = Id::parse(ObjectSpec::KIND, &object)
+        .ok_or_else(|| ApiError::not_found("no such object"))?;
+    let deadline = tokio::time::Instant::now() + crate::replica::RECORD_WAIT;
+    let obj = loop {
+        match c.store().collection::<Object>().get(&id) {
+            Ok(obj) if obj.status.sha256 == sha256 => break obj,
+            _ if tokio::time::Instant::now() >= deadline => {
+                return Err(ApiError::unavailable(
+                    "the record of that object has not reached this server",
+                ));
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+        }
+    };
+    c.ensure_bytes(&obj).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn peer_allowed(c: &Client, headers: &HeaderMap) -> ApiResult<()> {
+    let required = std::env::var(pistack_rpc::REQUIRE_JOIN_ENV).ok();
+    authorize_peer(c.store(), headers, required.as_deref())
+}
+
+fn bucket_id(bucket: &str) -> ApiResult<Id> {
+    Id::parse(BucketSpec::KIND, bucket).ok_or_else(|| ApiError::not_found("no such bucket"))
+}
+
+/// Every multipart upload this server stages, for another server to copy.
+async fn peer_uploads(
+    State(c): State<Client>,
+    headers: HeaderMap,
+) -> ApiResult<Json<crate::staging::Staged>> {
+    peer_allowed(&c, &headers)?;
+    Ok(Json(c.staged(None).await?))
+}
+
+async fn peer_upload(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Path((bucket, upload)): Path<(String, String)>,
+) -> ApiResult<Json<crate::staging::Staged>> {
+    peer_allowed(&c, &headers)?;
+    let bucket = bucket_id(&bucket)?;
+    Ok(Json(c.staged(Some((&bucket, &upload))).await?))
+}
+
+async fn peer_part(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Path((bucket, upload, part)): Path<(String, String, u32)>,
+) -> ApiResult<Response> {
+    peer_allowed(&c, &headers)?;
+    let (file, size) = c
+        .open_staged_part(&bucket_id(&bucket)?, &upload, part)
+        .await?;
+    let mut resp = Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
+    if let Ok(len) = HeaderValue::from_str(&size.to_string()) {
+        resp.headers_mut().insert(header::CONTENT_LENGTH, len);
+    }
+    Ok(resp)
+}
+
+/// Copy an upload's `meta.json` here because the server that created it
+/// asked.
+async fn peer_upload_pull(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Path((bucket, upload)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    peer_allowed(&c, &headers)?;
+    c.pull_staged(&bucket_id(&bucket)?, &upload, crate::staging::Want::Meta)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Copy one part here because the server that took it asked.
+async fn peer_part_pull(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Path((bucket, upload, part)): Path<(String, String, u32)>,
+) -> ApiResult<StatusCode> {
+    peer_allowed(&c, &headers)?;
+    c.pull_staged(
+        &bucket_id(&bucket)?,
+        &upload,
+        crate::staging::Want::Part(part),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `required` is the value of `PISTACK_REQUIRE_JOIN`. Only `0` lets a
