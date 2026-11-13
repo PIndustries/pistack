@@ -11,6 +11,7 @@
 //!   the `Registrar` that turns agent hellos into `Host`s.
 //! * [`reconcile`] — the loop that turns `spec` into `status`.
 //! * [`console`] — a ticketed WebSocket in front of the guest's loopback VNC.
+//! * [`maintain`] — draining a host.
 //! * [`http`] — the `compute` API.
 //!
 //! `Forge::default()` is dev mode: a single `local` host backed by a
@@ -23,6 +24,7 @@ pub mod agent_driver;
 pub mod console;
 pub mod driver;
 pub mod http;
+pub mod maintain;
 mod metadata;
 mod nic;
 mod overlay;
@@ -214,6 +216,7 @@ impl Module for Forge {
             drivers: self.drivers.clone(),
             dev_admin: self.dev_admin,
             queue: self.queue.clone(),
+            strategy: self.strategy,
         })
     }
 
