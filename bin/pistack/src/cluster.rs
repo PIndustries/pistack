@@ -2341,6 +2341,18 @@ pub async fn fetch_snapshot_with(
     dest: &Path,
     limits: &SnapshotFetch,
 ) -> anyhow::Result<Downloaded> {
+    fetch_snapshot_as(api, dest, limits, "").await
+}
+
+/// [`fetch_snapshot_with`] as server `node`. A member names itself, so a
+/// leader that removed it refuses; a server joining for the first time has
+/// no standing yet and passes "".
+async fn fetch_snapshot_as(
+    api: &str,
+    dest: &Path,
+    limits: &SnapshotFetch,
+    node: &str,
+) -> anyhow::Result<Downloaded> {
     if dest.exists() {
         anyhow::bail!("{} already exists", dest.display());
     }
@@ -2350,7 +2362,7 @@ pub async fn fetch_snapshot_with(
     let mut restarts = 0u32;
     let result = loop {
         let _ = tokio::fs::remove_file(&partial).await;
-        match download_once(&url, &partial, limits.stall).await {
+        match download_once(&url, &partial, limits.stall, node).await {
             Ok(done) => match check_and_install(&partial, dest).await {
                 Ok(()) => break Ok(done),
                 Err(err) => {
@@ -2384,14 +2396,20 @@ pub async fn fetch_snapshot_with(
     result
 }
 
-async fn download_once(url: &str, partial: &Path, stall: Duration) -> Result<Downloaded, Attempt> {
+async fn download_once(
+    url: &str,
+    partial: &Path,
+    stall: Duration,
+    node: &str,
+) -> Result<Downloaded, Attempt> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     // The leader writes its copy before the first byte, so the wait for
     // headers is a stall too.
-    let response = match tokio::time::timeout(stall, with_join(client.get(url)).send()).await {
+    let request = as_node(with_join(client.get(url)), node);
+    let response = match tokio::time::timeout(stall, request.send()).await {
         Err(_) => {
             return Err(Attempt::NotStarted(anyhow::anyhow!(
                 "snapshot {url}: no answer for {stall:?}"
@@ -2404,6 +2422,13 @@ async fn download_once(url: &str, partial: &Path, stall: Duration) -> Result<Dow
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(Attempt::Refused(anyhow::anyhow!(
             "snapshot {url} returned 401; {REFUSED_HINT}"
+        )));
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // The body says when this server was removed.
+        let body = response.text().await.unwrap_or_default();
+        return Err(Attempt::Refused(anyhow::anyhow!(
+            "snapshot {url} returned 403: {body}"
         )));
     }
     if status.is_client_error() {
