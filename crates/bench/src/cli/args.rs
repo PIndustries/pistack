@@ -514,6 +514,9 @@ pub struct MachineCreate {
     /// Host selector `key=value` (repeatable).
     #[arg(long = "host-selector", value_name = "K=V")]
     pub host_selector: Vec<String>,
+    /// Availability zone: only hosts labelled `zone=<ZONE>`.
+    #[arg(long)]
+    pub zone: Option<String>,
     /// Wait until the machine is ready (or failed).
     #[arg(long)]
     pub wait: bool,
@@ -601,7 +604,7 @@ pub enum HostCmd {
     /// Show a host.
     #[command(alias = "get")]
     Show(NameArg),
-    /// Set or remove labels on a host.
+    /// Set or remove labels on a host. `zone` is the availability zone.
     Label(HostLabelArgs),
 }
 
