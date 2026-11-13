@@ -35,4 +35,5 @@ tokio-rustls.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tower.workspace = true
