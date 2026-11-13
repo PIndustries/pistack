@@ -9,6 +9,11 @@
 //!   └──── transport error / server says "unknown" ◄──────┘  (backoff, re-hello)
 //! ```
 //!
+//! A command marked `remember` runs once per id. Its result is kept (see
+//! [`crate::done`]), a second delivery of the id is answered from what was
+//! kept, and a result the server could not be told is sent again, to
+//! whichever server the agent reaches next.
+//!
 //! The command poll and the heartbeat run as separate tasks on purpose: a
 //! `select!` that dropped an in-flight poll to send a heartbeat would lose
 //! any command the server had just marked delivered. Liveness and readiness
@@ -35,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use pistack_types::node::{self, NodeIdentity, NODE_NAME_ENV};
 
+use crate::done::Completed;
 use crate::facts::{self, HostFacts};
 use crate::ovnhost::OvnHost;
 use crate::probe::{self, ProbeBook, ProbeTarget};
@@ -376,6 +382,8 @@ async fn run_agent_on(
         ovn,
         ovn_watch,
         underlay,
+        done: Arc::new(Completed::open(data_dir().join(crate::done::FILE))),
+        unsent: Mutex::new(Vec::new()),
     };
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -418,6 +426,10 @@ struct Agent {
     ovn_watch: Arc<AtomicBool>,
     /// Underlay address to announce instead of looking one up.
     underlay: Option<String>,
+    /// Results of remembered commands, by id.
+    done: Arc<Completed>,
+    /// Remembered results no server has taken yet.
+    unsent: Mutex<Vec<CommandResult>>,
 }
 
 /// The agent's data directory: `PISTACK_DATA_DIR`, which `pistack agent`
@@ -495,6 +507,7 @@ impl Agent {
             if forgotten.load(Ordering::Relaxed) {
                 break SessionEnd::Rehello;
             }
+            self.resend().await;
             let cmds = tokio::select! {
                 _ = session.cancelled() => break SessionEnd::Shutdown,
                 r = self.client.next_commands(wait) => r,
@@ -531,10 +544,24 @@ impl Agent {
     }
 
     async fn execute_all(&self, cmds: Vec<Command>) {
+        let results = self.run_all(cmds).await;
+        self.report(results).await;
+    }
+
+    /// Run each command and return the results in order. A remembered
+    /// command whose id was completed before is not run: its result is the
+    /// one that was kept.
+    async fn run_all(&self, cmds: Vec<Command>) -> Vec<CommandResult> {
         let mut results = Vec::with_capacity(cmds.len());
         for c in cmds {
             let id = c.id;
             let kind = c.kind;
+            let remember = c.remember;
+            if let Some(kept) = remember.then(|| self.done.get(id)).flatten() {
+                tracing::info!(%id, %kind, "anvil: command was already done; answering with its result");
+                results.push(kept);
+                continue;
+            }
             let r = match self.execute(c).await {
                 Ok(payload) => CommandResult::ok(id).with_payload(payload),
                 Err(e) => {
@@ -542,15 +569,44 @@ impl Agent {
                     CommandResult::from_api_error(id, &e)
                 }
             };
+            if remember {
+                self.done.record(&r);
+            }
             results.push(r);
         }
+        results
+    }
+
+    async fn report(&self, results: Vec<CommandResult>) {
         match self.client.report(&results).await {
             Ok(ack) if !ack.unknown.is_empty() => {
                 tracing::warn!(unknown = ?ack.unknown, "anvil: server no longer knew some commands")
             }
             Ok(_) => {}
-            // The server will time the commands out; the reconciler retries.
-            Err(e) => tracing::warn!(error = %e, "anvil: reporting results failed"),
+            Err(e) => {
+                // A remembered result is sent again on the next turn of the
+                // loop. Any other is dropped: the server times the command
+                // out and whoever asked retries.
+                tracing::warn!(error = %e, "anvil: reporting results failed");
+                let mut unsent = self.unsent.lock().unwrap_or_else(|e| e.into_inner());
+                unsent.extend(
+                    results
+                        .into_iter()
+                        .filter(|r| self.done.get(r.id).is_some()),
+                );
+                let extra = unsent.len().saturating_sub(crate::done::KEEP_MAX);
+                unsent.drain(..extra);
+            }
+        }
+    }
+
+    /// Send again the results no server has taken. A server that does not
+    /// know an id has not been asked for that command yet; if it is, the
+    /// command arrives again and is answered from the record.
+    async fn resend(&self) {
+        let waiting = std::mem::take(&mut *self.unsent.lock().unwrap_or_else(|e| e.into_inner()));
+        if !waiting.is_empty() {
+            self.report(waiting).await;
         }
     }
 
@@ -1849,6 +1905,8 @@ still here
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             underlay: None,
+            done: Arc::new(Completed::in_memory()),
+            unsent: Mutex::new(Vec::new()),
         };
         let bad = agent
             .execute(Command {
@@ -2022,6 +2080,8 @@ still here
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             underlay: None,
+            done: Arc::new(Completed::in_memory()),
+            unsent: Mutex::new(Vec::new()),
         };
         let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
             command_timeout: Duration::from_secs(5),
@@ -2514,6 +2574,8 @@ still here
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             underlay: None,
+            done: Arc::new(Completed::in_memory()),
+            unsent: Mutex::new(Vec::new()),
         };
         let request = |image: &str, source: Option<pistack_rpc::ImageSource>| MachineRequest {
             id: Id::new(pistack_types::kind::MACHINE),
@@ -2752,5 +2814,118 @@ still here
             .join(req.volume.to_string());
         assert!(!mounted.exists());
         assert!(!mounted.with_extension("loop").exists());
+    }
+
+    fn agent_on(base: &str, rt: crate::runtime::SharedRuntime, done: Completed) -> Agent {
+        Agent {
+            client: AgentClient::new(base, "node-a").unwrap(),
+            runtimes: Runtimes::all(rt),
+            facts: facts::gather(),
+            probes: Arc::new(ProbeBook::new()),
+            images: ImageCache::new(std::path::Path::new("/nonexistent")),
+            ovn: Arc::new(OvnHost::system()),
+            ovn_watch: Arc::new(AtomicBool::new(false)),
+            underlay: None,
+            done: Arc::new(done),
+            unsent: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn command(kind: CommandKind, machine: &Id, remember: bool) -> Command {
+        Command {
+            id: uuid::Uuid::now_v7(),
+            kind,
+            payload: serde_json::json!({
+                "id": machine.to_string(),
+                "name": "web",
+                "image": "ubuntu-24.04"
+            }),
+            issued_at: Utc::now(),
+            remember,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_command_delivered_again_is_not_run_again() {
+        use crate::runtime::{MachineRuntime as _, PowerState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(crate::done::FILE);
+        let mock = Arc::new(crate::runtime::MockRuntime::new());
+        let machine = Id::new(pistack_types::kind::MACHINE);
+        let power = || async { mock.list().await.unwrap()[0].power };
+        let start = || command(CommandKind::StartMachine, &machine, false);
+        let stop = command(CommandKind::StopMachine, &machine, true);
+
+        let agent = agent_on("http://127.0.0.1:1", mock.clone(), Completed::open(&record));
+        let first = agent.run_all(vec![start(), stop.clone()]).await;
+        assert!(first.iter().all(|r| r.ok));
+        assert_eq!(power().await, PowerState::Off);
+
+        // Started again, and then the old stop arrives a second time, as it
+        // does when a new leader issues what the old one had outstanding.
+        let again = agent.run_all(vec![start(), stop.clone()]).await;
+        assert_eq!(again[1], first[1]);
+        assert_eq!(power().await, PowerState::On);
+
+        // The agent restarts and still knows the id.
+        let agent = agent_on("http://127.0.0.1:1", mock.clone(), Completed::open(&record));
+        let after = agent.run_all(vec![stop.clone()]).await;
+        assert_eq!(after[0], first[1]);
+        assert_eq!(power().await, PowerState::On);
+
+        // A command that is not marked runs every time it arrives.
+        let plain = Command {
+            remember: false,
+            ..stop
+        };
+        assert!(agent.run_all(vec![plain]).await[0].ok);
+        assert_eq!(power().await, PowerState::Off);
+    }
+
+    #[tokio::test]
+    async fn a_result_the_old_server_did_not_take_goes_to_the_next_one() {
+        let queue = pistack_rpc::CommandQueue::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().nest("/rpc", pistack_rpc::router(queue.clone()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The agent's server is gone; it has heard of the other one.
+        let mock = Arc::new(crate::runtime::MockRuntime::new());
+        let agent = agent_on("http://127.0.0.1:1/rpc", mock, Completed::in_memory());
+        agent.client.learn_servers([live.as_str()]);
+
+        let machine = Id::new(pistack_types::kind::MACHINE);
+        let payload = serde_json::json!({"id": machine.to_string()});
+        let kept = queue
+            .enqueue_keyed(
+                "node-a",
+                "machine/m",
+                CommandKind::StopMachine,
+                payload.clone(),
+            )
+            .unwrap();
+        let dropped = queue
+            .enqueue("node-a", CommandKind::StopMachine, payload)
+            .unwrap();
+        let cmds = queue.next("node-a", Duration::ZERO, 16).await;
+        assert_eq!(cmds.len(), 2);
+
+        agent.execute_all(cmds).await;
+        // Only the remembered result waits to be sent again.
+        assert_eq!(agent.unsent.lock().unwrap().len(), 1);
+        assert_eq!(queue.pending_count(), 2);
+
+        agent.resend().await;
+        assert!(agent.unsent.lock().unwrap().is_empty());
+        let result = tokio::time::timeout(Duration::from_secs(5), kept.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!result.ok, "the mock holds no such machine");
+        assert_eq!(queue.pending_count(), 1);
+        drop(dropped);
+        server.abort();
     }
 }

@@ -15,6 +15,7 @@
 //!   heartbeats and the command loop over `pistack-rpc`.
 
 pub mod agent;
+pub mod done;
 pub mod facts;
 pub mod images;
 mod overlay;
