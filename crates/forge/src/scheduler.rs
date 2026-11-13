@@ -4,7 +4,8 @@
 //! Placement. One pure function: filters, then weighs, then picks.
 //!
 //! Filters (hard): host is `Ready`; it supports the machine kind; its labels
-//! satisfy `spec.host_selector`; it has room for `size` after subtracting
+//! satisfy `spec.host_selector` and, when the machine names one, its `zone`
+//! label is `spec.zone`; it has room for `size` after subtracting
 //! `allocations` made earlier in the same pass.
 //!
 //! Weights (soft): affinity/anti-affinity hints first, then free memory
@@ -13,7 +14,7 @@
 //! deterministic tie-break.
 
 use crate::ovn::Refusal;
-use crate::types::{usable_underlay, Host, MachineSpec};
+use crate::types::{usable_underlay, Host, MachineSpec, ZONE_LABEL};
 use pistack_types::{ApiError, ApiResult, Id, Phase, Resources};
 use std::collections::BTreeMap;
 
@@ -93,10 +94,15 @@ pub fn place(
             rej.kind += 1;
             continue;
         }
-        if !spec
-            .host_selector
-            .iter()
-            .all(|(k, v)| h.meta.labels.get(k) == Some(v))
+        let in_zone = spec
+            .zone
+            .as_ref()
+            .is_none_or(|z| h.meta.labels.get(ZONE_LABEL) == Some(z));
+        if !in_zone
+            || !spec
+                .host_selector
+                .iter()
+                .all(|(k, v)| h.meta.labels.get(k) == Some(v))
         {
             rej.selector += 1;
             continue;
@@ -336,6 +342,26 @@ mod tests {
         assert_eq!(
             err.details.get("selector").and_then(|v| v.as_u64()),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn a_zone_is_a_hard_selector_on_the_zone_label() {
+        let mut a = host("a", 32768, &["kvm"]);
+        a.meta.labels.insert(ZONE_LABEL.into(), "east".into());
+        let mut b = host("b", 8192, &["kvm"]);
+        b.meta.labels.insert(ZONE_LABEL.into(), "west".into());
+        let unlabelled = host("c", 65536, &["kvm"]);
+        let hosts = [a, b.clone(), unlabelled];
+        let mut s = spec(MachineKind::Vm);
+        s.zone = Some("west".into());
+        let got = place(&s, &SIZE, &hosts, &Allocations::new(), Strategy::Spread).unwrap();
+        assert_eq!(got, b.meta.id);
+        s.zone = Some("north".into());
+        let err = place(&s, &SIZE, &hosts, &Allocations::new(), Strategy::Spread).unwrap_err();
+        assert_eq!(
+            err.details.get("selector").and_then(|v| v.as_u64()),
+            Some(3)
         );
     }
 

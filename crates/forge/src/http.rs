@@ -16,7 +16,8 @@
 
 use crate::driver::DriverRegistry;
 use crate::types::{
-    new_machine, new_size, Host, Machine, MachineSpec, Size, DELETE_ANNOTATION, SYSTEM_LABEL_PREFIX,
+    new_machine, new_size, Host, Machine, MachineSpec, Size, DELETE_ANNOTATION,
+    SYSTEM_LABEL_PREFIX, ZONE_LABEL,
 };
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Request, State},
@@ -321,6 +322,23 @@ fn refuse_volumes(volumes: &[String]) -> ApiResult<()> {
     ))
 }
 
+/// A zone and a `zone` host selector say the same thing. Two different
+/// values can match no host, so refuse them here.
+fn check_zone(spec: &MachineSpec) -> ApiResult<()> {
+    let Some(zone) = &spec.zone else {
+        return Ok(());
+    };
+    if zone.trim().is_empty() {
+        return Err(ApiError::bad_request("spec.zone must not be empty"));
+    }
+    match spec.host_selector.get(ZONE_LABEL) {
+        Some(sel) if sel != zone => Err(ApiError::unprocessable(format!(
+            "spec.zone is '{zone}' but spec.host_selector asks for zone '{sel}'"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 async fn list_machines(
     State(s): State<AppState>,
     scope: Scope,
@@ -343,6 +361,7 @@ async fn create_machine(
         return Err(ApiError::bad_request("spec.size is required"));
     }
     refuse_volumes(&body.spec.volumes)?;
+    check_zone(&body.spec)?;
     let size = resolve_size(&s, &body.spec.size)?;
     let mut spec = body.spec;
     // Store the canonical size name so renames of the request form do not
@@ -393,6 +412,7 @@ async fn update_machine(
         if spec.volumes != m.spec.volumes {
             refuse_volumes(&spec.volumes)?;
         }
+        check_zone(&spec)?;
         let size = resolve_size(&s, &spec.size)?;
         spec.size = size.meta.name.clone();
         // Reboot requests are made through the action endpoint, never by PUT.

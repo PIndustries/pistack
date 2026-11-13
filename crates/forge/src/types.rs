@@ -77,6 +77,10 @@ pub const WAIT_VOLUME_ANNOTATION: &str = "loom.pistack.io/wait-volume";
 /// only that host.
 pub const NODE_PIN_ANNOTATION: &str = "loom.pistack.io/node";
 
+/// Host label that names the availability zone. `MachineSpec::zone` is a
+/// hard selector on it.
+pub const ZONE_LABEL: &str = "zone";
+
 /// Labels under this prefix are written by PiStack itself. An operator
 /// cannot set them, and replacing a host's labels keeps them.
 pub const SYSTEM_LABEL_PREFIX: &str = "pistack.io/";
@@ -310,6 +314,10 @@ pub struct MachineSpec {
     /// Hard constraint: every pair must match a host label.
     #[serde(default)]
     pub host_selector: BTreeMap<String, String>,
+    /// Availability zone. Hard constraint: the host's `zone` label must
+    /// equal it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
     #[serde(default)]
     pub power: DesiredPower,
     /// Monotonic counter bumped by `POST /machines/{id}/reboot`. The
