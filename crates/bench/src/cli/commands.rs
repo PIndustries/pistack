@@ -1239,6 +1239,12 @@ async fn user(ctx: &Ctx, cmd: UserCmd, io: &mut Io<'_>) -> CliResult<()> {
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, false).await.map(|_| ())
         }
+        UserCmd::RevokeTokens(a) => {
+            let c = ctx.client()?;
+            let path = format!("{}/revoke-tokens", k.item_path(&a.name));
+            let v = c.post(&path, &json!({})).await?;
+            report(ctx, io, k, &v, "tokens revoked")
+        }
     }
 }
 

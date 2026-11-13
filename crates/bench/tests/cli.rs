@@ -306,6 +306,11 @@ async fn identity_post(
     }
     let path = uri.path().to_owned();
     m.identity_posts.lock().unwrap().push(path.clone());
+    if path.ends_with("/revoke-tokens") {
+        return Json(json!({"id": "prin-0000", "name": "bob", "kind": "prin",
+            "status": {"tokens_not_before": "2026-11-13T10:00:00Z"}}))
+        .into_response();
+    }
     Json(signing_keys(&m)).into_response()
 }
 
@@ -539,6 +544,10 @@ async fn serve() -> (String, Mock) {
         .route("/identity/signing-keys", get(list_signing_keys))
         .route("/identity/signing-keys/rotate", post(identity_post))
         .route("/identity/signing-keys/retire", post(identity_post))
+        .route(
+            "/identity/principals/{id}/revoke-tokens",
+            post(identity_post),
+        )
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
         .route("/compute/machines/{id}/start", post(start))
@@ -1356,4 +1365,12 @@ async fn signing_keys_are_listed_rotated_and_retired() {
     assert_eq!(r.code, 0, "{r:?}");
     assert!(r.out.contains("bbbb2222"), "{}", r.out);
     assert!(r.out.ends_with("retired aaaa1111\n"), "{}", r.out);
+
+    let r = run(&["user", "revoke-tokens", "bob"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("user \"bob\" tokens revoked"), "{}", r.out);
+    assert_eq!(
+        mock.identity_posts.lock().unwrap().last().unwrap(),
+        "/identity/principals/bob/revoke-tokens"
+    );
 }

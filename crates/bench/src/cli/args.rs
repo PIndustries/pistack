@@ -453,7 +453,13 @@ pub struct UserCreate {
     #[arg(long)]
     pub disabled: bool,
 }
-crud!(UserCmd, UserCreate);
+crud!(
+    UserCmd,
+    UserCreate,
+    /// Refuse every token the user holds now. They log in again to get a
+    /// new one. One token cannot be revoked on its own.
+    RevokeTokens(NameArg)
+);
 
 #[derive(Subcommand, Debug)]
 pub enum SigningKeyCmd {
