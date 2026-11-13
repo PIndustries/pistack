@@ -131,9 +131,35 @@ A restarted server finds its existing store and comes back as a follower. It ask
 
 With three voters the cluster keeps a leader with one server down. With two down, the remaining server cannot win an election, and a leader that is left alone steps down. There is no leader and no writes until a second voter returns.
 
-## When a server must rejoin
+## When a server cannot follow the log
 
-A follower that falls too far behind cannot catch up from the log. The leader keeps the last 10,000 entries, plus whatever a follower seen in the last ten minutes still needs, up to 200,000. A server that was down for longer logs one of these and stops replicating:
+There are two cases in which the leader cannot bring a member up to date from its log, however often the member asks.
+
+- **The member fell too far behind.** The leader keeps the last 10,000 entries, plus whatever a follower seen in the last ten minutes still needs, up to 200,000. A server that was down for longer needs entries the leader has trimmed.
+- **The member's log differs from the leader's.** The server was the leader, wrote entries that no majority confirmed, and lost the leadership before they reached anyone. The new leader's log has other entries at those positions. Clients were never told those writes had succeeded: each was answered `503`.
+
+In both cases the member replaces its own store. It downloads a snapshot from the leader it is following, checks it, moves `state.redb` aside as `state.redb.replaced-<time>`, puts the snapshot in its place and starts again. It logs this:
+
+```text
+replication stopped: the leader cannot feed this store from its log. This server will replace its store with a snapshot from the leader and start again
+replacing this server's store with a snapshot from the leader
+store replaced: log entries 31 to 35 of the old store were never confirmed by a majority and are not in the new one. The old store is kept. Starting again on the new store
+starting again on the new store
+```
+
+The line `store replaced` names what was lost. For a server that was only behind it says so instead, with the entry the old store ended at. The same line carries the path of the old store as `kept=`.
+
+What to know about it:
+
+- **The process starts again.** The server stops serving, runs its own binary again with the same arguments and environment, and opens the new store. The process id stays the same. On three local servers the gap was under a tenth of a second. If running the binary fails, for example because it was replaced on disk with one that does not start, the process exits with an error and `Restart=on-failure` in the shipped unit starts it. Without a service manager you then start it yourself, with the usual flags; `--join` and a token are not needed.
+- **It keeps its place.** The server has the same id and the same role afterwards. A voter comes back as a voter and counts toward the majority as soon as it has pulled once. It is not demoted to a learner: it carries its own term and vote over to the new store, and the snapshot is the log of the leader it follows, which holds every confirmed write.
+- **The old store is kept.** The two newest `state.redb.replaced-<time>` files stay in the data directory and older ones are deleted. The file is a whole store and holds the cluster's secrets, like `state.redb`. To look at the writes that were lost, copy it into an empty directory as `state.redb` and run `pistack --data-dir <that directory> store dump`. Nothing puts those writes back; apply them again by hand if they are wanted.
+- **Not while leading.** A leader never replaces its store, and a follower does it only with a snapshot from the leader it heard from within the last election timeout. A snapshot from an older term than the server's own is refused.
+- **Not more than once in ten minutes.** If the leader refuses the server again within ten minutes of a replacement, the server logs that it is waiting and leaves the store alone until the ten minutes are over. The time is read from the name of the newest `state.redb.replaced-<time>` file. A download or check that fails leaves the old store untouched and is tried again after 30 seconds, then one minute, doubling up to ten minutes.
+- **Not a removed server.** A server taken out with `pi server remove` is refused the snapshot and does not come back this way. See [Removing and replacing a server](#removing-and-replacing-a-server).
+- **Not after a restore.** A server still running on its old store when another was restored from a backup is not in the restored member list, so the snapshot is refused and it logs `the leader's member list does not name this server`. Empty it and join it again as the restore section says.
+
+`PISTACK_AUTO_RESYNC=0` turns this off. The server then logs one of these, stops replicating, and stays in the member list as a voter that holds nothing new until you act:
 
 ```text
 replication stopped: the leader no longer keeps the entries this store needs. Stop this node, move state.redb aside (keep node.id), and start it with --join <leader api>
@@ -143,17 +169,15 @@ replication stopped: the leader no longer keeps the entries this store needs. St
 replication stopped: this store has entries the leader never had. Stop this node, remove state.redb (keep node.id), and start it with --join <leader api>
 ```
 
-The second message means this server accepted writes as leader that never reached the others. Those writes are lost when you remove the file. Keep a copy if you need to look at them.
-
-The procedure is manual:
+The procedure by hand:
 
 ```sh
 # on the server that logged the message, after stopping pistack
 mv /var/lib/pistack/state.redb /var/lib/pistack/state.redb.old
-pistack --data-dir /var/lib/pistack server --join http://10.0.0.12:8443 --listen 10.0.0.11:8443
+PISTACK_JOIN_TOKEN=pij_... pistack --data-dir /var/lib/pistack server --join http://10.0.0.12:8443 --listen 10.0.0.11:8443
 ```
 
-Leave `node.id` in place so the server keeps its member identity. It comes back as a learner and is promoted again when it has caught up.
+Leave `node.id` in place so the server keeps its member identity. Done by hand it needs a join token, comes back as a learner and is promoted again when it has caught up.
 
 ## Removing and replacing a server
 
@@ -200,13 +224,13 @@ pistack --data-dir /var/lib/pistack server --listen 10.0.0.11:8443
 
 `store restore` copies the backup into the data directory, checks the copy the way `store backup` does, and only then puts it in place as `state.redb`. A backup that is cut short or damaged, that was written by a newer `pistack`, or that is not the store of a server that has run is refused, and the data directory is left as it was. The backup file itself is never changed.
 
-The data directory must be empty or absent. With `--force` the command restores into a directory that has things in it: the `state.redb` and `admin-password` that are there are renamed to `state.redb.before-restore-<time>` and `admin-password.before-restore-<time>`, `adopt.url` and `state.partial` are removed, and everything else is left alone. It refuses while a server has the store open. Delete the renamed files yourself once you no longer want them.
+The data directory must be empty or absent. With `--force` the command restores into a directory that has things in it: the `state.redb` and `admin-password` that are there are renamed to `state.redb.before-restore-<time>` and `admin-password.before-restore-<time>`, `adopt.url`, `state.partial` and `state.resync` are removed, and everything else is left alone. It refuses while a server has the store open. Delete the renamed files yourself once you no longer want them.
 
 A restore founds the cluster again with one server. The member list in the backup is dropped, so the server you start on the restored store is the only member and the leader, whether it is the machine the backup came from or a new one. It keeps the cluster id, so tokens, API keys and the admin password are those of the backup. `--init` and `--join` are not needed.
 
 What a restore does not put back:
 
-- **Other servers.** Restore one server and start it. On every other server, stop `pistack`, empty the data directory or move `state.redb` aside, and start it with `--join` as a new server. Do this before they can reach the restored server: a server still running on its old store holds writes from after the backup and the same cluster key. The restored server raises the term so that such a server is told its log has diverged, but this has not been tried on a real cluster.
+- **Other servers.** Restore one server and start it. On every other server, stop `pistack`, empty the data directory or move `state.redb` aside, and start it with `--join` as a new server. Do this before they can reach the restored server: a server still running on its old store holds writes from after the backup and the same cluster key. The restored server raises the term so that such a server is told its log has diverged. It then asks for a snapshot and is refused, because the restored member list does not name it. This has not been tried on a real cluster.
 - **Anything written after the backup.** Machines, volumes and addresses created since are unknown to the restored store, and ones deleted since are back in it. What is running on the hosts is not rolled back with it, and what the control plane then does about the difference has not been tested.
 - **The root key in Vault.** With the default `software` backend the root key is in the backup. With the `vault` backend the backup holds the wrapped key and the server needs the same Vault settings and a Transit key version that can still unwrap it. `store restore` prints which of the two the backup holds; run `pistack keep status` to check before starting.
 - **Files outside the store.** `tls/`, `agent/` and the module directories are not touched. A certificate in `tls/` is reused as it is. If the cloud CA was made after the backup was taken, remove `tls/` so the server issues a new one, and enroll the agents again.
@@ -238,12 +262,14 @@ pistack --data-dir /var/lib/pistack store dump
 | --- | --- |
 | `state.redb` | The state store: all resources, cluster membership and the replication log. |
 | `state.redb.before-restore-<time>` | The store that was here before `store restore --force`. |
+| `state.redb.replaced-<time>` | The store this server had before it replaced it with a snapshot from the leader. The two newest are kept. |
+| `state.resync` | A snapshot that was checked and is about to become `state.redb`. |
 | `state.restore` | A backup being checked by `store restore`. |
 | `admin-password` | The generated admin password, written when the cluster was founded. |
 | `node.id` | This server's member id. Keep it across a rejoin. |
 | `node.name` | The node name, chosen once. `PISTACK_NODE_NAME` overrides and rewrites it. |
 | `adopt.url` | The join target, present only while a join is in progress. |
-| `state.partial` | A snapshot download in progress. |
+| `state.partial` | A snapshot download in progress, for a join or for a store replacement. |
 | `tls/` | Certificate, key and CA for `--tls-listen`. |
 | `agent/` | The agent's certificate, on a machine that also runs an agent. |
 | `images/`, `volumes/`, `silo/`, `shares/` | Module data. See [Storage](Storage). |

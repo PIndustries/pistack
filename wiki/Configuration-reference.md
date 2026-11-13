@@ -132,8 +132,9 @@ See [Metrics and alarms](Metrics-and-alarms).
 | `PISTACK_RPC_INSECURE` | off | `1` stops `/rpc` from requiring a client certificate. Needed for agents today; see [Agents and hosts](Agents-and-hosts). |
 | `PISTACK_REQUIRE_JOIN` | unset | `/cluster` always needs a member or a join token unless this is `0`, which opens it. `1` also makes every `/rpc` call carry a valid join token. |
 | `PISTACK_JOIN_TOKEN` | none | The join token a new server sends on its first start. Also `pistack agent --token`. |
+| `PISTACK_AUTO_RESYNC` | on | `0` stops a member from replacing its own store when the leader cannot bring it up to date from the log. It then logs what to do and waits. See [Running a cluster](Running-a-cluster#when-a-server-cannot-follow-the-log). |
 
-Both switches accept only the exact value `1`.
+`PISTACK_RPC_INSECURE` and `PISTACK_REQUIRE_JOIN=1` accept only the exact value `1`.
 
 ### Networking
 
