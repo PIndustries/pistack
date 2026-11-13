@@ -43,6 +43,7 @@ use pistack_types::node::{self, NodeIdentity, NODE_NAME_ENV};
 use crate::done::Completed;
 use crate::facts::{self, HostFacts};
 use crate::ovnhost::OvnHost;
+use crate::ovnmeta::MetaNets;
 use crate::probe::{self, ProbeBook, ProbeTarget};
 use crate::runtime::{select_runtimes, RunningMachine, Runtimes};
 
@@ -359,7 +360,8 @@ pub async fn run_agent_with_facts(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let ovn = Arc::new(OvnHost::system());
-    run_agent_on(client, runtimes, facts, ovn, None, shutdown).await
+    let meta = Arc::new(MetaNets::system());
+    run_agent_on(client, runtimes, facts, ovn, meta, None, shutdown).await
 }
 
 async fn run_agent_on(
@@ -367,6 +369,7 @@ async fn run_agent_on(
     runtimes: Runtimes,
     facts: HostFacts,
     ovn: Arc<OvnHost>,
+    meta: Arc<MetaNets>,
     underlay: Option<String>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -381,6 +384,7 @@ async fn run_agent_on(
         images: ImageCache::new(&data_dir()),
         ovn,
         ovn_watch,
+        meta,
         underlay,
         done: Arc::new(Completed::open(data_dir().join(crate::done::FILE))),
         unsent: Mutex::new(Vec::new()),
@@ -424,6 +428,8 @@ struct Agent {
     /// Report OVN in heartbeats. Turned on by a hello answer that carries
     /// OVN settings, and from the start on a host that has Open vSwitch.
     ovn_watch: Arc<AtomicBool>,
+    /// Metadata namespaces for guests on OVN networks.
+    meta: Arc<MetaNets>,
     /// Underlay address to announce instead of looking one up.
     underlay: Option<String>,
     /// Results of remembered commands, by id.
@@ -533,6 +539,7 @@ impl Agent {
             probes: self.probes.clone(),
             ovn: self.ovn.clone(),
             ovn_watch: self.ovn_watch.clone(),
+            meta: self.meta.clone(),
         }
     }
 
@@ -651,6 +658,9 @@ impl Agent {
                 tracing::info!(machine = %req.id, name = %req.name, kind = ?req.kind, "anvil: start");
                 if req.nics.iter().any(on_ovn) {
                     self.ovn.require_ready().await?;
+                    // So the guest finds metadata on its first boot. A
+                    // failure here does not stop the start.
+                    self.meta.refresh(&self.client).await;
                 }
                 self.localize_image(&mut req).await?;
                 let rt = self.runtimes.start(&req).await?;
@@ -693,6 +703,7 @@ impl Agent {
                 tracing::info!(machine = %req.machine, "anvil: plug port");
                 if on_ovn(&req.nic) {
                     self.ovn.require_ready().await?;
+                    self.meta.refresh(&self.client).await;
                 }
                 attach_port(&self.runtimes, &req).await?;
                 Ok(serde_json::Value::Null)
@@ -1265,6 +1276,7 @@ struct HeartbeatTask {
     probes: Arc<ProbeBook>,
     ovn: Arc<OvnHost>,
     ovn_watch: Arc<AtomicBool>,
+    meta: Arc<MetaNets>,
 }
 
 /// Runs due probes about once a second. An exec probe asks the runtime that
@@ -1436,6 +1448,12 @@ impl HeartbeatTask {
                     tracing::debug!(waiting = ack.commands_waiting, "anvil: heartbeat");
                 }
                 Err(e) => tracing::warn!(error = %e, "anvil: heartbeat failed"),
+            }
+            // Follow the guests: a network that gained its first guest
+            // here gets a metadata namespace, one that lost its last
+            // guest loses it.
+            if self.ovn_watch.load(Ordering::Relaxed) {
+                self.meta.refresh(&self.client).await;
             }
         }
     }
@@ -1933,6 +1951,7 @@ still here
             images: ImageCache::new(std::path::Path::new("/nonexistent")),
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(MetaNets::system()),
             underlay: None,
             done: Arc::new(Completed::in_memory()),
             unsent: Mutex::new(Vec::new()),
@@ -2108,6 +2127,7 @@ still here
             images: ImageCache::new(std::path::Path::new("/nonexistent")),
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(MetaNets::system()),
             underlay: None,
             done: Arc::new(Completed::in_memory()),
             unsent: Mutex::new(Vec::new()),
@@ -2218,6 +2238,11 @@ still here
             Runtimes::all(rt),
             facts,
             ovn,
+            Arc::new(MetaNets::with(
+                Arc::new(crate::ovnmeta::tests::FakeHost::default()),
+                Arc::new(crate::ovnmeta::tests::FakeListen::default()),
+                true,
+            )),
             Some("10.66.66.5".into()),
             shutdown.clone(),
         ));
@@ -2264,6 +2289,116 @@ still here
         assert_eq!(refused.code, pistack_types::error::ErrorCode::Unavailable);
         assert!(refused.message.contains("not ready for OVN"), "{refused}");
         assert!(refused.message.contains("ovn-controller"), "{refused}");
+
+        shutdown.cancel();
+        agent.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ovn_host_serves_metadata_for_the_networks_the_server_lists() {
+        use crate::ovnhost::tests::{tools, FakeSwitch};
+        use crate::ovnmeta::tests::{get, net, FakeHost, FakeListen, NET_A, PORT_A};
+        use pistack_rpc::proto::{MetadataAnswer, MetadataNetwork, MetadataQuery};
+
+        // The server's side of the two metadata calls: a list that the
+        // test changes, and an answer that repeats what it was asked.
+        let listed: Arc<Mutex<Vec<MetadataNetwork>>> = Arc::new(Mutex::new(Vec::new()));
+        let list = listed.clone();
+        let metadata = axum::Router::new()
+            .route(
+                "/metadata/networks/{node}",
+                axum::routing::get(move || {
+                    let list = list.clone();
+                    async move { axum::Json(list.lock().unwrap().clone()) }
+                }),
+            )
+            .route(
+                "/metadata/guest",
+                axum::routing::post(|axum::Json(q): axum::Json<MetadataQuery>| async move {
+                    axum::Json(MetadataAnswer {
+                        status: 200,
+                        body: format!("{} {} {}\n", q.node_name, q.network, q.path).into_bytes(),
+                    })
+                }),
+            );
+        let queue = pistack_rpc::CommandQueue::new(pistack_rpc::QueueConfig {
+            command_timeout: Duration::from_secs(10),
+            capacity: 8,
+            heartbeat_interval: Duration::from_secs(1),
+            ovn: None,
+        });
+        let rpc = pistack_rpc::router(queue.clone()).merge(metadata);
+        let app = axum::Router::new().nest("/rpc", rpc);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/rpc", listener.local_addr().unwrap());
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        });
+
+        let switch = FakeSwitch::new();
+        switch.controller(Some("connected"));
+        let host = Arc::new(FakeHost::default());
+        let listen = Arc::new(FakeListen::default());
+        let meta = Arc::new(MetaNets::with(host.clone(), listen.clone(), true));
+        let rt: crate::runtime::SharedRuntime = Arc::new(crate::runtime::MockRuntime::new());
+        // A host with Open vSwitch watches OVN from the start.
+        let facts = HostFacts {
+            node_name: "node-a".into(),
+            resources: Resources::default(),
+            capabilities: vec!["ovs".into()],
+        };
+        let agent = tokio::spawn(run_agent_on(
+            AgentClient::new(base, "node-a").unwrap(),
+            Runtimes::all(rt),
+            facts,
+            Arc::new(OvnHost::with(switch.clone(), tools(false))),
+            meta,
+            Some("10.66.66.5".into()),
+            shutdown.clone(),
+        ));
+        let until = |want: Vec<String>| {
+            let host = host.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while host.namespaces() != want {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .expect("the agent follows the server's list");
+            }
+        };
+
+        // No guest on an OVN network here: nothing is built.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(host.namespaces().is_empty());
+
+        // The first guest of a network arrives.
+        *listed.lock().unwrap() = vec![net(NET_A, PORT_A, &["10.1.0.0/24"])];
+        until(vec![PORT_A.to_owned()]).await;
+        let mut reply = String::new();
+        for _ in 0..100 {
+            // The listener opens a moment after the namespace exists.
+            if listen.bound(PORT_A) {
+                reply = get(listen.addr(PORT_A), "/latest/meta-data/hostname").await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(
+            reply.ends_with(&format!("node-a {NET_A} /latest/meta-data/hostname\n")),
+            "{reply}"
+        );
+
+        // The last one leaves.
+        listed.lock().unwrap().clear();
+        until(Vec::new()).await;
 
         shutdown.cancel();
         agent.await.unwrap().unwrap();
@@ -2602,6 +2737,7 @@ still here
             images: ImageCache::new(dir.path()),
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(MetaNets::system()),
             underlay: None,
             done: Arc::new(Completed::in_memory()),
             unsent: Mutex::new(Vec::new()),
@@ -2854,6 +2990,7 @@ still here
             images: ImageCache::new(std::path::Path::new("/nonexistent")),
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(MetaNets::system()),
             underlay: None,
             done: Arc::new(done),
             unsent: Mutex::new(Vec::new()),

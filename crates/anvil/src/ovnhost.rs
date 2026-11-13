@@ -57,7 +57,7 @@ pub(crate) trait Runner: Send + Sync {
     async fn run(&self, argv: &[String]) -> ApiResult<String>;
 }
 
-struct SystemRunner;
+pub(crate) struct SystemRunner;
 
 #[async_trait]
 impl Runner for SystemRunner {
@@ -96,7 +96,7 @@ pub(crate) struct Tools {
 }
 
 impl Tools {
-    fn from_system() -> ApiResult<Self> {
+    pub(crate) fn from_system() -> ApiResult<Self> {
         let sudo = sudo_prefix(agent_is_root(), env_flag(SUDO_ENV), sudo_bin())?;
         let vsctl = ovsplug::ovs_vsctl_bin()?;
         let appctl = tool(APPCTL_BIN_ENV, "ovn-appctl")?;
@@ -137,7 +137,7 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn agent_is_root() -> bool {
+pub(crate) fn agent_is_root() -> bool {
     #[cfg(unix)]
     {
         // SAFETY: geteuid does not fail and does not touch Rust memory.
