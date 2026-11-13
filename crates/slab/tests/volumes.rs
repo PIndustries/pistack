@@ -667,6 +667,167 @@ async fn agent_confirm_sets_attached_and_a_failure_clears_the_claim() {
     );
 }
 
+#[tokio::test]
+async fn an_attach_cut_short_by_a_leader_change_is_finished_by_the_next_leader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = || QueueConfig {
+        command_timeout: Duration::from_secs(30),
+        ..QueueConfig::default()
+    };
+    let old_queue = CommandQueue::new(cfg());
+    let c = client(&dir).with_queue(old_queue.clone());
+    old_queue.attach_store(c.store().clone());
+    let vol = c
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    let path = LocalFileBackend::new(dir.path())
+        .volume_path(&vol)
+        .to_string_lossy()
+        .into_owned();
+    let machine = place_machine(&c, "fleet");
+    let records = |c: &Client| {
+        c.store()
+            .raw_scan("meta", pistack_rpc::COMMAND_RECORD_PREFIX)
+            .expect("scan")
+            .len()
+    };
+
+    // The request claims the volume and asks the host. The host has the
+    // command when the leader goes, and the request goes with it.
+    let request = tokio::spawn({
+        let c = c.clone();
+        let (id, machine) = (vol.meta.id.clone(), machine.clone());
+        async move { c.attach_volume(&id, &machine, Some("vdb".into())).await }
+    });
+    let sent = old_queue
+        .next("fleet", Duration::from_secs(5), 1)
+        .await
+        .into_iter()
+        .next()
+        .expect("attach command");
+    // While the request is alive the reconciler leaves its attach alone.
+    c.resume_attaches().await.expect("resume");
+    assert!(!request.is_finished());
+    assert_eq!(old_queue.pending_count(), 1);
+    request.abort();
+    let _ = request.await;
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert_eq!(attached(&v).1, "Attaching");
+    assert_eq!(records(&c), 1);
+
+    // The next leader: the same store, a queue with nothing in it.
+    let new_queue = CommandQueue::new(cfg());
+    new_queue.attach_store(c.store().clone());
+    let next = c.clone().with_queue(new_queue.clone());
+    let agent = tokio::spawn({
+        let queue = new_queue.clone();
+        let path = path.clone();
+        async move {
+            let cmds = queue.next("fleet", Duration::from_secs(5), 1).await;
+            let cmd = cmds.into_iter().next().expect("attach command");
+            queue
+                .ack(
+                    "fleet",
+                    CommandResult::ok(cmd.id).with_payload(json!({
+                        "device": "vdb",
+                        "host_path": path,
+                    })),
+                )
+                .expect("ack attach");
+            cmd
+        }
+    });
+    next.resume_attaches().await.expect("resume");
+    let again = agent.await.expect("agent");
+    // The same command, so a host that already plugged the disk answers
+    // from memory and does not plug it twice.
+    assert_eq!(again.id, sent.id);
+    assert!(again.remember);
+    assert_eq!(again.kind, CommandKind::AttachVolume);
+    let v = next
+        .get_volume(None, &vol.meta.id.to_string())
+        .expect("get");
+    assert_eq!(
+        attached(&v),
+        (true, "attached", machine.to_string().as_str())
+    );
+    assert_eq!(v.status.host_path.as_deref(), Some(path.as_str()));
+    assert_eq!(records(&next), 0);
+
+    // Nothing is left to finish.
+    next.resume_attaches().await.expect("resume");
+    assert_eq!(new_queue.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn an_unfinished_attach_is_not_resumed_on_a_node_the_volume_is_not_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(5),
+        ..QueueConfig::default()
+    });
+    let c = client(&dir).with_node("alpha").with_queue(queue.clone());
+    queue.attach_store(c.store().clone());
+    let vol = c
+        .create_volume(create("disk", spec(1)))
+        .await
+        .expect("create");
+    let vol = c
+        .reconcile_volume(&vol.meta.id)
+        .await
+        .expect("reconcile")
+        .expect("exists");
+    assert_eq!(vol.status.home_node.as_deref(), Some("alpha"));
+
+    // Claimed for a machine on the volume's node, and left at that. Before
+    // the next leader looks, the machine is placed on another host.
+    let machine = place_machine(&c, "alpha");
+    c.begin_attach(&vol.meta.id, &machine, Some("vdb".into()))
+        .expect("claim");
+    let beta = c
+        .store()
+        .collection::<Resource<HostSpec, HostStatus>>()
+        .create(Resource::new(
+            "beta",
+            None,
+            HostSpec {
+                node_name: "beta".into(),
+            },
+        ))
+        .expect("host");
+    c.store()
+        .collection::<Resource<MachineSpec, MachineStatus>>()
+        .modify(&machine, |m| {
+            m.status.host = Some(beta.meta.id.clone());
+            Ok(())
+        })
+        .expect("move");
+
+    c.resume_attaches().await.expect("resume");
+    // Nothing was sent to either host, and the claim is cleared with the
+    // reason, so the volume can be attached where it is.
+    assert_eq!(queue.pending_count(), 0);
+    assert!(queue.next("beta", Duration::ZERO, 4).await.is_empty());
+    assert!(queue.next("alpha", Duration::ZERO, 4).await.is_empty());
+    let v = c.get_volume(None, &vol.meta.id.to_string()).expect("get");
+    assert!(v.status.attached_to.is_none());
+    let (held, reason, message) = attached(&v);
+    assert!(!held);
+    assert_eq!(reason, "AttachFailed");
+    assert!(message.contains("held on node alpha"), "{message}");
+    let left = c
+        .store()
+        .raw_scan("meta", pistack_rpc::COMMAND_RECORD_PREFIX)
+        .expect("scan");
+    assert!(left.is_empty());
+}
+
 async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(uri);
     let body = match body {
