@@ -125,6 +125,26 @@ impl Module for Gate {
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let state = self.state(&ctx)?;
         bootstrap_with(&state.store, self.password_file.as_deref())?;
+        // A cloud upgraded from before key ids has its key set and peer
+        // secret saved by whichever server leads; only a leader's writes
+        // replicate.
+        let (store, leadership, shutdown) = (
+            state.store.clone(),
+            ctx.leadership.clone(),
+            ctx.shutdown.clone(),
+        );
+        tokio::spawn(async move {
+            leadership
+                .run_while_leader(shutdown, move |_active| {
+                    let store = store.clone();
+                    async move {
+                        if let Err(e) = token::ensure_saved(&store) {
+                            tracing::warn!(error = %e, "gate: could not save the signing key set");
+                        }
+                    }
+                })
+                .await;
+        });
         spawn_audit_sweep(&ctx, state.store, audit::Retention::from_env());
         Ok(())
     }
