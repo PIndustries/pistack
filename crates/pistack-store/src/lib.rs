@@ -1148,11 +1148,85 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
 }
 
-/// Copy a redb file and open the copy.
+/// What [`check_file`] read from a store file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreFileInfo {
+    /// The schema version the file records; 1 when it has no marker.
+    pub schema_version: u32,
+    pub resources: u64,
+    pub names: u64,
+    pub meta: u64,
+}
+
+/// Check that `path` is a whole store: redb opens it and its pages pass
+/// redb's checksums, the three tables are there and every row of each can
+/// be read. Nothing is migrated and no marker is written, but redb may
+/// finish an interrupted commit in the file, so give it a copy and not
+/// somebody's only backup. A file that is missing, cut short or damaged is
+/// an error.
+pub fn check_file(path: &Path) -> Result<StoreFileInfo> {
+    if !path.is_file() {
+        return Err(StoreError::Storage(format!(
+            "{} is not a file",
+            path.display()
+        )));
+    }
+    // redb asserts on some damage, a file shorter than its header says for
+    // one, where it could return an error. Here that is an answer too.
+    std::panic::catch_unwind(|| read_whole_file(path)).unwrap_or_else(|_| {
+        Err(StoreError::Storage(
+            "redb gave up reading the file; it is cut short or damaged".into(),
+        ))
+    })
+}
+
+fn read_whole_file(path: &Path) -> Result<StoreFileInfo> {
+    let mut db = Database::open(path)?;
+    if !db.check_integrity()? {
+        return Err(StoreError::Storage(
+            "the file failed redb's integrity check".into(),
+        ));
+    }
+    let tx = db.begin_read()?;
+    let mut info = StoreFileInfo {
+        schema_version: 1,
+        resources: 0,
+        names: 0,
+        meta: 0,
+    };
+    for item in tx.open_table(RESOURCES)?.iter()? {
+        item?;
+        info.resources += 1;
+    }
+    for item in tx.open_table(NAMES)?.iter()? {
+        item?;
+        info.names += 1;
+    }
+    for item in tx.open_table(META)?.iter()? {
+        let (key, value) = item?;
+        if key.value() == SCHEMA_KEY {
+            info.schema_version = serde_json::from_slice(value.value())?;
+        }
+        info.meta += 1;
+    }
+    Ok(info)
+}
+
+/// True when another process, a running server, holds this store file.
+pub fn is_held_open(path: &Path) -> bool {
+    matches!(
+        Database::open(path),
+        Err(redb::DatabaseError::DatabaseAlreadyOpen)
+    )
+}
+
+/// Copy a redb file and check the copy with [`check_file`].
 ///
 /// The write lock is held for the copy, so the bytes stay at the last commit.
-/// `dst` must not already exist.
-pub fn backup_file(src: &Path, dst: &Path) -> Result<()> {
+/// `dst` must not already exist. The copy records the schema version even
+/// when `src` was last written before stores had the marker, so a restore
+/// can tell what it was given.
+pub fn backup_file(src: &Path, dst: &Path) -> Result<StoreFileInfo> {
     if dst.exists() {
         return Err(StoreError::Storage(format!(
             "{} already exists",
@@ -1179,16 +1253,28 @@ pub fn backup_file(src: &Path, dst: &Path) -> Result<()> {
             }
         }
     }
-    match Database::open(dst) {
-        Ok(check) => {
-            let _ = check.begin_read()?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(dst);
-            Err(e.into())
+    let checked = check_file(dst).and_then(|info| {
+        stamp_schema(dst)?;
+        Ok(info)
+    });
+    if checked.is_err() {
+        let _ = std::fs::remove_file(dst);
+    }
+    checked
+}
+
+/// Write the version-1 marker into a store file that has none.
+fn stamp_schema(path: &Path) -> Result<()> {
+    let db = Database::open(path)?;
+    let tx = db.begin_write()?;
+    {
+        let mut meta = tx.open_table(META)?;
+        if meta.get(SCHEMA_KEY)?.is_none() {
+            meta.insert(SCHEMA_KEY, serde_json::to_vec(&1u32)?.as_slice())?;
         }
     }
+    tx.commit()?;
+    Ok(())
 }
 
 fn copy_db(src: &Path, dst: &Path) -> Result<()> {
@@ -1323,6 +1409,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
         unmarked_store(&path);
+        assert_eq!(check_file(&path).unwrap().schema_version, 1);
         let store = open_plain(&path).unwrap();
         assert_eq!(store.get_meta::<u32>(SCHEMA_KEY).unwrap(), Some(1));
         let id: Option<String> = store.get_meta("cluster_id").unwrap();
@@ -1410,6 +1497,76 @@ mod tests {
         assert_eq!(id.as_deref(), Some("abc"));
     }
 
+    #[test]
+    fn a_backup_and_a_snapshot_carry_the_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("state.redb");
+        let store = open_as(&src, 3, STEPS).unwrap();
+        let snap = dir.path().join("snap.redb");
+        store.snapshot_file(&src, &snap).unwrap();
+        drop(store);
+        let copy = dir.path().join("copy.redb");
+        assert_eq!(backup_file(&src, &copy).unwrap().schema_version, 3);
+        assert_eq!(check_file(&copy).unwrap().schema_version, 3);
+        assert_eq!(check_file(&snap).unwrap().schema_version, 3);
+
+        // A store from before the marker is backed up as version 1, in writing.
+        let old = dir.path().join("old.redb");
+        unmarked_store(&old);
+        let copy = dir.path().join("old-copy.redb");
+        assert_eq!(backup_file(&old, &copy).unwrap().schema_version, 1);
+        let db = Database::open(&copy).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(meta.get(SCHEMA_KEY).unwrap().unwrap().value(), b"1");
+    }
+
+    #[test]
+    fn check_file_refuses_a_file_that_is_cut_short_damaged_or_not_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("state.redb");
+        let store = open_plain(&src).unwrap();
+        for i in 0..40 {
+            store
+                .put_meta(&format!("row/{i:04}"), &"x".repeat(9000))
+                .unwrap();
+        }
+        drop(store);
+        let good = std::fs::read(&src).unwrap();
+        let info = check_file(&src).unwrap();
+        assert_eq!(info.schema_version, SCHEMA_VERSION);
+        assert_eq!(info.meta, 41);
+
+        for keep in [good.len() / 2, good.len() - 4096, 100, 0] {
+            let cut = dir.path().join(format!("cut-{keep}.redb"));
+            std::fs::write(&cut, &good[..keep]).unwrap();
+            assert!(check_file(&cut).is_err(), "cut to {keep} bytes");
+        }
+
+        // Damage a stored value, not free space: the last row written.
+        let mut bad = good.clone();
+        let needle = b"row/0039";
+        let at = (0..bad.len() - needle.len())
+            .rev()
+            .find(|at| &bad[*at..*at + needle.len()] == needle)
+            .unwrap();
+        for byte in &mut bad[at + 64..at + 2048] {
+            *byte ^= 0x5a;
+        }
+        let damaged = dir.path().join("damaged.redb");
+        std::fs::write(&damaged, &bad).unwrap();
+        assert!(check_file(&damaged).is_err(), "a damaged row");
+
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, b"not a store").unwrap();
+        assert!(check_file(&other).is_err());
+        assert!(check_file(&dir.path().join("missing.redb")).is_err());
+
+        // A redb file that is not a pistack store.
+        let foreign = dir.path().join("foreign.redb");
+        drop(Database::create(&foreign).unwrap());
+        assert!(check_file(&foreign).is_err());
+    }
     use serde::Deserialize;
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
