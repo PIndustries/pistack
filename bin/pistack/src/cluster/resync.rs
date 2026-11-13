@@ -272,10 +272,12 @@ async fn attempt(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow
         restarts: 1,
         ..SnapshotFetch::default()
     };
-    fetch_snapshot_as(leader, &incoming, &limits, &handle.node_id).await?;
+    let peer = Peer::at(&handle.store, leader);
+    let via = Via::Member(&handle.peers, peer.clone());
+    fetch_snapshot_as(&via, &incoming, &limits, &handle.node_id).await?;
     // The download may have taken long. Ask again who leads.
-    let url = format!("{}/cluster", leader.trim_end_matches('/'));
-    let status: ClusterStatus = rpc_get_json(&url, &handle.node_id).await?;
+    let status: ClusterStatus =
+        rpc_get_json(&handle.peers, &peer, "/cluster", &handle.node_id).await?;
     if !status.leader {
         anyhow::bail!("{leader} stopped leading while the snapshot came down");
     }

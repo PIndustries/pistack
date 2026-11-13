@@ -7,6 +7,8 @@
 //! pistack server                 private address, no store: discover, adopt, or found
 //! pistack server --init          found a new cluster even if peers answer
 //! pistack server --join URL      adopt that control plane and skip discovery
+//!                                (https with PISTACK_JOIN_CA_SHA256, or
+//!                                plain http with --insecure-join)
 //! pistack server                 existing store: stay in that cluster and announce
 //! pistack agent  --join URL      a host (anvil)
 //! pistack store dump             inspect state
@@ -55,6 +57,14 @@ enum Cmd {
         /// Adopt an existing control plane. Skips discovery.
         #[arg(long, conflicts_with = "init")]
         join: Option<String>,
+        /// SHA-256 of the cloud's root CA certificate, as `pi join-token
+        /// create` prints it. Needed for the first join over https.
+        #[arg(long = "join-ca-sha256", env = "PISTACK_JOIN_CA_SHA256")]
+        join_ca: Option<String>,
+        /// Let the first join go over plain http: the join token and the
+        /// whole store cross the network in the clear.
+        #[arg(long, env = "PISTACK_INSECURE_JOIN")]
+        insecure_join: bool,
         /// Listen address. A private IPv4 address with no store discovers its /24.
         /// `0.0.0.0` does not discover.
         #[arg(long, env = "PISTACK_LISTEN", default_value = "0.0.0.0:8443")]
@@ -155,6 +165,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Server {
             init,
             join,
+            join_ca,
+            insecure_join,
             listen,
             public_url,
             insecure_http,
@@ -166,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
                 data_dir: cli.data_dir,
                 init,
                 join,
+                join_ca,
+                insecure_join,
                 listen,
                 public_url,
                 insecure_http,
