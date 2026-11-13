@@ -27,6 +27,14 @@
 //! logged write, confirmed like any other, so every server agrees. From then
 //! on the `/cluster` routes refuse that id, on every server, until it joins
 //! again with a join token.
+//!
+//! A member the leader can no longer feed from its log, because the two
+//! logs differ or the leader trimmed what the member needs, replaces its
+//! own store with a snapshot and starts again ([`resync`]).
+
+mod resync;
+
+pub use resync::{auto_resync_value, AUTO_RESYNC_ENV};
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -184,6 +192,17 @@ pub struct ClusterHandle {
     pub membership: Mutex<()>,
     /// Set when another server answered that this one was removed.
     pub removed: AtomicBool,
+    /// Replace the store by itself when the leader cannot feed it from the
+    /// log. `PISTACK_AUTO_RESYNC=0` turns it off.
+    pub auto_resync: AtomicBool,
+    pub resync: Mutex<resync::ResyncState>,
+    /// The store is not replaced again this soon; ten minutes outside tests.
+    pub resync_gap: Mutex<Duration>,
+    /// Set once the store file was replaced under this process. No vote is
+    /// given and no term taken after it: they would go to the old file.
+    pub sealed: AtomicBool,
+    /// The store file was replaced and the process must start again on it.
+    pub restart: AtomicBool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -254,6 +273,7 @@ pub fn load_or_create_node_id(data_dir: &Path) -> anyhow::Result<String> {
 /// [`BootKind::Keep`] without opening a socket.
 pub async fn prepare_store(req: &BootRequest<'_>) -> anyhow::Result<BootKind> {
     let path = req.data_dir.join("state.redb");
+    resync::finish_interrupted(req.data_dir);
     if path.exists() {
         return Ok(BootKind::Keep);
     }
@@ -582,6 +602,11 @@ pub fn handle_from(
         confirm_wait: Mutex::new(CONFIRM_WAIT),
         membership: Mutex::new(()),
         removed: AtomicBool::new(false),
+        auto_resync: AtomicBool::new(true),
+        resync: Mutex::new(resync::ResyncState::default()),
+        resync_gap: Mutex::new(resync::RESYNC_GAP),
+        sealed: AtomicBool::new(false),
+        restart: AtomicBool::new(false),
     }
 }
 
@@ -591,6 +616,18 @@ impl ClusterHandle {
     pub fn with_agent_api(mut self, agent_api: Option<String>) -> Self {
         self.agent_api = agent_api;
         self
+    }
+
+    /// Set before the handle is shared. See [`resync`].
+    pub fn with_auto_resync(self, on: bool) -> Self {
+        self.auto_resync.store(on, Ordering::Relaxed);
+        self
+    }
+
+    /// True when the follow loop replaced the store file and stopped the
+    /// server so that it starts again on the new one.
+    pub fn wants_restart(&self) -> bool {
+        self.restart.load(Ordering::Acquire)
     }
 }
 
@@ -1121,6 +1158,9 @@ async fn vote(
     }
     let (before, response) = {
         let _ballot = guard(&handle.ballot);
+        if handle.sealed.load(Ordering::Acquire) {
+            return Ok(refuse(&handle));
+        }
         let mut ballot = load_ballot(&handle.store).map_err(store_err)?;
         if req.pre {
             return Ok(Json(consider_pre_vote(&ballot, &req)));
@@ -1270,6 +1310,18 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
                         note_refusal(&handle, &err);
                         tracing::debug!(leader = %found, error = %err, "leader check failed")
                     }
+                }
+            }
+        }
+        // Here and not in a task of its own: this loop is the only place a
+        // server becomes leader, so it cannot become one while its store is
+        // being replaced.
+        if resync::due(&handle) {
+            if let Some(leader) = fresh_leader(&handle) {
+                if resync::run(&handle, &leader).await {
+                    handle.restart.store(true, Ordering::Release);
+                    shutdown.cancel();
+                    break;
                 }
             }
         }
@@ -1607,16 +1659,27 @@ fn note_pull(handle: &ClusterHandle, leader: &str, pulled: anyhow::Result<()>) {
     let mut last = guard(&handle.pull_error);
     match pulled {
         Ok(()) => {
+            guard(&handle.resync).wanted = None;
             if last.take().is_some() {
                 tracing::info!(leader = %leader, "replication caught up");
             }
         }
         Err(err) => {
             let text = format!("{err:#}");
+            let heals = handle.auto_resync.load(Ordering::Relaxed);
+            if heals && !text.contains(REMOVED_MARK) {
+                guard(&handle.resync).wanted = resync::why(&text);
+            }
             if text.contains(REMOVED_MARK) {
                 note_removed(handle);
             } else if last.as_deref() == Some(text.as_str()) {
                 tracing::debug!(leader = %leader, error = %text, "replication pull failed");
+            } else if heals && resync::why(&text).is_some() {
+                tracing::warn!(
+                    leader = %leader,
+                    error = %text,
+                    "replication stopped: the leader cannot feed this store from its log. This server will replace its store with a snapshot from the leader and start again"
+                );
             } else if text.contains("compacted") {
                 tracing::warn!(
                     leader = %leader,
@@ -1644,6 +1707,9 @@ fn since_contact(handle: &ClusterHandle) -> Option<Duration> {
 /// Move to `term` when it is newer than ours and clear our vote.
 fn adopt_term(handle: &ClusterHandle, term: u64) -> anyhow::Result<bool> {
     let _ballot = guard(&handle.ballot);
+    if handle.sealed.load(Ordering::Acquire) {
+        return Ok(false);
+    }
     let mut ballot = load_ballot(&handle.store)?;
     if term <= ballot.current_term {
         return Ok(false);
@@ -1847,6 +1913,7 @@ fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     *guard(&handle.last_heard) = Instant::now();
     *guard(&handle.leader_contact) = Some(Instant::now());
     *guard(&handle.pull_error) = None;
+    guard(&handle.resync).wanted = None;
     // Acknowledgements from an earlier time leading say nothing about what
     // followers hold now.
     guard(&handle.progress).clear();
@@ -4958,5 +5025,359 @@ mod tests {
         assert_eq!(after.members, [Member::voter("sim", &api)]);
         assert_eq!(removed_of(&sim.handle.store).unwrap(), ["sim2"]);
         sim.kill();
+    }
+
+    /// What a restart does after the follow loop replaced the store: a new
+    /// process opens `state.redb` in the same data directory, on the same
+    /// address, with no flags and no operator step.
+    async fn start_again(voter: LiveVoter) -> LiveVoter {
+        voter.kill();
+        let id = voter.handle.node_id.clone();
+        let LiveVoter { addr, dir, api, .. } = voter;
+        let store = open_store(dir.path());
+        let ready = match establish_local(&store, &id, &api, None, true).unwrap() {
+            LocalRole::Ready(ready) => ready,
+            LocalRole::NeedJoin => panic!("the new store was not taken as this server's own"),
+        };
+        assert!(!ready.leader);
+        let listener = loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let back = start_voter(&id, listener, store, dir, &ready);
+        run(&back);
+        back
+    }
+
+    /// Replaced stores in `dir`.
+    fn set_aside(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                name.starts_with("state.redb.replaced-")
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Three voters; `sim` leads, loses its API, and writes five entries
+    /// nobody copies. A survivor wins and writes on. Returns the deposed
+    /// leader, the winner and the other survivor once `sim` has stood down.
+    async fn a_deposed_leader_with_unconfirmed_entries(
+        heal: bool,
+    ) -> (LiveVoter, LiveVoter, LiveVoter) {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        sim.handle.auto_resync.store(heal, Ordering::Relaxed);
+        assert_eq!(post_write(&sim.api, "kept").await, 200);
+        wait_for("followers copy", Duration::from_secs(3), || {
+            marker(&sim2.handle.store, "kept").is_some()
+                && marker(&sim3.handle.store, "kept").is_some()
+        })
+        .await;
+
+        // The API goes dark and open pulls drain; the process lives on and
+        // still believes it leads.
+        sim.serve_stop.cancel();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(sim.leads());
+        for n in 0..5 {
+            sim.handle
+                .store
+                .put_meta(&format!("unconfirmed-{n}"), &"yes".to_string())
+                .unwrap();
+        }
+        wait_for("a survivor wins", Duration::from_secs(8), || {
+            sim2.leads() || sim3.leads()
+        })
+        .await;
+        let (winner, other) = if sim2.leads() {
+            (sim2, sim3)
+        } else {
+            (sim3, sim2)
+        };
+        for n in 0..3 {
+            assert_eq!(post_write(&winner.api, &format!("after-{n}")).await, 200);
+        }
+        wait_for("the old leader stands down", Duration::from_secs(5), || {
+            !sim.leads()
+        })
+        .await;
+        (sim, winner, other)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deposed_leader_with_unconfirmed_entries_heals_itself() {
+        let (sim, winner, other) = a_deposed_leader_with_unconfirmed_entries(true).await;
+        let old_tip = sim.handle.store.commit_index().unwrap();
+        let old_term = sim.handle.store.log_term_at(old_tip).unwrap();
+        assert_eq!(old_term, Some(6));
+
+        wait_for(
+            "the old leader replaces its store",
+            Duration::from_secs(10),
+            || sim.handle.wants_restart(),
+        )
+        .await;
+        assert!(sim.loop_stop.is_cancelled(), "the server was not stopped");
+        assert!(!sim.leads());
+        // Sealed: it gives no vote on the store it set aside.
+        let vote = VoteRequest {
+            term: winner.term() + 5,
+            candidate_id: other.handle.node_id.clone(),
+            last_index: u64::MAX,
+            last_term: u64::MAX,
+            pre: false,
+        };
+        *guard(&sim.handle.leader_contact) = None;
+        let Json(answer) = super::vote(State(sim.handle.clone()), HeaderMap::new(), Json(vote))
+            .await
+            .unwrap();
+        assert!(!answer.granted);
+        assert_eq!(answer.term, sim.term());
+
+        let aside = set_aside(sim.dir.path());
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(!sim.dir.path().join("state.resync").exists());
+        assert!(!sim.dir.path().join("state.partial").exists());
+        // The old store is whole, with the writes nobody else has.
+        let copy = sim.dir.path().join("look.redb");
+        std::fs::copy(&aside[0], &copy).unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        let old = Store::open(&copy, events).unwrap();
+        for n in 0..5 {
+            let key = format!("unconfirmed-{n}");
+            assert_eq!(marker(&old, &key).as_deref(), Some("yes"));
+        }
+        assert_eq!(old.commit_index().unwrap(), old_tip);
+        assert!(entry_for(&old, "unconfirmed-4").is_some());
+        drop(old);
+
+        let back = start_again(sim).await;
+        assert_eq!(*guard(&back.handle.role), Role::Voter);
+        assert_eq!(back.term(), winner.term());
+        assert_eq!(post_write(&winner.api, "later").await, 200);
+        wait_for("the old leader converges", Duration::from_secs(5), || {
+            marker(&back.handle.store, "later").is_some()
+        })
+        .await;
+        let store = &back.handle.store;
+        let tip = store.commit_index().unwrap();
+        assert_eq!(tip, winner.handle.store.commit_index().unwrap());
+        assert_eq!(
+            store.log_term_at(tip).unwrap(),
+            winner.handle.store.log_term_at(tip).unwrap()
+        );
+        assert_eq!(marker(store, "kept").as_deref(), Some("yes"));
+        assert_eq!(marker(store, "after-2").as_deref(), Some("yes"));
+        for n in 0..5 {
+            let key = format!("unconfirmed-{n}");
+            assert_eq!(marker(store, &key), None, "{key} is still in the store");
+            assert!(entry_for(store, &key).is_none(), "{key} is still logged");
+        }
+        // The same member as before, on every server, and nothing stuck.
+        for view in [&winner, &other, &back] {
+            let members = members_of(&view.handle.store).unwrap();
+            assert_eq!(members.len(), 3);
+            assert!(is_voter(&members, "sim"));
+        }
+        assert!(guard(&back.handle.pull_error).is_none());
+        assert!(!back.handle.wants_restart());
+        assert!(winner.leads() && !back.leads() && !other.leads());
+        // It counts toward the majority again: the other follower can go.
+        other.kill();
+        assert_eq!(post_write(&winner.api, "two-of-three").await, 200);
+        winner.kill();
+        back.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_auto_resync_off_a_diverged_server_waits_for_the_operator() {
+        let (sim, winner, other) = a_deposed_leader_with_unconfirmed_entries(false).await;
+        wait_for("the pull is refused", Duration::from_secs(5), || {
+            locked(&sim.handle.pull_error).is_some_and(|text| text.contains("diverged"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(!sim.handle.wants_restart());
+        assert!(!sim.loop_stop.is_cancelled());
+        assert!(!sim.handle.sealed.load(Ordering::Relaxed));
+        assert!(set_aside(sim.dir.path()).is_empty());
+        assert!(!sim.dir.path().join("state.resync").exists());
+        assert!(guard(&sim.handle.resync).wanted.is_none());
+        assert_eq!(
+            marker(&sim.handle.store, "unconfirmed-0").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(marker(&sim.handle.store, "after-0"), None);
+        sim.kill();
+        winner.kill();
+        other.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_the_leader_trimmed_past_heals_itself_and_stays_a_voter() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        assert_eq!(post_write(&sim.api, "early").await, 200);
+        wait_for("followers copy", Duration::from_secs(3), || {
+            marker(&sim3.handle.store, "early").is_some()
+        })
+        .await;
+        sim3.kill();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let behind = sim3.handle.store.commit_index().unwrap();
+        for n in 0..300 {
+            sim.handle.store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        // The leader stops holding rows for a server it has not seen.
+        guard(&sim.handle.progress).remove("sim3");
+        sim.handle.log_keep.store(50, Ordering::Relaxed);
+        wait_for("sim2 is current", Duration::from_secs(5), || {
+            sim2.handle.store.get_meta::<i32>("k299").unwrap() == Some(299)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        guard(&sim.handle.progress).remove("sim3");
+        assert!(compact_now(&sim.handle).unwrap() > 0);
+        assert!(sim.handle.store.log_start().unwrap() > behind + 1);
+
+        // sim3 comes back on its old store.
+        let store = sim3.handle.store.clone();
+        let ready = match establish_local(&store, "sim3", &sim3.api, None, true).unwrap() {
+            LocalRole::Ready(ready) => ready,
+            LocalRole::NeedJoin => panic!("sim3 lost its membership"),
+        };
+        let LiveVoter { addr, dir, .. } = sim3;
+        let listener = loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let sim3 = start_voter("sim3", listener, store, dir, &ready);
+        run(&sim3);
+        wait_for("sim3 replaces its store", Duration::from_secs(10), || {
+            sim3.handle.wants_restart()
+        })
+        .await;
+        assert_eq!(set_aside(sim3.dir.path()).len(), 1);
+        assert_eq!(sim3.handle.store.commit_index().unwrap(), behind);
+
+        let back = start_again(sim3).await;
+        assert_eq!(*guard(&back.handle.role), Role::Voter);
+        sim.handle.store.put_meta("later", &"yes").unwrap();
+        wait_for("sim3 converges", Duration::from_secs(5), || {
+            marker(&back.handle.store, "later").is_some()
+        })
+        .await;
+        assert_eq!(
+            back.handle.store.get_meta::<i32>("k299").unwrap(),
+            Some(299)
+        );
+        assert_eq!(
+            back.handle.store.commit_index().unwrap(),
+            sim.handle.store.commit_index().unwrap()
+        );
+        assert!(is_voter(&members_of(&sim.handle.store).unwrap(), "sim3"));
+        assert!(sim.leads() && !back.leads());
+        assert_eq!(sim.term(), 6, "the term moved");
+        assert!(guard(&back.handle.pull_error).is_none());
+        sim.kill();
+        sim2.kill();
+        back.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_never_replaces_its_store() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        assert_eq!(post_write(&sim.api, "kept").await, 200);
+        // As if a refused pull from an earlier time following were left over.
+        guard(&sim.handle.resync).wanted = Some(resync::Why::Diverged);
+        assert!(!resync::due(&sim.handle));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(sim.leads());
+        assert!(!sim.handle.wants_restart());
+        assert!(!sim.handle.sealed.load(Ordering::Relaxed));
+        assert!(set_aside(sim.dir.path()).is_empty());
+        assert!(!sim.dir.path().join("state.resync").exists());
+        assert_eq!(post_write(&sim.api, "still-leading").await, 200);
+
+        // A follower that wants it is held to the leader it follows: with
+        // none answering it does nothing.
+        sim.kill();
+        sim3.kill();
+        guard(&sim2.handle.resync).wanted = Some(resync::Why::Diverged);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!sim2.handle.wants_restart());
+        assert!(set_aside(sim2.dir.path()).is_empty());
+        sim2.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_removed_server_does_not_heal_itself_back_in() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        assert_eq!(post_write(&sim.api, "kept").await, 200);
+        wait_for("followers pull", Duration::from_secs(3), || {
+            guard(&sim.handle.progress).len() == 2
+        })
+        .await;
+        remove_member(&sim.handle, "sim3", false).await.unwrap();
+        wait_for("sim3 learns it was removed", Duration::from_secs(5), || {
+            sim3.handle.removed.load(Ordering::Relaxed)
+        })
+        .await;
+        guard(&sim3.handle.resync).wanted = Some(resync::Why::Diverged);
+        assert!(!resync::due(&sim3.handle));
+        // Even asked directly, the leader refuses it the snapshot.
+        sim3.handle.removed.store(false, Ordering::Relaxed);
+        assert!(!resync::run(&sim3.handle, &sim.api).await);
+        assert!(sim3.handle.removed.load(Ordering::Relaxed));
+        assert!(!sim3.handle.sealed.load(Ordering::Relaxed));
+        assert!(set_aside(sim3.dir.path()).is_empty());
+        assert!(!sim3.dir.path().join("state.resync").exists());
+        sim.kill();
+        sim2.kill();
+        sim3.kill();
+    }
+
+    #[test]
+    fn a_store_replaced_a_moment_ago_is_not_replaced_again() {
+        let members = [
+            Member::voter("a", "http://a"),
+            Member::voter("b", "http://b"),
+        ];
+        let (handle, dir) = bare_handle("b", "http://b", None, &members, false, "http://a");
+        let want = || {
+            *guard(&handle.resync) = resync::ResyncState::default();
+            guard(&handle.resync).wanted = Some(resync::Why::Diverged);
+        };
+        assert!(!resync::due(&handle), "nothing was refused");
+        want();
+        assert!(resync::due(&handle));
+
+        // Each of these holds it off on its own.
+        for flag in [&handle.removed, &handle.sealed, &handle.leader] {
+            flag.store(true, Ordering::Release);
+            assert!(!resync::due(&handle));
+            flag.store(false, Ordering::Release);
+        }
+        handle.auto_resync.store(false, Ordering::Relaxed);
+        assert!(!resync::due(&handle));
+        handle.auto_resync.store(true, Ordering::Relaxed);
+        assert!(resync::due(&handle));
+
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let earlier = dir.path().join(format!("state.redb.replaced-{stamp}"));
+        std::fs::write(&earlier, b"an earlier store").unwrap();
+        assert!(!resync::due(&handle));
+        assert!(!resync::due(&handle));
+        // Once the wait is over it may go ahead.
+        *guard(&handle.resync_gap) = Duration::ZERO;
+        want();
+        assert!(resync::due(&handle));
     }
 }

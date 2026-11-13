@@ -179,7 +179,16 @@ fn agent_api(tls_listen: Option<&str>, agent_url: Option<&str>) -> anyhow::Resul
     Ok(Some(url.trim_end_matches('/').to_owned()))
 }
 
-pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
+/// How a server came to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// It was told to.
+    Shutdown,
+    /// It replaced its own store and has to start again on the new file.
+    Restart,
+}
+
+pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
     std::fs::create_dir_all(&opts.data_dir)
         .with_context(|| format!("creating data dir {}", opts.data_dir.display()))?;
     // Modules that keep files default under PISTACK_DATA_DIR.
@@ -315,7 +324,12 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
             crate::cluster::advertise_ip(&opts.listen),
             leadership.clone(),
         )
-        .with_agent_api(agent_api.clone()),
+        .with_agent_api(agent_api.clone())
+        .with_auto_resync(crate::cluster::auto_resync_value(
+            std::env::var(crate::cluster::AUTO_RESYNC_ENV)
+                .ok()
+                .as_deref(),
+        )),
     );
     crate::cluster::spawn_background(
         cluster.clone(),
@@ -356,7 +370,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
 
     let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
-    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster));
+    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster.clone()));
 
     let tls = opts
         .tls_listen
@@ -386,8 +400,28 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         tracing::info!("shutting down");
         sd.cancel();
     });
-    bound.serve(shutdown).await?;
-    Ok(())
+    let served = bound.serve(shutdown.clone());
+    tokio::pin!(served);
+    tokio::select! {
+        done = &mut served => done?,
+        // Open requests get a moment to finish and no more: the store
+        // they read is no longer the one in the data directory.
+        _ = restart_grace(&cluster, &shutdown) => {}
+    }
+    if cluster.wants_restart() {
+        return Ok(Stopped::Restart);
+    }
+    Ok(Stopped::Shutdown)
+}
+
+/// Ends five seconds after the cluster loop stopped the server to start it
+/// again. Never ends on an ordinary shutdown.
+async fn restart_grace(cluster: &crate::cluster::ClusterHandle, shutdown: &CancellationToken) {
+    shutdown.cancelled().await;
+    if !cluster.wants_restart() {
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 }
 
 pub fn backup(data_dir: PathBuf, to: PathBuf) -> anyhow::Result<()> {

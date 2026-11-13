@@ -162,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
             agent_url,
             dev,
         } => {
-            server::run(server::ServerOpts {
+            let stopped = server::run(server::ServerOpts {
                 data_dir: cli.data_dir,
                 init,
                 join,
@@ -173,7 +173,11 @@ async fn main() -> anyhow::Result<()> {
                 agent_url,
                 dev,
             })
-            .await
+            .await?;
+            match stopped {
+                server::Stopped::Shutdown => Ok(()),
+                server::Stopped::Restart => Err(start_again()),
+            }
         }
         Cmd::Agent { join, token } => {
             anvil::run_agent(anvil::AgentOpts {
@@ -198,4 +202,27 @@ async fn main() -> anyhow::Result<()> {
             KeepCmd::Rewrap => keepcmd::rewrap(&cli.data_dir),
         },
     }
+}
+
+/// Replace this process with a new one given the same arguments. It returns
+/// only when that failed, and the error ends the process with a failure
+/// status so a service manager starts it instead.
+fn start_again() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    tracing::info!("starting again on the new store");
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            return anyhow::anyhow!(
+                "the store was replaced and the server must be started again; it could not find its own binary: {err}"
+            )
+        }
+    };
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow::anyhow!(
+        "the store was replaced and the server must be started again; running {} failed: {err}",
+        exe.display()
+    )
 }
