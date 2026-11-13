@@ -67,7 +67,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 # crypto / auth
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 argon2 = "0.5"
 rand = "0.8"
 sha2 = "0.10"
