@@ -124,6 +124,15 @@ enum KeepCmd {
     /// After rotating the Transit key, re-encrypt the stored root key under
     /// its latest version. Do this before raising min_decryption_version.
     Rewrap,
+    /// Seal every secret and private key again under a new root key
+    /// (software backend). Safe to interrupt: run it again to finish.
+    RotateRootKey {
+        /// File holding the new key. If it does not exist a new key is
+        /// written to it. A cluster needs it: every server must be given
+        /// the same key. Delete the file when all servers are done.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,6 +223,9 @@ async fn main() -> anyhow::Result<()> {
                 allow_plaintext_key,
             } => keepcmd::migrate_to_software(&cli.data_dir, allow_plaintext_key),
             KeepCmd::Rewrap => keepcmd::rewrap(&cli.data_dir),
+            KeepCmd::RotateRootKey { key_file } => {
+                keepcmd::rotate_root_key(&cli.data_dir, key_file.as_deref())
+            }
         },
     }
 }
