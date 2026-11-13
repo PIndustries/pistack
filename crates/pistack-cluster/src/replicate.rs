@@ -125,6 +125,77 @@ pub fn plan_promotions(
     Some(next)
 }
 
+/// Why a server cannot be removed from the membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalRefused {
+    /// No member has that id.
+    NotMember,
+    /// The server asked to do the removal is the one to remove.
+    Leader,
+    /// Too few of the voters that would be left are answering.
+    NoMajority { voters: usize, reachable: usize },
+}
+
+impl std::fmt::Display for RemovalRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotMember => f.write_str("no such server in this cluster"),
+            Self::Leader => f.write_str(
+                "this server is the leader and cannot remove itself: stop it, wait for another server to take over, and remove it from there",
+            ),
+            Self::NoMajority { voters, reachable } => write!(
+                f,
+                "removing this server would leave {voters} voters of which only {reachable} are answering, which is not a majority; pass force to remove it anyway"
+            ),
+        }
+    }
+}
+
+/// The membership without `id`, or why it must stay.
+///
+/// `leader_id` is the server doing the removal and counts as reachable;
+/// `reachable` says which other servers it heard from lately. Taking out a
+/// voter is refused when fewer than a majority of the voters left are
+/// reachable, because the cluster would stop committing the moment the
+/// change is made. `force` skips that check and nothing else. A learner has
+/// no vote, so removing one is never refused for this.
+pub fn plan_removal(
+    members: &[Member],
+    id: &str,
+    leader_id: &str,
+    reachable: impl Fn(&str) -> bool,
+    force: bool,
+) -> Result<Vec<Member>, RemovalRefused> {
+    let Some(target) = members.iter().find(|member| member.id == id) else {
+        return Err(RemovalRefused::NotMember);
+    };
+    if id == leader_id {
+        return Err(RemovalRefused::Leader);
+    }
+    let next: Vec<Member> = members
+        .iter()
+        .filter(|member| member.id != id)
+        .cloned()
+        .collect();
+    if target.role == Role::Voter && !force {
+        let voters: Vec<&Member> = next
+            .iter()
+            .filter(|member| member.role == Role::Voter)
+            .collect();
+        let up = voters
+            .iter()
+            .filter(|voter| voter.id == leader_id || reachable(&voter.id))
+            .count();
+        if up < voters.len() / 2 + 1 {
+            return Err(RemovalRefused::NoMajority {
+                voters: voters.len(),
+                reachable: up,
+            });
+        }
+    }
+    Ok(next)
+}
+
 /// True when `id` is a voter in `members`.
 pub fn is_voter(members: &[Member], id: &str) -> bool {
     members
@@ -495,6 +566,51 @@ mod tests {
         assert!(is_voter(&four, "a"));
         assert!(!is_voter(&four, "d"));
         assert!(!is_voter(&four, "zz"));
+    }
+
+    #[test]
+    fn a_removal_needs_a_majority_of_the_voters_left_unless_forced() {
+        let three = vec![
+            Member::voter("a", "a"),
+            Member::voter("b", "b"),
+            Member::voter("c", "c"),
+        ];
+        let all = |_: &str| true;
+        let none = |_: &str| false;
+        // The dead one goes: the two left are both up.
+        let next = plan_removal(&three, "c", "a", |id| id == "b", false).unwrap();
+        assert_eq!(next.len(), 2);
+        assert!(is_voter(&next, "a") && is_voter(&next, "b"));
+        assert_eq!(voter_target(&next), 2);
+        // The live one would go and leave the leader with the dead one.
+        assert_eq!(
+            plan_removal(&three, "b", "a", |id| id == "b", false),
+            Err(RemovalRefused::NoMajority {
+                voters: 2,
+                reachable: 1
+            })
+        );
+        let forced = plan_removal(&three, "b", "a", |id| id == "b", true).unwrap();
+        assert!(!forced.iter().any(|m| m.id == "b"));
+        // Force does not let the leader remove itself, or find a stranger.
+        assert_eq!(
+            plan_removal(&three, "a", "a", all, true),
+            Err(RemovalRefused::Leader)
+        );
+        assert_eq!(
+            plan_removal(&three, "zz", "a", all, true),
+            Err(RemovalRefused::NotMember)
+        );
+        // A learner has no vote, so nothing about the majority changes.
+        let mut four = three.clone();
+        four.push(Member::learner("d", "d"));
+        let next = plan_removal(&four, "d", "a", none, false).unwrap();
+        assert_eq!(next, three);
+        // With a learner waiting, the voter that went is replaced.
+        let next = plan_removal(&four, "c", "a", all, false).unwrap();
+        let promoted = plan_promotions(&next, all).unwrap();
+        assert!(promoted.iter().all(|m| m.role == Role::Voter));
+        assert_eq!(promoted.len(), 3);
     }
 
     #[test]
