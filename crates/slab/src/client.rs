@@ -1628,9 +1628,12 @@ impl Client {
     }
 
     fn silo(&self) -> silo::Client {
+        // A backup may have been written by another server. The peers
+        // are the cluster members; a store with none asks nobody.
         silo::Client::new(self.store.clone(), self.silo_root.clone())
             .with_max_object_bytes(self.max_object_bytes)
             .with_min_part_bytes(self.min_part_bytes)
+            .with_peers(silo::Peers::from_cluster(self.store.clone()))
     }
 
     /// Client used only to finish a multipart upload.

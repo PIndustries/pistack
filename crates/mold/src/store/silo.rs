@@ -7,18 +7,22 @@
 //! whose key is `sha256/<hex>`. Bytes land in that bucket's directory
 //! under the silo data root. The reference mold stores is `sha256:<hex>`.
 //!
-//! `put` reads the whole stream, then calls `silo::Client::put_object`.
-//! The silo client accepts a byte slice, capped at [`silo::MAX_OBJECT_BYTES`]
-//! (default 5 GiB). `open` is `get_object`. `delete` is `delete_object` and
-//! treats a missing object as success.
+//! Nothing is held in memory. The key is the checksum, which is known
+//! only once the stream has ended, so `put` streams the upload to
+//! `staging/<uuid>` (silo hashes it on the way to disk), then copies that
+//! object to `sha256/<hex>` and deletes the staging one. An image that is
+//! already stored is not copied again. The cap is the silo client's
+//! `max_object_bytes` (default 5 GiB). `open` streams the object file;
+//! on a server that does not hold the bytes, silo fetches them from one
+//! that does. `delete` is `delete_object` and treats a missing object as
+//! success.
 
 use async_trait::async_trait;
 use pistack_types::{error::ErrorCode, ApiError, ApiResult, Meta, Spec};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 
-use super::{hex, ImageData, ImageStore, Stored};
+use super::{ImageData, ImageStore, Stored};
 
 /// Bucket used when the caller passes an empty name.
 pub const DEFAULT_BUCKET: &str = "pistack-images";
@@ -84,34 +88,7 @@ fn missing(err: &ApiError) -> bool {
     err.code == ErrorCode::NotFound
 }
 
-/// Read `data` into one buffer. The silo put takes a byte slice and refuses
-/// anything larger than [`silo::MAX_OBJECT_BYTES`].
-async fn read_blob(data: &mut ImageData) -> ApiResult<(Vec<u8>, String, u64)> {
-    let max = ::silo::MAX_OBJECT_BYTES as u64;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut out = Vec::new();
-    let mut size: u64 = 0;
-    loop {
-        let n = data
-            .read(&mut buf)
-            .await
-            .map_err(|e| ApiError::bad_request(format!("reading upload: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        let next = size + n as u64;
-        if next > max {
-            return Err(ApiError::bad_request(::silo::object_too_large_message(
-                max as usize,
-            )));
-        }
-        hasher.update(&buf[..n]);
-        out.extend_from_slice(&buf[..n]);
-        size = next;
-    }
-    Ok((out, hex(&hasher.finalize()), size))
-}
+const CHUNK: usize = 256 * 1024;
 
 #[async_trait]
 impl ImageStore for SiloStore {
@@ -119,25 +96,59 @@ impl ImageStore for SiloStore {
         "silo"
     }
 
-    async fn put(&self, mut data: ImageData) -> ApiResult<Stored> {
-        let (bytes, sha256, size) = read_blob(&mut data).await?;
-        let key = format!("sha256/{sha256}");
+    async fn put(&self, data: ImageData) -> ApiResult<Stored> {
         let bucket_id = self.ensure_bucket()?;
-        let obj = self
+        let ctype = || Some("application/octet-stream".to_owned());
+        let staging = format!("staging/{}", uuid::Uuid::now_v7());
+        let staged = self
             .client
-            .put_object(
+            .put_object_stream(
                 &bucket_id,
-                &key,
-                &bytes,
-                Some("application/octet-stream".to_owned()),
+                &staging,
+                ReaderStream::with_capacity(data, CHUNK),
+                None,
+                ctype(),
             )
             .await?;
-        if obj.status.sha256 != sha256 || obj.status.size_bytes != size {
-            let _ = self.client.delete_object(&bucket_id, &key).await;
-            return Err(ApiError::internal(
-                "silo object does not match the uploaded bytes",
-            ));
+        let sha256 = staged.status.sha256.clone();
+        let size = staged.status.size_bytes;
+        let key = format!("sha256/{sha256}");
+
+        let copied = async {
+            match self.client.head_object(&bucket_id, &key) {
+                Ok(have) if have.status.sha256 == sha256 && have.status.size_bytes == size => {
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(err) if missing(&err) => {}
+                Err(err) => return Err(err),
+            }
+            let (_obj, file) = self.client.open_object(&bucket_id, &staging).await?;
+            let obj = self
+                .client
+                .put_object_stream(
+                    &bucket_id,
+                    &key,
+                    ReaderStream::with_capacity(file, CHUNK),
+                    Some(size),
+                    ctype(),
+                )
+                .await?;
+            if obj.status.sha256 != sha256 || obj.status.size_bytes != size {
+                let _ = self.client.delete_object(&bucket_id, &key).await;
+                return Err(ApiError::internal(
+                    "silo object does not match the uploaded bytes",
+                ));
+            }
+            Ok(())
         }
+        .await;
+        if let Err(err) = self.client.delete_object(&bucket_id, &staging).await {
+            if !missing(&err) {
+                tracing::warn!(key = %staging, error = %err, "removing a staged image failed");
+            }
+        }
+        copied?;
         Ok(Stored {
             reference: format!("{REF_PREFIX}{sha256}"),
             size,
@@ -147,25 +158,20 @@ impl ImageStore for SiloStore {
 
     async fn open(&self, reference: &str) -> ApiResult<ImageData> {
         let key = object_key(reference)?;
-        let bucket = self.client.get_bucket(None, &self.bucket).map_err(|err| {
+        let gone = |err: ApiError| {
             if missing(&err) {
                 ApiError::not_found(format!("image data {reference} not found"))
             } else {
                 err
             }
-        })?;
-        let (_obj, bytes) = self
+        };
+        let bucket = self.client.get_bucket(None, &self.bucket).map_err(gone)?;
+        let (_obj, file) = self
             .client
-            .get_object(&bucket.meta.id, &key)
+            .open_object(&bucket.meta.id, &key)
             .await
-            .map_err(|err| {
-                if missing(&err) {
-                    ApiError::not_found(format!("image data {reference} not found"))
-                } else {
-                    err
-                }
-            })?;
-        Ok(Box::pin(std::io::Cursor::new(bytes)))
+            .map_err(gone)?;
+        Ok(Box::pin(file))
     }
 
     async fn delete(&self, reference: &str) -> ApiResult<()> {
@@ -185,7 +191,10 @@ impl ImageStore for SiloStore {
     fn local_path(&self, reference: &str) -> Option<PathBuf> {
         let key = object_key(reference).ok()?;
         let bucket = self.client.get_bucket(None, &self.bucket).ok()?;
-        self.client.key_path(&bucket.meta.id, &key).ok()
+        // The record is on every server; the file may not be on this one
+        // yet. Without it the caller streams, and silo fetches the bytes.
+        let path = self.client.key_path(&bucket.meta.id, &key).ok()?;
+        path.is_file().then_some(path)
     }
 }
 
@@ -200,7 +209,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
     fn sample(client: &crate::Client, name: &str, format: ImageFormat) -> crate::Image {
         client
@@ -223,11 +232,14 @@ mod tests {
             .expect("create image")
     }
 
+    /// Object files under `dir`.
     fn files_under(dir: &std::path::Path) -> usize {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return 0;
         };
+        // Dot directories are silo's own bookkeeping, not objects.
         rd.flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .map(|e| {
                 let path = e.path();
                 if path.is_dir() {
@@ -486,5 +498,59 @@ mod tests {
             .backing_ref
             .as_ref()
             .is_some_and(|r| { r.starts_with("sha256:") && r.len() == "sha256:".len() + 64 }));
+    }
+
+    #[tokio::test]
+    async fn a_put_keeps_only_the_checksum_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::in_memory().expect("store");
+        let objects = ::silo::Client::new(store, dir.path().join("silo"));
+        let blobs = SiloStore::new(objects.clone(), "");
+
+        // Several read chunks, so the upload cannot have gone through in one piece.
+        let payload: Vec<u8> = (0..3 * CHUNK + 17).map(|i| (i % 251) as u8).collect();
+        let stored = blobs
+            .put(Box::pin(std::io::Cursor::new(payload.clone())))
+            .await
+            .expect("put");
+        assert_eq!(stored.size, payload.len() as u64);
+        let bucket = objects.get_bucket(None, DEFAULT_BUCKET).expect("bucket");
+        let keys = |objects: &::silo::Client| -> Vec<String> {
+            objects
+                .list_objects(&bucket.meta.id)
+                .expect("list")
+                .into_iter()
+                .map(|o| o.spec.key)
+                .collect()
+        };
+        assert_eq!(keys(&objects), vec![format!("sha256/{}", stored.sha256)]);
+
+        let mut got = Vec::new();
+        blobs
+            .open(&stored.reference)
+            .await
+            .expect("open")
+            .read_to_end(&mut got)
+            .await
+            .expect("read");
+        assert_eq!(got, payload);
+        assert!(blobs.local_path(&stored.reference).is_some());
+
+        // The same image again is the same object, and nothing is left staged.
+        let again = blobs
+            .put(Box::pin(std::io::Cursor::new(payload)))
+            .await
+            .expect("second put");
+        assert_eq!(again, stored);
+        assert_eq!(keys(&objects), vec![format!("sha256/{}", stored.sha256)]);
+
+        // A record with no file here is not a local path.
+        std::fs::remove_file(
+            objects
+                .key_path(&bucket.meta.id, &format!("sha256/{}", stored.sha256))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(blobs.local_path(&stored.reference).is_none());
     }
 }
