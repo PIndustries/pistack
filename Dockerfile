@@ -7,6 +7,9 @@
 #   docker build --target server -t pistack .
 #   docker build --target agent  -t pistack:agent .
 #
+# --build-arg PISTACK_BUILD=26.11.12.1 sets the build number the binaries
+# print. Without it they say "dev".
+#
 # server is the control plane on a distroless base, running as a non-root
 # user. agent adds the host helpers and what they call, and runs as root.
 # docs/RELEASING.md says what each can and cannot do in a container.
@@ -17,6 +20,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+ARG PISTACK_BUILD
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p pistack -p bench \

@@ -5,13 +5,15 @@
 # Pack one release tarball from built binaries.
 #
 #   packaging/make-tarball.sh BIN_DIR VERSION ARCH OUT_DIR
-#   packaging/make-tarball.sh target/release 0.1.0 x86_64 dist
+#   packaging/make-tarball.sh target/release 26.11.12.1 x86_64 dist
 #
 # Writes OUT_DIR/pistack-VERSION-linux-ARCH.tar.gz and a .sha256 next to it.
+# VERSION only names the tarball. What the binaries print was fixed when they
+# were built, by PISTACK_BUILD.
 # The release workflow calls this; it also runs by hand.
 set -euo pipefail
 
-[ $# -eq 4 ] || { sed -n '5,11p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+[ $# -eq 4 ] || { sed -n '5,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 bin_dir="$1"; version="$2"; arch="$3"; out_dir="$4"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

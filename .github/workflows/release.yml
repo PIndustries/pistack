@@ -1,15 +1,18 @@
 # Builds what people download: release tarballs for Linux x86_64 and aarch64,
-# and the server and agent container images. Runs when a version tag is pushed
+# and the server and agent container images. Runs when a build tag is pushed
 # and when someone starts it by hand, never on a pull request, and nothing in
 # ci.yml waits for it. Do not make it a required check.
 #
-# A run on a v* tag publishes a GitHub Release and pushes the images. A run
-# started by hand on a branch is a rehearsal: it builds and checks everything
-# and publishes nothing. docs/RELEASING.md has the steps.
+# A build is numbered by its date: <year>.<month>.<day>.<build>, as in
+# 26.11.12.1. A run on such a tag publishes a GitHub Release, pushes the images
+# and moves "latest". A run started by hand on a branch is a rehearsal: it
+# builds and checks everything and publishes nothing. docs/RELEASING.md has the
+# steps.
 name: release
 on:
   push:
-    tags: ["v*"]
+    # Wide on purpose. The plan job checks the tag properly and fails a wrong one.
+    tags: ["[0-9][0-9].[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
 
 permissions:
@@ -28,34 +31,30 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       publish: ${{ steps.plan.outputs.publish }}
-      prerelease: ${{ steps.plan.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - name: version
         id: plan
         run: |
           set -euo pipefail
-          cargo_version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "pistack") | .version')
-          if [ "$GITHUB_REF_TYPE" = tag ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            if [ "$version" != "$cargo_version" ]; then
-              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $cargo_version in Cargo.toml"
+          # Two-digit year, month 1-12, day 1-31, build from 1, no leading zeros.
+          build_re='^[1-9][0-9]\.(1[0-2]|[1-9])\.(3[01]|[12][0-9]|[1-9])\.[1-9][0-9]*$'
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! [[ "$GITHUB_REF_NAME" =~ $build_re ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not a build number. Want <year>.<month>.<day>.<build> with a two-digit year, no leading zeros and the build counting from 1, as in 26.11.12.1"
               exit 1
             fi
+            version="$GITHUB_REF_NAME"
             publish=true
           else
-            version="$cargo_version-dev.$(git rev-parse --short HEAD)"
+            version="dev.$(git rev-parse --short HEAD)"
             publish=false
           fi
-          # 1.2.3-rc.1 is a pre-release: no "latest" tag, marked as such on GitHub.
-          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
           {
             echo "version=$version"
             echo "publish=$publish"
-            echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
-          echo "version $version, publish $publish, prerelease $prerelease" >> "$GITHUB_STEP_SUMMARY"
+          echo "version $version, publish $publish" >> "$GITHUB_STEP_SUMMARY"
 
   # The runner image sets the oldest glibc the binaries run on (22.04: 2.35).
   tarball:
@@ -77,6 +76,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # No build cache on purpose: a release is built from clean.
       - name: build
+        env:
+          PISTACK_BUILD: ${{ needs.plan.outputs.version }}
         run: cargo build --release --locked -p pistack -p bench
       - name: pack
         run: |
@@ -92,6 +93,8 @@ jobs:
           sudo "$RUNNER_TEMP/$name/install.sh"
           pistack --version
           pi --version
+          test "$(pistack --version)" = "pistack $VERSION"
+          test "$(pi --version)" = "pi $VERSION"
           for h in pistack-overlay pistack-fip pistack-shelf-helper pistack-youki-cleanup; do
             test -x "/usr/local/sbin/$h"
           done
@@ -131,8 +134,12 @@ jobs:
         run: |
           set -euo pipefail
           for target in server agent; do
-            docker buildx build --target "$target" --load -t "pistack:$target" .
+            docker buildx build --target "$target" --build-arg "PISTACK_BUILD=$VERSION" \
+              --load -t "pistack:$target" .
             docker run --rm "pistack:$target" --version
+            docker run --rm --entrypoint /usr/local/bin/pi "pistack:$target" --version
+            test "$(docker run --rm "pistack:$target" --version)" = "pistack $VERSION"
+            test "$(docker run --rm --entrypoint /usr/local/bin/pi "pistack:$target" --version)" = "pi $VERSION"
           done
           test "$(docker run --rm --entrypoint id pistack:agent -u)" = 0
           test "$(docker image inspect -f '{{.Config.User}}' pistack:server)" = 65532:65532
@@ -145,7 +152,8 @@ jobs:
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           mkdir -p digests
           for target in server agent; do
-            docker buildx build --target "$target" \
+            # The same build argument as above, so this is the build that was tried.
+            docker buildx build --target "$target" --build-arg "PISTACK_BUILD=$VERSION" \
               --label "org.opencontainers.image.version=$VERSION" \
               --label "org.opencontainers.image.revision=$GITHUB_SHA" \
               --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
@@ -168,7 +176,6 @@ jobs:
       packages: write
     env:
       VERSION: ${{ needs.plan.outputs.version }}
-      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -185,9 +192,8 @@ jobs:
           for target in server agent; do
             suffix=""
             [ "$target" = agent ] && suffix="-agent"
-            tags=(-t "$IMAGE:$VERSION$suffix")
-            [ "$PRERELEASE" = false ] && tags+=(-t "$IMAGE:latest$suffix")
-            docker buildx imagetools create "${tags[@]}" \
+            docker buildx imagetools create \
+              -t "$IMAGE:$VERSION$suffix" -t "$IMAGE:latest$suffix" \
               "$IMAGE@$(cat "digests/$target-x86_64")" \
               "$IMAGE@$(cat "digests/$target-aarch64")"
             docker buildx imagetools inspect "$IMAGE:$VERSION$suffix"
@@ -200,7 +206,6 @@ jobs:
     permissions:
       contents: write
     env:
-      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -223,7 +228,6 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
-            flags=(--verify-tag --generate-notes --title "PiStack $GITHUB_REF_NAME")
-            [ "$PRERELEASE" = true ] && flags+=(--prerelease)
-            gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --latest \
+              --title "PiStack $GITHUB_REF_NAME" dist/*
           fi
