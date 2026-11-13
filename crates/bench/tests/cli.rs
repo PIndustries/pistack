@@ -627,6 +627,98 @@ async fn cluster_status_lists_the_servers_and_marks_the_leader() {
     assert_eq!(v["members"].as_array().unwrap().len(), 4);
 }
 
+/// A server that refuses every write the way a follower does, naming
+/// `leader`, and counts what it was sent.
+async fn follower(leader: String) -> (String, Arc<Mutex<u32>>) {
+    let refused = Arc::new(Mutex::new(0));
+    let count = refused.clone();
+    let app = Router::new().fallback(move || {
+        let leader = leader.clone();
+        let count = count.clone();
+        async move {
+            *count.lock().unwrap() += 1;
+            (
+                StatusCode::CONFLICT,
+                Json(
+                    json!({"error": {"code": "conflict", "message": "not the leader",
+                    "details": {"leader": leader}}}),
+                ),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), refused)
+}
+
+#[tokio::test]
+async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
+    let (leader, mock) = serve().await;
+    let (url, refused) = follower(leader.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let create = [
+        "machine", "create", "web", "--size", "s.1x1", "--image", "a",
+    ];
+
+    // The leader checks the token, so the retry carried it.
+    let on = ["--url", url.as_str(), "--token", TOKEN];
+    let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(mock.machines.lock().unwrap().contains_key("web"));
+    assert_eq!(*refused.lock().unwrap(), 1);
+    assert_eq!(
+        r.err,
+        format!("{url} is not the leader; sending the request to {leader}\n")
+    );
+    assert!(r.out.contains("web"), "{}", r.out);
+
+    // The leader's own answer comes back as it is, with the notice.
+    let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("is not the leader; sending"), "{}", r.err);
+    assert!(r.err.contains("error: machine already exists"), "{}", r.err);
+
+    // Two followers that name each other: one retry, then the refusal.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other = format!("http://{}", listener.local_addr().unwrap());
+    let (lost, lost_refused) = follower(other.clone()).await;
+    let back = lost.clone();
+    let app = Router::new().fallback(move || {
+        let back = back.clone();
+        async move {
+            (
+                StatusCode::CONFLICT,
+                Json(
+                    json!({"error": {"code": "conflict", "message": "not the leader",
+                    "details": {"leader": back}}}),
+                ),
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let on = ["--url", lost.as_str(), "--token", TOKEN];
+    let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert_eq!(*lost_refused.lock().unwrap(), 1);
+    assert!(r.err.contains("error: not the leader"), "{}", r.err);
+    assert!(
+        r.err.contains(&format!("\"leader\":\"{lost}\"")),
+        "{}",
+        r.err
+    );
+
+    // A leader on another scheme is not followed: the token stays put.
+    let (url, refused) = follower("https://127.0.0.1:1".into()).await;
+    let on = ["--url", url.as_str(), "--token", TOKEN];
+    let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert_eq!(*refused.lock().unwrap(), 1);
+    assert!(r.err.starts_with("error: not the leader"), "{}", r.err);
+    assert!(r.err.contains("https://127.0.0.1:1"), "{}", r.err);
+}
+
 #[tokio::test]
 async fn usage_errors_and_completion() {
     let dir = tempfile::tempdir().unwrap();

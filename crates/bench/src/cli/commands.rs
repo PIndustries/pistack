@@ -425,7 +425,7 @@ async fn login(ctx: &mut Ctx, a: LoginArgs, io: &mut Io<'_>) -> CliResult<()> {
         "ttl_secs": a.ttl,
     }));
     let url = a.url.trim_end_matches('/').to_owned();
-    let anon = Client::new(&url, None, ctx.insecure)?;
+    let anon = Client::new(&url, None, ctx.insecure)?.with_notices(ctx.notices.clone());
     let resp = anon.post("/identity/tokens", &body).await?;
     let token = str_at(&resp, "/token");
     if token.is_empty() {

@@ -17,7 +17,7 @@ use clap::{CommandFactory, Parser};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-pub use client::{CliError, CliResult, Client};
+pub use client::{CliError, CliResult, Client, Notices};
 pub use config::{Config, Profile};
 pub use output::{Format, Output};
 
@@ -49,6 +49,8 @@ pub struct Ctx {
     pub project: Option<String>,
     pub insecure: bool,
     pub fmt: Format,
+    /// What the clients this command made have to say on stderr.
+    pub notices: Notices,
 }
 
 impl Ctx {
@@ -82,6 +84,7 @@ impl Ctx {
             config_path,
             config,
             profile_name,
+            notices: Notices::default(),
         })
     }
 
@@ -92,12 +95,21 @@ impl Ctx {
                 "no server configured: run `pi login URL --name USER`, or pass --url / PI_URL",
             )
         })?;
-        Client::new(url, self.token.clone(), self.insecure)
+        self.client_with(url)
     }
 
     /// A client that may be unauthenticated (login, version, modules).
     pub fn client_with(&self, url: &str) -> CliResult<Client> {
-        Client::new(url, self.token.clone(), self.insecure)
+        Ok(Client::new(url, self.token.clone(), self.insecure)?.with_notices(self.notices.clone()))
+    }
+
+    /// Print and forget what the clients had to say.
+    fn flush_notices(&self, stderr: &mut dyn Write) -> std::io::Result<()> {
+        let notices = std::mem::take(&mut *self.notices.lock().unwrap_or_else(|e| e.into_inner()));
+        for notice in notices {
+            writeln!(stderr, "{notice}")?;
+        }
+        Ok(())
     }
 }
 
@@ -128,7 +140,9 @@ pub async fn run(args: Vec<String>, io: &mut Io<'_>) -> Result<i32> {
     }
 
     let mut ctx = Ctx::from_cli(&cli)?;
-    match commands::dispatch(&mut ctx, cli.cmd, io).await {
+    let done = commands::dispatch(&mut ctx, cli.cmd, io).await;
+    ctx.flush_notices(io.stderr)?;
+    match done {
         Ok(code) => Ok(code),
         Err(e) => {
             writeln!(io.stderr, "error: {e}")?;
