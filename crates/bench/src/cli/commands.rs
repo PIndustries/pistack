@@ -1380,6 +1380,12 @@ async fn join_token(ctx: &Ctx, cmd: JoinTokenCmd, io: &mut Io<'_>) -> CliResult<
                 Output::Table | Output::Wide => {
                     report(ctx, io, k, &jt, "created")?;
                     writeln!(io.stdout, "token (shown once): {}", str_at(&v, "/token"))?;
+                    // What a new server checks the leader against when it
+                    // joins over https. An older server does not send it.
+                    let ca = str_at(&v, "/ca_sha256");
+                    if !ca.is_empty() {
+                        writeln!(io.stdout, "ca sha256: {ca}")?;
+                    }
                 }
                 Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/token"))?,
                 _ => print_one(io.stdout, ctx.fmt, &v)?,
