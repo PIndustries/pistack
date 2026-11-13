@@ -8,7 +8,7 @@
 //! * [`AuthCaller`] — axum extractor giving the verified [`Caller`].
 //! * [`attach_caller`] — gateway middleware that puts the `Caller` in request extensions.
 //! * [`authorize`] — the RBAC decision (`policy.rs`).
-//! * [`check_quota`] / [`record_usage`] — project quotas (`quota.rs`).
+//! * [`quota`] — project limits and the admission check modules use (`quota.rs`).
 //! * The resource types in [`types`].
 //!
 //! HTTP lives under the `identity` prefix; see `api.rs`.

@@ -590,3 +590,120 @@ async fn a_token_stops_working_when_what_it_stood_on_is_gone() {
     assert_eq!(who(by_password).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(who(admin).await.0, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn admin_sets_limits_and_a_member_reads_them_with_usage() {
+    std::env::set_var(ADMIN_PASSWORD_ENV, "correct-horse");
+    let store = Store::in_memory().unwrap();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: CancellationToken::new(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    let gate = Gate::default();
+    gate.start(ctx.clone()).await.unwrap();
+    let app = gate.router(ctx);
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let admin = v["token"].as_str().unwrap().to_owned();
+
+    for (path, body) in [
+        (
+            "/projects",
+            json!({"name": "web", "quotas": {"machines": 3}}),
+        ),
+        ("/projects", json!({"name": "other"})),
+        (
+            "/principals",
+            json!({"name": "alice", "password": "pw-alice", "default_project": "web"}),
+        ),
+        (
+            "/bindings",
+            json!({"principal": "alice", "role": "member", "project": "web"}),
+        ),
+    ] {
+        let (s, v) = call(&app, "POST", path, Some(&admin), Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+    let (_, v) = login(&app, "alice", "pw-alice").await;
+    let alice = v["token"].as_str().unwrap().to_owned();
+
+    // Set two limits; the one that was there stays.
+    let (s, v) = call(
+        &app,
+        "PUT",
+        "/projects/web/quotas",
+        Some(&admin),
+        Some(json!({"quotas": {"vcpus": 16, "volumes_gib": 500}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["quotas"]["machines"]["limit"], 3);
+    assert_eq!(v["quotas"]["vcpus"]["limit"], 16);
+    assert_eq!(v["quotas"]["volumes_gib"]["limit"], 500);
+
+    // A module records what it counted; the report shows it.
+    let web = gate::resolve_project(&store, "web").unwrap().meta.id;
+    gate::quota::mirror_usage(&store, &web, &[("vcpus", 6)]);
+
+    // null clears one limit and leaves the rest.
+    let (s, v) = call(
+        &app,
+        "PUT",
+        "/projects/web/quotas",
+        Some(&admin),
+        Some(json!({"quotas": {"volumes_gib": null}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["quotas"]["volumes_gib"]["limit"], Value::Null);
+    assert_eq!(v["quotas"]["vcpus"], json!({"limit": 16, "used": 6}));
+
+    // A name no module enforces is refused, and nothing is stored.
+    let (s, v) = call(
+        &app,
+        "PUT",
+        "/projects/web/quotas",
+        Some(&admin),
+        Some(json!({"quotas": {"vcpu": 4}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("'vcpu'"));
+
+    // The member reads limits and usage of her own project only, and
+    // cannot change them.
+    let (s, v) = call(&app, "GET", "/projects/web/quotas", Some(&alice), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "web");
+    assert_eq!(v["quotas"]["vcpus"], json!({"limit": 16, "used": 6}));
+    assert_eq!(v["quotas"]["machines"], json!({"limit": 3, "used": 0}));
+    assert_eq!(v["quotas"]["networks"], json!({"limit": null, "used": 0}));
+    assert!(v["quotas"].get("vcpu").is_none());
+    let (s, _) = call(&app, "GET", "/projects/other/quotas", Some(&alice), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = call(
+        &app,
+        "PUT",
+        "/projects/web/quotas",
+        Some(&alice),
+        Some(json!({"quotas": {"vcpus": 1000}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Editing the project keeps the usage that was recorded.
+    let (s, v) = call(
+        &app,
+        "PUT",
+        "/projects/web",
+        Some(&admin),
+        Some(json!({"description": "front end"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["usage"]["vcpus"], 6);
+    assert_eq!(v["spec"]["quotas"]["vcpus"], 16);
+}
