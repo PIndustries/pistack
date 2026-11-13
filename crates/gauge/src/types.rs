@@ -7,11 +7,23 @@ use chrono::{DateTime, Utc};
 use pistack_types::{kind, Resource, Spec};
 use serde::{Deserialize, Serialize};
 
-/// Cap on the sample ring held by [`crate::Gauge`]. Oldest points are dropped.
-/// The ring is also snapshotted under `$PISTACK_DATA_DIR/gauge` when attached.
-pub const MAX_SAMPLES: usize = 10_000;
+/// Points kept per series. At a report every fifteen seconds that is a
+/// quarter of an hour.
+pub const WINDOW_POINTS: usize = 60;
+/// No point is kept longer than this.
+pub const WINDOW_AGE: chrono::Duration = chrono::Duration::minutes(60);
+/// Series one server keeps. A machine with one disk and one interface is
+/// about a dozen, so this is room for some four thousand machines.
+pub const MAX_SERIES: usize = 50_000;
+/// A series with no sample for this long is left out of `/metrics` and of
+/// alarms: its machine or host is gone or has stopped reporting.
+pub const STALE_AFTER: chrono::Duration = chrono::Duration::minutes(5);
+/// How long an alarm's `last_value` may lag while its phase stays the same.
+/// Each change of it is a write to the store.
+pub const ALARM_REFRESH: chrono::Duration = chrono::Duration::seconds(60);
 
-/// One observation. Not a store resource; the ring lives on [`crate::SampleRing`].
+/// One observation. Not a store resource; samples live in [`crate::SampleRing`].
+/// `metric` is a series key: a name, or `name{label="value",...}`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sample {
     pub metric: String,
@@ -42,6 +54,9 @@ pub enum AlarmPhase {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AlarmSpec {
     pub name: String,
+    /// A series, or a name and some labels that select several, such as
+    /// `pistack_machine_cpu_usage_cores{machine="mach-..."}` or just
+    /// `pistack_host_load1`. The alarm fires while any of them crosses.
     pub metric: String,
     pub comparison: Comparison,
     pub threshold: f64,
@@ -58,6 +73,10 @@ pub struct AlarmStatus {
     pub phase: AlarmPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_value: Option<f64>,
+    /// The series `last_value` is from: the one that crosses the furthest,
+    /// or comes closest to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
 }
 
 impl Default for AlarmStatus {
@@ -65,6 +84,7 @@ impl Default for AlarmStatus {
         Self {
             phase: AlarmPhase::Pending,
             last_value: None,
+            series: None,
         }
     }
 }
@@ -90,26 +110,4 @@ pub(crate) fn phase_for(comparison: Comparison, value: f64, threshold: f64) -> A
     } else {
         AlarmPhase::Ok
     }
-}
-
-/// Prometheus metric names are `[a-zA-Z_:][a-zA-Z0-9_:]*`. Characters outside
-/// `[a-zA-Z0-9_:]` become `_`. A leading digit is prefixed with `_`.
-pub(crate) fn sanitize_metric(name: &str) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if out.is_empty() {
-        return "_".into();
-    }
-    if out.as_bytes()[0].is_ascii_digit() {
-        out.insert(0, '_');
-    }
-    out
 }

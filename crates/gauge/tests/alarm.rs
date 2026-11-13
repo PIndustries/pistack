@@ -10,27 +10,14 @@ use pistack_store::Store;
 use pistack_types::module::CancellationToken;
 use pistack_types::{kind, Caller, Id, Module, ModuleContext};
 use serde_json::{json, Value};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tower::ServiceExt;
 
 struct Harness {
     router: axum::Router,
 }
 
-/// The gauge ring persists under `$PISTACK_DATA_DIR/gauge`. Point it at a
-/// temporary directory, once per test process and before any router
-/// attaches the ring, so a test run never writes into the source tree.
-fn isolated_data_dir() {
-    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PISTACK_DATA_DIR", dir.path());
-        dir
-    });
-}
-
 fn harness() -> Harness {
-    isolated_data_dir();
     let store = Store::in_memory().unwrap();
     let gauge = Gauge;
     let ctx = ModuleContext {
@@ -50,6 +37,16 @@ fn harness() -> Harness {
 
 impl Harness {
     async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, String) {
+        self.call_as(admin_caller(), method, path, body).await
+    }
+
+    async fn call_as(
+        &self,
+        caller: Caller,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, String) {
         let mut req = Request::builder().method(method).uri(path);
         let body = match body {
             Some(v) => {
@@ -59,7 +56,7 @@ impl Harness {
             None => Body::empty(),
         };
         let mut req = req.body(body).unwrap();
-        req.extensions_mut().insert(admin_caller());
+        req.extensions_mut().insert(caller);
         let res = self.router.clone().oneshot(req).await.unwrap();
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -181,4 +178,70 @@ async fn missing_caller_is_unauthorized() {
     let body = json_body(status, &raw);
     assert_eq!(body["error"]["code"], "unauthorized");
     assert_eq!(body["error"]["message"], "no credentials");
+}
+
+fn member_of(project: &Id) -> Caller {
+    Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "member".into(),
+        project: Some(project.clone()),
+        roles: vec!["member".into()],
+        system: false,
+    }
+}
+
+#[tokio::test]
+async fn pistack_series_are_for_the_admin_and_each_project_sees_its_own() {
+    let h = harness();
+    let mine = Id::new(kind::PROJECT);
+    let theirs = Id::new(kind::PROJECT);
+    let memory = |machine: &str, project: &Id| {
+        gauge::series(
+            gauge::catalog::MACHINE_MEMORY,
+            &[("machine", machine), ("project", &project.to_string())],
+        )
+    };
+    gauge::Gauge
+        .client(Store::in_memory().unwrap())
+        .record_all(vec![
+            (memory("scope-mine", &mine), 1.0),
+            (memory("scope-theirs", &theirs), 2.0),
+            (
+                gauge::series(gauge::catalog::HOST_LOAD1, &[("host", "scope-h1")]),
+                3.0,
+            ),
+        ]);
+    let member = member_of(&mine);
+
+    // The exposition has every project and host in it: admin only.
+    let (st, text) = h.call("GET", "/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        text.contains("scope-theirs") && text.contains("scope-h1"),
+        "{text}"
+    );
+    let (st, raw) = h.call_as(member.clone(), "GET", "/metrics", None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{raw}");
+    assert!(!raw.contains("scope-"), "{raw}");
+
+    // The samples a member lists leave out hosts and other projects.
+    let (st, raw) = h.call_as(member.clone(), "GET", "/samples", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(raw.contains("scope-mine"), "{raw}");
+    assert!(
+        !raw.contains("scope-theirs") && !raw.contains("scope-h1"),
+        "{raw}"
+    );
+    let (_, raw) = h.call("GET", "/samples", None).await;
+    assert!(
+        raw.contains("scope-theirs") && raw.contains("scope-h1"),
+        "{raw}"
+    );
+
+    // Nobody posts under PiStack's own names, the admin included.
+    for caller in [member, admin_caller()] {
+        let body = json!({"metric": "pistack_host_load1{host=\"scope-h1\"}", "value": 99.0});
+        let (st, raw) = h.call_as(caller, "POST", "/samples", Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+    }
 }

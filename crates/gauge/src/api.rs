@@ -3,15 +3,21 @@
 
 //! HTTP surface, mounted by the gateway at `/gauge`.
 //!
-//! `POST /samples` `{metric, value}` records a point and re-evaluates alarms
-//! on that metric. `GET /samples?metric=` lists the ring.
+//! `POST /samples` `{metric, value}` records a point and re-evaluates the
+//! alarms that watch it. Names that start with `pistack_` are PiStack's own
+//! and cannot be posted. `GET /samples?metric=` lists the window: all of it
+//! for a cloud admin, and for anyone else what was posted plus PiStack's
+//! series for their own project.
 //! `GET|POST /alarms`, `GET|DELETE /alarms/{id}`.
-//! `GET /metrics` is Prometheus text (latest sample per metric).
+//! `GET /metrics` is the Prometheus text for a cloud admin. A scraper uses
+//! `/metrics` at the root of the API, which also takes a scrape token.
 //!
 //! The `Caller` comes from request extensions (set by the gateway). Without
 //! one, the request is rejected.
 
+use crate::catalog::RESERVED_PREFIX;
 use crate::client::Client;
+use crate::series::Series;
 use crate::types::{Alarm, AlarmSpec, Sample};
 use axum::{
     extract::{Extension, Path, Query, Request, State},
@@ -166,15 +172,31 @@ async fn record_sample(
     State(client): State<Client>,
     Json(body): Json<SampleIn>,
 ) -> ApiResult<Response> {
+    if body.metric.trim().starts_with(RESERVED_PREFIX) {
+        return Err(ApiError::bad_request(format!(
+            "metric names that start with {RESERVED_PREFIX} are recorded by PiStack and cannot be posted"
+        )));
+    }
     Ok(created(client.record_sample(body.metric, body.value)?))
 }
 
 async fn list_samples(
     State(client): State<Client>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<SampleQuery>,
 ) -> Json<Vec<Sample>> {
     let metric = q.metric.as_deref().filter(|m| !m.is_empty());
-    Json(client.list_samples(metric))
+    let mut samples = client.list_samples(metric);
+    if !caller.is_admin() {
+        // Host series and other projects' machines are not theirs to see.
+        let own = caller.project.as_ref().map(Id::to_string);
+        samples.retain(|s| {
+            let series = Series::parse(&s.metric);
+            !series.name.starts_with(RESERVED_PREFIX)
+                || (own.is_some() && series.labels.get("project") == own.as_ref())
+        });
+    }
+    Json(samples)
 }
 
 async fn list_alarms(
@@ -222,12 +244,25 @@ async fn delete_alarm(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn metrics(State(client): State<Client>) -> impl IntoResponse {
+async fn metrics(
+    State(client): State<Client>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<impl IntoResponse> {
+    if !caller.is_admin() {
+        return Err(ApiError::forbidden(
+            "metrics of every host and project are for a cloud admin",
+        ));
+    }
+    Ok(text_response(client.metrics_text()))
+}
+
+/// A reply in the Prometheus text format.
+pub fn text_response(text: String) -> impl IntoResponse {
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        client.metrics_text(),
+        text,
     )
 }
