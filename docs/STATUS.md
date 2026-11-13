@@ -233,11 +233,12 @@ Done
 - JWT tokens with expiry; API keys
 - argon2id passwords
 - Quota framework: limits per project, set by an admin, read with usage by members (`pi quota`)
+- Audit log: every change, login, secret read and refusal, with principal, API key, client address and outcome; read by a cloud admin with filters and paging (`pi audit list`); kept 90 days and 50,000 records by default
 
 Partial
 - Roles: admin, member, reader only; custom roles grant nothing; the policy engine is built and unused
 - Nested projects: parent recorded, nothing inherited
-- Audit log is written and cannot be read
+- Audit log: admin only, no per-project view; ordinary reads, object uploads and server joins are not recorded; no export or forwarding to another system
 - Password rule is "not empty"; no lockout
 
 Missing
