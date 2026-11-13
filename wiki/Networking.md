@@ -33,12 +33,36 @@ pi machine create web --image ubuntu-24.04 --size m.2x4 --network app
 
 | Resource | Notes |
 | --- | --- |
-| Network | `--kind overlay` (default) or `--kind provider` with `--physnet` and optionally `--vlan`. `--external` marks a network that routers use as their gateway and that floating IPs come from. |
+| Network | `--kind overlay` (default) or `--kind provider` with `--physnet` and optionally `--vlan`. `--external` marks a network that routers use as their gateway and that floating IPs come from. `--auto-floating-ip` is described below. |
 | Subnet | A CIDR on a network, with a gateway, allocation pools, DNS servers and DHCP on by default. |
 | Port | An address on a network, bound to a machine. Created for you when a machine names a network. |
 | Router | Connects subnets to each other and to one external network. |
 | Security group | Rules by direction, protocol, port range and remote CIDR or group. |
 | Floating IP | An address on an external network mapped to a port. |
+
+## Automatic floating IPs
+
+A machine gets no floating IP unless someone asks. Creating an external network changes nothing for the machines that exist.
+
+An admin can mark one external network so that every machine with an IPv4 address gets a floating IP from it:
+
+```sh
+pi network create public --external --auto-floating-ip
+pi network set public --auto-floating-ip true     # an existing network
+pi network set public --auto-floating-ip false
+```
+
+- Only an admin can turn it on. Anyone who may edit the network can turn it off.
+- Only an external network can carry it, and only one network in the cloud at a time. Marking a second one is refused until the first is turned off.
+- It applies to machines in every project. The floating IP is created in the machine's project, named after the machine, labelled `pistack.io/auto-fip=true`, and deleted with the machine.
+- A machine labelled `pistack.io/auto-fip=false` gets none: `pi machine create ... --label pistack.io/auto-fip=false`. A project with that label opts out all its machines; a machine in it labelled `pistack.io/auto-fip=true` still gets one. Setting the label later removes the automatic floating IP the machine or project already had.
+- It counts against the project's `floating_ips` quota. When the quota is full, or the pool has no free address, the machine keeps running without a floating IP and carries a condition of type `FloatingIp` with the reason (`QuotaExceeded`, `PoolExhausted`) and the message. The condition goes away when the floating IP could be created. `pi machine show <name> -o json` shows it under `status.conditions`.
+- Turning the setting off stops new floating IPs. The ones already given stay until their machine is deleted or you delete them with `pi fip delete`.
+- A floating IP you create and associate yourself is never touched, and a machine that has one is not given a second.
+
+Upgrading from a build without the setting: until then a network named `fleet`, or the only external network, handed a floating IP to every machine. Those floating IPs stay in place and keep working. No new ones are created until you mark a network. The server logs one warning when it becomes leader while such floating IPs exist and no network is marked. Run `pi fip list` and look for the label to see them.
+
+## Scheduling
 
 A machine that names a network is only scheduled on a host that reported an underlay address. The mock host of `--dev` mode reports none, so in dev mode such a machine stays `pending`. A pod that names no network uses its project's network if there is exactly one; with several you must name one.
 
