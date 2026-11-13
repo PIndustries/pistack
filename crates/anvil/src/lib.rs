@@ -13,6 +13,8 @@
 //!   whether this host is a working chassis.
 //! * [`usage`] — what the host and its machines are using, for the
 //!   heartbeat.
+//! * `ovnmeta` — answers `169.254.169.254` for guests on OVN networks,
+//!   from a namespace per network.
 //! * [`agent`] — [`run_agent`], the entry point for `pistack agent`: hello,
 //!   heartbeats and the command loop over `pistack-rpc`.
 
@@ -22,6 +24,7 @@ pub mod facts;
 pub mod images;
 mod overlay;
 mod ovnhost;
+mod ovnmeta;
 mod probe;
 pub mod runtime;
 pub mod usage;
