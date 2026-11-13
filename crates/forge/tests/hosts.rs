@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Host maintenance through the router: an admin labels hosts and the
-//! scheduler follows the labels.
+//! Host maintenance through the router: an admin labels, disables and
+//! enables hosts, and the scheduler follows.
 
 use axum::{
     body::Body,
@@ -347,4 +347,97 @@ async fn a_machine_zone_is_a_selector_on_the_zone_label() {
         .await;
         assert!(st.is_client_error(), "{st}");
     }
+}
+
+#[tokio::test]
+async fn a_disabled_host_keeps_its_machines_and_takes_no_new_ones() {
+    let h = harness().await;
+    let (a, a_driver) = h.add_host("a");
+    let (b, _) = h.add_host("b");
+
+    // Equal hosts tie to the older one, so the first machine is on a.
+    let first = h.machine("first", vm(json!({}))).await;
+    assert_eq!(h.ready_on(&first.meta.id).await, a.meta.id);
+
+    let reason = json!({"reason": "replacing a fan"});
+    let (st, _) = raw(
+        &h.app,
+        &project_admin(),
+        "POST",
+        "/hosts/a/disable",
+        Some(reason.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, host) = call::<Host>(&h.app, &admin(), "POST", "/hosts/a/disable", Some(reason)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(host.spec.disabled);
+    assert_eq!(host.spec.disabled_reason, "replacing a fan");
+    // Disabling again with no body keeps the reason.
+    let (st, host) = call::<Host>(&h.app, &admin(), "POST", "/hosts/a/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(host.spec.disabled_reason, "replacing a fan");
+    // The host itself is still healthy.
+    assert_eq!(host.status.phase, Phase::Ready);
+
+    // a is emptier, but everything new goes to b.
+    for name in ["n1", "n2", "n3"] {
+        let m = h.machine(name, vm(json!({}))).await;
+        assert_eq!(h.ready_on(&m.meta.id).await, b.meta.id);
+    }
+
+    // The machine that was on a is still there and can still be driven.
+    let id = first.meta.id.to_string();
+    let (st, _) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        &format!("/machines/{id}/stop"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    h.wait(&first.meta.id, |m| m.status.power == forge::PowerState::Off)
+        .await;
+    let (st, _) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        &format!("/machines/{id}/start"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let m = h
+        .wait(&first.meta.id, |m| m.status.power == forge::PowerState::On)
+        .await;
+    assert_eq!(m.status.host.as_ref(), Some(&a.meta.id));
+    assert_eq!(a_driver.len(), 1);
+
+    // With every host disabled a machine waits and says so.
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/b/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let waiting = h.machine("waiting", vm(json!({}))).await;
+    let waiting = h
+        .wait(&waiting.meta.id, |m| {
+            m.status
+                .conditions
+                .iter()
+                .any(|c| c.kind == "Scheduled" && !c.status)
+        })
+        .await;
+    assert!(
+        waiting.status.message.contains("2 disabled"),
+        "{}",
+        waiting.status.message
+    );
+
+    // Enabling a host clears the reason and the machine lands there.
+    let (st, _) = raw(&h.app, &project_admin(), "POST", "/hosts/a/enable", None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, host) = call::<Host>(&h.app, &admin(), "POST", "/hosts/a/enable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!host.spec.disabled);
+    assert!(host.spec.disabled_reason.is_empty());
+    assert_eq!(h.ready_on(&waiting.meta.id).await, a.meta.id);
 }

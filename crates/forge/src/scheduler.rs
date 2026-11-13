@@ -3,7 +3,7 @@
 
 //! Placement. One pure function: filters, then weighs, then picks.
 //!
-//! Filters (hard): host is `Ready`; it supports the machine kind; its labels
+//! Filters (hard): host is `Ready` and not disabled; it supports the machine kind; its labels
 //! satisfy `spec.host_selector` and, when the machine names one, its `zone`
 //! label is `spec.zone`; it has room for `size` after subtracting
 //! `allocations` made earlier in the same pass.
@@ -63,6 +63,7 @@ impl Allocations {
 #[derive(Debug, Default)]
 struct Rejections {
     not_ready: usize,
+    disabled: usize,
     kind: usize,
     selector: usize,
     resources: usize,
@@ -83,6 +84,10 @@ pub fn place(
     for h in hosts {
         if h.status.phase != Phase::Ready {
             rej.not_ready += 1;
+            continue;
+        }
+        if h.spec.disabled {
+            rej.disabled += 1;
             continue;
         }
         if !h
@@ -139,17 +144,19 @@ pub fn place(
 
     if candidates.is_empty() {
         return Err(ApiError::unavailable(format!(
-            "no host can take a {:?} machine of size {}: {} hosts, {} not ready, {} lack a driver, {} fail the selector, {} lack resources",
+            "no host can take a {:?} machine of size {}: {} hosts, {} not ready, {} disabled, {} lack a driver, {} fail the selector, {} lack resources",
             spec.kind,
             spec.size,
             hosts.len(),
             rej.not_ready,
+            rej.disabled,
             rej.kind,
             rej.selector,
             rej.resources
         ))
         .with_detail("hosts", hosts.len() as u64)
         .with_detail("not_ready", rej.not_ready as u64)
+        .with_detail("disabled", rej.disabled as u64)
         .with_detail("no_driver", rej.kind as u64)
         .with_detail("selector", rej.selector as u64)
         .with_detail("resources", rej.resources as u64));
@@ -285,6 +292,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, b.meta.id);
+    }
+
+    #[test]
+    fn filters_disabled() {
+        let mut a = host("a", 32768, &["kvm"]);
+        a.spec.disabled = true;
+        let b = host("b", 8192, &["kvm"]);
+        let place_one = |hosts: &[Host]| {
+            place(
+                &spec(MachineKind::Vm),
+                &SIZE,
+                hosts,
+                &Allocations::new(),
+                Strategy::Spread,
+            )
+        };
+        assert_eq!(place_one(&[a.clone(), b.clone()]).unwrap(), b.meta.id);
+        let err = place_one(std::slice::from_ref(&a)).unwrap_err();
+        assert!(err.message.contains("1 disabled"), "{}", err.message);
+        assert_eq!(
+            err.details.get("disabled").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        a.spec.disabled = false;
+        assert_eq!(place_one(&[a.clone(), b]).unwrap(), a.meta.id);
     }
 
     #[test]
