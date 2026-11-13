@@ -12,6 +12,8 @@
 //! | POST   | `/agents/heartbeat`        | [`Heartbeat`]   | [`HeartbeatAck`] |
 //! | GET    | `/agents/{node}/commands`  | `?wait=&max=`   | `Vec<Command>`   |
 //! | POST   | `/agents/{node}/results`   | `Vec<CommandResult>` | [`ReportAck`] |
+//! | GET    | `/metadata/networks/{node}` |                | `Vec<MetadataNetwork>` |
+//! | POST   | `/metadata/guest`          | [`MetadataQuery`] | [`MetadataAnswer`] |
 //!
 //! Every type here is `serde` and nothing else; the transport can be swapped
 //! for gRPC later without touching the queue or the modules.
@@ -753,6 +755,44 @@ impl CommandResult {
             })),
         }
     }
+}
+
+/// A network with a guest on the asking host, and what the host needs to
+/// answer metadata for it when the networks are OVN.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataNetwork {
+    /// Fabric network id.
+    pub network: String,
+    /// Name of the network's metadata port in OVN. The host sets it as
+    /// `iface-id` on its end.
+    pub port: String,
+    /// MAC of that port.
+    pub mac: String,
+    /// The network's IPv4 subnets, the way back to the guests.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+}
+
+/// One metadata request a host passes on for a guest. The host fills in
+/// `network` and `address` from where the connection arrived, never from
+/// what the guest sent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataQuery {
+    pub node_name: String,
+    pub network: String,
+    /// The guest's address on that network.
+    pub address: std::net::IpAddr,
+    /// Request path, e.g. `/latest/meta-data/hostname`.
+    pub path: String,
+}
+
+/// What to send back to the guest.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataAnswer {
+    /// HTTP status for the guest. An unknown guest or path is 404.
+    pub status: u16,
+    #[serde(default)]
+    pub body: Vec<u8>,
 }
 
 /// Reply to a batch of results.

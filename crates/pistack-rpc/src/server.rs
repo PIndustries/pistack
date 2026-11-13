@@ -269,7 +269,7 @@ fn check_node_name(name: &str) -> ApiResult<()> {
 /// certificate with the node name as its common name, so a verified peer
 /// may only speak for that node. Without a verified peer (plain HTTP with
 /// `PISTACK_RPC_INSECURE=1`) there is nothing to bind and the name stands.
-fn check_peer_node(ext: &axum::http::Extensions, node: &str) -> ApiResult<()> {
+pub fn check_peer_node(ext: &axum::http::Extensions, node: &str) -> ApiResult<()> {
     let peer = ext
         .get::<ConnectInfo<PeerIdentity>>()
         .map(|c| &c.0)

@@ -86,9 +86,11 @@ pub fn build(
     // Keyed commands record their ids here, so they keep them when this
     // server restarts or another one takes the lead.
     asm.queue.attach_store(store.clone());
-    // The image download sits on the same transport and behind the same
-    // checks: an agent has a client certificate, not a gate token.
-    let images = agent_image_routes(mold::Client::new(store.clone(), asm.images.clone()));
+    // The image download and the metadata an OVN host asks for sit on the
+    // same transport and behind the same checks: an agent has a client
+    // certificate, not a gate token.
+    let images = agent_image_routes(mold::Client::new(store.clone(), asm.images.clone()))
+        .merge(forge::agent_metadata_routes(store.clone()));
     app = app.nest(
         "/rpc",
         pistack_rpc::router_with_extra(asm.queue.clone(), store.clone(), images),

@@ -15,7 +15,8 @@ use serde::Deserialize;
 use crate::error::RpcError;
 use crate::proto::{
     AgentHello, Command, CommandResult, EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck,
-    HelloAck, ReportAck, DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
+    HelloAck, MetadataAnswer, MetadataNetwork, MetadataQuery, ReportAck, DEFAULT_POLL_BATCH,
+    JOIN_HEADER, MAX_LONG_POLL_SECS,
 };
 
 /// Slack added to a long-poll's request timeout so a server that honours
@@ -410,6 +411,43 @@ impl AgentClient {
     /// Report one result.
     pub async fn report_one(&self, result: CommandResult) -> Result<ReportAck, RpcError> {
         self.report(std::slice::from_ref(&result)).await
+    }
+
+    /// The networks that have a guest on this host and need a metadata
+    /// port here. Empty unless the cluster's networks are OVN.
+    pub async fn metadata_networks(&self) -> Result<Vec<MetadataNetwork>, RpcError> {
+        self.send(|base| {
+            self.http
+                .get(format!("{base}/metadata/networks/{}", self.node_name))
+                .timeout(Duration::from_secs(15))
+        })
+        .await
+    }
+
+    /// Status and body of metadata `path` for the guest that holds
+    /// `address` on `network` on this host. The path travels in the body:
+    /// it can name a secret and must not end up in an access log.
+    pub async fn metadata(
+        &self,
+        network: &str,
+        address: std::net::IpAddr,
+        path: &str,
+    ) -> Result<(u16, Vec<u8>), RpcError> {
+        let query = MetadataQuery {
+            node_name: self.node_name.clone(),
+            network: network.to_owned(),
+            address,
+            path: path.to_owned(),
+        };
+        let answer: MetadataAnswer = self
+            .send(|base| {
+                self.http
+                    .post(format!("{base}/metadata/guest"))
+                    .json(&query)
+                    .timeout(Duration::from_secs(15))
+            })
+            .await?;
+        Ok((answer.status, answer.body))
     }
 }
 

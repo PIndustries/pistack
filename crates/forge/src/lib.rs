@@ -40,6 +40,7 @@ pub use driver::{
     ChannelDriver, DriverCommand, DriverRegistry, DriverReply, DriverRequest, HostDriver,
     MachineRuntime, MockDriver,
 };
+pub use metadata::agent_routes as agent_metadata_routes;
 pub use overlay::{
     ServiceEndpointView, ServicePortView, ServiceRecord, ServiceStatusView, ServiceView,
 };
