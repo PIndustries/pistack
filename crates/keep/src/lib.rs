@@ -8,6 +8,8 @@
 //!   verify client certificates, read secret payloads.
 //! * [`tls::server_config`] / [`tls::client_config`] — rustls configs built
 //!   from `keep` material, so the gateway and agents can speak (m)TLS.
+//! * [`files`] — a certificate, key and CA bundle as files in a directory,
+//!   replaced as a set. [`Client::renew_certificate`] issues the next one.
 //! * [`redeem_join_token`] — turn a join token into a grant and mark one use.
 //! * [`Client::lookup_access_key`] — the secret, project, principal and
 //!   project-scoped `Caller` of a live access key, for request signing
@@ -49,6 +51,7 @@ pub mod ca;
 pub mod client;
 pub mod crypto;
 pub mod error;
+pub mod files;
 pub mod join;
 pub mod peer;
 pub mod quota;
@@ -66,7 +69,7 @@ use std::sync::OnceLock;
 pub use access_key::{AccessKey, AccessKeyCredential, CreatedAccessKey};
 pub use backend::KeyBackend;
 pub use ca::{Ca, Issued};
-pub use client::Client;
+pub use client::{managed_cert_role, Client};
 pub use crypto::{RootKey, Sealed};
 pub use error::{KeepError, Result};
 pub use join::{

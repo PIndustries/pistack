@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use crate::access_key::{ACCESS_KEYS, ROLE_ACCESS_KEY};
 use crate::backend::KeyBackend;
 use crate::ca::{
-    open_secret, seal_pem_secret, Ca, Issued, RESERVED_LABEL_PREFIX, ROLE_LABEL, ROLE_PRIVATE_KEY,
+    open_secret, pem_to_der, seal_pem_secret, serial_from_der, Ca, Issued, RESERVED_LABEL_PREFIX,
+    ROLE_AGENT, ROLE_LABEL, ROLE_PRIVATE_KEY, ROLE_SERVER,
 };
 use crate::crypto::RootKey;
 use crate::error::{KeepError, Result};
@@ -134,15 +135,33 @@ impl Client {
     /// Server certificate for a gateway or agent endpoint. `sans` are DNS
     /// names and IPs; the common name is not implied as a SAN.
     pub fn issue_server_cert(&self, cn: &str, sans: &[String]) -> Result<Pki> {
-        self.issue_pki(cn, sans.to_vec(), CertUsage::Server)
+        self.issue_pki(cn, sans.to_vec(), CertUsage::Server, None)
     }
 
     /// Client certificate an agent or service presents for mTLS.
     pub fn issue_client_cert(&self, cn: &str) -> Result<Pki> {
-        self.issue_pki(cn, Vec::new(), CertUsage::Client)
+        self.issue_pki(cn, Vec::new(), CertUsage::Client, None)
     }
 
-    fn issue_pki(&self, cn: &str, sans: Vec<String>, usage: CertUsage) -> Result<Pki> {
+    /// [`issue_client_cert`](Self::issue_client_cert) for a key the caller
+    /// made and shows in `csr_pem`. The returned `key_pem` is empty.
+    pub fn issue_client_cert_for(&self, cn: &str, csr_pem: &str) -> Result<Pki> {
+        self.issue_pki(cn, Vec::new(), CertUsage::Client, Some(csr_pem))
+    }
+
+    /// [`issue_server_cert`](Self::issue_server_cert) for a key the caller
+    /// made and shows in `csr_pem`. The returned `key_pem` is empty.
+    pub fn issue_server_cert_for(&self, cn: &str, sans: &[String], csr_pem: &str) -> Result<Pki> {
+        self.issue_pki(cn, sans.to_vec(), CertUsage::Server, Some(csr_pem))
+    }
+
+    fn issue_pki(
+        &self,
+        cn: &str,
+        sans: Vec<String>,
+        usage: CertUsage,
+        csr_pem: Option<&str>,
+    ) -> Result<Pki> {
         let spec = CertificateSpec {
             common_name: cn.to_owned(),
             sans,
@@ -150,14 +169,76 @@ impl Client {
             ttl_days: default_ttl_days(),
             issuer: None,
         };
-        let issued = self.ca.issue(&spec)?;
+        let issued = match csr_pem {
+            Some(csr) => self.ca.issue_for_request(&spec, csr)?,
+            None => self.ca.issue(&spec)?,
+        };
         let name = format!("{}-{}", sanitize(cn), issued.serial);
         let pki = Pki {
             cert_pem: issued.cert_pem.clone(),
             key_pem: issued.key_pem.clone(),
             ca_pem: self.ca.bundle_pem(),
         };
-        self.persist_certificate(None, &name, spec, issued, String::new(), BTreeMap::new())?;
+        let role = match usage {
+            CertUsage::Client => ROLE_AGENT,
+            _ => ROLE_SERVER,
+        };
+        let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned())]);
+        self.persist_certificate(None, &name, spec, issued, String::new(), labels)?;
+        Ok(pki)
+    }
+
+    /// The cloud's own certificate with this serial: one issued for an
+    /// agent or a server listener, not one a project asked for.
+    pub fn managed_certificate(&self, serial: u64) -> Result<Option<Certificate>> {
+        Ok(self
+            .store
+            .collection::<Certificate>()
+            .list(None)?
+            .into_iter()
+            .find(|c| c.status.serial == serial && managed_cert_role(c).is_some()))
+    }
+
+    /// Renew the certificate with serial `presented`, which the caller has
+    /// just proved it holds by using it for TLS. The new one has the same
+    /// name, SANs and usage and the key in `csr_pem`; its `key_pem` comes
+    /// back empty. The old one is marked as renewed and stays valid until
+    /// it expires, so the holder can keep it until the new one works.
+    ///
+    /// Refused when this cloud has no record of the certificate (it was
+    /// deleted, which is how a host is removed for good), when it is
+    /// revoked, or when `cn` is not the name it was issued for.
+    pub fn renew_certificate(&self, presented: u64, cn: &str, csr_pem: &str) -> Result<Pki> {
+        let old = self.managed_certificate(presented)?.ok_or_else(|| {
+            KeepError::Unauthorized("this cloud has no record of that certificate".into())
+        })?;
+        let issuer = old
+            .status
+            .issuer
+            .clone()
+            .unwrap_or_else(|| self.ca.issuing_id().clone());
+        if old.status.revoked || self.ca.crl(&issuer)?.iter().any(|r| r.serial == presented) {
+            return Err(KeepError::Unauthorized("certificate is revoked".into()));
+        }
+        if old.spec.common_name != cn {
+            return Err(KeepError::Denied(pistack_types::ApiError::forbidden(
+                format!("certificate is for '{}', not '{cn}'", old.spec.common_name),
+            )));
+        }
+        let pki = self.issue_pki(cn, old.spec.sans.clone(), old.spec.usage, Some(csr_pem))?;
+        let serial = serial_from_der(&pem_to_der(&pki.cert_pem)?)?;
+        self.store
+            .collection::<Certificate>()
+            .modify(&old.meta.id, |c| {
+                c.status.renewed_by = Some(serial);
+                Ok(())
+            })?;
+        tracing::info!(
+            cn,
+            old = presented,
+            new = serial,
+            "keep: certificate renewed"
+        );
         Ok(pki)
     }
 
@@ -378,13 +459,18 @@ impl Client {
         description: String,
         labels: BTreeMap<String, String>,
     ) -> Result<Certificate> {
-        let key_secret = seal_pem_secret(
-            &self.store,
-            &self.root_key,
-            &format!("{name}-key"),
-            project.clone(),
-            &issued.key_pem,
-        )?;
+        // A certificate issued for a request has no key here to keep.
+        let key_secret = if issued.key_pem.is_empty() {
+            None
+        } else {
+            Some(seal_pem_secret(
+                &self.store,
+                &self.root_key,
+                &format!("{name}-key"),
+                project.clone(),
+                &issued.key_pem,
+            )?)
+        };
         let mut cert = Certificate::new(name, project, spec);
         cert.meta.description = description;
         cert.meta.labels = labels;
@@ -396,14 +482,17 @@ impl Client {
             fingerprint_sha256: issued.fingerprint_sha256,
             cert_pem: issued.cert_pem,
             issuer: Some(issued.issuer),
-            key_secret: Some(key_secret.clone()),
+            key_secret: key_secret.clone(),
             revoked: false,
+            renewed_by: None,
         };
         match self.store.collection::<Certificate>().create(cert) {
             Ok(c) => Ok(c),
             Err(e) => {
                 // Do not leave an orphaned key behind.
-                let _ = self.store.collection::<StoredSecret>().delete(&key_secret);
+                if let Some(k) = &key_secret {
+                    let _ = self.store.collection::<StoredSecret>().delete(k);
+                }
                 Err(e.into())
             }
         }
@@ -529,6 +618,29 @@ fn reserved_labels(labels: &BTreeMap<String, String>) -> Vec<(&String, &String)>
 }
 
 /// Turn a CN into something that fits the resource-name rules.
+/// `agent` or `server` for a certificate the cloud issued for itself, and
+/// `None` for one a caller asked for. Certificates from before the role
+/// label are told by having no project and the name `issue_pki` gives.
+pub fn managed_cert_role(c: &Certificate) -> Option<&'static str> {
+    if c.meta.project.is_some() {
+        return None;
+    }
+    match c.meta.labels.get(ROLE_LABEL).map(String::as_str) {
+        Some(ROLE_AGENT) => return Some(ROLE_AGENT),
+        Some(ROLE_SERVER) => return Some(ROLE_SERVER),
+        Some(_) => return None,
+        None => {}
+    }
+    let named = format!("{}-{}", sanitize(&c.spec.common_name), c.status.serial);
+    if c.meta.name != named {
+        return None;
+    }
+    Some(match c.spec.usage {
+        CertUsage::Client => ROLE_AGENT,
+        _ => ROLE_SERVER,
+    })
+}
+
 fn sanitize(cn: &str) -> String {
     let s: String = cn
         .chars()
@@ -614,6 +726,128 @@ mod tests {
         c.delete_certificate(&cert.meta.id).unwrap();
         assert!(c.get_secret(&key).is_err());
         assert_eq!(c.list_cas().unwrap().len(), 2);
+    }
+
+    fn serial_of(pki: &Pki) -> u64 {
+        serial_from_der(&pem_to_der(&pki.cert_pem).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_certificate_is_renewed_for_a_new_key_and_the_old_one_is_marked() {
+        let c = client();
+        let first = c.issue_client_cert("n1").unwrap();
+        let old = serial_of(&first);
+        assert_eq!(
+            managed_cert_role(&c.managed_certificate(old).unwrap().unwrap()),
+            Some(ROLE_AGENT)
+        );
+
+        let req = crate::ca::new_key_request("n1").unwrap();
+        let renewed = c.renew_certificate(old, "n1", &req.csr_pem).unwrap();
+        // The key is the requester's: none comes back and none is stored.
+        assert!(renewed.key_pem.is_empty());
+        let new = serial_of(&renewed);
+        assert_ne!(new, old);
+        let rec = c.managed_certificate(new).unwrap().unwrap();
+        assert!(rec.status.key_secret.is_none());
+        assert_eq!(rec.spec.common_name, "n1");
+        assert_eq!(rec.spec.usage, CertUsage::Client);
+        assert_eq!(managed_cert_role(&rec), Some(ROLE_AGENT));
+        // Both verify: the old one is kept until the new one works.
+        assert_eq!(
+            c.managed_certificate(old)
+                .unwrap()
+                .unwrap()
+                .status
+                .renewed_by,
+            Some(new)
+        );
+        for pki in [&first, &renewed] {
+            let der = pem_to_der(&pki.cert_pem).unwrap();
+            assert_eq!(c.verify_client_cert(&der).unwrap(), "n1");
+        }
+
+        // Another node's name, with this node's certificate.
+        let other = crate::ca::new_key_request("n2").unwrap();
+        let err = pistack_types::ApiError::from(
+            c.renew_certificate(new, "n2", &other.csr_pem).unwrap_err(),
+        );
+        assert_eq!(err.code, pistack_types::error::ErrorCode::Forbidden);
+        // A request for another name than the one asked for.
+        assert!(matches!(
+            c.renew_certificate(new, "n1", &other.csr_pem),
+            Err(KeepError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_revoked_or_deleted_certificate_is_not_renewed() {
+        let c = client();
+        let req = || crate::ca::new_key_request("n1").unwrap().csr_pem;
+        let count = || c.list_certificates(None).unwrap().len();
+
+        let revoked = serial_of(&c.issue_client_cert("n1").unwrap());
+        let id = c.managed_certificate(revoked).unwrap().unwrap().meta.id;
+        c.revoke_certificate(&id).unwrap();
+        let before = count();
+        let err = c.renew_certificate(revoked, "n1", &req()).unwrap_err();
+        assert!(
+            matches!(&err, KeepError::Unauthorized(m) if m.contains("revoked")),
+            "{err}"
+        );
+
+        // Revoked on the CA only, the record not marked.
+        let on_ca = serial_of(&c.issue_client_cert("n1").unwrap());
+        c.ca().revoke(c.ca().issuing_id(), on_ca).unwrap();
+        assert!(matches!(
+            c.renew_certificate(on_ca, "n1", &req()),
+            Err(KeepError::Unauthorized(_))
+        ));
+
+        // The record deleted: the host was removed.
+        let gone = serial_of(&c.issue_client_cert("n1").unwrap());
+        let id = c.managed_certificate(gone).unwrap().unwrap().meta.id;
+        c.delete_certificate(&id).unwrap();
+        assert!(matches!(
+            c.renew_certificate(gone, "n1", &req()),
+            Err(KeepError::Unauthorized(_))
+        ));
+        // A serial this cloud never issued.
+        assert!(c.renew_certificate(9999, "n1", &req()).is_err());
+        // Nothing was issued by any of the refusals.
+        assert_eq!(count(), before + 1);
+
+        // A certificate a project asked for is not the cloud's to renew.
+        let project = Id::new(pistack_types::kind::PROJECT);
+        let theirs = c
+            .issue_certificate(
+                Some(project),
+                "web",
+                CertificateSpec {
+                    common_name: "n1".into(),
+                    usage: CertUsage::Client,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(c
+            .renew_certificate(theirs.status.serial, "n1", &req())
+            .is_err());
+    }
+
+    #[test]
+    fn a_server_certificate_keeps_its_names_when_renewed() {
+        let c = client();
+        let sans = vec!["10.0.0.11".to_owned(), "pistack".to_owned()];
+        let first = c.issue_server_cert("pistack", &sans).unwrap();
+        let req = crate::ca::new_key_request("pistack").unwrap();
+        let renewed = c
+            .renew_certificate(serial_of(&first), "pistack", &req.csr_pem)
+            .unwrap();
+        let rec = c.managed_certificate(serial_of(&renewed)).unwrap().unwrap();
+        assert_eq!(rec.spec.sans, sans);
+        assert_eq!(rec.spec.usage, CertUsage::Server);
+        assert_eq!(managed_cert_role(&rec), Some(ROLE_SERVER));
     }
 
     #[test]

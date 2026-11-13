@@ -176,6 +176,10 @@ pub struct CertificateStatus {
     pub key_secret: Option<Id>,
     #[serde(default)]
     pub revoked: bool,
+    /// Serial of the certificate issued to replace this one at renewal.
+    /// This one stays valid until it expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_by: Option<u64>,
 }
 
 pub type Certificate = Resource<CertificateSpec, CertificateStatus>;

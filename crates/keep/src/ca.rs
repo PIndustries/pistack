@@ -13,6 +13,12 @@
 //! Serials come from one monotonic counter in store meta ([`META_SERIAL`]),
 //! so no two certificates in the cloud share one. Revocation is a list of
 //! serials on the CA's status, served as JSON by `GET /cas/{id}/crl`.
+//!
+//! A leaf is signed either for a key made here ([`Ca::issue`]) or for a key
+//! made where it will be used and shown in a PKCS#10 request
+//! ([`Ca::issue_for_request`], [`new_key_request`]); that key never reaches
+//! the control plane. Agents and servers renew their certificates the
+//! second way, once [`renew_at`] has passed.
 
 use chrono::{DateTime, Datelike, Duration, Utc};
 use parking_lot::Mutex;
@@ -20,10 +26,12 @@ use pistack_store::Store;
 use pistack_types::{Id, Phase};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType, SerialNumber, PKCS_ECDSA_P256_SHA256,
+    KeyPair, KeyUsagePurpose, PublicKeyData, SanType, SerialNumber, SignatureAlgorithm,
+    PKCS_ECDSA_P256_SHA256,
 };
 use std::net::IpAddr;
 use std::sync::Arc;
+use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::crypto::{sha256_hex, RootKey};
@@ -46,8 +54,102 @@ pub const ROLE_LABEL: &str = "keep.pistack.io/role";
 /// [`ROLE_LABEL`] value on a certificate's or CA's private-key secret.
 pub const ROLE_PRIVATE_KEY: &str = "private-key";
 
+/// [`ROLE_LABEL`] value on the client certificate of a host agent.
+pub const ROLE_AGENT: &str = "agent";
+/// [`ROLE_LABEL`] value on the certificate of a server's TLS listener.
+pub const ROLE_SERVER: &str = "server";
+
+/// When a certificate valid from `not_before` to `not_after` is renewed:
+/// after two thirds of its lifetime.
+pub fn renew_at(not_before: DateTime<Utc>, not_after: DateTime<Utc>) -> DateTime<Utc> {
+    let life = (not_after - not_before).num_seconds().max(0);
+    not_before + Duration::seconds(life / 3 * 2)
+}
+
+/// A key made where it will be used, and the request to certify it.
+pub struct KeyRequest {
+    /// Stays with whoever made it.
+    pub key_pem: String,
+    /// PKCS#10, signed with the key: what goes to the CA.
+    pub csr_pem: String,
+}
+
+/// Make a P-256 key and a certificate request for common name `cn`.
+pub fn new_key_request(cn: &str) -> Result<KeyRequest> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    let mut params = CertificateParams::default();
+    params.distinguished_name = dn(cn);
+    let csr = params.serialize_request(&key)?;
+    Ok(KeyRequest {
+        key_pem: key.serialize_pem(),
+        csr_pem: csr.pem()?,
+    })
+}
+
+/// The public key and name out of a certificate request.
+struct RequestedKey {
+    common_name: String,
+    /// The raw key as it sits in the request's SubjectPublicKeyInfo.
+    key: Vec<u8>,
+}
+
+impl PublicKeyData for RequestedKey {
+    fn der_bytes(&self) -> &[u8] {
+        &self.key
+    }
+    fn algorithm(&self) -> &SignatureAlgorithm {
+        &PKCS_ECDSA_P256_SHA256
+    }
+}
+
+const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+const OID_P256: &str = "1.2.840.10045.3.1.7";
+
+/// Read a PEM certificate request. Its signature must verify under the key
+/// it carries, which proves the sender holds the private half. Only P-256
+/// keys are taken, the one kind this CA issues for.
+fn parse_request(csr_pem: &str) -> Result<RequestedKey> {
+    let bad = |m: String| KeepError::Invalid(format!("certificate request: {m}"));
+    let p = pem::parse(csr_pem).map_err(|e| bad(format!("bad PEM: {e}")))?;
+    if p.tag() != "CERTIFICATE REQUEST" {
+        return Err(bad(format!(
+            "expected CERTIFICATE REQUEST, got {}",
+            p.tag()
+        )));
+    }
+    let (rest, csr) = X509CertificationRequest::from_der(p.contents())
+        .map_err(|e| bad(format!("cannot parse: {e}")))?;
+    if !rest.is_empty() {
+        return Err(bad("trailing bytes".into()));
+    }
+    csr.verify_signature()
+        .map_err(|_| bad("its signature does not verify under its own key".into()))?;
+    let info = &csr.certification_request_info;
+    let alg = &info.subject_pki.algorithm;
+    let curve = alg
+        .parameters
+        .as_ref()
+        .and_then(|p| p.as_oid().ok())
+        .map(|o| o.to_id_string());
+    if alg.algorithm.to_id_string() != OID_EC_PUBLIC_KEY || curve.as_deref() != Some(OID_P256) {
+        return Err(bad("the key must be ECDSA P-256".into()));
+    }
+    let common_name = info
+        .subject
+        .iter_common_name()
+        .next()
+        .and_then(|a| a.as_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| bad("no common name".into()))?;
+    Ok(RequestedKey {
+        common_name,
+        key: info.subject_pki.subject_public_key.data.to_vec(),
+    })
+}
+
 /// A freshly issued certificate and its key. The key PEM exists only here
-/// until the caller seals it.
+/// until the caller seals it, and is empty when the certificate was issued
+/// for a request: that key was never here.
 #[derive(Clone, Debug)]
 pub struct Issued {
     pub cert_pem: String,
@@ -175,8 +277,30 @@ impl Ca {
         b
     }
 
-    /// Issue a leaf certificate. The caller persists the result.
+    /// Issue a leaf certificate with a new key. The caller persists the
+    /// result.
     pub fn issue(&self, spec: &CertificateSpec) -> Result<Issued> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let mut issued = self.sign_leaf(spec, &key)?;
+        issued.key_pem = key.serialize_pem();
+        Ok(issued)
+    }
+
+    /// Issue a leaf certificate for the key in `csr_pem`. The request must
+    /// name `spec.common_name`; SANs, usage and lifetime come from `spec`
+    /// alone, whatever the request asks for.
+    pub fn issue_for_request(&self, spec: &CertificateSpec, csr_pem: &str) -> Result<Issued> {
+        let req = parse_request(csr_pem)?;
+        if req.common_name != spec.common_name {
+            return Err(KeepError::Invalid(format!(
+                "certificate request is for '{}', not '{}'",
+                req.common_name, spec.common_name
+            )));
+        }
+        self.sign_leaf(spec, &req)
+    }
+
+    fn sign_leaf(&self, spec: &CertificateSpec, key: &impl PublicKeyData) -> Result<Issued> {
         if spec.common_name.trim().is_empty() {
             return Err(KeepError::Invalid("common_name is required".into()));
         }
@@ -187,7 +311,6 @@ impl Ca {
             .issuer
             .clone()
             .unwrap_or_else(|| self.issuing_id.clone());
-        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let serial = next_serial(&self.store)?;
 
         let mut params = CertificateParams::default();
@@ -220,7 +343,7 @@ impl Ca {
             }
             let (y, m, d) = ymd(end);
             params.not_after = rcgen::date_time_ymd(y, m, d);
-            Ok(params.signed_by(&key, &s.handle, &s.key)?)
+            Ok(params.signed_by(key, &s.handle, &s.key)?)
         })?;
         let (not_before, not_after) = validity(cert.der())?;
         let fingerprint_sha256 = sha256_hex(cert.der());
@@ -232,7 +355,7 @@ impl Ca {
         })?;
         Ok(Issued {
             cert_pem: cert.pem(),
-            key_pem: key.serialize_pem(),
+            key_pem: String::new(),
             serial,
             not_before,
             not_after,
@@ -614,6 +737,13 @@ fn common_name(cert: &X509Certificate<'_>) -> Result<String> {
         .ok_or_else(|| KeepError::Pki("certificate has no common name".into()))
 }
 
+/// Serial number of a DER certificate.
+pub fn serial_from_der(der: &[u8]) -> Result<u64> {
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| KeepError::Pki(format!("cannot parse certificate: {e}")))?;
+    Ok(serial_u64(cert.serial.to_bytes_be().as_slice()))
+}
+
 fn serial_u64(be: &[u8]) -> u64 {
     let mut out = 0u64;
     for b in be.iter().skip(be.len().saturating_sub(8)) {
@@ -782,6 +912,67 @@ mod tests {
             Err(KeepError::Unauthorized(_))
         ));
         assert!(is_revoked(&store, &der).unwrap());
+    }
+
+    #[test]
+    fn a_request_is_signed_for_the_key_it_carries() {
+        let (_store, ca) = boot();
+        let req = new_key_request("agent-01").unwrap();
+        assert!(req.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
+        let spec = CertificateSpec {
+            common_name: "agent-01".into(),
+            usage: CertUsage::Client,
+            ..Default::default()
+        };
+        let issued = ca.issue_for_request(&spec, &req.csr_pem).unwrap();
+        // The key was made by the requester and is not in the answer.
+        assert!(issued.key_pem.is_empty());
+        let der = pem_to_der(&issued.cert_pem).unwrap();
+        assert_eq!(ca.verify_client_cert(&der).unwrap(), "agent-01");
+        assert_eq!(serial_from_der(&der).unwrap(), issued.serial);
+
+        // The certificate and the requester's key make a working identity.
+        let pki = crate::tls::Pki {
+            cert_pem: issued.cert_pem.clone(),
+            key_pem: req.key_pem.clone(),
+            ca_pem: ca.bundle_pem(),
+        };
+        crate::tls::client_config(&ca.bundle_pem(), Some(&pki)).unwrap();
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
+        let key = KeyPair::from_pem(&req.key_pem).unwrap();
+        assert_eq!(
+            cert.public_key().subject_public_key.data.as_ref(),
+            key.der_bytes()
+        );
+
+        // A request for another name is refused, and so is one whose
+        // signature was not made with its own key.
+        let other = CertificateSpec {
+            common_name: "agent-02".into(),
+            ..spec.clone()
+        };
+        assert!(matches!(
+            ca.issue_for_request(&other, &req.csr_pem),
+            Err(KeepError::Invalid(_))
+        ));
+        let mut der = pem::parse(&req.csr_pem).unwrap().into_contents();
+        let last = der.len() - 1;
+        der[last] ^= 0x01;
+        let forged = pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", der));
+        assert!(matches!(
+            ca.issue_for_request(&spec, &forged),
+            Err(KeepError::Invalid(_))
+        ));
+        assert!(ca.issue_for_request(&spec, "not pem").is_err());
+        assert!(ca.issue_for_request(&spec, &issued.cert_pem).is_err());
+    }
+
+    #[test]
+    fn renewal_is_due_after_two_thirds_of_the_lifetime() {
+        let nb = Utc::now();
+        let na = nb + Duration::days(366);
+        assert_eq!(renew_at(nb, na), nb + Duration::days(244));
+        assert_eq!(renew_at(nb, nb), nb);
     }
 
     #[test]
