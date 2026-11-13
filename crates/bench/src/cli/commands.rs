@@ -47,6 +47,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Quota { cmd } => quota(ctx, cmd, io).await,
         Cmd::Audit { cmd } => audit(ctx, cmd, io).await,
         Cmd::User { cmd } => user(ctx, cmd, io).await,
+        Cmd::SigningKey { cmd } => signing_key(ctx, cmd, io).await,
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
         Cmd::Key { cmd } => key(ctx, cmd, io).await,
@@ -1239,6 +1240,70 @@ async fn user(ctx: &Ctx, cmd: UserCmd, io: &mut Io<'_>) -> CliResult<()> {
             do_create(ctx, io, k, body, false).await.map(|_| ())
         }
     }
+}
+
+/// `pi signing-key`: the keys tokens are signed with. Only ids and dates
+/// come back; the secrets stay in the store.
+async fn signing_key(ctx: &Ctx, cmd: SigningKeyCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let c = ctx.client()?;
+    let v = match cmd {
+        SigningKeyCmd::List => c.get_value("/identity/signing-keys").await?,
+        SigningKeyCmd::Rotate => c.post("/identity/signing-keys/rotate", &json!({})).await?,
+        SigningKeyCmd::Retire(a) => {
+            if !a.yes {
+                if !io.tty {
+                    return Err(CliError::usage(
+                        "refusing to retire signing keys without --yes (no terminal to confirm on)",
+                    ));
+                }
+                write!(
+                    io.stderr,
+                    "tokens signed with an older key stop working at once. retire? [y/N] "
+                )?;
+                io.stderr.flush()?;
+                if !matches!(io.read_line()?.trim(), "y" | "Y" | "yes") {
+                    return Ok(());
+                }
+            }
+            c.post("/identity/signing-keys/retire", &json!({})).await?
+        }
+    };
+    if !matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+        print_one(io.stdout, ctx.fmt, &v)?;
+        return Ok(());
+    }
+    let keys = v
+        .pointer("/keys")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let now = chrono::Utc::now();
+    let rows: Vec<Vec<String>> = keys
+        .iter()
+        .map(|k| {
+            vec![
+                str_at(k, "/kid"),
+                if k["current"] == true { "yes" } else { "" }.to_owned(),
+                output::age(&str_at(k, "/created_at"), now),
+                str_at(k, "/retire_at"),
+            ]
+        })
+        .collect();
+    write!(
+        io.stdout,
+        "{}",
+        output::table(
+            &["KEY", "CURRENT", "AGE", "VERIFIES-UNTIL"],
+            &rows,
+            ctx.fmt.no_headers
+        )
+    )?;
+    if let Some(retired) = v.pointer("/retired").and_then(Value::as_array) {
+        for kid in retired {
+            writeln!(io.stdout, "retired {}", kid.as_str().unwrap_or_default())?;
+        }
+    }
+    Ok(())
 }
 
 async fn role(ctx: &Ctx, cmd: RoleCmd, io: &mut Io<'_>) -> CliResult<()> {

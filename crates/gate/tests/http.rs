@@ -707,3 +707,65 @@ async fn admin_sets_limits_and_a_member_reads_them_with_usage() {
     assert_eq!(v["status"]["usage"]["vcpus"], 6);
     assert_eq!(v["spec"]["quotas"]["vcpus"], 16);
 }
+
+#[tokio::test]
+async fn signing_keys_rotate_and_retire_through_the_api() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let old = v["token"].as_str().unwrap().to_owned();
+
+    let (s, v) = call(&app, "GET", "/signing-keys", Some(&old), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(v["keys"][0]["current"], true);
+    // Ids and dates only.
+    assert!(!v.to_string().contains("secret"));
+    let first = v["keys"][0]["kid"].as_str().unwrap().to_owned();
+
+    let (s, v) = call(&app, "POST", "/signing-keys/rotate", Some(&old), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let keys = v["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0]["kid"], first.as_str());
+    assert_eq!(keys[0]["current"], false);
+    assert!(keys[0]["retire_at"].is_string());
+    assert_eq!(keys[1]["current"], true);
+
+    // The token from before still works; a new login is signed by the new key.
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&old), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let new = v["token"].as_str().unwrap().to_owned();
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&new), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, v) = call(&app, "POST", "/signing-keys/retire", Some(&new), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["retired"], json!([first]));
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&old), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&new), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Not for a plain user.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&new),
+        Some(json!({"name": "bob", "password": "bob-password-1"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, v) = login(&app, "bob", "bob-password-1").await;
+    let bob = v["token"].as_str().unwrap().to_owned();
+    for (method, path) in [
+        ("GET", "/signing-keys"),
+        ("POST", "/signing-keys/rotate"),
+        ("POST", "/signing-keys/retire"),
+    ] {
+        let (s, _) = call(&app, method, path, Some(&bob), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
