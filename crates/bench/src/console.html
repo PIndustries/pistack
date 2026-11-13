@@ -253,6 +253,40 @@
   .panel table { border: 0; border-radius: 0; }
   .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 0 1.2rem; }
 
+  /* The launch wizard: steps on the left, one step's choices on the right. */
+  /* Only when shown: a plain display rule beats the hidden attribute. */
+  form.wiz:not([hidden]) { display: grid; grid-template-columns: 12.5rem minmax(0, 1fr); gap: 0; padding: 0; overflow: hidden; }
+  .wiz .steps { border-right: 1px solid var(--line); padding: 1rem 0.6rem; background: var(--panel-2); display: flex; flex-direction: column; gap: 0.15rem; }
+  .wiz .steps strong { padding: 0 0.6rem 0.7rem; font-size: 1rem; }
+  .wiz .steps button { display: flex; align-items: center; gap: 0.6rem; text-align: left; background: none; border: 0; padding: 0.5rem 0.6rem; border-radius: 8px; color: var(--muted); }
+  .wiz .steps button:hover:not(:disabled) { background: var(--hover); border-color: transparent; }
+  .wiz .steps button[aria-current="step"] { background: var(--active); color: var(--text); }
+  .wiz .steps .n { flex: none; width: 1.35rem; height: 1.35rem; border-radius: 50%; display: grid; place-items: center; font-size: 0.72rem; font-weight: 700; border: 1px solid var(--line-strong); }
+  .wiz .steps button.done .n { background: var(--accent); color: var(--ink); border-color: transparent; }
+  .wiz .steps button.missing .n { border-color: var(--bad); color: var(--bad); }
+  .wiz .body { padding: 1.1rem 1.3rem 1rem; min-width: 0; display: flex; flex-direction: column; min-height: 23rem; }
+  .wiz .body h4 { margin: 0 0 0.2rem; font-size: 1.05rem; }
+  .wiz .body .lead { color: var(--muted); margin: 0 0 1rem; font-size: 0.88rem; max-width: 70ch; }
+  .wiz .pane { flex: 1; }
+  .wiz .pane > .sub { margin: 0.8rem 0 0; font-size: 0.84rem; max-width: 75ch; }
+  .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.6rem; }
+  .opts button { display: block; text-align: left; padding: 0.7rem 0.85rem; background: var(--field); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+  .opts button b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .opts button span { display: block; color: var(--muted); font-size: 0.8rem; margin-top: 0.15rem; }
+  .opts button[aria-pressed="true"] { border-color: var(--accent); background: var(--active); box-shadow: inset 0 0 0 1px var(--accent); }
+  .opts button:disabled { opacity: 0.5; }
+  .opts .nothing { grid-column: 1 / -1; color: var(--muted); border: 1px dashed var(--line); border-radius: 10px; padding: 1.2rem; text-align: center; }
+  .wiz .foot { display: flex; align-items: center; gap: 0.5rem; margin-top: 1.1rem; padding-top: 0.9rem; border-top: 1px solid var(--line); }
+  .wiz .foot .sum { flex: 1; min-width: 0; color: var(--muted); font-size: 0.84rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wiz .foot .sum b { color: var(--text); font-weight: 550; }
+  .wiz .review { margin: 0; }
+  @media (max-width: 860px) {
+    form.wiz:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+    .wiz .steps { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    .wiz .steps strong { display: none; }
+    .wiz .steps button { white-space: nowrap; }
+  }
+
   /* Machine page and overview: header, tabs, charts, activity. */
   .crumb { background: none; border: 0; padding: 0; color: var(--muted); font-size: 0.86rem; cursor: pointer; }
   .crumb:hover:not(:disabled) { color: var(--text); border-color: transparent; }
@@ -1136,49 +1170,250 @@ function field(label, node) {
   return wrap;
 }
 
+// ---- launching a machine ---------------------------------------------------
+
+// Cards to pick from. `multi` lets several be on at once.
+function optionCards(items, picked, multi, onChange, emptyText) {
+  const box = el("div", null, "opts");
+  if (!items.length) { box.append(el("div", emptyText, "nothing")); return box; }
+  for (const it of items) {
+    const b = el("button"); b.type = "button";
+    b.append(el("b", it.title), el("span", it.detail || " "));
+    b.disabled = !!it.disabled;
+    if (it.disabled && it.why) b.title = it.why;
+    b.setAttribute("aria-pressed", String(picked.has(it.value)));
+    b.addEventListener("click", () => {
+      if (multi) { if (picked.has(it.value)) picked.delete(it.value); else picked.add(it.value); }
+      else { picked.clear(); picked.add(it.value); }
+      for (const o of box.children) o.setAttribute("aria-pressed", "false");
+      [...box.children].forEach((o, i) => o.setAttribute("aria-pressed", String(picked.has(items[i].value))));
+      onChange();
+    });
+    box.append(b);
+  }
+  return box;
+}
+
+function launchWizard() {
+  const form = el("form");
+  form.className = "create wiz";
+  form.autocomplete = "off";
+  const state = {
+    image: new Set(), size: new Set(), networks: new Set(), groups: new Set(), zone: new Set([""]),
+  };
+  const name = el("input"); name.required = true; name.placeholder = "web-1"; name.maxLength = 63;
+  const count = el("input"); count.type = "number"; count.min = "1"; count.max = "10"; count.value = "1";
+  const key = el("textarea"); key.placeholder = "ssh-ed25519 AAAA... you@laptop"; key.rows = 3;
+  const userData = el("textarea"); userData.placeholder = "#cloud-config"; userData.rows = 6;
+  try { key.value = localStorage.getItem("pistack.sshkey") || ""; } catch (e) { /* private window */ }
+  let data = null;
+  let failed = "";
+
+  const steps = [
+    { key: "details", title: "Details", lead: "What to call it and how many. With more than one, each gets the name and a number." },
+    { key: "image", title: "Image", lead: "The disk the machine starts from." },
+    { key: "size", title: "Size", lead: "How much CPU, memory and root disk it gets." },
+    { key: "networks", title: "Networks", lead: "Where it is attached. It gets one address on each network you pick. Without a network it has no address." },
+    { key: "groups", title: "Security groups", lead: "Which traffic may reach it. With none picked it gets the project's default group." },
+    { key: "access", title: "Access", lead: "How you get in, and what it does on first boot." },
+    { key: "review", title: "Review", lead: "Check it over, then launch." },
+  ];
+  let at = 0;
+
+  const nav = el("div", null, "steps");
+  nav.append(el("strong", "Launch a machine"));
+  const body = el("div", null, "body");
+  const heading = el("h4");
+  const lead = el("p", null, "lead");
+  const pane = el("div", null, "pane");
+  const foot = el("div", null, "foot");
+  const sum = el("div", null, "sum");
+  const prev = el("button", "Back"); prev.type = "button";
+  const next = el("button", "Next"); next.type = "button";
+  const launch = el("button", "Launch", "primary"); launch.type = "submit";
+  foot.append(sum, prev, next, launch);
+  body.append(heading, lead, pane, foot);
+  form.append(nav, body);
+
+  const one = (set) => [...set][0] || "";
+  const howMany = () => Math.min(10, Math.max(1, parseInt(count.value, 10) || 1));
+  const missing = () => {
+    const out = [];
+    if (!name.value.trim()) out.push("details");
+    if (!one(state.image)) out.push("image");
+    if (!one(state.size)) out.push("size");
+    return out;
+  };
+  const sizeText = (s) => {
+    const r = (s && s.spec) || {};
+    return (r.vcpus || 0) + " vCPU · " + gib(r.memory_mib || 0) + " GiB · " + (r.disk_gib || 0) + " GiB disk";
+  };
+  const refresh = () => {
+    const lacks = missing();
+    [...nav.querySelectorAll("button")].forEach((b, i) => {
+      const k = steps[i].key;
+      if (i === at) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
+      const filled = { details: !!name.value.trim(), image: !!one(state.image), size: !!one(state.size),
+        networks: state.networks.size > 0, groups: state.groups.size > 0, access: !!key.value.trim() }[k];
+      b.classList.toggle("done", !!filled);
+      b.classList.toggle("missing", lacks.includes(k) && at === steps.length - 1);
+    });
+    sum.replaceChildren();
+    const parts = [name.value.trim() || "unnamed", one(state.image), one(state.size), [...state.networks].join(", ")].filter(Boolean);
+    parts.forEach((p, i) => { if (i) sum.append(" · "); sum.append(i ? p : el("b", (howMany() > 1 ? howMany() + " × " : "") + p)); });
+    prev.hidden = at === 0;
+    next.hidden = at === steps.length - 1;
+    launch.hidden = at !== steps.length - 1;
+    launch.disabled = lacks.length > 0 || !data;
+    launch.textContent = howMany() > 1 ? "Launch " + howMany() + " machines" : "Launch";
+  };
+  const draw = () => {
+    const step = steps[at];
+    heading.textContent = step.title;
+    lead.textContent = step.lead;
+    pane.replaceChildren();
+    if (!data && step.key !== "details" && step.key !== "access") {
+      pane.append(el("div", failed || "Reading what this project can use…", "sub"));
+      refresh();
+      return;
+    }
+    if (step.key === "details") {
+      const row = el("div"); row.className = "row";
+      row.append(field("Name", name), field("How many", count));
+      pane.append(row);
+      const zones = data ? data.zones : [];
+      if (zones.length) {
+        pane.append(el("h3", "Availability zone"));
+        pane.append(optionCards(
+          [{ value: "", title: "Any zone", detail: "wherever there is room" }]
+            .concat(zones.map(z => ({ value: z.name, title: z.name, detail: z.hosts + (z.hosts === 1 ? " host" : " hosts") }))),
+          state.zone, false, refresh, ""));
+      }
+    } else if (step.key === "image") {
+      pane.append(optionCards(data.images.map(i => {
+        const ready = phaseOf(i) === "ready";
+        return { value: i.name, title: i.name, disabled: !ready, why: "This image is not ready",
+          detail: [(i.spec && i.spec.format) || "", (i.spec && i.spec.arch) || "", ready ? "" : phaseOf(i)].filter(Boolean).join(" · ") };
+      }), state.image, false, refresh, "No image yet. Upload one on the Images page first."));
+    } else if (step.key === "size") {
+      pane.append(optionCards(data.sizes.map(s => ({ value: s.name, title: s.name, detail: sizeText(s) })),
+        state.size, false, refresh, "No size is defined. An admin adds them with pi size create."));
+    } else if (step.key === "networks") {
+      pane.append(optionCards(data.networks.map(n => ({
+        value: n.name, title: n.name,
+        detail: n.spec && n.spec.external ? "external · addresses come from outside" : ((n.spec && n.spec.kind && n.spec.kind.type) || "network"),
+      })), state.networks, true, refresh, "No network yet. Create one on the Networks page, with a subnet."));
+      pane.append(el("p", "Name a network to boot on that project's bridge. A router on that network NATs the guest. The address on the port is the address the guest uses.", "sub"));
+      pane.append(el("p", "A machine gets no floating IP on its own. If an admin has marked an external network for automatic floating IPs, the guest gets one from it when it has an address, and the auto DNS zone publishes its name.", "sub"));
+    } else if (step.key === "groups") {
+      pane.append(optionCards(data.groups.map(g => ({
+        value: g.name, title: g.name,
+        detail: (((g.spec && g.spec.rules) || []).length) + " rules",
+      })), state.groups, true, refresh, "No security group yet. The project's default group will be used."));
+    } else if (step.key === "access") {
+      pane.append(field("SSH public key", key));
+      pane.append(el("p", "Paste the public half. It is put in the default user's authorized keys, and kept in this browser for next time.", "sub"));
+      pane.append(field("User data (cloud-init)", userData));
+    } else {
+      const kv = el("div", null, "kv review");
+      const size = data.sizes.find(s => s.name === one(state.size));
+      kv.append(
+        kvLine("Name", name.value.trim() + (howMany() > 1 ? "-1 … " + name.value.trim() + "-" + howMany() : "")),
+        kvLine("Image", one(state.image)),
+        kvLine("Size", one(state.size) ? one(state.size) + " — " + sizeText(size) : ""),
+        kvLine("Zone", one(state.zone) || "any"),
+        kvLine("Networks", [...state.networks].join(", ") || "none: it will have no address"),
+        kvLine("Security groups", [...state.groups].join(", ") || "the project's default group"),
+        kvLine("SSH key", key.value.trim() ? key.value.trim().split(/\s+/).slice(-1)[0].slice(0, 40) : "none: you will need the console to get in"),
+        kvLine("User data", userData.value.trim() ? userData.value.trim().split("\n").length + " lines" : "none"),
+      );
+      pane.append(kv);
+      const lacks = missing();
+      if (lacks.length) {
+        pane.append(el("p", "Still needed: " + lacks.map(k => steps.find(s => s.key === k).title.toLowerCase()).join(", ") + ".", "sub"));
+      }
+    }
+    refresh();
+  };
+  steps.forEach((s, i) => {
+    const b = el("button"); b.type = "button";
+    b.append(el("span", String(i + 1), "n"), s.title);
+    b.addEventListener("click", () => { at = i; draw(); });
+    nav.append(b);
+  });
+  prev.addEventListener("click", () => { at = Math.max(0, at - 1); draw(); });
+  next.addEventListener("click", () => { at = Math.min(steps.length - 1, at + 1); draw(); });
+  name.addEventListener("input", refresh);
+  count.addEventListener("input", refresh);
+  key.addEventListener("input", refresh);
+  // Enter in a field moves on; it does not launch from the first step.
+  form.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && ev.target.tagName === "INPUT" && at !== steps.length - 1) { ev.preventDefault(); next.click(); }
+  });
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (at !== steps.length - 1 || missing().length) { at = steps.length - 1; draw(); return; }
+    setErr("");
+    launch.disabled = true;
+    const spec = { kind: "vm", size: one(state.size), image: one(state.image), networks: [...state.networks], volumes: [] };
+    if (state.groups.size) spec.security_groups = [...state.groups];
+    if (one(state.zone)) spec.zone = one(state.zone);
+    if (userData.value.trim()) spec.user_data = userData.value;
+    if (key.value.trim()) {
+      spec.ssh_keys = [key.value.trim()];
+      try { localStorage.setItem("pistack.sshkey", key.value.trim()); } catch (e) { /* private window */ }
+    }
+    const base = name.value.trim();
+    const names = howMany() > 1 ? Array.from({ length: howMany() }, (_, i) => base + "-" + (i + 1)) : [base];
+    const made = [];
+    try {
+      for (const n of names) {
+        await api("POST", "/compute/machines", { name: n, spec });
+        made.push(n);
+      }
+      formOpen[current] = false;
+      await render();
+    } catch (e) {
+      setErr((made.length ? "Launched " + made.join(", ") + ", then: " : "") + e.message);
+      launch.disabled = false;
+    }
+  });
+
+  // What can be picked, read once when the form is built.
+  (async () => {
+    const list = async (path) => itemsOf(await api("GET", path));
+    try {
+      const [images, sizes, networks, groups, hosts] = await Promise.all([
+        list("/image/images"), list("/compute/sizes"), list("/network/networks"),
+        list("/network/security-groups").catch(() => []), list("/compute/hosts").catch(() => []),
+      ]);
+      const zoneHosts = new Map();
+      for (const h of hosts) {
+        const z = h.labels && h.labels.zone;
+        if (z && !(h.spec && h.spec.disabled)) zoneHosts.set(z, (zoneHosts.get(z) || 0) + 1);
+      }
+      sizes.sort((a, b) => ((a.spec.vcpus || 0) - (b.spec.vcpus || 0)) || ((a.spec.memory_mib || 0) - (b.spec.memory_mib || 0)));
+      data = { images, sizes, networks, groups, zones: [...zoneHosts].map(([name, n]) => ({ name, hosts: n })).sort((a, b) => a.name.localeCompare(b.name)) };
+      // One of each to start from, where there is only one sensible pick.
+      const ready = images.filter(i => phaseOf(i) === "ready");
+      if (ready.length === 1) state.image.add(ready[0].name);
+      const inside = networks.filter(n => !(n.spec && n.spec.external));
+      if (inside.length === 1) state.networks.add(inside[0].name);
+    } catch (e) {
+      failed = "Could not read what this project can use: " + e.message;
+    }
+    draw();
+  })();
+  draw();
+  return form;
+}
+
 function createForm() {
+  if (current === "machines") return launchWizard();
   const form = el("form");
   form.className = "create";
   form.autocomplete = "off";
-  if (current === "machines") {
-    const name = el("input"); name.required = true; name.placeholder = "demo";
-    const size = el("input"); size.value = "s.1x1";
-    const image = el("input"); image.value = "ubuntu-24.04";
-    const network = el("input"); network.placeholder = "app";
-    const group = el("input"); group.placeholder = "default";
-    const key = el("textarea"); key.placeholder = "ssh-ed25519 AAAA...";
-    const userData = el("textarea"); userData.placeholder = "#cloud-config";
-    form.append(el("strong", "New machine"));
-    const row = el("div"); row.className = "row";
-    row.append(field("Name", name), field("Size", size), field("Image", image));
-    const netRow = el("div"); netRow.className = "row";
-    netRow.append(field("Network", network), field("Security group", group));
-    form.append(row, netRow, field("SSH public key", key), field("User data", userData));
-    form.append(el("p", "A machine gets no floating IP on its own. If an admin has marked an external network for automatic floating IPs, the guest gets one from it when it has an address, and the auto DNS zone publishes its name.", "sub"));
-    form.append(el("p", "Name a network to boot on that project's bridge. A router on that network NATs the guest. The address on the port is the address the guest uses.", "sub"));
-    const go = el("button", "Create machine"); go.className = "primary"; go.type = "submit";
-    form.append(go);
-    form.addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      setErr("");
-      go.disabled = true;
-      try {
-        const spec = { kind: "vm", size: size.value.trim(), image: image.value.trim(), networks: [], volumes: [] };
-        const net = network.value.trim();
-        if (net) spec.networks = [net];
-        const sg = group.value.trim();
-        if (sg) spec.security_groups = [sg];
-        if (userData.value.trim()) spec.user_data = userData.value;
-        const line = key.value.trim();
-        if (line) spec.ssh_keys = [line];
-        await api("POST", "/compute/machines", { name: name.value.trim(), spec });
-        name.value = ""; key.value = ""; network.value = ""; group.value = ""; userData.value = "";
-        await render();
-      } catch (e) { setErr(e.message); }
-      go.disabled = false;
-    });
-    return form;
-  }
   if (current === "networks") {
     const name = el("input"); name.required = true;
     form.append(field("Network name", name));
