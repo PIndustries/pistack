@@ -11,7 +11,7 @@
 //!   the `Registrar` that turns agent hellos into `Host`s.
 //! * [`reconcile`] — the loop that turns `spec` into `status`.
 //! * [`console`] — a ticketed WebSocket in front of the guest's loopback VNC.
-//! * [`maintain`] — draining a host.
+//! * [`maintain`] — draining a host, and evacuating one that is down.
 //! * [`http`] — the `compute` API.
 //!
 //! `Forge::default()` is dev mode: a single `local` host backed by a

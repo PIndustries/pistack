@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Host maintenance through the router: an admin labels, disables, enables
-//! and drains hosts, and the scheduler follows.
+//! Host maintenance through the router: an admin labels, disables, enables,
+//! drains and evacuates hosts, and the scheduler follows.
 
 use axum::{
     body::Body,
     http::{header, Request, StatusCode},
     Router,
 };
-use forge::maintain::DrainReport;
-use forge::{new_host, DriverRegistry, Forge, Host, Machine, MockDriver};
+use forge::maintain::{DrainReport, EvacuateReport};
+use forge::{
+    new_host, DriverRegistry, Forge, Host, HostDriver, Machine, MachineRuntime, MockDriver,
+    EVACUATED_FROM_ANNOTATION,
+};
 use http_body_util::BodyExt;
 use pistack_rpc::proto::{CommandKind, CommandResult, Heartbeat, MachineReport, MigrateRequest};
 use pistack_rpc::{CommandQueue, QueueConfig};
 use pistack_store::Store;
-use pistack_types::{kind, Caller, Id, Module, ModuleContext, Phase, Resources};
+use pistack_types::{
+    kind, ApiError, ApiResult, Caller, Id, Module, ModuleContext, Phase, Resource, Resources, Spec,
+};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -625,4 +630,327 @@ async fn drain_without_live_migration_moves_nothing_and_says_so() {
     assert_eq!(m.status.phase, Phase::Ready);
     assert_eq!(m.status.host.as_ref(), Some(&a.meta.id));
     assert_eq!(a_driver.len(), 1);
+}
+
+// slab's rows as forge reads them. forge does not depend on slab.
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct VolumeSpec {
+    volume_type: String,
+}
+
+impl Spec for VolumeSpec {
+    const KIND: &'static str = kind::VOLUME;
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct VolumeStatus {
+    attached_to: Option<Id>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct VolumeTypeSpec {
+    backend: String,
+}
+
+impl Spec for VolumeTypeSpec {
+    const KIND: &'static str = "voltype";
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Nothing {}
+
+impl Harness {
+    fn volume_type(&self, name: &str, backend: &str) {
+        self.store
+            .collection::<Resource<VolumeTypeSpec, Nothing>>()
+            .create(Resource::new(
+                name,
+                None,
+                VolumeTypeSpec {
+                    backend: backend.into(),
+                },
+            ))
+            .unwrap();
+    }
+
+    /// A volume of `volume_type` recorded as attached to `machine`.
+    fn attach(&self, name: &str, volume_type: &str, machine: &Id) {
+        let mut vol = Resource::<VolumeSpec, VolumeStatus>::new(
+            name,
+            None,
+            VolumeSpec {
+                volume_type: volume_type.into(),
+            },
+        );
+        vol.status.attached_to = Some(machine.clone());
+        self.store
+            .collection::<Resource<VolumeSpec, VolumeStatus>>()
+            .create(vol)
+            .unwrap();
+    }
+
+    /// Make the reconciler see `host` as down: no report for a minute.
+    async fn go_silent(&self, host: &Id) {
+        self.drivers.unregister(host);
+        let driver: Arc<dyn HostDriver> = Arc::new(Unreachable);
+        self.drivers.register(host.clone(), driver);
+        self.store
+            .collection::<Host>()
+            .modify(host, |h| {
+                h.status.last_seen = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+                Ok(())
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self
+            .store
+            .collection::<Host>()
+            .get(host)
+            .unwrap()
+            .status
+            .phase
+            != Phase::Error
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "host never went down"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// The driver of a host nothing answers on.
+struct Unreachable;
+
+#[async_trait::async_trait]
+impl HostDriver for Unreachable {
+    async fn start(&self, _m: &Machine) -> ApiResult<MachineRuntime> {
+        Err(ApiError::unavailable("host does not answer"))
+    }
+    async fn stop(&self, _id: &Id) -> ApiResult<()> {
+        Err(ApiError::unavailable("host does not answer"))
+    }
+    async fn delete(&self, _id: &Id) -> ApiResult<()> {
+        Err(ApiError::unavailable("host does not answer"))
+    }
+    async fn list(&self) -> ApiResult<Vec<MachineRuntime>> {
+        Err(ApiError::unavailable("host does not answer"))
+    }
+}
+
+fn evacuate_body(confirm_dead: bool, rebuild: bool) -> Option<serde_json::Value> {
+    Some(json!({"confirm_dead": confirm_dead, "rebuild_from_image": rebuild}))
+}
+
+#[tokio::test]
+async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
+    let h = harness().await;
+    let (dead, _) = h.add_host("dead");
+    let (spare, spare_driver) = h.add_host("spare");
+    h.volume_type("standard", "local");
+    h.volume_type("ceph", "rbd");
+
+    // Everything starts on `dead`.
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/spare/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let plain = h.machine("plain", vm(json!({}))).await;
+    let shared = h.machine("shared", vm(json!({}))).await;
+    let local = h.machine("local", vm(json!({}))).await;
+    let unknown = h.machine("unknown", vm(json!({}))).await;
+    let metal = h.machine("metal", vm(json!({"kind": "metal"}))).await;
+    for m in [&plain, &shared, &local, &unknown, &metal] {
+        assert_eq!(h.ready_on(&m.meta.id).await, dead.meta.id);
+    }
+    h.attach("blocks", "ceph", &shared.meta.id);
+    h.attach("scratch", "standard", &local.meta.id);
+    h.attach("blocks2", "ceph", &local.meta.id);
+    h.attach("odd", "gone-type", &unknown.meta.id);
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/spare/enable", None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // A host that is up is refused, whatever the flags say, and so is a
+    // project admin.
+    let (st, body) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(true, true),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let (st, _) = raw(
+        &h.app,
+        &project_admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(true, true),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    h.go_silent(&dead.meta.id).await;
+
+    // Without the flag nothing moves: every machine would lose its disk.
+    let (st, report) =
+        call::<EvacuateReport>(&h.app, &admin(), "POST", "/hosts/dead/evacuate", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(report.evacuated.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.len(), 5);
+    let why = names(&report.skipped);
+    assert!(why[0].1.contains("root disk"), "{why:?}");
+    assert!(why[0].1.contains("rebuild_from_image"), "{why:?}");
+    for m in [&plain, &shared] {
+        let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
+        assert_eq!(m.status.host.as_ref(), Some(&dead.meta.id));
+    }
+
+    let (st, report) = call::<EvacuateReport>(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(false, true),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let moved: Vec<&str> = report.evacuated.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(moved, ["plain", "shared"]);
+    assert_eq!(report.evacuated[0].rebuilt_from, "ubuntu");
+    assert!(report.evacuated[0].volumes.is_empty());
+    // The shared volume is named: it is plugged back in.
+    assert_eq!(report.evacuated[1].volumes, ["blocks"]);
+    let why = names(&report.skipped);
+    assert_eq!(why.len(), 3, "{why:?}");
+    assert_eq!(why[0].0, "local");
+    assert!(why[0].1.contains("volume scratch"), "{why:?}");
+    assert!(why[0].1.contains("local storage"), "{why:?}");
+    assert_eq!(why[1].0, "unknown");
+    assert!(why[1].1.contains("volume odd"), "{why:?}");
+    assert_eq!(why[2].0, "metal");
+    assert!(why[2].1.contains("bare metal"), "{why:?}");
+
+    // The evacuated machines come up on the other host and say what happened.
+    for m in [&plain, &shared] {
+        assert_eq!(h.ready_on(&m.meta.id).await, spare.meta.id);
+        let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
+        assert_eq!(
+            m.meta.annotations.get(EVACUATED_FROM_ANNOTATION),
+            Some(&dead.meta.id.to_string())
+        );
+        let note = m
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Evacuated")
+            .expect("an Evacuated condition");
+        assert!(note.status);
+        assert!(note.message.contains("root disk"), "{}", note.message);
+        assert!(note.message.contains("image ubuntu"), "{}", note.message);
+    }
+    assert_eq!(spare_driver.len(), 2);
+    // The skipped ones were not touched.
+    for m in [&local, &unknown, &metal] {
+        let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
+        assert_eq!(m.status.host.as_ref(), Some(&dead.meta.id));
+        assert_eq!(m.status.phase, Phase::Ready);
+        assert!(!m.meta.annotations.contains_key(EVACUATED_FROM_ANNOTATION));
+    }
+
+    // Running it again moves nothing more and names the same three.
+    let (_, again) = call::<EvacuateReport>(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(false, true),
+    )
+    .await;
+    assert!(again.evacuated.is_empty(), "{again:?}");
+    assert_eq!(again.skipped, report.skipped);
+}
+
+/// A driver whose start hangs until the test lets it fail.
+struct Stuck {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl HostDriver for Stuck {
+    async fn start(&self, _m: &Machine) -> ApiResult<MachineRuntime> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(ApiError::unavailable("host went away during the start"))
+    }
+    async fn stop(&self, _id: &Id) -> ApiResult<()> {
+        Ok(())
+    }
+    async fn delete(&self, _id: &Id) -> ApiResult<()> {
+        Ok(())
+    }
+    async fn list(&self) -> ApiResult<Vec<MachineRuntime>> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_host_is_evacuated_only_when_confirmed_dead() {
+    let h = harness().await;
+    let (hung, _) = h.add_host("hung");
+    let stuck = Arc::new(Stuck {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    h.drivers.unregister(&hung.meta.id);
+    h.drivers
+        .register_local(hung.meta.id.clone(), stuck.clone());
+
+    // The machine is placed on the host and its start never returns.
+    let m = h.machine("caught", vm(json!({}))).await;
+    stuck.entered.notified().await;
+    let (spare, _) = h.add_host("spare");
+
+    // The host still looks alive. Disabled alone is not enough.
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/hung/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/hung/evacuate",
+        evacuate_body(false, true),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(
+        String::from_utf8_lossy(&body).contains("confirm"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (st, report) = call::<EvacuateReport>(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/hung/evacuate",
+        evacuate_body(true, true),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(report.evacuated.len(), 1, "{report:?}");
+
+    // The old start fails only now. Its answer is about the host the
+    // machine has left and must not land on the machine.
+    stuck.release.notify_one();
+    assert_eq!(h.ready_on(&m.meta.id).await, spare.meta.id);
+    let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
+    assert!(m.status.message.is_empty(), "{}", m.status.message);
 }

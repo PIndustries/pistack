@@ -77,6 +77,12 @@ pub const WAIT_VOLUME_ANNOTATION: &str = "loom.pistack.io/wait-volume";
 /// only that host.
 pub const NODE_PIN_ANNOTATION: &str = "loom.pistack.io/node";
 
+/// Set on a machine that an evacuation moved off a host. The value is that
+/// host's id. If the host comes back still holding the machine, that copy is
+/// stale and the registrar has the agent delete it. slab reads the same key
+/// to plug shared volumes back in.
+pub const EVACUATED_FROM_ANNOTATION: &str = "pistack.io/evacuated-from";
+
 /// Host label that names the availability zone. `MachineSpec::zone` is a
 /// hard selector on it.
 pub const ZONE_LABEL: &str = "zone";

@@ -9,7 +9,8 @@
 //! the resource as stored and the client polls `status.phase`.
 //! Live migration is the exception: it enqueues on the source node and only
 //! then records the destination on `status`, so port binding can follow.
-//! Draining a host starts live migrations the same way.
+//! Draining a host starts live migrations the same way, and evacuating
+//! one resets the status of its machines so they are placed again.
 //!
 //! Project scoping reads `pistack_types::Caller` from request extensions
 //! when the gateway's auth layer attached one. With no `Caller` the request
@@ -67,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/{id}/disable", post(disable_host))
         .route("/hosts/{id}/enable", post(enable_host))
         .route("/hosts/{id}/drain", post(drain_host))
+        .route("/hosts/{id}/evacuate", post(evacuate_host))
         .route("/sizes", get(list_sizes).post(create_size))
         .route(
             "/sizes/{id}",
@@ -721,6 +723,25 @@ async fn drain_host(
         host,
         migrating,
         not_moved,
+    }))
+}
+
+/// Reschedule the machines of a host that is down. See
+/// [`crate::maintain::evacuate`] for what is moved and what is lost.
+async fn evacuate_host(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<crate::maintain::EvacuateReport>> {
+    scope.require_admin()?;
+    let opts: crate::maintain::EvacuateOptions = optional_body(&body)?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let (evacuated, skipped) = crate::maintain::evacuate(&s.store, &host, opts)?;
+    Ok(Json(crate::maintain::EvacuateReport {
+        host,
+        evacuated,
+        skipped,
     }))
 }
 
