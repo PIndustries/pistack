@@ -152,6 +152,7 @@ mod tests {
         );
         assert!(text.contains("Needs attention"));
         assert!(text.contains("Control plane"));
+        assert!(text.contains("/identity/tokens/self/switch"));
         assert!(text.contains("Launch a machine"));
         assert!(text.contains("Recent activity"));
         assert!(text.contains("/gauge/samples"));

@@ -199,6 +199,7 @@
   #filter { width: 13rem; font-size: 0.86rem; }
   .live { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; font-size: 0.8rem; white-space: nowrap; cursor: pointer; }
   .live input { width: auto; accent-color: var(--accent); }
+  #project { width: auto; max-width: 13rem; padding: 0.35rem 1.6rem 0.35rem 0.6rem; font-weight: 550; text-overflow: ellipsis; }
   #who { color: var(--muted); font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16rem; }
   #menu { display: none; }
   header button { white-space: nowrap; }
@@ -443,6 +444,7 @@
         <strong id="crumb-title">Overview</strong>
       </div>
       <div class="head-tools">
+        <select id="project" aria-label="Project" title="The project you are working in" hidden></select>
         <input id="filter" type="search" placeholder="Filter rows" aria-label="Filter the rows on this page" autocomplete="off">
         <label class="live" title="Reload this page every few seconds"><input type="checkbox" id="live" checked><span>Live</span></label>
         <button type="button" id="theme" class="ghost" aria-label="Switch between light and dark">◐</button>
@@ -991,7 +993,83 @@ function setWho(who, fallback) {
   const node = document.getElementById("who");
   node.textContent = (who.principal_name || fallback) + (readOnly ? " · read-only" : "");
   node.title = who.project ? "Project " + who.project : "";
+  loadProjects();
 }
+
+// ---- the project you are working in ---------------------------------------
+
+const projectBox = document.getElementById("project");
+// Set once a project has been picked for a token that came without one,
+// so a refusal is shown and not tried again.
+let autoPicked = false;
+// The projects this caller can hold a token for, grouped under the project
+// each one sits in. With one project the box only says where you are.
+async function loadProjects() {
+  let mine;
+  try { mine = await api("GET", "/identity/tokens/self/projects"); }
+  catch (e) { projectBox.hidden = true; return; }
+  if (!Array.isArray(mine)) { projectBox.hidden = true; return; }
+  const here = mine.find(p => p.current);
+  if (!mine.length) {
+    projectBox.hidden = true;
+    if (!here) setErr("You have no role in any project yet. Ask an admin to add you to one.");
+    return;
+  }
+  // Signed in without a project: go to the one used last, else the first.
+  if (!here && !autoPicked) {
+    autoPicked = true;
+    let last = "";
+    try { last = localStorage.getItem("pistack.project") || ""; } catch (e) { /* private window */ }
+    const pick = mine.find(p => p.name === last) || mine[0];
+    await switchProject(pick.name);
+    return;
+  }
+  projectBox.replaceChildren();
+  if (!here) {
+    const none = option("", "No project");
+    none.selected = true;
+    none.disabled = true;
+    projectBox.append(none);
+  }
+  const groups = new Map();
+  for (const p of mine) {
+    const o = option(p.name, p.name);
+    o.selected = !!p.current;
+    o.title = (p.roles || []).join(", ");
+    if (!p.parent_name) { projectBox.append(o); continue; }
+    if (!groups.has(p.parent_name)) {
+      const g = el("optgroup");
+      g.label = p.parent_name;
+      groups.set(p.parent_name, g);
+    }
+    groups.get(p.parent_name).append(o);
+  }
+  for (const g of groups.values()) projectBox.append(g);
+  projectBox.disabled = mine.length < 2 && !!here;
+  projectBox.hidden = false;
+}
+// Move to another project: a new token for it, which ends when this one
+// would have, and everything on screen read again.
+async function switchProject(want) {
+  setErr("");
+  projectBox.disabled = true;
+  try {
+    const data = await api("POST", "/identity/tokens/self/switch", { project: want });
+    setToken(data.token);
+    try { localStorage.setItem("pistack.project", want); } catch (e) { /* private window */ }
+    openMachine = null;
+    keyOnce = null;
+    sampleCache = { at: 0, rows: [] };
+    for (const k of Object.keys(formOpen)) formOpen[k] = false;
+    setWho(data.caller || {}, "signed in");
+    loadCounts();
+    await render();
+  } catch (e) {
+    setErr(e.message);
+    loadProjects();
+  }
+}
+projectBox.addEventListener("change", () => { if (projectBox.value) switchProject(projectBox.value); });
 
 // ---- navigation -----------------------------------------------------------
 
