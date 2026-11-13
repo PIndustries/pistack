@@ -1546,6 +1546,79 @@ impl Client {
         Ok(())
     }
 
+    /// Plug shared volumes back into machines that were evacuated.
+    ///
+    /// An evacuated machine starts on a new host as a fresh guest, without
+    /// the disks that were hot-plugged into the old one. A volume still
+    /// recorded on the old host's node is plugged into the machine where it
+    /// runs now, once it is ready there. Only a backend that needs no host
+    /// path can follow: an RBD image. A local file or an LVM volume lived on
+    /// the dead host, and forge does not evacuate a machine that has one.
+    pub async fn reattach_evacuated(&self, only: Option<&Id>) -> ApiResult<()> {
+        if only.is_some_and(|m| !matches!(place::evacuated_move(&self.store, m), Ok(Some(_)))) {
+            return Ok(());
+        }
+        for vol in self.volumes().list(None)? {
+            let Some(machine) = vol.status.attached_to.clone() else {
+                continue;
+            };
+            if only.is_some_and(|m| *m != machine) {
+                continue;
+            }
+            if let Err(e) = self.reattach_moved(&vol, &machine).await {
+                tracing::warn!(
+                    volume = %vol.meta.id,
+                    machine = %machine,
+                    error = %e,
+                    "slab: volume was not plugged back in after the evacuation; will retry"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn reattach_moved(&self, vol: &Volume, machine: &Id) -> ApiResult<()> {
+        let Some(node) = vol.status.attach_node.clone() else {
+            return Ok(());
+        };
+        if !condition_holds(vol, "Attached") || !self.has_queue() {
+            return Ok(());
+        }
+        let Some(moved) = place::evacuated_move(&self.store, machine)? else {
+            return Ok(());
+        };
+        // Already followed the machine, or attached somewhere the
+        // evacuation did not touch.
+        if node != moved.from || node == moved.to {
+            return Ok(());
+        }
+        if self.volume_needs_host_path(&vol.meta.id)? {
+            return Ok(());
+        }
+        let done = self
+            .plug_volume(&vol.meta.id, machine, vol.status.device.clone())
+            .await?;
+        self.volumes().modify(&vol.meta.id, |v| {
+            if v.status.attached_to.as_ref() != Some(machine) {
+                return Ok(());
+            }
+            v.status.attach_node = Some(moved.to.clone());
+            v.status.host_path = done.host_path.clone().filter(|p| !p.is_empty());
+            if !done.device.is_empty() {
+                v.status.device = Some(done.device.clone());
+            }
+            Ok(())
+        })?;
+        tracing::info!(
+            volume = %vol.meta.id,
+            machine = %machine,
+            from = %moved.from,
+            to = %moved.to,
+            "slab: volume plugged back in after the evacuation"
+        );
+        Ok(())
+    }
+
     async fn detach_stale(&self, vol: &Volume, machine: &Id) -> ApiResult<()> {
         let host_path = vol.status.host_path.clone().unwrap_or_default();
         let node = vol.status.attach_node.clone();

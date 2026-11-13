@@ -3,7 +3,8 @@
 
 //! Event-driven reconciler: every write to a slab kind wakes it, it looks
 //! at `status.phase` and asks the backend to make it true. A pass also
-//! drops attaches whose machine record is gone.
+//! drops attaches whose machine record is gone, and plugs shared volumes
+//! back into machines that were evacuated to another host.
 
 use pistack_types::{kind, Event, EventAction};
 use std::time::Duration;
@@ -14,7 +15,8 @@ use crate::client::Client;
 use crate::types::{KIND_BACKUP, KIND_SNAPSHOT, KIND_VOLUME};
 
 /// How often to drop attaches whose machine no longer exists, even when
-/// no machine-delete event arrived.
+/// no machine-delete event arrived. Evacuated machines are checked on the
+/// same tick.
 const STALE_ATTACH_EVERY: Duration = Duration::from_secs(30);
 
 pub async fn run(
@@ -49,6 +51,9 @@ pub async fn run(
                             if let Err(e) = client.reconcile_stale_attaches().await {
                                 tracing::warn!(error = %e, "slab: stale attach reconcile failed");
                             }
+                            if let Err(e) = client.reattach_evacuated(None).await {
+                                tracing::warn!(error = %e, "slab: evacuated attach reconcile failed");
+                            }
                         }
                         ev = events.recv() => match ev {
                             Ok(ev) => handle(&client, ev).await,
@@ -81,6 +86,8 @@ async fn handle(client: &Client, ev: Event) {
         return;
     }
     let res = match ev.kind.as_str() {
+        // A machine that became ready on a new host after an evacuation.
+        kind::MACHINE => client.reattach_evacuated(Some(&ev.id)).await,
         KIND_VOLUME => client.reconcile_volume(&ev.id).await.map(|_| ()),
         KIND_SNAPSHOT => client.reconcile_snapshot(&ev.id).await.map(|_| ()),
         KIND_BACKUP => client.reconcile_backup(&ev.id).await.map(|_| ()),

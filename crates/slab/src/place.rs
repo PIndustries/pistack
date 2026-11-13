@@ -6,7 +6,7 @@
 //! field they do not need.
 
 use pistack_store::Store;
-use pistack_types::{kind, ApiError, ApiResult, Id, Resource, Spec};
+use pistack_types::{kind, ApiError, ApiResult, Id, Phase, Resource, Spec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -20,6 +20,57 @@ impl Spec for MachineSpecView {
 struct MachineStatusView {
     #[serde(default)]
     host: Option<Id>,
+    #[serde(default)]
+    phase: Phase,
+}
+
+/// Annotation forge puts on a machine it evacuated off a dead host. The
+/// value is that host's id. Same key as `forge::EVACUATED_FROM_ANNOTATION`.
+const EVACUATED_FROM: &str = "pistack.io/evacuated-from";
+
+/// Where an evacuated machine was and where it runs now, as agent node
+/// names.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Moved {
+    pub from: String,
+    pub to: String,
+}
+
+/// The move of a machine that was evacuated and is running again on
+/// another host. `None` for any other machine, and while an evacuated one
+/// is still waiting for a host or starting.
+pub(crate) fn evacuated_move(store: &Store, machine: &Id) -> ApiResult<Option<Moved>> {
+    let Some(placed) = store
+        .collection::<Resource<MachineSpecView, MachineStatusView>>()
+        .try_get(machine)?
+    else {
+        return Ok(None);
+    };
+    let Some(from) = placed
+        .meta
+        .annotations
+        .get(EVACUATED_FROM)
+        .and_then(|id| Id::parse(kind::HOST, id))
+    else {
+        return Ok(None);
+    };
+    let Some(now) = placed.status.host else {
+        return Ok(None);
+    };
+    if placed.status.phase != Phase::Ready || now == from {
+        return Ok(None);
+    }
+    let hosts = store.collection::<Resource<HostSpecView, HostStatusView>>();
+    let (Some(from), Some(to)) = (hosts.try_get(&from)?, hosts.try_get(&now)?) else {
+        return Ok(None);
+    };
+    if from.spec.node_name.is_empty() || to.spec.node_name.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Moved {
+        from: from.spec.node_name,
+        to: to.spec.node_name,
+    }))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
