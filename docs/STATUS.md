@@ -27,7 +27,6 @@ Found by the three-server lab run, fixes in open pull requests or in progress:
 - Hosts cannot follow a leader change: they are sent to the servers' plain HTTP address, where they cannot show their certificate (in progress).
 - An admin cannot read cluster status since #117 (in progress).
 - A server that led and had writes no majority confirmed has to be wiped and rejoined by hand when it returns.
-- Every machine is given a floating IP as soon as an external network exists. There is no switch for it.
 
 ## Compute
 
@@ -98,6 +97,7 @@ Done
 - Networks, subnets, allocation pools, ports, fixed IPs, MACs
 - Routers, external gateway, SNAT (IPv4)
 - Floating IPs on OVN, overlay and hostnat
+- Automatic floating IPs from one marked external network, off by default, with an opt-out per machine and per project
 - Security groups: stateful, ingress and egress, remote group, default group per project
 - Port security toggle
 - Provider networks, flat and VLAN
