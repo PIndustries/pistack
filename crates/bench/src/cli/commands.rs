@@ -53,6 +53,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Machine { cmd } => machine(ctx, cmd, io).await,
         Cmd::Size { cmd } => size(ctx, cmd, io).await,
         Cmd::Host { cmd } => host(ctx, cmd, io).await,
+        Cmd::Cluster { cmd } => cluster(ctx, cmd, io).await,
         Cmd::Network { cmd } => network(ctx, cmd, io).await,
         Cmd::Subnet { cmd } => subnet(ctx, cmd, io).await,
         Cmd::Port { cmd } => port(ctx, cmd, io).await,
@@ -632,6 +633,72 @@ async fn modules(ctx: &Ctx, io: &mut Io<'_>) -> CliResult<()> {
             }
         }
         _ => print_value(io.stdout, ctx.fmt, &Value::Array(mods))?,
+    }
+    Ok(())
+}
+
+/// `pi cluster status`: what the server `pi` talks to believes about the
+/// control plane. Another server may be a moment behind it.
+async fn cluster(ctx: &Ctx, cmd: ClusterCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let ClusterCmd::Status = cmd;
+    let c = ctx.client()?;
+    let v = c.get_value("/cluster").await?;
+    let members = v
+        .pointer("/members")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    match ctx.fmt.output {
+        Output::Table | Output::Wide => {
+            let leader_api = str_at(&v, "/leader_api");
+            let leader_id = str_at(&v, "/leader_id");
+            // The address is what the server follows now; the id is what
+            // its store last recorded, used when no member has the address.
+            let by_api = members
+                .iter()
+                .any(|m| !leader_api.is_empty() && str_at(m, "/api") == leader_api);
+            let leads = |m: &Value| {
+                if by_api {
+                    str_at(m, "/api") == leader_api
+                } else {
+                    !leader_api.is_empty() && str_at(m, "/id") == leader_id
+                }
+            };
+            let rows: Vec<Vec<String>> = members
+                .iter()
+                .map(|m| {
+                    vec![
+                        str_at(m, "/id"),
+                        str_at(m, "/role").to_lowercase(),
+                        if leads(m) { "yes" } else { "" }.to_owned(),
+                        str_at(m, "/api"),
+                        str_at(m, "/agent_api"),
+                    ]
+                })
+                .collect();
+            write!(
+                io.stdout,
+                "{}",
+                output::table(
+                    &["SERVER", "ROLE", "LEADER", "API", "AGENT API"],
+                    &rows,
+                    ctx.fmt.no_headers
+                )
+            )?;
+            if !members.iter().any(leads) {
+                writeln!(
+                    io.stderr,
+                    "{} knows no leader right now",
+                    str_at(&v, "/api")
+                )?;
+            }
+        }
+        Output::Name => {
+            for m in &members {
+                writeln!(io.stdout, "{}", str_at(m, "/id"))?;
+            }
+        }
+        _ => print_value(io.stdout, ctx.fmt, &v)?,
     }
     Ok(())
 }
