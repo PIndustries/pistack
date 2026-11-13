@@ -747,6 +747,27 @@ impl Store {
         ])
     }
 
+    /// Put two meta keys in one transaction, and so in one log entry: a
+    /// follower applies both or neither.
+    pub fn put_meta_pair<A: Serialize, B: Serialize>(
+        &self,
+        first: (&str, &A),
+        second: (&str, &B),
+    ) -> Result<()> {
+        self.backend.batch(vec![
+            Op::Put {
+                table: "meta".into(),
+                key: first.0.into(),
+                value: serde_json::to_vec(first.1)?,
+            },
+            Op::Put {
+                table: "meta".into(),
+                key: second.0.into(),
+                value: serde_json::to_vec(second.1)?,
+            },
+        ])
+    }
+
     /// Delete one meta key.
     pub fn delete_meta(&self, key: &str) -> Result<bool> {
         self.backend.delete("meta", key)
@@ -1725,6 +1746,36 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].index, 2);
         assert!(second[0].ops.iter().any(|op| op.key == "members"));
+    }
+
+    #[test]
+    fn a_pair_of_meta_keys_is_one_log_entry() {
+        let store = Store::in_memory().unwrap();
+        store.set_record_log(true);
+        store
+            .put_meta_pair(("members", &"[]"), ("cluster_removed", &vec!["n2"]))
+            .unwrap();
+        assert_eq!(store.commit_index().unwrap(), 1);
+        let log = store.read_log(0, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        let keys: Vec<&str> = log[0].ops.iter().map(|op| op.key.as_str()).collect();
+        assert_eq!(keys, ["members", "cluster_removed"]);
+        let copy = Store::in_memory().unwrap();
+        copy.apply_entries(&log).unwrap();
+        assert_eq!(
+            copy.get_meta::<Vec<String>>("cluster_removed").unwrap(),
+            Some(vec!["n2".to_owned()])
+        );
+        // A server that stood down writes neither half.
+        store.set_write_fence(true);
+        let err = store
+            .put_meta_pair(("members", &"[1]"), ("cluster_removed", &vec!["n3"]))
+            .unwrap_err();
+        assert!(err.is_not_leader());
+        assert_eq!(
+            store.get_meta::<String>("members").unwrap().as_deref(),
+            Some("[]")
+        );
     }
 
     #[test]
