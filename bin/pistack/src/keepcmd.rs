@@ -54,7 +54,7 @@ fn cluster_note(store: &Store) {
     }
 }
 
-fn describe(state: &RootKeyState) -> String {
+pub(crate) fn describe(state: &RootKeyState) -> String {
     match state {
         RootKeyState::Empty => "none (the first server start creates one)".into(),
         RootKeyState::Software => "software: keep/root_key, in the clear".into(),

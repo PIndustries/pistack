@@ -10,7 +10,8 @@
 //! pistack server                 existing store: stay in that cluster and announce
 //! pistack agent  --join URL      a host (anvil)
 //! pistack store dump             inspect state
-//! pistack store backup --to FILE copy the store and open the copy
+//! pistack store backup --to FILE copy the store and check the copy
+//! pistack store restore --from FILE   put a backup in an empty data directory
 //! pistack keep status            where the root key is kept; can the configured backend open it
 //! pistack keep migrate-to-vault  move the software root key into Vault Transit
 //! pistack keep migrate-to-software --allow-plaintext-key   the reverse
@@ -24,6 +25,7 @@ mod fabricchoice;
 mod gateway;
 mod keepcmd;
 mod listen;
+mod restore;
 mod server;
 
 use clap::{Parser, Subcommand};
@@ -113,11 +115,23 @@ enum KeepCmd {
 enum StoreCmd {
     /// Dump every resource as JSON lines.
     Dump,
-    /// Copy `data_dir/state.redb` to `--to` and open the copy.
+    /// Copy `data_dir/state.redb` to `--to` and check the copy.
     Backup {
         /// Destination file. It must not already exist.
         #[arg(long)]
         to: PathBuf,
+    },
+    /// Check a backup and put it in the data directory as `state.redb`. The
+    /// server that then starts there is the only member of the cluster.
+    /// Stop the server first.
+    Restore {
+        /// A file written by `pistack store backup`. It is not changed.
+        #[arg(long)]
+        from: PathBuf,
+        /// Restore into a data directory that is not empty. The store that
+        /// is there is renamed, not deleted.
+        #[arg(long)]
+        force: bool,
     },
     /// Rows and bytes per table, and how much of the store is replication log.
     /// Stop the server first: the store file opens once.
@@ -165,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Store { cmd } => match cmd {
             StoreCmd::Dump => server::dump(cli.data_dir),
             StoreCmd::Backup { to } => server::backup(cli.data_dir, to),
+            StoreCmd::Restore { from, force } => restore::run(&cli.data_dir, &from, force),
             StoreCmd::Stats => server::stats(cli.data_dir),
         },
         Cmd::Keep { cmd } => match cmd {
