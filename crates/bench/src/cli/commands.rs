@@ -45,6 +45,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
 
         Cmd::Project { cmd } => project(ctx, cmd, io).await,
         Cmd::Quota { cmd } => quota(ctx, cmd, io).await,
+        Cmd::Audit { cmd } => audit(ctx, cmd, io).await,
         Cmd::User { cmd } => user(ctx, cmd, io).await,
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
@@ -1077,6 +1078,140 @@ async fn quota(ctx: &Ctx, cmd: QuotaCmd, io: &mut Io<'_>) -> CliResult<()> {
             }
         }
         _ => print_value(io.stdout, ctx.fmt, &report)?,
+    }
+    Ok(())
+}
+
+/// `--since` and `--until`: an RFC 3339 time as it is, or an age such as
+/// `90s`, `30m`, `2h`, `7d` counted back from `now`.
+fn audit_time(raw: &str, now: chrono::DateTime<chrono::Utc>) -> CliResult<String> {
+    let raw = raw.trim();
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(t.with_timezone(&chrono::Utc).to_rfc3339());
+    }
+    let bad = || {
+        CliError::usage(format!(
+            "'{raw}' is not a time: give an RFC 3339 time such as 2026-11-12T08:00:00Z, or an age such as 30m, 2h or 7d"
+        ))
+    };
+    let split = raw.len().checked_sub(1).ok_or_else(bad)?;
+    let (n, unit) = raw.split_at_checked(split).ok_or_else(bad)?;
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return Err(bad()),
+    };
+    Ok((now - chrono::Duration::seconds(secs)).to_rfc3339())
+}
+
+fn query_escape(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let AuditCmd::List(a) = cmd;
+    let now = chrono::Utc::now();
+    let mut query = vec![
+        ("limit", a.limit.clamp(1, 1000).to_string()),
+        (
+            "order",
+            if a.oldest_first { "asc" } else { "desc" }.to_owned(),
+        ),
+    ];
+    if let Some(t) = &a.since {
+        query.push(("since", audit_time(t, now)?));
+    }
+    if let Some(t) = &a.until {
+        query.push(("until", audit_time(t, now)?));
+    }
+    for (key, value) in [
+        ("principal", a.principal),
+        ("project", a.in_project),
+        ("action", a.action),
+        ("kind", a.kind),
+        ("resource", a.resource),
+        ("outcome", a.outcome),
+        ("after", a.after),
+    ] {
+        if let Some(value) = value {
+            query.push((key, value));
+        }
+    }
+    let query: Vec<String> = query
+        .iter()
+        .map(|(k, v)| format!("{k}={}", query_escape(v)))
+        .collect();
+    let c = ctx.client()?;
+    let page = c
+        .get_value(&format!("/identity/audit?{}", query.join("&")))
+        .await?;
+    let items = page
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    match ctx.fmt.output {
+        Output::Table | Output::Wide => {
+            let wide = ctx.fmt.output == Output::Wide;
+            let rows: Vec<Vec<String>> = items
+                .iter()
+                .map(|r| {
+                    let who = match str_at(r, "/spec/principal") {
+                        p if p.is_empty() => "-".to_owned(),
+                        p => p,
+                    };
+                    let mut row = vec![
+                        str_at(r, "/created_at"),
+                        who,
+                        str_at(r, "/spec/client"),
+                        str_at(r, "/spec/action"),
+                        str_at(r, "/spec/kind"),
+                        str_at(r, "/spec/resource"),
+                        str_at(r, "/spec/status"),
+                    ];
+                    if wide {
+                        row.extend([
+                            str_at(r, "/spec/project"),
+                            str_at(r, "/spec/api_key"),
+                            str_at(r, "/spec/method"),
+                            str_at(r, "/spec/path"),
+                            str_at(r, "/id"),
+                        ]);
+                    }
+                    row
+                })
+                .collect();
+            let mut headers = vec![
+                "when", "who", "from", "action", "kind", "resource", "status",
+            ];
+            if wide {
+                headers.extend(["project", "api key", "method", "path", "id"]);
+            }
+            write!(
+                io.stdout,
+                "{}",
+                output::table(&headers, &rows, ctx.fmt.no_headers)
+            )?;
+            if let Some(next) = page.get("next").and_then(Value::as_str) {
+                writeln!(io.stderr, "more records: --after {next}")?;
+            }
+        }
+        Output::Name => {
+            for r in &items {
+                writeln!(io.stdout, "{}", str_at(r, "/id"))?;
+            }
+        }
+        _ => print_value(io.stdout, ctx.fmt, &page)?,
     }
     Ok(())
 }
