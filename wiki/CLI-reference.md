@@ -149,6 +149,7 @@ pi user list
 pi user show <NAME>
 pi user create <NAME>
 pi user delete <NAME>
+pi user revoke-tokens <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -161,6 +162,24 @@ pi user delete <NAME>
 | `user create` | `--password-stdin` | Read the password from stdin |
 | `user create` | `--default-project <DEFAULT_PROJECT>` | Default project (name or id) |
 | `user create` | `--disabled` |  |
+
+`user revoke-tokens` refuses every token the user holds at that moment. They log in again to get a new one. An admin can do it for anyone, a user for themselves. See [Identity and access](Identity-and-access#tokens).
+
+## pi signing-key
+
+The keys tokens are signed with (admin). `signing-keys` is an alias.
+
+```text
+pi signing-key list
+pi signing-key rotate
+pi signing-key retire
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `signing-key retire` | `-y, --yes` | Do not ask for confirmation |
+
+`list` prints each key's id, whether it signs new tokens, its age and when it stops verifying. `rotate` signs with a new key and lets the one before it verify for 7 more days. `retire` drops every key but the current one at once, which logs out everyone whose token was signed with an older key. See [Identity and access](Identity-and-access#rotating-the-signing-key).
 
 ## pi role
 
@@ -350,6 +369,8 @@ pi host evacuate <NAME>
 | `host evacuate` | `--confirm-dead` | The host is disabled but may still be reporting, and you know it is dead. If it is not, its machines will run twice until it reports |
 
 `host stats` prints what the host is using now: load, memory, its data disk and how many machines it holds. See [Metrics and alarms](Metrics-and-alarms).
+
+`host list -o wide` adds `CERT-EXPIRES`, the last day of the host's agent certificate, and `host show` prints it as `status.cert_expires`. It is empty for a host that never enrolled.
 
 `host disable` stops new placements; the machines on the host keep running. `host drain` disables the host and live-migrates what it can. `host evacuate` is for a host that is down. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 

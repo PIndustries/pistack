@@ -234,6 +234,8 @@ Done
 - argon2id passwords
 - Quota framework: limits per project, set by an admin, read with usage by members (`pi quota`)
 - Audit log: every change, login, secret read and refusal, with principal, API key, client address and outcome; read by a cloud admin with filters and paging (`pi audit list`); kept 90 days and 50,000 records by default
+- Token signing keys with ids, rotated and retired by an admin (`pi signing-key`); the key servers recognise each other with is separate and does not rotate with them
+- All of a user's tokens refused at once (`pi user revoke-tokens`)
 
 Partial
 - Roles: admin, member, reader only; custom roles grant nothing; the policy engine is built and unused
@@ -242,7 +244,8 @@ Partial
 - Password rule is "not empty"; no lockout
 
 Missing
-- Signing-key rotation; a single token cannot be revoked, only its user disabled or its key deleted
+- A single token cannot be revoked, only all of a user's at once
+- Signing-key rotation on a schedule: it is by hand
 - Groups, domains
 - OIDC, SAML, LDAP, federation
 - MFA
@@ -253,11 +256,16 @@ Done
 - Encrypted secrets with versions
 - Cloud CA, certificates, revocation list
 - Root key in software or wrapped by Vault Transit
+- Re-encryption under a new root key, offline, software backend (`pistack keep rotate-root-key`)
+- Listener certificates renew while the server runs
 - S3 access keys; join tokens with limits
 
 Partial
-- No re-encryption under a new root key; `rotate_after_days` is ignored
-- Agent certificates are never renewed
+- Agent certificates renew themselves, but only for an agent on HTTPS
+- `rotate_after_days` on a secret and `root_key_rotate_after_days` only warn; nothing is rotated automatically
+- No re-encryption under a new root key with the Vault backend
+- The cloud CA cannot be rotated: issuing CA 5 years, root 10
+- A host cannot be removed for good; its certificates are revoked by hand
 - Vault tested against a mock and a dev server only
 - Secrets and certificates have no CLI
 

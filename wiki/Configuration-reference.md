@@ -60,6 +60,7 @@ Root-key operations on the local store. Stop the server first.
 | `pistack keep migrate-to-vault` | Wrap the root key with Vault Transit and drop the plaintext copy. |
 | `pistack keep migrate-to-software --allow-plaintext-key` | The reverse. |
 | `pistack keep rewrap` | Re-encrypt the root key under the latest Transit key version. |
+| `pistack keep rotate-root-key [--key-file PATH]` | Encrypt every secret and private key again under a new root key. Software backend only. Can be interrupted and run again. In a cluster, give every server the same key file. |
 
 ## Config file
 
@@ -80,6 +81,7 @@ max_access_keys_per_project = 100
 max_live_join_tokens = 100        # unexpired, unspent join tokens at once
 max_join_token_uses = 100         # most uses a multi-use join token may have
 join_token_grace_secs = 604800    # expired or spent join tokens are deleted after this
+root_key_rotate_after_days = 0    # warn when the root key is older than this; 0 never warns
 ```
 
 The file format also defines `data_dir`, `node_name`, `[server]`, `[tls]` and `[log]`. The server does not apply them. Use the flags and variables on this page for those. Unknown top-level keys are an error, so a typo stops the server at start.

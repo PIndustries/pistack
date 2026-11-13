@@ -11,10 +11,16 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **A join by discovery is plain HTTP.** Discovery announces the API address, so a server that joins that way needs `--insecure-join`.
 - **TLS between servers was tried on one machine.** Three servers on loopback joined, replicated and elected with `required`. It has not been run across machines or through an upgrade from an older release.
 - **`reader` is not read-only.** Only `gate` and `keep` enforce it. In the other modules a `reader` token can create and delete resources in its project. Fixed by [PIndustries/pistack#103](https://github.com/PIndustries/pistack/pull/103), not merged.
-- **The token signing key does not rotate.** A token stops working when its principal is disabled or deleted, when the API key it came from is deleted, or when it expires. There is no way to cancel one token on its own.
+- **One token cannot be cancelled.** A token stops working when its principal is disabled or deleted, when the API key it came from is deleted, when its signing key is retired, or when it expires. `pi user revoke-tokens` refuses all of one user's tokens at once; there is no way to pick one.
+- **The token signing key rotates only by hand.** `pi signing-key rotate` is an admin's command. Nothing runs it on a schedule.
 - **Custom roles grant nothing.** Authorization knows only `admin`, `member` and `reader`. The policy engine in `crates/pistack-policy` is not wired in.
 - **The root key is in the store by default.** With the `software` backend, a copy of `state.redb` is enough to read every secret. The Vault backend has not been run against a production Vault.
-- **Agent certificates are not renewed.** They are valid for 365 days.
+- **The cloud CA does not rotate.** The issuing CA lasts 5 years and the root 10. Every certificate in the cloud ends with the issuing CA, and there is no command or working manual procedure to replace it. See [Identity and access](Identity-and-access#how-long-the-cloud-ca-lasts).
+- **Only an agent on HTTPS renews its certificate.** Renewal is proved with the certificate, and a certificate is only shown over HTTPS. Agents that connect over plain HTTP, which is the only way that works end to end today, keep the certificate they enrolled with.
+- **A host cannot be removed for good.** There is no command for it. Revoke the host's certificates through `/secrets` to cut it off and stop it renewing.
+- **A renewed certificate does not revoke the one before it.** The old one stays valid until its own date, about four months later.
+- **Root key rotation is offline and for the software backend.** `pistack keep rotate-root-key` needs every server stopped and, in a cluster, the same key file on each. Under Vault only the wrapping key rotates.
+- **Nothing checks that every server runs the same build before a signing key is rotated.** A server still on a build without key ids refuses the new tokens, and loses the cluster when the first key is retired.
 
 ## Control plane
 

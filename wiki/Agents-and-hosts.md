@@ -54,7 +54,7 @@ Pass the token to the agent with `--token` or in `PISTACK_JOIN_TOKEN`.
 
 ## Enrollment and identity
 
-On first start the agent sends its node name and the join token to `/rpc/agents/enroll`. The server spends one use of the token and issues a client certificate whose common name is the node name. The agent saves it in `<data_dir>/agent/` as `cert.pem`, `key.pem` and `ca.pem`. The certificate is valid for 365 days. The agent does not renew it.
+On first start the agent makes a private key, and sends its node name, the join token and a certificate request for that key to `/rpc/agents/enroll`. The server spends one use of the token and issues a client certificate whose common name is the node name. The agent saves it in `<data_dir>/agent/` as `cert.pem`, `key.pem` and `ca.pem`. The private key is made on the host and never sent. The certificate is valid for 365 days, or until the cloud's issuing CA expires if that is sooner.
 
 On later starts the agent finds the certificate and needs no token.
 
@@ -67,6 +67,36 @@ The node name is the host's identity. It is chosen once, in this order, and writ
 5. a generated `node-<hex>`
 
 Because the name is kept in the file, renaming the machine does not change the host record. Setting `PISTACK_NODE_NAME` to something new does: the control plane sees a new host. A certificate speaks only for the node named in it. If the saved certificate names a different node, the agent enrolls again when it has a token and refuses to start when it does not.
+
+### Certificate renewal
+
+An agent that talks to the server over HTTPS renews its own certificate. It looks at it half a minute after start and then every hour. Once two thirds of the certificate's lifetime have passed (about eight months into a 365-day certificate) it:
+
+1. makes a new private key on the host,
+2. asks `/rpc/agents/renew` for a certificate for it, over the connection the current certificate secures,
+3. connects once more with the new certificate and checks that the server accepts it,
+4. replaces the files in `<data_dir>/agent/` and uses the new certificate for every call from then on.
+
+The agent is not restarted and its command loop is not interrupted. Until step 3 passes, the old certificate stays on disk and in use, so a renewal that fails half way costs nothing; it is tried again five minutes later. The new set is written to `<data_dir>/agent/next/` first and moved into place only after the server accepted it. An agent stopped in the middle finishes or drops that on its next start.
+
+The server renews only for the node the presenting certificate names. It refuses when:
+
+- the certificate has been revoked (`pi api POST /secrets/certificates/<id>/revoke`),
+- the certificate's record has been deleted from the cloud,
+- the certificate has expired.
+
+The old certificate is not revoked by a renewal. It stays valid until its own last day, about four months later.
+
+There is no `pi host` command that removes a host for good yet. To cut one off, revoke its certificates: find them with `pi api GET /secrets/certificates` (the name is `<node>-<serial>`) and revoke each one. The agent is refused from its next call and cannot renew.
+
+An agent whose certificate has already expired cannot renew it, because the server no longer accepts it for anything. What happens next depends on how the agent was started:
+
+- With a join token (`--token` or `PISTACK_JOIN_TOKEN`) it enrolls again with that token, at start or while running, and logs `client certificate has expired and cannot renew itself; enrolling again with the join token`. The token has to be one that is still valid.
+- Without one it refuses to start and tells you to create a join token and pass it. A running agent logs the same thing as an error every five minutes.
+
+Renewal needs HTTPS. An agent on plain HTTP never shows its certificate, so it has nothing to prove a renewal with and its certificate is not renewed. Agents joined over plain HTTP with `PISTACK_RPC_INSECURE=1`, the only way that works end to end today, are in that position.
+
+`pi host list -o wide` has a `CERT-EXPIRES` column and `pi host show` prints `status.cert_expires`: the last day of the newest certificate the cloud has issued for that node and not revoked. The leader also logs a warning for any agent or server certificate that is more than a day past its renewal point with no successor issued, and again every six hours, until it is renewed, revoked or deleted. A month after such a certificate expires the warning stops.
 
 ## What the host reports
 
