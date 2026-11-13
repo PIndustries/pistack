@@ -107,15 +107,23 @@
     padding: 1.5rem;
     background: radial-gradient(900px 480px at 50% -10%, rgba(52, 199, 89, .10), transparent 60%);
   }
+  /* The pi tile, as on the P.Industries site. */
   .mark {
-    display: inline-block;
-    width: 0.55rem;
-    height: 0.55rem;
-    border-radius: 50%;
-    background: var(--ok);
-    box-shadow: 0 0 0 4px rgba(141, 240, 106, .15);
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 0.5rem;
+    background: linear-gradient(150deg, #8df06a, #159a3c);
+    box-shadow: 0 0 16px rgba(75, 222, 128, .45);
+    color: #04130a;
+    font-size: 1.05rem;
+    font-weight: 900;
+    line-height: 1;
   }
-  #login h1 { display: flex; align-items: center; gap: 0.55rem; }
+  #login .mark { width: 2.4rem; height: 2.4rem; border-radius: 0.65rem; font-size: 1.4rem; }
+  #login h1 { display: flex; align-items: center; gap: 0.7rem; }
   #login form, .card, form.create, .detail, .once, .tile, .panel {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -257,7 +265,7 @@
 <body>
 <section id="login">
   <form id="login-form" autocomplete="off" onsubmit="event.preventDefault()">
-    <h1><span class="mark"></span>PiStack</h1>
+    <h1><span class="mark" aria-hidden="true">π</span>PiStack</h1>
     <p class="sub">Sign in to this cloud. The token stays in this tab.</p>
     <label for="user">Name</label>
     <input id="user" name="name" autocomplete="username" value="admin" required>
@@ -269,7 +277,7 @@
 </section>
 <div id="shell" hidden>
   <aside id="side">
-    <div class="brand"><span class="mark"></span><strong>PiStack</strong></div>
+    <div class="brand"><span class="mark" aria-hidden="true">π</span><strong>PiStack</strong></div>
     <input id="nav-filter" type="search" placeholder="Jump to…  ( / )" aria-label="Filter the navigation" autocomplete="off">
     <nav>
       <button type="button" data-view="overview" aria-current="page">Overview</button>
