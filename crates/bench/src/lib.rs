@@ -94,7 +94,7 @@ mod tests {
         assert!(text.contains("pistack.io/auto"));
         assert!(text.contains("console/vnc"));
         assert!(text.contains(">Console<") || text.contains("\"Console\""));
-        assert!(text.contains("When the guest gets an address, the fleet pool gives it a floating IP and the auto DNS zone publishes its name."));
+        assert!(text.contains("A machine gets no floating IP on its own. If an admin has marked an external network for automatic floating IPs, the guest gets one from it when it has an address, and the auto DNS zone publishes its name."));
         assert!(text.contains("Name a network to boot on that project's bridge. A router on that network NATs the guest. The address on the port is the address the guest uses."));
         assert!(text.contains("security_groups"));
         assert!(text.contains(">Reboot<") || text.contains("\"Reboot\""));
