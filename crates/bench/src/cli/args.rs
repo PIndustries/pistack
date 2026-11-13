@@ -601,6 +601,23 @@ pub enum HostCmd {
     /// Show a host.
     #[command(alias = "get")]
     Show(NameArg),
+    /// Set or remove labels on a host.
+    Label(HostLabelArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct HostLabelArgs {
+    /// Name or id.
+    pub name: String,
+    /// Labels to set, `key=value`.
+    #[arg(value_name = "K=V")]
+    pub labels: Vec<String>,
+    /// Label key to remove (repeatable).
+    #[arg(long = "remove", value_name = "KEY")]
+    pub remove: Vec<String>,
+    /// Drop every label that is not given here.
+    #[arg(long)]
+    pub replace: bool,
 }
 
 #[derive(Subcommand, Debug)]
