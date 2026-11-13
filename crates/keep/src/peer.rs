@@ -3,12 +3,17 @@
 
 //! How one control-plane server proves to another that it is a member.
 //!
-//! The key is derived from the token signing secret, which is in every
-//! member's store and in every snapshot and nowhere else. A server has it
-//! from the moment it holds the cluster's state and needs nothing handed
-//! to it. The cluster routes and the object-bytes route both check it.
+//! The key is the cluster's peer secret (`gate::token::peer_secret`), which
+//! is in every member's store and in every snapshot and nowhere else. A
+//! server has it from the moment it holds the cluster's state and needs
+//! nothing handed to it. The cluster routes and the object-bytes route both
+//! check it.
+//!
+//! It used to be derived from the token signing secret. It is now its own
+//! value, saved once, so the signing keys can rotate without servers
+//! losing each other. A cloud from before saves the value it had been
+//! deriving, so servers on either build offer and accept the same key.
 
-use hmac::Mac;
 use pistack_store::Store;
 use subtle::ConstantTimeEq;
 
@@ -16,15 +21,9 @@ use subtle::ConstantTimeEq;
 pub const PEER_HEADER: &str = "x-pistack-cluster";
 
 /// The key members prove themselves with. `None` before the identity
-/// module has made the signing secret.
+/// module has made its first signing key, which is when the secret is made.
 pub fn peer_key(store: &Store) -> Option<String> {
-    let secret = store
-        .get_meta::<String>(gate::token::META_JWT_SECRET)
-        .ok()??;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(b"pistack cluster peer v1");
-    let digest = mac.finalize().into_bytes();
-    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+    gate::token::peer_secret(store)
 }
 
 /// Whether `offered` is this cluster's peer key. Compared in constant time.
@@ -57,6 +56,37 @@ mod tests {
             .put_meta(gate::token::META_JWT_SECRET, &"b3RoZXI=".to_owned())
             .unwrap();
         assert!(!is_member(&other, key.as_bytes()));
+    }
+
+    #[test]
+    fn rotating_the_signing_key_leaves_the_peer_key_alone() {
+        let store = Store::in_memory().unwrap();
+        store
+            .put_meta(gate::token::META_JWT_SECRET, &"c2VjcmV0".to_owned())
+            .unwrap();
+        // What a server on the build before this one offers and accepts.
+        let before = {
+            use hmac::Mac;
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"c2VjcmV0").unwrap();
+            mac.update(b"pistack cluster peer v1");
+            let d = mac.finalize().into_bytes();
+            d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        assert_eq!(peer_key(&store).unwrap(), before);
+
+        gate::token::ensure_saved(&store).unwrap();
+        assert_eq!(peer_key(&store).unwrap(), before);
+        gate::token::rotate(&store, chrono::Utc::now()).unwrap();
+        assert_eq!(peer_key(&store).unwrap(), before);
+        // Retiring the old signing key deletes the secret the peer key
+        // used to be derived from. The key stays.
+        gate::token::retire(&store).unwrap();
+        assert!(store
+            .get_meta::<String>(gate::token::META_JWT_SECRET)
+            .unwrap()
+            .is_none());
+        assert_eq!(peer_key(&store).unwrap(), before);
+        assert!(is_member(&store, before.as_bytes()));
     }
 }
 
