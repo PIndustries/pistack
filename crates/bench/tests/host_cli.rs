@@ -98,6 +98,35 @@ async fn enable(State(m): State<Mock>, Path(id): Path<String>) -> Json<Value> {
     Json(host.clone())
 }
 
+async fn drain(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let mut writes = m.writes.lock().unwrap();
+    let earlier = writes.iter().filter(|(p, _)| p.ends_with("/drain")).count();
+    writes.push((format!("/compute/hosts/{id}/drain"), body));
+    let host = m.host.lock().unwrap().clone();
+    // The first call starts a migration; the second finds the host empty.
+    if earlier > 0 {
+        return Json(json!({"host": host, "migrating": [], "not_moved": []}));
+    }
+    Json(json!({
+        "host": host,
+        "migrating": [{
+            "id": "mach-0199a5e0-aaaa-7000-8000-000000000002",
+            "name": "web",
+            "to": "host-0199a5e0-aaaa-7000-8000-000000000009",
+            "to_name": "rack2",
+        }],
+        "not_moved": [{
+            "id": "mach-0199a5e0-aaaa-7000-8000-000000000003",
+            "name": "pod",
+            "reason": "is a container; only a virtual machine can be live-migrated",
+        }],
+    }))
+}
+
 async fn create_machine(
     State(m): State<Mock>,
     Json(body): Json<Value>,
@@ -133,6 +162,7 @@ async fn serve() -> (String, Mock) {
         .route("/compute/hosts/{id}/labels", put(set_labels))
         .route("/compute/hosts/{id}/disable", post(disable))
         .route("/compute/hosts/{id}/enable", post(enable))
+        .route("/compute/hosts/{id}/drain", post(drain))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -270,4 +300,43 @@ async fn host_disable_shows_the_reason_and_enable_clears_it() {
     assert_eq!(mock.last_write().0, "/compute/hosts/rack1/enable");
     let r = pi(&url, &["host", "list"]).await;
     assert!(!r.out.contains("disabled"), "{}", r.out);
+}
+
+#[tokio::test]
+async fn host_drain_lists_what_moves_and_what_stays() {
+    let (url, mock) = serve().await;
+
+    let r = pi(
+        &url,
+        &["host", "drain", "rack1", "--reason", "kernel update"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    let (path, body) = mock.last_write();
+    assert_eq!(path, "/compute/hosts/rack1/drain");
+    assert_eq!(body, json!({"reason": "kernel update"}));
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "host \"rack1\" disabled",
+            "machine \"web\" migrating to rack2",
+            "machine \"pod\" not moved: is a container; only a virtual machine can be live-migrated",
+            "2 still on host \"rack1\": 1 migrating, 1 not moved. Run the command again to check.",
+        ]
+    );
+
+    let r = pi(&url, &["host", "drain", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(
+        r.out.contains("no machines are left on host \"rack1\""),
+        "{}",
+        r.out
+    );
+
+    // Other output formats get the whole report.
+    let r = pi(&url, &["-o", "json", "host", "drain", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert!(v["migrating"].is_array(), "{}", r.out);
 }

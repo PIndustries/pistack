@@ -610,6 +610,10 @@ pub enum HostCmd {
     Disable(HostDisableArgs),
     /// Let the scheduler use a host again.
     Enable(NameArg),
+    /// Disable a host and live-migrate its machines to other hosts.
+    /// Machines that cannot be moved are listed and left running.
+    /// Run it again to see what is still on the host.
+    Drain(HostDisableArgs),
 }
 
 #[derive(Args, Debug)]

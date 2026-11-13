@@ -1309,6 +1309,51 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
                 .await?;
             report(ctx, io, k, &v, "disabled")
         }
+        HostCmd::Drain(a) => {
+            let c = ctx.client()?;
+            let path = format!("{}/drain", k.item_path(&a.name));
+            let v = c
+                .post(&path, &compact(json!({ "reason": a.reason })))
+                .await?;
+            if !matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+                print_one(io.stdout, ctx.fmt, &v)?;
+                return Ok(());
+            }
+            let host = str_at(&v, "/host/name");
+            writeln!(io.stdout, "host \"{host}\" disabled")?;
+            let list = |ptr: &str| v.pointer(ptr).and_then(Value::as_array).cloned();
+            let migrating = list("/migrating").unwrap_or_default();
+            let not_moved = list("/not_moved").unwrap_or_default();
+            for m in &migrating {
+                let to = match str_at(m, "/to_name") {
+                    name if name.is_empty() => short_id(&str_at(m, "/to")),
+                    name => name,
+                };
+                writeln!(
+                    io.stdout,
+                    "machine \"{}\" migrating to {to}",
+                    str_at(m, "/name")
+                )?;
+            }
+            for m in &not_moved {
+                writeln!(
+                    io.stdout,
+                    "machine \"{}\" not moved: {}",
+                    str_at(m, "/name"),
+                    str_at(m, "/reason")
+                )?;
+            }
+            match migrating.len() + not_moved.len() {
+                0 => writeln!(io.stdout, "no machines are left on host \"{host}\"")?,
+                n => writeln!(
+                    io.stdout,
+                    "{n} still on host \"{host}\": {} migrating, {} not moved. Run the command again to check.",
+                    migrating.len(),
+                    not_moved.len()
+                )?,
+            }
+            Ok(())
+        }
         HostCmd::Enable(a) => {
             let c = ctx.client()?;
             let path = format!("{}/enable", k.item_path(&a.name));
