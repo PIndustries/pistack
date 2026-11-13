@@ -288,9 +288,9 @@ fn decode_payload(payload: &str, encoding: Encoding) -> ApiResult<Vec<u8>> {
 /// follower cannot issue one itself: only the leader writes the store.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRenew {
-    /// Serial of the certificate the server holds now.
-    pub serial: u64,
-    pub common_name: String,
+    /// The certificate the server holds now. The leader may have no
+    /// record of it; its signature is what it goes by.
+    pub cert_pem: String,
     /// Request for a new key the server made.
     pub csr_pem: String,
 }
@@ -316,16 +316,7 @@ async fn peer_renew_certificate(
     if !crate::peer::is_member(c.store(), offered) {
         return Err(ApiError::unauthorized("not a member of this cluster"));
     }
-    let role = c
-        .managed_certificate(req.serial)?
-        .as_ref()
-        .and_then(crate::client::managed_cert_role);
-    if role.is_some_and(|r| r != crate::ca::ROLE_SERVER) {
-        return Err(ApiError::forbidden(
-            "only a server's listener certificate is renewed here",
-        ));
-    }
-    let pki = c.renew_certificate(req.serial, &req.common_name, &req.csr_pem)?;
+    let pki = c.renew_listener_certificate(&req.cert_pem, &req.csr_pem)?;
     Ok(Json(PeerRenewed {
         cert_pem: pki.cert_pem,
         ca_pem: pki.ca_pem,

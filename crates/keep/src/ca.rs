@@ -32,7 +32,7 @@ use rcgen::{
 use std::net::IpAddr;
 use std::sync::Arc;
 use x509_parser::certification_request::X509CertificationRequest;
-use x509_parser::prelude::{FromDer, X509Certificate};
+use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 use crate::crypto::{sha256_hex, RootKey};
 use crate::error::{KeepError, Result};
@@ -406,6 +406,17 @@ impl Ca {
                 ));
             }
         }
+        let ca_id = self.signer_of(&cert)?;
+        let serial = serial_u64(cert.serial.to_bytes_be().as_slice());
+        if self.crl(&ca_id)?.iter().any(|r| r.serial == serial) {
+            return Err(KeepError::Unauthorized("certificate is revoked".into()));
+        }
+        common_name(&cert)
+    }
+
+    /// The CA of ours whose signature is on `cert`. Says nothing about its
+    /// dates, its usage or whether it was revoked.
+    fn signer_of(&self, cert: &X509Certificate<'_>) -> Result<Id> {
         let issuer_dn = cert.issuer().to_string();
         let (ca_id, ca_der) = {
             let signers = self.signers.lock();
@@ -423,12 +434,60 @@ impl Ca {
             .map_err(|e| KeepError::Pki(format!("cannot parse CA certificate: {e}")))?;
         cert.verify_signature(Some(ca_cert.public_key()))
             .map_err(|_| KeepError::Unauthorized("bad certificate signature".into()))?;
-        let serial = serial_u64(cert.serial.to_bytes_be().as_slice());
-        if self.crl(&ca_id)?.iter().any(|r| r.serial == serial) {
-            return Err(KeepError::Unauthorized("certificate is revoked".into()));
-        }
-        common_name(&cert)
+        Ok(ca_id)
     }
+
+    /// Read the name and SANs off a server certificate this CA signed, so
+    /// one like it can be issued. A certificate from anywhere else, or one
+    /// that is not for server use, is refused. Its dates are not looked
+    /// at: a listener certificate that has expired is still replaced.
+    pub fn read_listener_cert(&self, der: &[u8]) -> Result<ListenerCert> {
+        let (_, cert) = X509Certificate::from_der(der)
+            .map_err(|e| KeepError::Pki(format!("cannot parse certificate: {e}")))?;
+        self.signer_of(&cert)
+            .map_err(|_| KeepError::Unauthorized("not issued by this cloud's CA".into()))?;
+        match cert.extended_key_usage() {
+            Ok(Some(eku)) if eku.value.server_auth => {}
+            _ => {
+                return Err(KeepError::Unauthorized(
+                    "certificate is not a server certificate".into(),
+                ))
+            }
+        }
+        let mut sans = Vec::new();
+        if let Ok(Some(ext)) = cert.subject_alternative_name() {
+            for name in &ext.value.general_names {
+                match name {
+                    GeneralName::DNSName(dns) => sans.push((*dns).to_owned()),
+                    GeneralName::IPAddress(raw) => {
+                        let ip = match raw.len() {
+                            4 => <[u8; 4]>::try_from(*raw).ok().map(IpAddr::from),
+                            16 => <[u8; 16]>::try_from(*raw).ok().map(IpAddr::from),
+                            _ => None,
+                        };
+                        if let Some(ip) = ip {
+                            sans.push(ip.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(ListenerCert {
+            common_name: common_name(&cert)?,
+            sans,
+            fingerprint_sha256: sha256_hex(der),
+        })
+    }
+}
+
+/// What is needed to issue a certificate like an existing listener one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerCert {
+    pub common_name: String,
+    /// DNS names and IP addresses, as [`CertificateSpec::sans`] takes them.
+    pub sans: Vec<String>,
+    pub fingerprint_sha256: String,
 }
 
 /// Is the DER certificate's serial on any authority's revocation list?
