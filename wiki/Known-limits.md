@@ -20,7 +20,9 @@ What does not work yet, as of version 0.1.0 on `main`. Each item was read in the
 - **At most three voters.** Further servers are learners. Two servers give one voter and one learner, with no failover.
 - **No way to remove a member.** A server that is gone for good stays in the member list.
 - **Rejoining a server that fell behind is manual.** See [Running a cluster](Running-a-cluster).
-- **No restore command.** Restoring a backup means putting the file in place by hand.
+- **Restore brings back one server.** `pistack store restore` puts a backup in place and that server becomes the only member. The other servers are emptied and joined again by hand. See [Running a cluster](Running-a-cluster).
+- **Restore rolls back the store only.** Machines and volumes made after the backup are unknown to the restored store, and deleted ones are back in it. What the control plane does about the difference with the hosts has not been tested.
+- **Servers do not compare schema versions.** Each store checks its own. A release that raises the version needs every server stopped and upgraded together.
 - **Discovery is IPv4 and one /24.** It only runs when `--listen` is a private IPv4 address.
 - **Only the store is replicated.** Images, local volumes, objects and shares are files on one server's disk.
 - **The config file is mostly not applied.** Only `[modules.silo]` and `[modules.keep]` are read.

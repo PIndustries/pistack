@@ -142,4 +142,4 @@ An NFS share with no CIDR, or a CephFS share when `ceph` or `PISTACK_CEPH_FS` is
 | Objects | `<data_dir>/silo` | |
 | Shares | `<data_dir>/shares` | `PISTACK_SHELF_DIR` |
 
-`pistack store backup` covers the first row only. Back up the directories with your usual tools.
+`pistack store backup` and `pistack store restore` cover the first row only. Back up the directories with your usual tools.
