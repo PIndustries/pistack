@@ -3300,6 +3300,7 @@ mod tests {
                     .layer(axum::Extension(keep::PeerIdentity {
                         addr: None,
                         common_name: None,
+                        cert_serial: None,
                         tls,
                     }));
                 let request = axum::http::Request::post("/rpc/agents/heartbeat")

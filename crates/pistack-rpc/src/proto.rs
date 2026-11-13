@@ -8,6 +8,8 @@
 //! | Method | Path                       | Body            | Reply            |
 //! | ------ | -------------------------- | --------------- | ---------------- |
 //! | POST   | `/agents/enroll`           | [`EnrollRequest`] | [`EnrollResponse`] |
+//! | POST   | `/agents/renew`            | [`RenewRequest`] | [`RenewResponse`] |
+//! | GET    | `/agents/whoami`           |                 | [`Whoami`]       |
 //! | POST   | `/agents/hello`            | [`AgentHello`]  | [`HelloAck`]     |
 //! | POST   | `/agents/heartbeat`        | [`Heartbeat`]   | [`HeartbeatAck`] |
 //! | GET    | `/agents/{node}/commands`  | `?wait=&max=`   | `Vec<Command>`   |
@@ -39,15 +41,46 @@ pub const JOIN_HEADER: &str = "x-pistack-join";
 pub struct EnrollRequest {
     /// Becomes the certificate common name and the agent node name.
     pub node_name: String,
+    /// Certificate request for a key the agent made. With it the server
+    /// signs that key and sends none back. Without it (an agent from
+    /// before requests) the server makes the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csr_pem: Option<String>,
 }
 
 /// Material returned by `/agents/enroll`. Persist and present on TLS.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnrollResponse {
     pub cert_pem: String,
+    /// Empty when the request carried `csr_pem`: the agent has the key.
+    #[serde(default)]
     pub key_pem: String,
     pub ca_pem: String,
     pub grant: keep::JoinGrant,
+}
+
+/// Ask for a new certificate for the node the caller's client certificate
+/// names. That certificate is the proof; no join token is needed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenewRequest {
+    pub node_name: String,
+    /// Request for a new key made on the agent.
+    pub csr_pem: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenewResponse {
+    pub cert_pem: String,
+    pub ca_pem: String,
+}
+
+/// What the server saw on this connection: `GET /agents/whoami`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Whoami {
+    pub node_name: String,
+    /// Serial of the client certificate the caller presented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_serial: Option<u64>,
 }
 
 /// First message an agent sends after it starts.

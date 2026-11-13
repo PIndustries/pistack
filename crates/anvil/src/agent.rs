@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 
 use crate::images::ImageCache;
 use chrono::Utc;
-use keep::Pki;
 use pistack_rpc::proto::{
     AgentHello, Command, CommandKind, CommandResult, DiskTarget, ExecRequest, Heartbeat, LogText,
     MachineKind, MachineRef, MachineReport, MachineRequest, MigrateRequest, PortPlug, VolumeAttach,
@@ -112,6 +111,14 @@ pub async fn run_agent(opts: AgentOpts) -> anyhow::Result<()> {
             sd.cancel();
         }
     });
+    // Renews the client certificate beside the command loop. It swaps the
+    // new one into `client`, which the loop shares, so nothing reconnects.
+    tokio::spawn(crate::renew::run(
+        client.clone(),
+        opts.data_dir.join("agent"),
+        normalize_join_token(opts.token.clone()),
+        shutdown.clone(),
+    ));
 
     run_agent_with_facts(client, runtimes, facts, shutdown).await
 }
@@ -155,7 +162,7 @@ pub fn agent_identity(
     data_dir: &std::path::Path,
     env: Option<&str>,
 ) -> anyhow::Result<NodeIdentity> {
-    let enrolled = load_agent_pki(&data_dir.join("agent"))
+    let enrolled = keep::files::load(&data_dir.join("agent"))
         .ok()
         .flatten()
         .and_then(|pki| cert_node_name(&pki.cert_pem));
@@ -183,20 +190,67 @@ pub fn cert_node_name(cert_pem: &str) -> Option<String> {
 /// Build the agent client. Prefer a persisted client certificate issued for
 /// `node`; otherwise enroll with the join token when present. A certificate
 /// for another node is replaced by re-enrolling, never used, because the
-/// control plane only accepts a certificate for its own node. Plain HTTP
-/// without a certificate only works when the control plane sets
+/// control plane only accepts a certificate for its own node. A certificate
+/// that has expired cannot renew itself any more: with a join token the
+/// agent enrolls again, without one it stops and says what to do. Plain
+/// HTTP without a certificate only works when the control plane sets
 /// `PISTACK_RPC_INSECURE=1`.
 async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<AgentClient> {
+    connect_and_enroll_at(opts, node, chrono::Utc::now()).await
+}
+
+async fn connect_and_enroll_at(
+    opts: &AgentOpts,
+    node: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<AgentClient> {
     let base = join_url(&opts.join);
     let token = normalize_join_token(opts.token.clone());
     let cert_dir = opts.data_dir.join("agent");
+    let secure = base.starts_with("https://");
+    if keep::files::recover(&cert_dir)? {
+        tracing::info!("finished a certificate renewal that was interrupted");
+    }
 
-    if let Some(pki) = load_agent_pki(&cert_dir)? {
-        match persisted_cert_use(
+    if let Some(pki) = keep::files::load(&cert_dir)? {
+        let cert_use = persisted_cert_use(
             cert_node_name(&pki.cert_pem).as_deref(),
             node,
             token.is_some(),
-        ) {
+        );
+        let expired = crate::renew::validity(&pki.cert_pem)
+            .ok()
+            .map(|(_, not_after)| not_after)
+            .filter(|not_after| *not_after <= now);
+        let cert_use = match (cert_use, expired) {
+            (CertUse::Keep, Some(not_after)) => match expired_cert_use(secure, token.is_some()) {
+                ExpiredUse::Ignore => {
+                    tracing::warn!(
+                        node,
+                        expired = %not_after,
+                        "agent certificate has expired; it is not shown over plain HTTP and is ignored"
+                    );
+                    return Ok(connect(&opts.join, node, opts.token.clone())?);
+                }
+                ExpiredUse::Reenroll => {
+                    tracing::warn!(
+                        node,
+                        expired = %not_after,
+                        "agent certificate has expired and cannot renew itself; enrolling again with the join token"
+                    );
+                    CertUse::EnrollAgain
+                }
+                ExpiredUse::Refuse => anyhow::bail!(
+                    "agent certificate in {} expired on {not_after} and cannot renew itself; \
+                         create a join token (pi join-token create) and start the agent with \
+                         --token to enroll again",
+                    cert_dir.display()
+                ),
+            },
+            (other, _) => other,
+        };
+        match cert_use {
+            CertUse::EnrollAgain => {}
             CertUse::Keep => {
                 tracing::info!(node, "using persisted agent client certificate");
                 let mut client = AgentClient::with_mtls(&base, node, &pki.ca_pem, &pki)?;
@@ -224,15 +278,19 @@ async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<Agen
     }
 
     if let Some(t) = token.clone() {
-        let bootstrap = AgentClient::new(&base, node)?.with_token(t);
-        match bootstrap.enroll(node).await {
+        // A CA already on disk says which server to believe over HTTPS.
+        let known_ca = keep::files::load(&cert_dir)?.map(|pki| pki.ca_pem);
+        let bootstrap = match known_ca {
+            Some(ca) if base.starts_with("https://") => AgentClient::with_ca(&base, node, &ca)?,
+            _ => AgentClient::new(&base, node)?,
+        }
+        .with_token(t);
+        // The key is made here; only the request for it is sent.
+        let request = keep::ca::new_key_request(node)?;
+        match bootstrap.enroll(node, Some(&request.csr_pem)).await {
             Ok(enrolled) => {
-                let pki = Pki {
-                    cert_pem: enrolled.cert_pem,
-                    key_pem: enrolled.key_pem,
-                    ca_pem: enrolled.ca_pem,
-                };
-                save_agent_pki(&cert_dir, &pki)?;
+                let pki = crate::renew::enrolled_pki(enrolled, request.key_pem);
+                keep::files::save(&cert_dir, &pki)?;
                 tracing::info!("enrolled agent client certificate");
                 // Keep talking to whichever server enrolled us (the leader,
                 // if the join address pointed at a follower).
@@ -259,6 +317,8 @@ async fn connect_and_enroll(opts: &AgentOpts, node: &str) -> anyhow::Result<Agen
 #[derive(Debug, PartialEq, Eq)]
 enum CertUse {
     Keep,
+    /// It is for this node but has expired; a join token is at hand.
+    EnrollAgain,
     Reenroll(Option<String>),
     Refuse(Option<String>),
 }
@@ -270,6 +330,23 @@ fn persisted_cert_use(cert_node: Option<&str>, node: &str, have_token: bool) -> 
         Some(cn) if cn == node => CertUse::Keep,
         other if have_token => CertUse::Reenroll(other.map(str::to_owned)),
         other => CertUse::Refuse(other.map(str::to_owned)),
+    }
+}
+
+/// What to do with a certificate for this node that has expired.
+#[derive(Debug, PartialEq, Eq)]
+enum ExpiredUse {
+    /// Plain HTTP never shows it, so its date changes nothing.
+    Ignore,
+    Reenroll,
+    Refuse,
+}
+
+fn expired_cert_use(secure: bool, have_token: bool) -> ExpiredUse {
+    match (secure, have_token) {
+        (false, _) => ExpiredUse::Ignore,
+        (true, true) => ExpiredUse::Reenroll,
+        (true, false) => ExpiredUse::Refuse,
     }
 }
 
@@ -287,45 +364,6 @@ fn rpc_insecure() -> bool {
         .ok()
         .as_deref()
         .is_some_and(|v| v.trim() == "1")
-}
-
-fn load_agent_pki(dir: &std::path::Path) -> anyhow::Result<Option<Pki>> {
-    let cert = dir.join("cert.pem");
-    let key = dir.join("key.pem");
-    let ca = dir.join("ca.pem");
-    if !(non_empty(&cert) && non_empty(&key) && non_empty(&ca)) {
-        return Ok(None);
-    }
-    Ok(Some(Pki {
-        cert_pem: std::fs::read_to_string(&cert)?,
-        key_pem: std::fs::read_to_string(&key)?,
-        ca_pem: std::fs::read_to_string(&ca)?,
-    }))
-}
-
-fn save_agent_pki(dir: &std::path::Path, pki: &Pki) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join("cert.pem"), &pki.cert_pem)?;
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let path = dir.join("key.pem");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(pki.key_pem.as_bytes())?;
-    }
-    std::fs::write(dir.join("ca.pem"), &pki.ca_pem)?;
-    Ok(())
-}
-
-fn non_empty(path: &std::path::Path) -> bool {
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.len() > 0)
-        .unwrap_or(false)
 }
 
 /// Append [`RPC_PREFIX`] unless the operator already pointed at it.
@@ -1559,6 +1597,7 @@ mod tests {
     use super::*;
     use crate::runtime::MachineRuntime;
     use async_trait::async_trait;
+    use keep::Pki;
 
     #[test]
     fn plug_uses_cloud_only_when_that_runtime_owns_vms() {
@@ -1612,7 +1651,7 @@ mod tests {
         // An agent enrolled before node.name existed: the certificate's
         // name wins over whatever the host is called today.
         let dir = tempfile::tempdir().unwrap();
-        save_agent_pki(
+        keep::files::save(
             &dir.path().join("agent"),
             &issued_pki(&store, "enrolled-n1"),
         )
@@ -1692,6 +1731,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("someone-else") && err.contains(&node), "{err}");
+
+        // The key was made here: the control plane holds the certificate
+        // and no key for it.
+        let certs = store.collection::<keep::Certificate>().list(None).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert!(certs.iter().all(|c| c.status.key_secret.is_none()));
+
+        // Past its last day, on plain HTTP: the certificate is never
+        // shown there, so the agent connects without it and keeps the file.
+        let (_, not_after) = crate::renew::validity(&refreshed).unwrap();
+        let late = not_after + chrono::Duration::seconds(1);
+        let client = connect_and_enroll_at(&opts(None), &node, late)
+            .await
+            .unwrap();
+        assert_eq!(client.node_name(), node);
+        assert_eq!(cert(), refreshed);
+        // Over HTTPS it is what the agent proves itself with: a join
+        // token enrolls it again, and without one it stops.
+        assert_eq!(expired_cert_use(false, true), ExpiredUse::Ignore);
+        assert_eq!(expired_cert_use(true, true), ExpiredUse::Reenroll);
+        assert_eq!(expired_cert_use(true, false), ExpiredUse::Refuse);
         server.abort();
     }
 
