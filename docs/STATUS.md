@@ -40,6 +40,8 @@ Done
 - Scheduler: host filters, label selector, spread weights
 - Per-host resource accounting; a host that misses heartbeats is marked down
 - Volume hot-plug on libvirt
+- Host labels set by an admin; the `zone` label is the availability zone a machine can ask for
+- Disable and enable a host
 - Runtimes: libvirt/KVM, cloud-hypervisor, youki containers, bare metal power, mock
 - Pods, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, Ingress, Autoscaler (loom)
 
@@ -48,7 +50,9 @@ Partial
 - VNC console: only when the VM is on the API server's own host; libvirt only; no serial console
 - Console log: written on the host, no API to read it for a VM
 - Affinity: soft hints by machine name; no server groups, no hard rule
-- Availability zones and aggregates: label selector exists but nothing can set a host's labels
+- Host aggregates: labels and a host selector only; no aggregate resource
+- Drain: live-migrates running virtual machines on libvirt hosts; everything else is reported and left
+- Evacuate off a dead host: machines start elsewhere from their image without the root disk; RBD volumes follow, local ones do not; no fencing
 - Compute quota: machine count only; no vCPU, RAM, disk or GPU quota
 - NIC hot-plug: the agent can do it, nothing on the server asks it to
 - Boot from volume: the flag is stored, no runtime boots from one
@@ -60,11 +64,9 @@ Partial
 Missing
 - Resize
 - Cold migration
-- Evacuate off a dead host
 - Shelve, rescue, rebuild
 - Snapshot a machine to an image
 - Pause and suspend
-- Host maintenance, drain, disable
 - Overcommit ratios; the pack strategy exists but cannot be switched on
 - PCI passthrough, SR-IOV, NUMA, hugepages, CPU pinning
 - UEFI, Secure Boot, vTPM
