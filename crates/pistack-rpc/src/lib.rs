@@ -32,8 +32,8 @@ pub use proto::{
     EnrollRequest, EnrollResponse, ExecEnv, ExecOutput, ExecRequest, Heartbeat, HeartbeatAck,
     HelloAck, ImageSource, LogText, MachineKind, MachineRef, MachineReport, MachineRequest,
     MetadataAnswer, MetadataNetwork, MetadataQuery, OvnHostConfig, OvnReport, PortPlug, PowerState,
-    ProbeReport, ReportAck, RunningMachine, VolumeAttach, VolumeAttached, VolumeDetach,
-    JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
+    ProbeReport, RenewRequest, RenewResponse, ReportAck, RunningMachine, VolumeAttach,
+    VolumeAttached, VolumeDetach, Whoami, JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket, COMMAND_RECORD_PREFIX};
 pub use server::{

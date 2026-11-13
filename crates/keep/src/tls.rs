@@ -305,6 +305,8 @@ pub fn client_config_pinned(pin: [u8; 32]) -> Result<ClientConfig> {
 pub struct PeerIdentity {
     pub addr: Option<std::net::SocketAddr>,
     pub common_name: Option<String>,
+    /// Serial of the certificate behind `common_name`.
+    pub cert_serial: Option<u64>,
     /// The request came in on the TLS listener, with or without a
     /// certificate.
     pub tls: bool,
@@ -312,9 +314,11 @@ pub struct PeerIdentity {
 
 impl PeerIdentity {
     pub fn from_tls(addr: std::net::SocketAddr, conn: &rustls::CommonState) -> Self {
+        let leaf = conn.peer_certificates().and_then(|c| c.first());
         Self {
             addr: Some(addr),
             common_name: peer_common_name(conn),
+            cert_serial: leaf.and_then(|l| crate::ca::serial_from_der(l).ok()),
             tls: true,
         }
     }
@@ -323,6 +327,7 @@ impl PeerIdentity {
         Self {
             addr: Some(addr),
             common_name: None,
+            cert_serial: None,
             tls: false,
         }
     }

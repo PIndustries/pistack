@@ -7,6 +7,8 @@
 //!
 //! ```text
 //! POST /agents/enroll
+//! POST /agents/renew
+//! GET  /agents/whoami
 //! POST /agents/hello
 //! POST /agents/heartbeat
 //! GET  /agents/{node}/commands?wait=30&max=16
@@ -23,6 +25,12 @@
 //! The certificate's common name is the node name it was enrolled under
 //! (see [`pistack_types::node`]). A verified peer may hello, heartbeat,
 //! poll, and report only for that node; any other name gets 403.
+//!
+//! Renew gives the holder of a client certificate a new one for the same
+//! node and a key it made itself. The certificate it calls with is the
+//! proof, so renew needs one even where the rest of `/rpc` is open, and it
+//! refuses a certificate that is revoked or that this cloud holds no record
+//! of. The old certificate is not revoked: it runs out on its own date.
 //!
 //! Escape hatch for local HTTP and unit tests: set `PISTACK_RPC_INSECURE=1`
 //! to skip the client-certificate check. Join-token enforcement on every
@@ -44,7 +52,8 @@ use serde::Deserialize;
 
 use crate::proto::{
     AgentHello, Command, CommandResult, EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck,
-    HelloAck, ReportAck, DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
+    HelloAck, RenewRequest, RenewResponse, ReportAck, Whoami, DEFAULT_POLL_BATCH, JOIN_HEADER,
+    MAX_LONG_POLL_SECS,
 };
 use crate::queue::CommandQueue;
 
@@ -144,6 +153,8 @@ pub fn router_with_auth_and(
 ) -> Router {
     let enroll = Router::new()
         .route("/agents/enroll", post(enroll))
+        .route("/agents/renew", post(renew))
+        .route("/agents/whoami", get(whoami))
         .with_state(store.clone());
     let app = enroll
         .merge(routes(queue).layer(axum::Extension(store.clone())))
@@ -293,14 +304,68 @@ async fn enroll(
     // cannot mint another certificate with the same one-time token.
     let grant = keep::redeem_join_token(&store, token).map_err(ApiError::from)?;
     let client = keep::Client::open(&store).map_err(ApiError::from)?;
-    let pki = client
-        .issue_client_cert(&req.node_name)
-        .map_err(ApiError::from)?;
+    let pki = match req.csr_pem.as_deref() {
+        Some(csr) => client.issue_client_cert_for(&req.node_name, csr),
+        None => client.issue_client_cert(&req.node_name),
+    }
+    .map_err(ApiError::from)?;
     Ok(Json(EnrollResponse {
         cert_pem: pki.cert_pem,
         key_pem: pki.key_pem,
         ca_pem: pki.ca_pem,
         grant,
+    }))
+}
+
+fn verified_peer(ext: &axum::http::Extensions) -> Option<&PeerIdentity> {
+    ext.get::<ConnectInfo<PeerIdentity>>()
+        .map(|c| &c.0)
+        .or_else(|| ext.get::<PeerIdentity>())
+        .filter(|p| p.common_name.as_deref().is_some_and(|cn| !cn.is_empty()))
+}
+
+async fn renew(
+    State(store): State<Store>,
+    ext: axum::http::Extensions,
+    Json(req): Json<RenewRequest>,
+) -> ApiResult<Json<RenewResponse>> {
+    check_node_name(&req.node_name)?;
+    // The certificate on the connection is what is being renewed. A
+    // revoked one never gets here with a name: the listener strips it.
+    let peer = verified_peer(&ext);
+    let (Some(cn), Some(serial)) = (
+        peer.and_then(|p| p.common_name.as_deref()),
+        peer.and_then(|p| p.cert_serial),
+    ) else {
+        return Err(ApiError::unauthorized(
+            "renewal needs the client certificate that is being renewed",
+        ));
+    };
+    if cn != req.node_name {
+        return Err(ApiError::forbidden(format!(
+            "client certificate is for node {cn}, not {}",
+            req.node_name
+        )));
+    }
+    let client = keep::Client::open(&store).map_err(ApiError::from)?;
+    let pki = client
+        .renew_certificate(serial, &req.node_name, &req.csr_pem)
+        .map_err(ApiError::from)?;
+    Ok(Json(RenewResponse {
+        cert_pem: pki.cert_pem,
+        ca_pem: pki.ca_pem,
+    }))
+}
+
+/// The node name and certificate serial the server sees on this
+/// connection. An agent calls it with a new certificate to learn that the
+/// server takes it, before it lets go of the old one.
+async fn whoami(ext: axum::http::Extensions) -> ApiResult<Json<Whoami>> {
+    let peer =
+        verified_peer(&ext).ok_or_else(|| ApiError::unauthorized("missing client certificate"))?;
+    Ok(Json(Whoami {
+        node_name: peer.common_name.clone().unwrap_or_default(),
+        cert_serial: peer.cert_serial,
     }))
 }
 
@@ -706,6 +771,7 @@ mod tests {
         let peer = PeerIdentity {
             addr: None,
             common_name: Some("n1".into()),
+            cert_serial: None,
             tls: true,
         };
         let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
@@ -814,6 +880,7 @@ mod tests {
         let peer = PeerIdentity {
             addr: None,
             common_name: Some("n1".into()),
+            cert_serial: None,
             tls: true,
         };
         let (base, server) = serve_auth(store.clone(), RpcAuth::mtls_only(), Some(peer)).await;
@@ -864,6 +931,7 @@ mod tests {
         let peer = PeerIdentity {
             addr: None,
             common_name: Some("n1".into()),
+            cert_serial: None,
             tls: true,
         };
         let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
@@ -955,6 +1023,7 @@ mod tests {
             .post(format!("{base}/agents/enroll"))
             .json(&EnrollRequest {
                 node_name: "n1".into(),
+                csr_pem: None,
             })
             .send()
             .await
@@ -967,6 +1036,7 @@ mod tests {
             .header(JOIN_HEADER, "pij_nope")
             .json(&EnrollRequest {
                 node_name: "n1".into(),
+                csr_pem: None,
             })
             .send()
             .await
@@ -981,6 +1051,7 @@ mod tests {
             .header(JOIN_HEADER, &clear)
             .json(&EnrollRequest {
                 node_name: "n1".into(),
+                csr_pem: None,
             })
             .send()
             .await
@@ -1001,6 +1072,7 @@ mod tests {
             .header(JOIN_HEADER, &clear)
             .json(&EnrollRequest {
                 node_name: "n1".into(),
+                csr_pem: None,
             })
             .send()
             .await
@@ -1014,6 +1086,115 @@ mod tests {
         assert_eq!(status, 401, "{body}");
         message_is(&body, "missing client certificate");
 
+        server.abort();
+    }
+
+    async fn post_renew(base: &str, node: &str) -> (u16, String) {
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/agents/renew"))
+            .json(&RenewRequest {
+                node_name: node.into(),
+                csr_pem: keep::ca::new_key_request(node).unwrap().csr_pem,
+            })
+            .send()
+            .await
+            .unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn renew_is_proved_by_the_certificate_and_only_for_its_node() {
+        let store = Store::in_memory().unwrap();
+        let keep_client = keep::Client::open(&store).unwrap();
+        let first = keep_client.issue_client_cert("n1").unwrap();
+        let serial_of =
+            |pem: &str| keep::ca::serial_from_der(&keep::ca::pem_to_der(pem).unwrap()).unwrap();
+        let serial = serial_of(&first.cert_pem);
+        let issued = || keep_client.list_certificates(None).unwrap().len();
+
+        // No certificate on the connection: refused even where the rest
+        // of /rpc is open, and a join token does not stand in for it.
+        let (base, server) = serve_auth(store.clone(), RpcAuth::open(), None).await;
+        let (status, body) = post_renew(&base, "n1").await;
+        assert_eq!(status, 401, "{body}");
+        message_is(&body, "renewal needs the client certificate");
+        let (status, _) = call(&base, "GET", "/agents/whoami", None).await;
+        assert_eq!(status, 401);
+        server.abort();
+        // A name without a serial is not enough either.
+        let nameless = PeerIdentity {
+            addr: None,
+            common_name: Some("n1".into()),
+            cert_serial: None,
+            tls: true,
+        };
+        let (base, server) = serve_auth(store.clone(), RpcAuth::open(), Some(nameless)).await;
+        assert_eq!(post_renew(&base, "n1").await.0, 401);
+        server.abort();
+        assert_eq!(issued(), 1);
+
+        let peer = PeerIdentity {
+            addr: None,
+            common_name: Some("n1".into()),
+            cert_serial: Some(serial),
+            tls: true,
+        };
+        let (base, server) = serve_auth(store.clone(), RpcAuth::mtls_only(), Some(peer)).await;
+        let (status, body) = call(&base, "GET", "/agents/whoami", None).await;
+        assert_eq!(status, 200, "{body}");
+        let who: Whoami = serde_json::from_str(&body).unwrap();
+        assert_eq!(who.node_name, "n1");
+        assert_eq!(who.cert_serial, Some(serial));
+
+        // Another node's name with this node's certificate.
+        let (status, body) = post_renew(&base, "n2").await;
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(issued(), 1);
+
+        // Its own: a new certificate for the same node, and no key in
+        // the answer because the server never had one.
+        let (status, body) = post_renew(&base, "n1").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.contains("PRIVATE KEY"), "{body}");
+        let renewed: RenewResponse = serde_json::from_str(&body).unwrap();
+        let der = keep::ca::pem_to_der(&renewed.cert_pem).unwrap();
+        assert_eq!(keep_client.verify_client_cert(&der).unwrap(), "n1");
+        assert_ne!(serial_of(&renewed.cert_pem), serial);
+        assert!(renewed.ca_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(issued(), 2);
+
+        // Revoked: nothing more is issued for it.
+        let record = keep_client.managed_certificate(serial).unwrap().unwrap();
+        keep_client.revoke_certificate(&record.meta.id).unwrap();
+        let (status, body) = post_renew(&base, "n1").await;
+        assert_eq!(status, 401, "{body}");
+        message_is(&body, "certificate is revoked");
+        assert_eq!(issued(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn enroll_with_a_request_returns_no_key() {
+        let store = Store::in_memory().unwrap();
+        let keep_client = keep::Client::open(&store).unwrap();
+        let (_tok, clear) = create_join_token(&store, "rack", "admin", false, None).unwrap();
+        let (base, server) = serve_auth(store.clone(), RpcAuth::mtls_only(), None).await;
+        let request = keep::ca::new_key_request("n1").unwrap();
+        let client = AgentClient::new(&base, "n1").unwrap().with_token(clear);
+        let enrolled = client.enroll("n1", Some(&request.csr_pem)).await.unwrap();
+        assert!(enrolled.key_pem.is_empty());
+        let der = keep::ca::pem_to_der(&enrolled.cert_pem).unwrap();
+        assert_eq!(keep_client.verify_client_cert(&der).unwrap(), "n1");
+        // The certificate fits the key that stayed with the agent.
+        let pki = keep::Pki {
+            cert_pem: enrolled.cert_pem,
+            key_pem: request.key_pem,
+            ca_pem: enrolled.ca_pem.clone(),
+        };
+        keep::tls::client_config(&enrolled.ca_pem, Some(&pki)).unwrap();
+        // And the control plane stored no key for it.
+        let certs = keep_client.list_certificates(None).unwrap();
+        assert!(certs.iter().all(|c| c.status.key_secret.is_none()));
         server.abort();
     }
 }

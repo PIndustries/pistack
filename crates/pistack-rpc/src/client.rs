@@ -15,8 +15,8 @@ use serde::Deserialize;
 use crate::error::RpcError;
 use crate::proto::{
     AgentHello, Command, CommandResult, EnrollRequest, EnrollResponse, Heartbeat, HeartbeatAck,
-    HelloAck, MetadataAnswer, MetadataNetwork, MetadataQuery, ReportAck, DEFAULT_POLL_BATCH,
-    JOIN_HEADER, MAX_LONG_POLL_SECS,
+    HelloAck, MetadataAnswer, MetadataNetwork, MetadataQuery, RenewRequest, RenewResponse,
+    ReportAck, Whoami, DEFAULT_POLL_BATCH, JOIN_HEADER, MAX_LONG_POLL_SECS,
 };
 
 /// Slack added to a long-poll's request timeout so a server that honours
@@ -91,7 +91,10 @@ fn is_https(url: &str) -> bool {
 
 #[derive(Clone)]
 pub struct AgentClient {
-    http: reqwest::Client,
+    /// Shared by clones, so a renewed certificate reaches every task of
+    /// the agent at once. Each call takes the client that is current when
+    /// it starts; a long-poll already waiting finishes on the old one.
+    http: Arc<Mutex<reqwest::Client>>,
     servers: Arc<Mutex<Servers>>,
     node_name: String,
     token: Option<String>,
@@ -133,7 +136,7 @@ impl AgentClient {
         let base = base.trim_end_matches('/').to_owned();
         reqwest::Url::parse(&base).map_err(|e| RpcError::InvalidUrl(format!("{base}: {e}")))?;
         Ok(Self {
-            http,
+            http: Arc::new(Mutex::new(http)),
             servers: Arc::new(Mutex::new(Servers {
                 secure: is_https(&base),
                 current: base.clone(),
@@ -174,13 +177,101 @@ impl AgentClient {
         Self::with_http(http, base_url, node_name)
     }
 
-    /// Spend the join token once and receive a CA-signed client certificate.
-    pub async fn enroll(&self, node_name: &str) -> Result<EnrollResponse, RpcError> {
-        let body = EnrollRequest {
-            node_name: node_name.to_owned(),
+    /// Present `client` from the next call on. The certificate in use
+    /// until now is dropped only here, so call this once the new one is
+    /// known to work (see [`Self::with_identity`]).
+    pub fn use_identity(&self, ca_pem: &str, client: &keep::Pki) -> Result<(), RpcError> {
+        let http = mtls_http_client(ca_pem, client)?;
+        *self.http.lock().unwrap_or_else(|e| e.into_inner()) = http;
+        Ok(())
+    }
+
+    /// A separate client for the same node and servers that presents
+    /// `client`. Nothing it does moves this one, so a new certificate can
+    /// be tried while the old one keeps the agent connected.
+    pub fn with_identity(&self, ca_pem: &str, client: &keep::Pki) -> Result<Self, RpcError> {
+        let s = self.lock();
+        Ok(Self {
+            http: Arc::new(Mutex::new(mtls_http_client(ca_pem, client)?)),
+            servers: Arc::new(Mutex::new(Servers {
+                current: s.current.clone(),
+                known: s.known.clone(),
+                secure: s.secure,
+                refused: s.refused.clone(),
+            })),
+            node_name: self.node_name.clone(),
+            token: self.token.clone(),
+        })
+    }
+
+    fn http(&self) -> reqwest::Client {
+        self.http.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A client that trusts `ca_pem` and presents no certificate: for
+    /// enrolling over HTTPS with a server whose CA is already known.
+    pub fn with_ca(
+        base_url: impl Into<String>,
+        node_name: impl Into<String>,
+        ca_pem: &str,
+    ) -> Result<Self, RpcError> {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(format!("pistack-anvil/{}", pistack_types::BUILD));
+        for cert in
+            reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).map_err(RpcError::Http)?
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+        Self::with_http(builder.build()?, base_url, node_name)
+    }
+
+    /// Whether this client joined over HTTPS. Only there is its client
+    /// certificate ever shown to the server.
+    pub fn is_secure(&self) -> bool {
+        self.lock().secure
+    }
+
+    /// Ask for a new certificate for this node and the key behind
+    /// `csr_pem`. The certificate this client presents is the proof.
+    pub async fn renew(&self, csr_pem: &str) -> Result<RenewResponse, RpcError> {
+        let body = RenewRequest {
+            node_name: self.node_name.clone(),
+            csr_pem: csr_pem.to_owned(),
         };
         self.send(|base| {
-            self.http
+            self.http()
+                .post(format!("{base}/agents/renew"))
+                .json(&body)
+                .timeout(Duration::from_secs(30))
+        })
+        .await
+    }
+
+    /// The node and certificate the server sees this client as.
+    pub async fn whoami(&self) -> Result<Whoami, RpcError> {
+        self.send(|base| {
+            self.http()
+                .get(format!("{base}/agents/whoami"))
+                .timeout(Duration::from_secs(30))
+        })
+        .await
+    }
+
+    /// Spend the join token once and receive a CA-signed client
+    /// certificate. With `csr_pem` it is for the key behind that request
+    /// and the answer carries no key.
+    pub async fn enroll(
+        &self,
+        node_name: &str,
+        csr_pem: Option<&str>,
+    ) -> Result<EnrollResponse, RpcError> {
+        let body = EnrollRequest {
+            node_name: node_name.to_owned(),
+            csr_pem: csr_pem.map(str::to_owned),
+        };
+        self.send(|base| {
+            self.http()
                 .post(format!("{base}/agents/enroll"))
                 .json(&body)
                 .timeout(Duration::from_secs(30))
@@ -312,7 +403,7 @@ impl AgentClient {
             let base = self.base_url();
             // No request timeout: an image can take minutes. The caller
             // gives up when the body stalls.
-            let request = self.http.get(format!("{base}/images/{id}/data"));
+            let request = self.http().get(format!("{base}/images/{id}/data"));
             let resp = match self.prepare(request).send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -353,7 +444,7 @@ impl AgentClient {
 
     pub async fn hello(&self, hello: &AgentHello) -> Result<HelloAck, RpcError> {
         self.send(|base| {
-            self.http
+            self.http()
                 .post(format!("{base}/agents/hello"))
                 .json(hello)
                 .timeout(Duration::from_secs(30))
@@ -364,7 +455,7 @@ impl AgentClient {
     pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<HeartbeatAck, RpcError> {
         let ack: HeartbeatAck = self
             .send(|base| {
-                self.http
+                self.http()
                     .post(format!("{base}/agents/heartbeat"))
                     .json(hb)
                     .timeout(Duration::from_secs(30))
@@ -389,7 +480,7 @@ impl AgentClient {
         let wait_secs = wait.as_secs().min(MAX_LONG_POLL_SECS);
         let query = [("wait", wait_secs.to_string()), ("max", max.to_string())];
         self.send(|base| {
-            self.http
+            self.http()
                 .get(format!("{base}/agents/{}/commands", self.node_name))
                 .query(&query)
                 .timeout(Duration::from_secs(wait_secs) + POLL_GRACE)
@@ -400,7 +491,7 @@ impl AgentClient {
     /// Report results for commands this node received.
     pub async fn report(&self, results: &[CommandResult]) -> Result<ReportAck, RpcError> {
         self.send(|base| {
-            self.http
+            self.http()
                 .post(format!("{base}/agents/{}/results", self.node_name))
                 .json(results)
                 .timeout(Duration::from_secs(30))
@@ -417,7 +508,7 @@ impl AgentClient {
     /// port here. Empty unless the cluster's networks are OVN.
     pub async fn metadata_networks(&self) -> Result<Vec<MetadataNetwork>, RpcError> {
         self.send(|base| {
-            self.http
+            self.http()
                 .get(format!("{base}/metadata/networks/{}", self.node_name))
                 .timeout(Duration::from_secs(15))
         })
@@ -441,7 +532,7 @@ impl AgentClient {
         };
         let answer: MetadataAnswer = self
             .send(|base| {
-                self.http
+                self.http()
                     .post(format!("{base}/metadata/guest"))
                     .json(&query)
                     .timeout(Duration::from_secs(15))

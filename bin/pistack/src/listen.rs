@@ -121,6 +121,7 @@ impl Listener for TlsListener {
         Ok(GatewayPeer::plain(PeerIdentity {
             addr: Some(self.tcp.local_addr()?),
             common_name: None,
+            cert_serial: None,
             tls: true,
         }))
     }
@@ -922,6 +923,156 @@ mod tests {
         assert_eq!(resp.status(), 403);
 
         leader_task.abort();
+        t.shutdown.cancel();
+        t.task.await.expect("serve task").expect("serve");
+    }
+
+    fn agent_hello(node: &str) -> pistack_rpc::proto::AgentHello {
+        pistack_rpc::proto::AgentHello {
+            node_name: node.into(),
+            capabilities: vec!["mock".into()],
+            resources: Default::default(),
+            version: String::new(),
+            labels: Default::default(),
+            underlay_ip: None,
+        }
+    }
+
+    fn serial_of(cert_pem: &str) -> u64 {
+        keep::ca::serial_from_der(&keep::ca::pem_to_der(cert_pem).expect("der")).expect("serial")
+    }
+
+    #[tokio::test]
+    async fn an_agent_renews_its_certificate_at_the_threshold_and_keeps_working() {
+        use anvil::renew::{enroll_again, renew_if_due, Renewal};
+        use pistack_rpc::AgentClient;
+
+        let t = tls_server(
+            |store| {
+                axum::Router::new().nest(
+                    "/rpc",
+                    pistack_rpc::router_with_auth(
+                        pistack_rpc::CommandQueue::default(),
+                        store.clone(),
+                        pistack_rpc::RpcAuth::mtls_only(),
+                    ),
+                )
+            },
+            Leadership::always(),
+        )
+        .await;
+        let keep = keep::Client::open(&t.store).expect("keep");
+        let base = format!("https://{}/rpc", t.addr);
+        let agent_dir = t.data.join("agent");
+        let on_disk = || {
+            keep::files::load(&agent_dir)
+                .expect("load")
+                .expect("certificate")
+        };
+
+        // The agent as enrollment leaves it: a certificate on disk and a
+        // client that shows it. `in_loop` is the clone its command loop holds.
+        let first = keep.issue_client_cert("n1").expect("first certificate");
+        keep::files::save(&agent_dir, &first).expect("save");
+        let client = AgentClient::with_mtls(&base, "n1", &first.ca_pem, &first).expect("client");
+        let in_loop = client.clone();
+        let first_serial = serial_of(&first.cert_pem);
+        let seen = in_loop.whoami().await.expect("whoami");
+        assert_eq!(seen.node_name, "n1");
+        assert_eq!(seen.cert_serial, Some(first_serial));
+        in_loop.hello(&agent_hello("n1")).await.expect("hello");
+
+        // Before two thirds of the lifetime: nothing is asked for.
+        let due = renew_point(&first.cert_pem);
+        let early = due - chrono::Duration::seconds(1);
+        let step = renew_if_due(&client, &agent_dir, early)
+            .await
+            .expect("early");
+        assert!(matches!(step, Renewal::NotDue { .. }), "{step:?}");
+        assert_eq!(on_disk().cert_pem, first.cert_pem);
+        assert_eq!(keep.list_certificates(None).expect("list").len(), 2);
+
+        // At the threshold: a new certificate for a key made on the agent.
+        let step = renew_if_due(&client, &agent_dir, due).await.expect("renew");
+        let Renewal::Renewed { serial, .. } = step else {
+            panic!("not renewed: {step:?}");
+        };
+        assert_ne!(serial, first_serial);
+        let renewed = on_disk();
+        assert_eq!(serial_of(&renewed.cert_pem), serial);
+        assert_ne!(renewed.key_pem, first.key_pem);
+        assert!(!agent_dir.join("next").exists());
+        let record = keep
+            .managed_certificate(serial)
+            .expect("record")
+            .expect("record");
+        assert!(
+            record.status.key_secret.is_none(),
+            "the key never left the host"
+        );
+        assert_eq!(record.spec.common_name, "n1");
+
+        // The loop's client was never rebuilt and now shows the new one:
+        // it keeps working across the swap.
+        let seen = in_loop.whoami().await.expect("whoami after");
+        assert_eq!(seen.cert_serial, Some(serial));
+        in_loop
+            .hello(&agent_hello("n1"))
+            .await
+            .expect("hello after");
+        in_loop
+            .next_commands(Duration::ZERO)
+            .await
+            .expect("poll after");
+        // A restart reads the new files and they work.
+        let restarted =
+            AgentClient::with_mtls(&base, "n1", &renewed.ca_pem, &renewed).expect("restarted");
+        assert_eq!(
+            restarted.whoami().await.expect("whoami").cert_serial,
+            Some(serial)
+        );
+        // The old certificate was not revoked: it runs out on its own date.
+        let old = AgentClient::with_mtls(&base, "n1", &first.ca_pem, &first).expect("old");
+        assert_eq!(
+            old.whoami().await.expect("old whoami").cert_serial,
+            Some(first_serial)
+        );
+
+        // Revoked: no renewal, nothing issued, nothing changed on disk.
+        keep.revoke_certificate(&record.meta.id).expect("revoke");
+        let issued = keep.list_certificates(None).expect("list").len();
+        let err = renew_if_due(&client, &agent_dir, due)
+            .await
+            .expect_err("a revoked certificate must not renew");
+        assert!(
+            format!("{err:#}").contains("missing client certificate"),
+            "{err:#}"
+        );
+        assert_eq!(on_disk().cert_pem, renewed.cert_pem);
+        assert_eq!(on_disk().key_pem, renewed.key_pem);
+        assert_eq!(keep.list_certificates(None).expect("list").len(), issued);
+        assert!(in_loop.whoami().await.is_err());
+
+        // What is left is to enroll again with a join token, which is also
+        // what an agent whose certificate has expired does.
+        let (_, token) =
+            keep::create_join_token(&t.store, "again", "admin", false, None).expect("token");
+        let step = enroll_again(&client, &agent_dir, &token)
+            .await
+            .expect("enroll again");
+        let Renewal::Renewed { serial: third, .. } = step else {
+            panic!("not enrolled: {step:?}");
+        };
+        assert_ne!(third, serial);
+        assert_eq!(serial_of(&on_disk().cert_pem), third);
+        assert_eq!(
+            in_loop.whoami().await.expect("whoami").cert_serial,
+            Some(third)
+        );
+        // The token is spent.
+        assert!(enroll_again(&client, &agent_dir, &token).await.is_err());
+        assert_eq!(serial_of(&on_disk().cert_pem), third);
+
         t.shutdown.cancel();
         t.task.await.expect("serve task").expect("serve");
     }
