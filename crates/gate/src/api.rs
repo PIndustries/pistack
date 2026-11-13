@@ -9,6 +9,8 @@
 //! GET    /projects               (admin)            POST /projects (admin)
 //! GET    /projects/{id}          (member/reader of it, or admin)
 //! PUT    /projects/{id}          (admin)            DELETE /projects/{id} (admin)
+//! GET    /projects/{id}/quotas   limit and usage per resource (member/reader of it, or admin)
+//! PUT    /projects/{id}/quotas   set or clear single limits (admin)
 //! GET|POST /principals, GET|PUT|DELETE /principals/{id}   (admin; GET self allowed)
 //! GET|POST /roles, GET|PUT|DELETE /roles/{id}             (read: any caller; write: admin)
 //! GET|POST /bindings, GET|DELETE /bindings/{id}           (admin)
@@ -26,7 +28,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
-use pistack_store::Store;
+use pistack_store::{Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Caller, Id, ListQuery, Meta, Page};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -47,6 +49,7 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}",
             get(get_project).put(update_project).delete(delete_project),
         )
+        .route("/projects/{id}/quotas", get(get_quotas).put(set_quotas))
         .route("/principals", get(list_principals).post(create_principal))
         .route(
             "/principals/{id}",
@@ -387,20 +390,121 @@ async fn update_project(
 ) -> ApiResult<Json<Project>> {
     policy::authorize(&caller, "projects.update", None)?;
     let rev = if_match(&headers)?;
-    let mut p = crate::resolve_project(&st.store, &id)?;
-    if let Some(d) = req.description {
-        p.meta.description = d;
+    let id = crate::resolve_project(&st.store, &id)?.meta.id;
+    // Applied to the row as it is at the write, so usage a module recorded
+    // in the meantime is not put back to what this request first read.
+    let p = st.store.collection::<Project>().modify(&id, |p| {
+        check_revision(p, rev)?;
+        if let Some(d) = &req.description {
+            p.meta.description = d.clone();
+        }
+        if let Some(l) = &req.labels {
+            p.meta.labels = l.clone();
+        }
+        if let Some(e) = req.enabled {
+            p.spec.enabled = e;
+        }
+        if let Some(q) = &req.quotas {
+            p.spec.quotas = q.clone();
+        }
+        Ok(())
+    })?;
+    Ok(Json(p))
+}
+
+fn check_revision(p: &Project, expected: Option<u64>) -> Result<(), StoreError> {
+    match expected {
+        Some(exp) if exp != p.meta.revision => Err(StoreError::Revision {
+            expected: exp,
+            found: p.meta.revision,
+        }),
+        _ => Ok(()),
     }
-    if let Some(l) = req.labels {
-        p.meta.labels = l;
+}
+
+/// One resource in a project's quota report. `limit` is `null` when the
+/// resource is unlimited.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaLine {
+    pub limit: Option<u64>,
+    pub used: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuotaReport {
+    pub project: Id,
+    pub name: String,
+    pub quotas: BTreeMap<String, QuotaLine>,
+}
+
+fn quota_report(p: &Project) -> QuotaReport {
+    let names = crate::quota::RESOURCES
+        .iter()
+        .copied()
+        .chain(p.spec.quotas.keys().map(String::as_str))
+        .chain(p.status.usage.keys().map(String::as_str));
+    let quotas = names
+        .map(|r| {
+            let line = QuotaLine {
+                limit: p.spec.quotas.get(r).copied(),
+                used: p.status.usage.get(r).copied().unwrap_or(0),
+            };
+            (r.to_owned(), line)
+        })
+        .collect();
+    QuotaReport {
+        project: p.meta.id.clone(),
+        name: p.meta.name.clone(),
+        quotas,
     }
-    if let Some(e) = req.enabled {
-        p.spec.enabled = e;
+}
+
+async fn get_quotas(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<QuotaReport>> {
+    let p = crate::resolve_project(&st.store, &id)?;
+    policy::authorize(&caller, "projects.get", Some(&p.meta.id))?;
+    Ok(Json(quota_report(&p)))
+}
+
+/// Limits to change. A number sets the limit, `null` removes it, and a
+/// resource that is not named keeps what it has.
+#[derive(Debug, Deserialize)]
+pub struct SetQuotas {
+    pub quotas: BTreeMap<String, Option<u64>>,
+}
+
+async fn set_quotas(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+    Body(req): Body<SetQuotas>,
+) -> ApiResult<Json<QuotaReport>> {
+    policy::authorize(&caller, "projects.update", None)?;
+    // A misspelt name would be stored and never enforced.
+    if let Some(unknown) = req
+        .quotas
+        .keys()
+        .find(|r| !crate::quota::RESOURCES.contains(&r.as_str()))
+    {
+        return Err(ApiError::bad_request(format!(
+            "unknown quota resource '{unknown}'; known: {}",
+            crate::quota::RESOURCES.join(", ")
+        )));
     }
-    if let Some(q) = req.quotas {
-        p.spec.quotas = q;
-    }
-    Ok(Json(st.store.collection::<Project>().update(p, rev)?))
+    let id = crate::resolve_project(&st.store, &id)?.meta.id;
+    let p = st.store.collection::<Project>().modify(&id, |p| {
+        for (resource, limit) in &req.quotas {
+            match limit {
+                Some(n) => p.spec.quotas.insert(resource.clone(), *n),
+                None => p.spec.quotas.remove(resource),
+            };
+        }
+        Ok(())
+    })?;
+    Ok(Json(quota_report(&p)))
 }
 
 async fn delete_project(
