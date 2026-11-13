@@ -540,6 +540,7 @@ mod tests {
             machines: vec![],
             at: chrono::Utc::now(),
             ovn: None,
+            usage: None,
         }
     }
 
@@ -772,6 +773,7 @@ mod tests {
                         machines: vec![],
                         at: chrono::Utc::now(),
                         ovn: None,
+                        usage: None,
                     })
                     .await;
                 let _ = client.next_commands(Duration::ZERO).await;

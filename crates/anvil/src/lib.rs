@@ -11,6 +11,8 @@
 //!   serving this node's facts.
 //! * `ovnhost` — points Open vSwitch at the cluster's OVN and reports
 //!   whether this host is a working chassis.
+//! * [`usage`] — what the host and its machines are using, for the
+//!   heartbeat.
 //! * [`agent`] — [`run_agent`], the entry point for `pistack agent`: hello,
 //!   heartbeats and the command loop over `pistack-rpc`.
 
@@ -22,6 +24,7 @@ mod overlay;
 mod ovnhost;
 mod probe;
 pub mod runtime;
+pub mod usage;
 
 pub use agent::{run_agent, run_agent_with, run_agent_with_facts, AgentOpts};
 pub use facts::HostFacts;

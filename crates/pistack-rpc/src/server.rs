@@ -647,6 +647,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .await
             .unwrap();
@@ -734,6 +735,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         };
         let ack: HeartbeatAck = http
             .post(format!("{base}/agents/heartbeat"))
@@ -805,6 +807,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         };
         let http = reqwest::Client::new();
 
@@ -887,6 +890,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .send()
             .await
@@ -919,6 +923,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .await
             .unwrap();

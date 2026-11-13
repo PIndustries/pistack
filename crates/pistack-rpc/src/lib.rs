@@ -143,6 +143,7 @@ mod loopback {
                 }],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .await
             .unwrap();

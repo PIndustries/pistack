@@ -4,7 +4,7 @@
 //! In-memory runtime. Addresses are `10.0.0.N`, allocated in start order and
 //! stable for the life of the machine. Mirrors `forge::MockDriver`.
 
-use super::{MachineRequest, MachineRuntime, PowerState, RunningMachine};
+use super::{MachineRequest, MachineRuntime, MachineUsage, PowerState, RunningMachine};
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::BTreeMap;
@@ -20,7 +20,14 @@ struct State {
     machines: BTreeMap<Id, RunningMachine>,
     probes: BTreeMap<Id, Vec<crate::probe::ContainerProbes>>,
     next_addr: u32,
+    /// How many times usage was asked for; the made-up counters grow by it.
+    usage_calls: u64,
 }
+
+/// What a mock machine holds: 64 MiB, for a test to look for.
+pub const MOCK_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// CPU time a mock machine gains between two usage reports.
+pub const MOCK_CPU_STEP_NS: u64 = 1_000_000_000;
 
 impl MockRuntime {
     pub fn new() -> Self {
@@ -95,6 +102,39 @@ impl MachineRuntime for MockRuntime {
 
     async fn list(&self) -> ApiResult<Vec<RunningMachine>> {
         Ok(self.lock()?.machines.values().cloned().collect())
+    }
+
+    /// Made-up figures for the machines that are on: fixed memory, and
+    /// counters that grow by a fixed step each time this is asked.
+    async fn usage(&self) -> Vec<MachineUsage> {
+        let Ok(mut st) = self.lock() else {
+            return Vec::new();
+        };
+        st.usage_calls += 1;
+        let n = st.usage_calls;
+        st.machines
+            .values()
+            .filter(|m| m.power == PowerState::On)
+            .map(|m| MachineUsage {
+                id: m.id.clone(),
+                cpu_ns: n * MOCK_CPU_STEP_NS,
+                memory_bytes: MOCK_MEMORY_BYTES,
+                memory_assigned_bytes: MOCK_MEMORY_BYTES,
+                memory_guest_used_bytes: None,
+                disks: vec![pistack_rpc::proto::DiskUsage {
+                    device: "vda".into(),
+                    read_bytes: n * 4096,
+                    write_bytes: n * 8192,
+                    read_ops: n,
+                    write_ops: n * 2,
+                }],
+                nics: vec![pistack_rpc::proto::NicUsage {
+                    name: "mock0".into(),
+                    rx_bytes: n * 1500,
+                    tx_bytes: n * 900,
+                }],
+            })
+            .collect()
     }
 }
 
