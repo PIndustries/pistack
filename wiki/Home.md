@@ -2,7 +2,7 @@
 
 PiStack is a private cloud written in Rust. It runs virtual machines, containers and bare-metal machines from one binary, one state store and one API. The `pistack` binary is both the control plane (`pistack server`) and the host agent (`pistack agent`). The `pi` command-line client talks to the API.
 
-It is for people who run their own hardware and want what OpenStack gives them (compute, networking, block and object storage, images, identity, DNS, load balancers) without operating a dozen services, a message queue and a database to get it.
+It is for people who run their own hardware and want a full cloud on it (compute, networking, block and object storage, images, identity, DNS, load balancers) without operating a dozen services, a message queue and a database to get it. It comes out of fifteen years of running private clouds and keeps what those years taught us to keep.
 
 ## Status
 
