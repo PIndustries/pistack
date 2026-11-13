@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+gate.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -40,4 +41,3 @@ reqwest.workspace = true
 tempfile.workspace = true
 percent-encoding.workspace = true
 tower = { workspace = true, features = ["util"] }
-gate.workspace = true
