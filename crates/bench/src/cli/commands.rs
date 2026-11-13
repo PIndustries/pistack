@@ -1301,6 +1301,20 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             let v = c.put(&path, &json!({ "labels": labels })).await?;
             report(ctx, io, k, &v, "labelled")
         }
+        HostCmd::Disable(a) => {
+            let c = ctx.client()?;
+            let path = format!("{}/disable", k.item_path(&a.name));
+            let v = c
+                .post(&path, &compact(json!({ "reason": a.reason })))
+                .await?;
+            report(ctx, io, k, &v, "disabled")
+        }
+        HostCmd::Enable(a) => {
+            let c = ctx.client()?;
+            let path = format!("{}/enable", k.item_path(&a.name));
+            let v = c.post_empty(&path).await?;
+            report(ctx, io, k, &v, "enabled")
+        }
     }
 }
 

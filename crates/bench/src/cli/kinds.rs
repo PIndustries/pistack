@@ -112,6 +112,22 @@ fn attach_state(v: &Value, _: DateTime<Utc>) -> String {
     }
 }
 
+/// Whether the scheduler may use the host. The reason follows when the
+/// operator gave one.
+fn host_scheduling(v: &Value, _: DateTime<Utc>) -> String {
+    if !v
+        .pointer("/spec/disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "enabled".to_owned();
+    }
+    match str_at(v, "/spec/disabled_reason").as_str() {
+        "" => "disabled".to_owned(),
+        reason => format!("disabled ({reason})"),
+    }
+}
+
 fn host_path(v: &Value, _: DateTime<Utc>) -> String {
     str_at(v, "/status/host_path")
 }
@@ -373,6 +389,7 @@ pub static KINDS: &[KindDef] = &[
             col!("NAME", name),
             col!("ID", id),
             col!("PHASE", phase),
+            col!("SCHEDULING", host_scheduling),
             col!("NODE", "/spec/node_name"),
             col!("VCPUS", "/spec/capacity/vcpus"),
             col!("FREE-VCPUS", "/status/free/vcpus"),

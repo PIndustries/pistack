@@ -67,6 +67,37 @@ async fn set_labels(
     Json(host.clone())
 }
 
+async fn disable(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    m.writes
+        .lock()
+        .unwrap()
+        .push((format!("/compute/hosts/{id}/disable"), body.clone()));
+    let mut host = m.host.lock().unwrap();
+    host["spec"]["disabled"] = json!(true);
+    if let Some(reason) = body.get("reason") {
+        host["spec"]["disabled_reason"] = reason.clone();
+    }
+    Json(host.clone())
+}
+
+async fn enable(State(m): State<Mock>, Path(id): Path<String>) -> Json<Value> {
+    m.writes
+        .lock()
+        .unwrap()
+        .push((format!("/compute/hosts/{id}/enable"), Value::Null));
+    let mut host = m.host.lock().unwrap();
+    host["spec"]["disabled"] = json!(false);
+    host["spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("disabled_reason");
+    Json(host.clone())
+}
+
 async fn create_machine(
     State(m): State<Mock>,
     Json(body): Json<Value>,
@@ -100,6 +131,8 @@ async fn serve() -> (String, Mock) {
         .route("/compute/hosts", get(list))
         .route("/compute/hosts/{id}", get(show))
         .route("/compute/hosts/{id}/labels", put(set_labels))
+        .route("/compute/hosts/{id}/disable", post(disable))
+        .route("/compute/hosts/{id}/enable", post(enable))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -200,4 +233,41 @@ async fn machine_create_sends_the_zone() {
     .await;
     assert_eq!(r.code, 0, "{}", r.err);
     assert!(mock.last_write().1["spec"].get("zone").is_none());
+}
+
+#[tokio::test]
+async fn host_disable_shows_the_reason_and_enable_clears_it() {
+    let (url, mock) = serve().await;
+
+    let r = pi(&url, &["host", "list"]).await;
+    assert!(r.out.contains("SCHEDULING"), "{}", r.out);
+    assert!(r.out.contains("enabled"), "{}", r.out);
+
+    let r = pi(
+        &url,
+        &["host", "disable", "rack1", "--reason", "replacing a fan"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("host \"rack1\" disabled"), "{}", r.out);
+    let (path, body) = mock.last_write();
+    assert_eq!(path, "/compute/hosts/rack1/disable");
+    assert_eq!(body, json!({"reason": "replacing a fan"}));
+
+    let r = pi(&url, &["host", "show", "rack1"]).await;
+    assert!(r.out.contains("replacing a fan"), "{}", r.out);
+    let r = pi(&url, &["host", "list"]).await;
+    assert!(r.out.contains("disabled (replacing a fan)"), "{}", r.out);
+
+    // No reason sends no reason.
+    let r = pi(&url, &["host", "disable", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(mock.last_write().1, json!({}));
+
+    let r = pi(&url, &["host", "enable", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("host \"rack1\" enabled"), "{}", r.out);
+    assert_eq!(mock.last_write().0, "/compute/hosts/rack1/enable");
+    let r = pi(&url, &["host", "list"]).await;
+    assert!(!r.out.contains("disabled"), "{}", r.out);
 }
