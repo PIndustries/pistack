@@ -15,12 +15,14 @@
 //! is treated as cloud admin in dev mode and rejected otherwise.
 
 use crate::driver::DriverRegistry;
-use crate::types::{new_machine, new_size, Host, Machine, MachineSpec, Size, DELETE_ANNOTATION};
+use crate::types::{
+    new_machine, new_size, Host, Machine, MachineSpec, Size, DELETE_ANNOTATION, SYSTEM_LABEL_PREFIX,
+};
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Request, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::Utc;
@@ -57,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/machines/{id}/console/vnc", get(console_vnc))
         .route("/hosts", get(list_hosts))
         .route("/hosts/{id}", get(get_host))
+        .route("/hosts/{id}/labels", put(set_host_labels))
         .route("/sizes", get(list_sizes).post(create_size))
         .route(
             "/sizes/{id}",
@@ -554,6 +557,55 @@ async fn get_host(
 ) -> ApiResult<Json<Host>> {
     scope.require_admin()?;
     Ok(Json(hosts(&s).resolve(None, &id)?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetHostLabels {
+    pub labels: BTreeMap<String, String>,
+}
+
+fn validate_label(key: &str, value: &str) -> ApiResult<()> {
+    if key.starts_with(SYSTEM_LABEL_PREFIX) {
+        return Err(ApiError::unprocessable(format!(
+            "label '{key}' is set by PiStack and cannot be written"
+        )));
+    }
+    let word = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 63
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+            && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+    };
+    if !word(key) || !word(value) {
+        return Err(ApiError::bad_request(format!(
+            "label '{key}={value}': key and value must be 1-63 chars of [A-Za-z0-9._/-] and start with a letter or digit"
+        )));
+    }
+    Ok(())
+}
+
+/// Replace the labels an operator owns. Labels PiStack wrote itself, the
+/// ones under `pistack.io/`, stay as they are.
+async fn set_host_labels(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<SetHostLabels>,
+) -> ApiResult<Json<Host>> {
+    scope.require_admin()?;
+    for (k, v) in &body.labels {
+        validate_label(k, v)?;
+    }
+    let host = hosts(&s).resolve(None, &id)?;
+    let host = hosts(&s).modify(&host.meta.id, |h| {
+        h.meta
+            .labels
+            .retain(|k, _| k.starts_with(SYSTEM_LABEL_PREFIX));
+        h.meta.labels.extend(body.labels.clone());
+        Ok(())
+    })?;
+    Ok(Json(host))
 }
 
 // ---- sizes -------------------------------------------------------------------

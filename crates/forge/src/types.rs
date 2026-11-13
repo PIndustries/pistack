@@ -77,6 +77,10 @@ pub const WAIT_VOLUME_ANNOTATION: &str = "loom.pistack.io/wait-volume";
 /// only that host.
 pub const NODE_PIN_ANNOTATION: &str = "loom.pistack.io/node";
 
+/// Labels under this prefix are written by PiStack itself. An operator
+/// cannot set them, and replacing a host's labels keeps them.
+pub const SYSTEM_LABEL_PREFIX: &str = "pistack.io/";
+
 // ---- Host ------------------------------------------------------------------
 
 /// What a host *is*: reported by the agent at hello time and on change.
