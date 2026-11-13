@@ -384,6 +384,7 @@ pi network list
 pi network show <NAME>
 pi network create <NAME>
 pi network delete <NAME>
+pi network set <NAME> --auto-floating-ip <BOOL>
 ```
 
 | Command | Argument or option | Meaning |
@@ -395,7 +396,10 @@ pi network delete <NAME>
 | `network create` | `--physnet <PHYSNET>` | Physical network name (provider networks) [default: physnet1] |
 | `network create` | `--mtu <MTU>` | [default: 1500] |
 | `network create` | `--external` | External network: routers get gateways and floating IPs here |
+| `network create` | `--auto-floating-ip` | Give every machine a floating IP from this network without being asked. Admin only; needs `--external`; one network at a time |
 | `network create` | `--dns-domain <DNS_DOMAIN>` |  |
+| `network set` | `<NAME>` | Name or id |
+| `network set` | `--auto-floating-ip <BOOL>` | Turn automatic floating IPs from this external network on or off. Turning it off leaves the floating IPs already given in place [possible values: true, false] |
 
 ## pi subnet
 

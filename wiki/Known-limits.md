@@ -73,6 +73,9 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **`hostnat` is single-host and IPv4 only.** Its helper needs five environment variables passed through `sudo`, and the repository ships no sudoers configuration for that.
 - **`overlay` puts each project router on one host.** There is no redundancy for it. Instance metadata is redirected to a port only the server listens on, so it does not appear to work on hosts that run only an agent.
 - **`ovn` is half built.** The northbound database is written. PiStack does not set up `ovn-controller` on hosts, virtual machines under libvirt are not plugged into OVN, and there is no metadata service or OVN load balancer.
+- **Automatic floating IPs come from one network for the whole cloud.** There is no pool per project, and the setting cannot be limited to some projects other than by labelling the ones that opt out.
+- **An automatic floating IP does not follow a machine to a new address.** It stays on the port it was first given. Delete it and the next pass creates one for the new address.
+- **Floating IPs given before the setting existed are not removed.** After an upgrade they stay until you delete them or their machine.
 - **Load balancer traffic goes through the leader process.**
 - **DNS defaults to port 5353**, which collides with mDNS on macOS and with avahi. Set `PISTACK_DNS_LISTEN`. The DNS server is authoritative only and does not forward.
 
