@@ -226,14 +226,17 @@ fn respond(store: &Store, guest: Guest, path: &str) -> (StatusCode, Vec<u8>) {
     }
     let body = match path {
         "/latest/meta-data" => {
-            Some(b"hostname\nlocal-ipv4\npublic-ipv4\npublic-keys\nsecrets\n".to_vec())
+            Some(b"hostname\nlocal-ipv4\npublic-ipv4\npublic-keys\nsecrets".to_vec())
         }
-        "/latest/meta-data/hostname" => Some(format!("{}\n", guest.name).into_bytes()),
-        "/latest/meta-data/local-ipv4" => Some(format!("{}\n", guest.local).into_bytes()),
-        "/latest/meta-data/public-ipv4" => Some(format!("{}\n", guest.public).into_bytes()),
-        "/latest/meta-data/public-keys" => guest.key.as_ref().map(|_| b"0\n".to_vec()),
+        // A value is the bare value and a listing has no last newline, as
+        // the EC2 service answers. `$(curl ...)` hid the difference; a
+        // program that reads the body whole did not.
+        "/latest/meta-data/hostname" => Some(guest.name.into_bytes()),
+        "/latest/meta-data/local-ipv4" => Some(guest.local.into_bytes()),
+        "/latest/meta-data/public-ipv4" => Some(guest.public.into_bytes()),
+        "/latest/meta-data/public-keys" => guest.key.as_ref().map(|_| b"0".to_vec()),
         "/latest/meta-data/public-keys/0/openssh-key" => {
-            guest.key.as_ref().map(|k| format!("{k}\n").into_bytes())
+            guest.key.map(|k| k.trim_end().to_owned().into_bytes())
         }
         "/latest/meta-data/secrets" => Some(secret_names(&guest.secrets)),
         "/latest/user-data" => Some(guest.user_data.into_bytes()),
@@ -246,12 +249,7 @@ fn respond(store: &Store, guest: Guest, path: &str) -> (StatusCode, Vec<u8>) {
 }
 
 fn secret_names(names: &[String]) -> Vec<u8> {
-    if names.is_empty() {
-        return Vec::new();
-    }
-    let mut body = names.join("\n");
-    body.push('\n');
-    body.into_bytes()
+    names.join("\n").into_bytes()
 }
 
 /// Payload of a secret named on this machine, in the machine's project.
@@ -412,13 +410,13 @@ mod tests {
         let peer = IpAddr::V4(Ipv4Addr::new(10, 90, 0, 10));
         let (code, body) = answer(&store, peer, "/latest/meta-data/local-ipv4");
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(body, b"10.90.0.10\n");
+        assert_eq!(body, b"10.90.0.10");
         let (_, host) = answer(&store, peer, "/latest/meta-data/hostname");
-        assert_eq!(host, b"box\n");
+        assert_eq!(host, b"box");
         let (_, pubip) = answer(&store, peer, "/latest/meta-data/public-ipv4");
-        assert_eq!(pubip, b"10.90.0.10\n");
+        assert_eq!(pubip, b"10.90.0.10");
         let (_, key) = answer(&store, peer, "/latest/meta-data/public-keys/0/openssh-key");
-        assert_eq!(key, b"ssh-ed25519 AAAAbox\n");
+        assert_eq!(key, b"ssh-ed25519 AAAAbox");
         let (_, data) = answer(&store, peer, "/latest/user-data");
         assert_eq!(data, b"#cloud-config\n");
 
@@ -445,7 +443,7 @@ mod tests {
             })
             .unwrap();
         let (_, pubip) = answer(&store, peer, "/latest/meta-data/public-ipv4/");
-        assert_eq!(pubip, b"10.66.66.84\n");
+        assert_eq!(pubip, b"10.66.66.84");
         let (missing, _) = answer(
             &store,
             IpAddr::V4(Ipv4Addr::new(10, 90, 0, 99)),
@@ -512,7 +510,7 @@ mod tests {
 
         let (code, names) = answer(&store, peer, "/latest/meta-data/secrets");
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(names, b"db-password\n");
+        assert_eq!(names, b"db-password");
         let (code, body) = answer(&store, peer, "/latest/meta-data/secrets/db-password");
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body, b"s3cr3t");
@@ -641,9 +639,9 @@ mod tests {
         let blue = t.blue_net.to_string();
 
         let (code, body) = answer_on(&t.store, "node-a", &red, peer, name);
-        assert_eq!((code, body.as_slice()), (StatusCode::OK, &b"red\n"[..]));
+        assert_eq!((code, body.as_slice()), (StatusCode::OK, &b"red"[..]));
         let (code, body) = answer_on(&t.store, "node-b", &blue, peer, name);
-        assert_eq!((code, body.as_slice()), (StatusCode::OK, &b"blue\n"[..]));
+        assert_eq!((code, body.as_slice()), (StatusCode::OK, &b"blue"[..]));
 
         // A host cannot read for a guest it does not run, whichever
         // network it names.
@@ -683,7 +681,7 @@ mod tests {
             .metadata(&red, peer, "/latest/meta-data/local-ipv4")
             .await
             .unwrap();
-        assert_eq!(got, (200, b"10.90.0.10\n".to_vec()));
+        assert_eq!(got, (200, b"10.90.0.10".to_vec()));
         let got = agent
             .metadata(&t.blue_net.to_string(), peer, "/latest/meta-data/hostname")
             .await
