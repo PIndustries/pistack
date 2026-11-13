@@ -42,9 +42,11 @@ A service account is a principal for a program. It is meant to authenticate with
 
 ```sh
 pi project create research --quota machines=20
+pi quota set research vcpus=64 volumes_gib=2000
+pi quota show research
 ```
 
-Only an admin can create, list or delete projects.
+Only an admin can create, list or delete projects, or set their quotas. A member or reader of a project can read its limits and usage. The resources that can be limited are listed under [Quotas](Concepts#quotas).
 
 Every token is scoped to one project, fixed when the token is issued. The project is chosen in this order:
 

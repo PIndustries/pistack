@@ -101,6 +101,21 @@ pi project delete <NAME>
 | `project create` | `--quota <RES=N>` | Quota `resource=limit` (repeatable) |
 | `project create` | `--disabled` |  |
 
+## pi quota
+
+Project quotas: limits and usage.
+
+```text
+pi quota show [PROJECT]
+pi quota set <PROJECT> <RES=N>...
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `quota show` | `[PROJECT]` | Project (name or id); default: the current scope |
+| `quota set` | `<PROJECT>` | Project (name or id) |
+| `quota set` | `<RES=N>...` | Limit `resource=N`; `resource=unlimited` removes it (repeatable) |
+
 ## pi user
 
 Users and service accounts.
