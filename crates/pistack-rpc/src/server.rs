@@ -398,15 +398,7 @@ async fn results(
 ) -> ApiResult<Json<ReportAck>> {
     check_node_name(&node)?;
     check_peer_node(&ext, &node)?;
-    let mut ack = ReportAck::default();
-    for r in results {
-        let id = r.id;
-        match q.ack(&node, r) {
-            Ok(()) => ack.accepted += 1,
-            Err(_) => ack.unknown.push(id),
-        }
-    }
-    Ok(Json(ack))
+    Ok(Json(q.ack_all(&node, results)))
 }
 
 #[cfg(test)]

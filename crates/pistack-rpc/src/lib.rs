@@ -34,7 +34,7 @@ pub use proto::{
     OvnHostConfig, OvnReport, PortPlug, PowerState, ProbeReport, ReportAck, RunningMachine,
     VolumeAttach, VolumeAttached, VolumeDetach, JOIN_HEADER, PROBE_LIVENESS, PROBE_READINESS,
 };
-pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
+pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket, COMMAND_RECORD_PREFIX};
 pub use server::{
     agent_address, router, router_with_auth, router_with_auth_and, router_with_extra,
     router_with_store, RpcAuth, REQUIRE_JOIN_ENV, RPC_INSECURE_ENV,

@@ -22,6 +22,8 @@ pub enum RpcError {
     NodeRemoved { id: CommandId, node: String },
     #[error("command queue was dropped")]
     Closed,
+    #[error("command was not recorded: {0}")]
+    Store(String),
     #[error("invalid url: {0}")]
     InvalidUrl(String),
     #[error("http: {0}")]
@@ -38,6 +40,7 @@ impl From<RpcError> for ApiError {
             RpcError::Timeout { .. } => ApiError::unavailable(e.to_string()),
             RpcError::NodeRemoved { .. } => ApiError::unavailable(e.to_string()),
             RpcError::Closed => ApiError::internal(e.to_string()),
+            RpcError::Store(_) => ApiError::unavailable(e.to_string()),
             RpcError::InvalidUrl(_) => ApiError::bad_request(e.to_string()),
             RpcError::Http(_) => ApiError::unavailable(e.to_string()),
             RpcError::Api { error, .. } => error,
