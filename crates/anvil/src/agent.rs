@@ -1856,6 +1856,7 @@ still here
                 kind: CommandKind::ReadLogs,
                 payload: serde_json::json!({}),
                 issued_at: Utc::now(),
+                remember: false,
             })
             .await
             .unwrap_err();
@@ -1866,6 +1867,7 @@ still here
                 kind: CommandKind::PlugPort,
                 payload: serde_json::json!({"machine": "nope"}),
                 issued_at: Utc::now(),
+                remember: false,
             })
             .await
             .unwrap_err();
@@ -1876,6 +1878,7 @@ still here
                 kind: CommandKind::UnplugPort,
                 payload: serde_json::json!(null),
                 issued_at: Utc::now(),
+                remember: false,
             })
             .await
             .unwrap_err();
@@ -1888,6 +1891,7 @@ still here
                 kind: CommandKind::ReadLogs,
                 payload: serde_json::json!({"id": id.to_string()}),
                 issued_at: Utc::now(),
+                remember: false,
             })
             .await
         {

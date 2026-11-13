@@ -606,6 +606,11 @@ pub struct Command {
     #[serde(default)]
     pub payload: serde_json::Value,
     pub issued_at: DateTime<Utc>,
+    /// The agent keeps the result of this command for a while and answers
+    /// a second delivery of the same id from that record, without running
+    /// it again. Set on commands whose id outlives a leader change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remember: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
