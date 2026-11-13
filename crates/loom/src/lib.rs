@@ -144,7 +144,7 @@ fn info() -> ModuleInfo {
         name: "loom",
         prefix: "loom",
         summary: "Container orchestration: pods, deployments, services, controllers",
-        version: env!("CARGO_PKG_VERSION"),
+        version: pistack_types::BUILD,
     }
 }
 

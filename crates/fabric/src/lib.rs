@@ -108,7 +108,7 @@ impl Module for Fabric {
             name: "fabric",
             prefix: "network",
             summary: "Networks, subnets, routers, security groups, floating IPs",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

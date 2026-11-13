@@ -441,7 +441,7 @@ impl Agent {
             node_name: self.facts.node_name.clone(),
             capabilities,
             resources: self.facts.resources,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: pistack_types::BUILD.to_owned(),
             labels: Default::default(),
             underlay_ip: self
                 .underlay

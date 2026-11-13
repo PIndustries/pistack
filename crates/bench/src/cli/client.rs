@@ -157,7 +157,7 @@ impl Client {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
             .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("pi/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("pi/{}", pistack_types::BUILD))
             .build()?;
         Ok(Client {
             http,

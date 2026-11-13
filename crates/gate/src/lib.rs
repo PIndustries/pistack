@@ -106,7 +106,7 @@ impl Module for Gate {
             name: "gate",
             prefix: "identity",
             summary: "Identity and access: principals, projects, roles, tokens, quotas",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

@@ -88,7 +88,7 @@ impl Module for Beacon {
             name: "beacon",
             prefix: "dns",
             summary: "DNS zones and records, served authoritatively (hickory)",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

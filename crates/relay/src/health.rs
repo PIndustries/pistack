@@ -57,7 +57,7 @@ async fn probe_inner(addr: SocketAddr, hm: &HealthMonitor) -> Probe {
         "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: pistack-relay/{}\r\nConnection: close\r\n\r\n",
         hm.path,
         addr,
-        env!("CARGO_PKG_VERSION")
+        pistack_types::BUILD
     );
     if let Err(e) = stream.write_all(req.as_bytes()).await {
         return Probe::Down(format!("write: {e}"));

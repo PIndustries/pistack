@@ -43,7 +43,7 @@ impl Module for Anvil {
             name: "anvil",
             prefix: "host",
             summary: "Per-host agent: runs machines, plugs networks, attaches disks",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
     fn router(&self, _ctx: ModuleContext) -> Router {

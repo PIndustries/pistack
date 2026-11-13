@@ -782,7 +782,7 @@ mod tests {
                 disk_gib: 100,
                 gpus: 0,
             },
-            version: "0.1.0".into(),
+            version: "26.11.12.1".into(),
             labels: Default::default(),
             underlay_ip: Some("10.66.66.5".into()),
         });

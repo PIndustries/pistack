@@ -117,7 +117,7 @@ impl Module for Keep {
             name: "keep",
             prefix: "secrets",
             summary: "Secrets, keys, certificates and the cloud CA",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

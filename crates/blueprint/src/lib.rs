@@ -56,7 +56,7 @@ impl Module for Blueprint {
             name: "blueprint",
             prefix: "blueprint",
             summary: "Declarative stacks, workflows and kits",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 
