@@ -1655,11 +1655,27 @@ fn network_config(nics: &[NicAttachment]) -> ApiResult<String> {
             "  nic{i}:\n    match:\n      macaddress: \"{}\"\n    dhcp4: false\n    addresses:\n      - {}/{}\n",
             nic.mac, nic.address, nic.prefix
         ));
-        if nic.routed && !nic.gateway.is_empty() {
+        let default_route = nic.routed && !nic.gateway.is_empty();
+        // On OVN the metadata port sits on the guest's own segment. The
+        // guest is configured from this file and takes no DHCP lease, so
+        // the route OVN's DHCP offers never reaches it. The other
+        // datapaths catch the address on the way to the gateway and need
+        // no route of their own.
+        let metadata_route = ovsplug::ovs_binding(nic)?.is_some();
+        if default_route {
+            out.push_str(&format!("    gateway4: {}\n", nic.gateway));
+        }
+        if default_route || metadata_route {
+            out.push_str("    routes:\n");
+        }
+        if default_route {
             out.push_str(&format!(
-                "    gateway4: {}\n    routes:\n      - to: default\n        via: {}\n",
-                nic.gateway, nic.gateway
+                "      - to: default\n        via: {}\n",
+                nic.gateway
             ));
+        }
+        if metadata_route {
+            out.push_str("      - to: 169.254.169.254/32\n        scope: link\n");
         }
     }
     Ok(out)
@@ -2034,6 +2050,26 @@ mod tests {
         assert!(plan.contains("gateway4: 10.90.0.1"));
         let only = network_config(std::slice::from_ref(&nic("10.90.0.10", false))).unwrap();
         assert!(!only.contains("gateway4"));
+        // Off OVN the seed is what it was: no route to the metadata address.
+        assert!(!plan.contains("169.254.169.254"), "{plan}");
+        assert!(!only.contains("routes"), "{only}");
+        assert_eq!(
+            network_config(std::slice::from_ref(&project)).unwrap(),
+            concat!(
+                "version: 2\n",
+                "ethernets:\n",
+                "  nic0:\n",
+                "    match:\n",
+                "      macaddress: \"52:54:00:aa:bb:cc\"\n",
+                "    dhcp4: false\n",
+                "    addresses:\n",
+                "      - 10.90.0.10/24\n",
+                "    gateway4: 10.90.0.1\n",
+                "    routes:\n",
+                "      - to: default\n",
+                "        via: 10.90.0.1\n",
+            )
+        );
         let mut bad = nic("10.90.0.10", false);
         bad.mac = "not-a-mac".into();
         assert!(network_config(std::slice::from_ref(&bad)).is_err());
@@ -2161,6 +2197,54 @@ mod tests {
             .collect(),
         });
         port
+    }
+
+    #[test]
+    fn the_seed_of_a_guest_on_ovn_has_an_on_link_route_to_metadata() {
+        // A routed network: the default route stays, the metadata route
+        // joins it under the one `routes` key.
+        let mut routed = ovn_nic();
+        routed.routed = true;
+        assert_eq!(
+            network_config(std::slice::from_ref(&routed)).unwrap(),
+            concat!(
+                "version: 2\n",
+                "ethernets:\n",
+                "  nic0:\n",
+                "    match:\n",
+                "      macaddress: \"52:54:00:aa:bb:cc\"\n",
+                "    dhcp4: false\n",
+                "    addresses:\n",
+                "      - 10.90.0.10/24\n",
+                "    gateway4: 10.90.0.1\n",
+                "    routes:\n",
+                "      - to: default\n",
+                "        via: 10.90.0.1\n",
+                "      - to: 169.254.169.254/32\n",
+                "        scope: link\n",
+            )
+        );
+        // No router: the metadata route is the only one.
+        let isolated = network_config(std::slice::from_ref(&ovn_nic())).unwrap();
+        assert!(
+            isolated.ends_with(concat!(
+                "      - 10.90.0.10/24\n",
+                "    routes:\n",
+                "      - to: 169.254.169.254/32\n",
+                "        scope: link\n",
+            )),
+            "{isolated}"
+        );
+        assert!(!isolated.contains("gateway4"), "{isolated}");
+        // Each interface is judged by its own network: one on OVN beside
+        // one that is not.
+        let mut second = nic("10.91.0.10", false);
+        second.mac = "52:54:00:aa:bb:dd".into();
+        let both = network_config(&[ovn_nic(), second]).unwrap();
+        assert_eq!(both.matches("169.254.169.254/32").count(), 1, "{both}");
+        let (first, rest) = both.split_once("  nic1:").unwrap();
+        assert!(first.contains("scope: link"), "{both}");
+        assert!(!rest.contains("routes"), "{both}");
     }
 
     #[test]
