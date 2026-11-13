@@ -116,6 +116,30 @@ pi quota set <PROJECT> <RES=N>...
 | `quota set` | `<PROJECT>` | Project (name or id) |
 | `quota set` | `<RES=N>...` | Limit `resource=N`; `resource=unlimited` removes it (repeatable) |
 
+## pi audit
+
+The audit log (admin).
+
+```text
+pi audit list
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `audit list` | `--since <TIME>` | Records from this time on: an RFC 3339 time, or an age such as 30m, 2h or 7d |
+| `audit list` | `--until <TIME>` | Records before this time, given like --since |
+| `audit list` | `--principal <WHO>` | Principal name or id |
+| `audit list` | `--in-project <PROJECT>` | Project name or id of the token that made the request |
+| `audit list` | `--action <ACTION>` | Action: create, update, delete, login, drain, update_quotas, ... |
+| `audit list` | `--kind <KIND>` | Resource kind as in the path: machines, bindings, hosts, ... |
+| `audit list` | `--resource <ID>` | Resource id or name, as the request gave it |
+| `audit list` | `--outcome <OUTCOME>` | `success`, `failure`, or one status code such as 403 |
+| `audit list` | `--limit <LIMIT>` | Most records to print [default: 100] |
+| `audit list` | `--after <ID>` | Continue after this record id (the last one of the page before) |
+| `audit list` | `--oldest-first` | Oldest first instead of newest first |
+
+Records print newest first. The filter is `--in-project` because `--project` is the global option that sets the scope of the request. See [Identity and access](Identity-and-access#audit) for what a record holds.
+
 ## pi user
 
 Users and service accounts.

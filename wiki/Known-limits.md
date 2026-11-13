@@ -28,7 +28,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Only the store is replicated.** Images, local volumes, objects and shares are files on one server's disk.
 - **The config file is mostly not applied.** Only `[modules.silo]` and `[modules.keep]` are read.
 - **No watch API.** Clients poll.
-- **The audit log cannot be read through the API.**
+- **The audit log is for cloud admins only, and it is not complete.** A project member cannot read their own project's records. Ordinary reads, object uploads and a control-plane server joining are not recorded, and the client address is whatever connected to the server, so a proxy hides the real one. See [Identity and access](Identity-and-access#audit).
 - **A pod is not refused by a quota.** The machine behind a pod counts towards its project's `machines`, `vcpus`, `memory_mib` and `disk_gib`, but the pod controller creates it without checking the limits.
 - **Quota usage is shown from the last change.** The number `pi quota show` prints for a resource is written when something of that kind is created or deleted in the project. The check that refuses a request always counts the records.
 
