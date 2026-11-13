@@ -88,6 +88,9 @@ pub struct KeepConfig {
     /// leader's sweep deletes it (see `sweep.rs`). `0` deletes it on the
     /// next sweep.
     pub join_token_grace_secs: u64,
+    /// Warn when the root key has not been rotated for this many days.
+    /// `0`, the default, never warns. Nothing rotates the key by itself.
+    pub root_key_rotate_after_days: u64,
 }
 
 impl Default for KeepConfig {
@@ -99,6 +102,7 @@ impl Default for KeepConfig {
             max_live_join_tokens: DEFAULT_MAX_LIVE_JOIN_TOKENS,
             max_join_token_uses: DEFAULT_MAX_JOIN_TOKEN_USES,
             join_token_grace_secs: DEFAULT_JOIN_TOKEN_GRACE_SECS,
+            root_key_rotate_after_days: 0,
         }
     }
 }

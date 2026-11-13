@@ -149,12 +149,13 @@ impl Module for Keep {
         let client = self.init(&ctx)?;
         let store = (*ctx.store::<Store>()).clone();
         let grace = client.limits().join_token_grace();
+        let root_key_days = client.limits().root_key_rotate_after_days;
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
         tokio::spawn(async move {
             leadership
                 .run_while_leader(shutdown, move |active| {
-                    sweep::run(store.clone(), grace, active)
+                    sweep::run(store.clone(), grace, root_key_days, active)
                 })
                 .await;
         });

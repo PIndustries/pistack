@@ -11,6 +11,12 @@
 //! each of them every [`WARN_EVERY`] until it is renewed, revoked or
 //! deleted, or has been expired for [`FORGET_AFTER`].
 //!
+//! A secret may carry `rotate_after_days`. Nothing rotates it: the same
+//! pass logs the secrets whose payload is older than that
+//! ([`secrets_past_rotation`]) until someone puts a new payload. The root
+//! key is treated the same way when `[modules.keep]
+//! root_key_rotate_after_days` is set ([`root_key_past_rotation`]).
+//!
 //! A join token stops being usable when it expires or when its last use
 //! is spent. Its record stays for [`KeepConfig::join_token_grace_secs`]
 //! (default 7 days) so an admin can still see which token enrolled what,
@@ -34,7 +40,7 @@ use pistack_types::CancellationToken;
 use std::time::Duration;
 
 use crate::client::managed_cert_role;
-use crate::types::{join_token_spent, Certificate, JoinToken};
+use crate::types::{join_token_spent, Certificate, JoinToken, Secret};
 
 /// Longest gap between sweeps.
 pub const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -172,6 +178,80 @@ pub fn certificates_not_renewing(store: &Store, now: DateTime<Utc>) -> Vec<NotRe
     out
 }
 
+/// A secret whose payload is older than its own `rotate_after_days`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PastRotation {
+    pub id: pistack_types::Id,
+    pub name: String,
+    pub project: Option<pistack_types::Id>,
+    pub rotate_after_days: u32,
+    /// Whole days since the payload was last put.
+    pub age_days: i64,
+}
+
+/// The secrets that set `rotate_after_days` and whose payload has not been
+/// replaced for longer than that at `now`. The age counts from the last
+/// rotation, or from creation for a payload never rotated.
+pub fn secrets_past_rotation(store: &Store, now: DateTime<Utc>) -> Vec<PastRotation> {
+    let secrets = match store.collection::<Secret>().list(None) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "keep sweep: cannot list secrets");
+            return Vec::new();
+        }
+    };
+    secrets
+        .into_iter()
+        .filter_map(|s| {
+            let days = s.spec.rotate_after_days.filter(|d| *d > 0)?;
+            let since = s.status.last_rotated.unwrap_or(s.meta.created_at);
+            let age_days = (now - since).num_days();
+            (now - since > chrono::Duration::days(i64::from(days))).then_some(PastRotation {
+                id: s.meta.id,
+                name: s.meta.name,
+                project: s.meta.project,
+                rotate_after_days: days,
+                age_days,
+            })
+        })
+        .collect()
+}
+
+/// The root key's age in days and what to run, when it is older than
+/// `after_days` at `now`. `after_days` of 0 never reports.
+pub fn root_key_past_rotation(
+    store: &Store,
+    after_days: u64,
+    now: DateTime<Utc>,
+) -> Option<(i64, &'static str)> {
+    if after_days == 0 {
+        return None;
+    }
+    let age = match crate::rekey::root_key_age(store) {
+        Ok(age) => age?,
+        Err(e) => {
+            tracing::warn!(error = %e, "keep sweep: cannot tell the age of the root key");
+            return None;
+        }
+    };
+    let days = (now - age.since).num_days();
+    (days > i64::try_from(after_days).unwrap_or(i64::MAX)).then_some((days, age.remedy))
+}
+
+fn warn_past_rotation(found: &[PastRotation]) {
+    for s in found {
+        tracing::warn!(
+            secret = %s.id,
+            name = %s.name,
+            project = s.project.as_ref().map(|p| p.to_string()).unwrap_or_default(),
+            age_days = s.age_days,
+            rotate_after_days = s.rotate_after_days,
+            "keep: secret is older than its rotate_after_days; put a new payload \
+             (PUT /secrets/secrets/{{id}}/payload). Nothing is rotated automatically"
+        );
+    }
+}
+
 fn warn_not_renewing(found: &[NotRenewing]) {
     for c in found {
         let what = match (c.role, c.expired) {
@@ -200,7 +280,12 @@ fn warn_not_renewing(found: &[NotRenewing]) {
 
 /// Sweep now, then every [`sweep_interval`]`(grace)`, until `active` is
 /// cancelled (leadership lost or shutdown).
-pub async fn run(store: Store, grace: Duration, active: CancellationToken) {
+pub async fn run(
+    store: Store,
+    grace: Duration,
+    root_key_rotate_after_days: u64,
+    active: CancellationToken,
+) {
     let mut tick = tokio::time::interval(sweep_interval(grace));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut warned: Option<tokio::time::Instant> = None;
@@ -227,13 +312,27 @@ pub async fn run(store: Store, grace: Duration, active: CancellationToken) {
                 }
                 if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
                     let s = store.clone();
-                    let found = tokio::task::spawn_blocking(move || {
-                        certificates_not_renewing(&s, Utc::now())
+                    let (certs, secrets, root) = tokio::task::spawn_blocking(move || {
+                        let now = Utc::now();
+                        (
+                            certificates_not_renewing(&s, now),
+                            secrets_past_rotation(&s, now),
+                            root_key_past_rotation(&s, root_key_rotate_after_days, now),
+                        )
                     })
                     .await
                     .unwrap_or_default();
-                    if !found.is_empty() {
-                        warn_not_renewing(&found);
+                    warn_not_renewing(&certs);
+                    warn_past_rotation(&secrets);
+                    if let Some((age_days, remedy)) = root {
+                        tracing::warn!(
+                            age_days,
+                            root_key_rotate_after_days,
+                            "keep: the root key is older than root_key_rotate_after_days; \
+                             nothing rotates it automatically: {remedy}"
+                        );
+                    }
+                    if !certs.is_empty() || !secrets.is_empty() || root.is_some() {
                         warned = Some(tokio::time::Instant::now());
                     }
                 }
@@ -427,7 +526,7 @@ mod tests {
                 (store.clone(), leadership.clone(), shutdown.clone());
             tokio::spawn(async move {
                 leadership
-                    .run_while_leader(shutdown, move |active| run(store.clone(), WEEK, active))
+                    .run_while_leader(shutdown, move |active| run(store.clone(), WEEK, 0, active))
                     .await
             })
         };
@@ -521,5 +620,71 @@ mod tests {
             .iter()
             .any(|n| n.expired));
         assert!(names(na + FORGET_AFTER + D::days(1)).is_empty());
+    }
+
+    #[test]
+    fn a_secret_older_than_its_rotate_after_days_is_reported_until_rotated() {
+        use crate::types::{Secret, SecretSpec};
+        let store = Store::in_memory().unwrap();
+        let c = crate::Client::open(&store).unwrap();
+        let mk = |name: &str, days: Option<u32>| {
+            let spec = SecretSpec {
+                rotate_after_days: days,
+                ..Default::default()
+            };
+            c.create_secret(Secret::new(name, None, spec), b"v1")
+                .unwrap()
+                .meta
+                .id
+        };
+        let monthly = mk("monthly", Some(30));
+        let yearly = mk("yearly", Some(365));
+        mk("never", None);
+        mk("zero", Some(0));
+        let names = |now| {
+            let mut v: Vec<String> = secrets_past_rotation(&store, now)
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            v.sort();
+            v
+        };
+        let t0 = Utc::now();
+        assert!(names(t0).is_empty());
+        assert!(names(t0 + D::days(29)).is_empty());
+        assert_eq!(names(t0 + D::days(31)), ["monthly"]);
+        assert_eq!(names(t0 + D::days(400)), ["monthly", "yearly"]);
+        let found = secrets_past_rotation(&store, t0 + D::days(31));
+        assert_eq!(found[0].id, monthly);
+        assert_eq!((found[0].rotate_after_days, found[0].age_days), (30, 31));
+
+        // A new payload starts the count again; nothing else does.
+        c.rotate_secret(&monthly, b"v2", None).unwrap();
+        assert!(names(t0 + D::days(29)).is_empty());
+        assert_eq!(names(t0 + D::days(400)), ["monthly", "yearly"]);
+        // The keys keep holds for itself set no age and are never listed.
+        assert!(!secrets_past_rotation(&store, t0 + D::days(4000))
+            .iter()
+            .any(|s| s.id != monthly && s.id != yearly));
+    }
+
+    #[test]
+    fn the_root_key_is_reported_once_it_is_older_than_the_setting() {
+        let store = Store::in_memory().unwrap();
+        // No key yet: nothing to say.
+        assert!(root_key_past_rotation(&store, 90, Utc::now()).is_none());
+        crate::Client::open(&store).unwrap();
+        let t0 = Utc::now();
+        // Off by default, quiet while young.
+        assert!(root_key_past_rotation(&store, 0, t0 + D::days(4000)).is_none());
+        assert!(root_key_past_rotation(&store, 90, t0 + D::days(89)).is_none());
+        let (days, remedy) = root_key_past_rotation(&store, 90, t0 + D::days(92)).unwrap();
+        assert!((91..=92).contains(&days), "{days}");
+        assert!(remedy.contains("rotate-root-key"));
+
+        // Rotating it starts the count again.
+        crate::rekey::rotate_root_key(&store, None).unwrap();
+        assert!(root_key_past_rotation(&store, 90, Utc::now() + D::days(89)).is_none());
+        assert!(root_key_past_rotation(&store, 90, Utc::now() + D::days(92)).is_some());
     }
 }
