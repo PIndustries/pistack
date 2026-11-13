@@ -129,6 +129,7 @@ impl Client {
                     b.status.message.clear();
                 }
                 Err(e) => {
+                    pistack_types::tally::reconcile_failed("relay");
                     b.status.phase = Phase::Error;
                     b.status.message = e.message.clone();
                 }
@@ -175,6 +176,7 @@ impl Client {
             }
             Err(e) => {
                 let _ = self.listeners().modify(&l.meta.id, |x| {
+                    pistack_types::tally::reconcile_failed("relay");
                     x.status.phase = Phase::Error;
                     x.status.message = e.message.clone();
                     x.status.observed_revision = x.meta.revision + 1;
@@ -223,6 +225,7 @@ impl Client {
                     x.status.message.clear();
                 }
                 Err(e) => {
+                    pistack_types::tally::reconcile_failed("relay");
                     x.status.phase = Phase::Error;
                     x.status.message = e.message.clone();
                 }

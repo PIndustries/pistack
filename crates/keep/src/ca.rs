@@ -519,6 +519,61 @@ fn load_signer(store: &Store, root_key: &RootKey, ca: &CertificateAuthority) -> 
     })
 }
 
+/// The cloud CA certificates as peers of this cluster should trust them:
+/// issuing CA then root, PEM concatenated. Read from the CA records, so it
+/// needs no root key. `None` for a store in which no CA was made yet.
+pub fn trust_bundle(store: &Store) -> Result<Option<String>> {
+    let Some(root) = try_by_name(store, ROOT_NAME)? else {
+        return Ok(None);
+    };
+    let mut bundle = String::new();
+    if let Some(issuing) = try_by_name(store, ISSUING_NAME)? {
+        bundle.push_str(&issuing.status.cert_pem);
+        if !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+    }
+    bundle.push_str(&root.status.cert_pem);
+    Ok(Some(bundle))
+}
+
+/// SHA-256 of the root CA certificate, 64 hex digits: what a new server is
+/// given to recognise this cloud by. `None` when no CA was made yet.
+pub fn root_fingerprint(store: &Store) -> Result<Option<String>> {
+    let Some(root) = try_by_name(store, ROOT_NAME)? else {
+        return Ok(None);
+    };
+    Ok(Some(sha256_hex(&pem_to_der(&root.status.cert_pem)?)))
+}
+
+/// The DNS names and IP addresses a DER certificate is valid for.
+pub fn names_from_der(der: &[u8]) -> Result<Vec<String>> {
+    use x509_parser::extensions::GeneralName;
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| KeepError::Pki(format!("cannot parse certificate: {e}")))?;
+    let san = cert
+        .subject_alternative_name()
+        .map_err(|e| KeepError::Pki(format!("bad subject alternative name: {e}")))?;
+    let Some(san) = san else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for name in &san.value.general_names {
+        match name {
+            GeneralName::DNSName(dns) => names.push((*dns).to_owned()),
+            GeneralName::IPAddress(bytes) => {
+                if let Ok(v4) = <[u8; 4]>::try_from(*bytes) {
+                    names.push(IpAddr::from(v4).to_string());
+                } else if let Ok(v6) = <[u8; 16]>::try_from(*bytes) {
+                    names.push(IpAddr::from(v6).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(names)
+}
+
 /// First certificate in a PEM string, as DER.
 pub fn pem_to_der(pem_str: &str) -> Result<Vec<u8>> {
     let p = pem::parse(pem_str).map_err(|e| KeepError::Pki(format!("bad PEM: {e}")))?;

@@ -165,6 +165,7 @@ impl Module for Beacon {
                     let events = events.clone();
                     async move {
                         if let Err(e) = client.reconcile_all() {
+                            pistack_types::tally::reconcile_failed("beacon");
                             tracing::warn!(error = %e, "beacon: initial reconcile");
                         }
                         auto::start(
@@ -185,6 +186,7 @@ impl Module for Beacon {
                                 ev = rx.recv() => match ev {
                                     Ok(ev) if ev.kind == pistack_types::kind::ZONE => {
                                         if let Err(e) = client.reconcile_zone(&ev.id) {
+                                            pistack_types::tally::reconcile_failed("beacon");
                                             tracing::warn!(zone = %ev.id, error = %e, "beacon: reconcile failed");
                                         }
                                     }

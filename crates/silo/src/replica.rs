@@ -10,7 +10,9 @@
 //! * **Peer endpoint.** `GET /silo/peer/blobs/{bucket-id}/{sha256}` serves
 //!   bytes this server holds for an object record with that checksum. It
 //!   only reads its own disk. It follows the same rule as `/cluster`: the
-//!   caller must be a member, proved with the cluster's peer key.
+//!   caller must be a member, proved with the cluster's peer key. The
+//!   call goes to the other server's TLS listener when it has one, as
+//!   every call between servers does (`keep::peer::PeerNet`).
 //! * **Fetch on miss.** A read that finds the record but not the bytes
 //!   asks each other member of the cluster, leader first, streams the
 //!   answer to a temp file, checks size and SHA-256, and renames it into
@@ -80,13 +82,18 @@ struct Member {
     id: String,
     #[serde(default)]
     api: String,
+    /// The server's TLS listener, when it has one.
+    #[serde(default)]
+    agent_api: Option<String>,
 }
 
 /// The other control-plane servers, as a source of object bytes.
 #[derive(Clone)]
 pub struct Peers {
     source: Source,
-    http: reqwest::Client,
+    /// Which address of a server is called and what its certificate is
+    /// checked against.
+    net: keep::peer::PeerNet,
     /// Where a fixed list reads the peer key from.
     key_from: Option<Store>,
 }
@@ -108,10 +115,10 @@ impl Peers {
     pub fn from_cluster(store: Store) -> Self {
         Self {
             source: Source::Cluster {
-                store,
+                store: store.clone(),
                 me: own_member_id(),
             },
-            http: http_client(),
+            net: keep::peer::PeerNet::from_env(store),
             key_from: None,
         }
     }
@@ -120,7 +127,7 @@ impl Peers {
     pub fn fixed(urls: Vec<String>) -> Self {
         Self {
             source: Source::Fixed(urls),
-            http: http_client(),
+            net: keep::peer::PeerNet::plain(),
             key_from: None,
         }
     }
@@ -142,8 +149,14 @@ impl Peers {
 
     /// API base URLs to ask, the leader first.
     pub fn urls(&self) -> Vec<String> {
+        self.targets().into_iter().map(|(api, _)| api).collect()
+    }
+
+    /// Each server to ask, the leader first: its API address and, when it
+    /// has one, its TLS address.
+    fn targets(&self) -> Vec<(String, Option<String>)> {
         match &self.source {
-            Source::Fixed(urls) => urls.clone(),
+            Source::Fixed(urls) => urls.iter().map(|url| (url.clone(), None)).collect(),
             Source::Cluster { store, me } => {
                 let members: Vec<Member> =
                     store.get_meta("members").ok().flatten().unwrap_or_default();
@@ -153,7 +166,7 @@ impl Peers {
                     .filter(|m| !m.api.trim().is_empty() && Some(&m.id) != me.as_ref())
                     .collect();
                 others.sort_by_key(|m| Some(&m.id) != leader.as_ref());
-                others.into_iter().map(|m| m.api).collect()
+                others.into_iter().map(|m| (m.api, m.agent_api)).collect()
             }
         }
     }
@@ -165,26 +178,29 @@ impl Peers {
     /// one server has nowhere to put a second copy. `unavailable` when
     /// fewer than `wanted` took it and there were peers to ask.
     pub async fn push(&self, obj: &Object, wanted: usize) -> ApiResult<()> {
-        let urls = self.urls();
+        let urls = self.targets();
         let wanted = wanted.min(urls.len());
         let wait = PUSH_BASE + Duration::from_secs(obj.status.size_bytes / (1024 * 1024));
         let mut taken = 0;
         let mut last = String::new();
-        for base in &urls {
+        let key = self.peer_key();
+        let path = format!("/silo/peer/pull/{}/{}", obj.meta.id, obj.status.sha256);
+        for (base, tls) in &urls {
             if taken >= wanted {
                 break;
             }
-            let url = format!(
-                "{}/silo/peer/pull/{}/{}",
-                base.trim_end_matches('/'),
-                obj.meta.id,
-                obj.status.sha256
-            );
-            let mut req = self.http.post(&url);
-            if let Some(key) = self.peer_key() {
-                req = req.header(keep::peer::PEER_HEADER, key);
-            }
-            match tokio::time::timeout(wait, req.send()).await {
+            // The same way as the fetch: at the TLS listener when the
+            // server has one.
+            let sent = self
+                .net
+                .send(base, tls.as_deref(), CONNECT_TIMEOUT, |client, base| {
+                    let req = client.post(format!("{}{path}", base.trim_end_matches('/')));
+                    match &key {
+                        Some(key) => req.header(keep::peer::PEER_HEADER, key),
+                        None => req,
+                    }
+                });
+            match tokio::time::timeout(wait, sent).await {
                 Ok(Ok(resp)) if resp.status().is_success() => taken += 1,
                 Ok(Ok(resp)) => last = format!("{base}: status {}", resp.status().as_u16()),
                 Ok(Err(e)) => last = format!("{base}: {e}"),
@@ -211,17 +227,15 @@ impl Peers {
     /// short or wrong answer never becomes the object. `not_found` when
     /// there is no peer to ask; `unavailable` when none of them had it.
     pub async fn fetch(&self, bucket: &Id, sha256: &str, size: u64, dest: &Path) -> ApiResult<()> {
-        let urls = self.urls();
+        let urls = self.targets();
         if urls.is_empty() {
             return Err(ApiError::not_found("no other server holds object bytes"));
         }
         let mut last = String::new();
-        for base in &urls {
-            let url = format!(
-                "{}/silo/peer/blobs/{bucket}/{sha256}",
-                base.trim_end_matches('/')
-            );
-            match self.fetch_from(&url, sha256, size, dest).await {
+        for (base, tls) in &urls {
+            let path = format!("/silo/peer/blobs/{bucket}/{sha256}");
+            let from = (base.as_str(), tls.as_deref());
+            match self.fetch_from(from, &path, sha256, size, dest).await {
                 Ok(()) => {
                     tracing::debug!(%bucket, sha256, peer = %base, "silo: fetched object bytes");
                     return Ok(());
@@ -240,19 +254,23 @@ impl Peers {
 
     async fn fetch_from(
         &self,
-        url: &str,
+        (api, tls): (&str, Option<&str>),
+        path: &str,
         sha256: &str,
         size: u64,
         dest: &Path,
     ) -> Result<(), String> {
-        let mut req = self.http.get(url);
-        if let Some(key) = self.peer_key() {
-            req = req.header(keep::peer::PEER_HEADER, key);
-        }
-        let mut resp = tokio::time::timeout(STALL, req.send())
+        let key = self.peer_key();
+        let sent = self.net.send(api, tls, CONNECT_TIMEOUT, |client, base| {
+            let req = client.get(format!("{base}{path}"));
+            match &key {
+                Some(key) => req.header(keep::peer::PEER_HEADER, key),
+                None => req,
+            }
+        });
+        let mut resp = tokio::time::timeout(STALL, sent)
             .await
-            .map_err(|_| "no answer".to_owned())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| "no answer".to_owned())??;
         if !resp.status().is_success() {
             return Err(format!("status {}", resp.status().as_u16()));
         }
@@ -296,13 +314,6 @@ impl Peers {
         guard.disarm();
         Ok(())
     }
-}
-
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// This server's member id, from `<data_dir>/node.id`.
@@ -546,7 +557,7 @@ mod tests {
                 store: store.clone(),
                 me: Some("n2".into()),
             },
-            http: http_client(),
+            net: keep::peer::PeerNet::plain(),
             key_from: None,
         };
         assert!(peers.urls().is_empty(), "no member list, nobody to ask");
@@ -555,7 +566,8 @@ mod tests {
             .put_meta(
                 "members",
                 &serde_json::json!([
-                    {"id": "n1", "api": "http://10.0.0.11:8080", "role": "voter"},
+                    {"id": "n1", "api": "http://10.0.0.11:8080", "role": "voter",
+                     "agent_api": "https://10.0.0.11:8444"},
                     {"id": "n2", "api": "http://10.0.0.12:8080", "role": "voter"},
                     {"id": "n3", "api": "http://10.0.0.13:8080", "role": "learner"},
                     {"id": "n4", "api": "", "role": "learner"}
@@ -567,6 +579,10 @@ mod tests {
             peers.urls(),
             vec!["http://10.0.0.13:8080", "http://10.0.0.11:8080"]
         );
+        // The TLS address goes with the server that has one.
+        let targets = peers.targets();
+        assert_eq!(targets[0], ("http://10.0.0.13:8080".to_owned(), None));
+        assert_eq!(targets[1].1.as_deref(), Some("https://10.0.0.11:8444"));
     }
 
     #[tokio::test]

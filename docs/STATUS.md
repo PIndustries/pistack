@@ -27,7 +27,6 @@ Found by the three-server lab run, fixes in open pull requests or in progress:
 - Hosts cannot follow a leader change: they are sent to the servers' plain HTTP address, where they cannot show their certificate (in progress).
 - An admin cannot read cluster status since #117 (in progress).
 - A server that led and had writes no majority confirmed has to be wiped and rejoined by hand when it returns.
-- Every machine is given a floating IP as soon as an external network exists. There is no switch for it.
 
 ## Compute
 
@@ -37,6 +36,7 @@ Done
 - Quota per project on machines, vCPUs, RAM and root disk
 - cloud-init user data and SSH keys on libvirt
 - Metadata service, EC2 layout, on overlay and hostnat
+- Metadata service on OVN, through a namespace per network on each host: written and unit-tested, not yet run on hosts
 - Live migration on libvirt (no CLI)
 - Scheduler: host filters, label selector, spread weights
 - Per-host resource accounting; a host that misses heartbeats is marked down
@@ -60,7 +60,6 @@ Partial
 - Root disk: one copy-on-write disk on libvirt; no extra ephemeral or swap disks
 - GPU: in sizes and the scheduler; hosts always report zero and there is no passthrough
 - Bare metal: power and PXE boot; does not write an image, no inspection or enrollment
-- Metadata service on OVN: no path from the guest
 
 Missing
 - Resize
@@ -98,6 +97,7 @@ Done
 - Networks, subnets, allocation pools, ports, fixed IPs, MACs
 - Routers, external gateway, SNAT (IPv4)
 - Floating IPs on OVN, overlay and hostnat
+- Automatic floating IPs from one marked external network, off by default, with an opt-out per machine and per project
 - Security groups: stateful, ingress and egress, remote group, default group per project
 - Port security toggle
 - Provider networks, flat and VLAN
@@ -233,11 +233,12 @@ Done
 - JWT tokens with expiry; API keys
 - argon2id passwords
 - Quota framework: limits per project, set by an admin, read with usage by members (`pi quota`)
+- Audit log: every change, login, secret read and refusal, with principal, API key, client address and outcome; read by a cloud admin with filters and paging (`pi audit list`); kept 90 days and 50,000 records by default
 
 Partial
 - Roles: admin, member, reader only; custom roles grant nothing; the policy engine is built and unused
 - Nested projects: parent recorded, nothing inherited
-- Audit log is written and cannot be read
+- Audit log: admin only, no per-project view; ordinary reads, object uploads and server joins are not recorded; no export or forwarding to another system
 - Password rule is "not empty"; no lockout
 
 Missing
@@ -280,13 +281,18 @@ Missing
 ## Telemetry
 
 Done
-- Threshold alarms
+- Host usage from the agent: load, memory used, free space on the data directory (`pi host stats`)
+- Machine usage on libvirt: CPU time, memory, disk and network counters per device (`pi machine stats`)
+- Control-plane health: role, term, commit index, follower lag, reconcile failures per module, commands queued per host, store size
+- Prometheus endpoint `/metrics` with stable names and labels, behind a scrape token or a cloud admin's token
+- Threshold alarms on any series, a machine's or a host's included
 - Pod logs
 
 Partial
-- Metrics: host capacity only; no usage, nothing per machine
-- Storage: 10,000 samples in memory on one server
-- Prometheus endpoint gives the latest value only
+- History: none; a server keeps the last 60 points per series in memory and Prometheus keeps the rest
+- Host and machine series are on the leader only and start empty after a failover
+- Machine usage: libvirt only; nothing for containers, cloud-hypervisor or bare metal
+- Alarms: `for_seconds` is ignored; no CLI
 - Events exist in-process with no API
 
 Missing
@@ -308,7 +314,7 @@ Partial
 - Backup works; restore is copying a file by hand
 - Upgrades: no schema version, no upgrade check
 - TLS: the main listener is plain HTTP; HTTPS is a second port
-- Command queue is in memory on the leader and lost on restart
+- Command queue is in memory on the leader. Machine start, stop and delete and volume attach and detach keep their id in the store and are issued again by the next leader, and the host runs each once. A live migration in flight at a leader change is not followed up
 - Health: `/healthz` only
 
 Missing
@@ -337,6 +343,6 @@ Missing
 ## Order of work
 
 1. Merge and prove PRs 109 and 110 on real Ceph and LVM. Fix what the three-server run found. Cut the first build.
-2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, durable command queue, evacuation.
-3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, metadata on OVN, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
+2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, evacuation.
+3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
 4. Long tail, on request: GPU and passthrough, UEFI and vTPM, bare metal deploy, trunks, QoS, VPN, BGP, DNSSEC, erasure coding, regions, billing.

@@ -368,6 +368,23 @@ fn steps(plan: &Plan) -> Vec<Step> {
             gw,
         ]));
     }
+    // A pod takes no DHCP lease, so it never hears the route OVN hands
+    // guests. The network's metadata port is on the link itself.
+    if let Some(att) = plan
+        .attachments
+        .iter()
+        .find(|a| matches!(a.plug, HostPlug::Ovs { .. }))
+    {
+        cmds.push(Step::Ip(vec![
+            "-n".into(),
+            plan.netns.clone(),
+            "route".into(),
+            "add".into(),
+            "169.254.169.254/32".into(),
+            "dev".into(),
+            att.guest.clone(),
+        ]));
+    }
     cmds
 }
 
@@ -1193,6 +1210,9 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(positions(&text, &plug).len() == 1, "{text}");
         assert!(!text.contains("master"), "{text}");
+        // Metadata is reached on the link, not through the gateway.
+        let metadata = ["route", "add", "169.254.169.254/32", "dev", "eth0"];
+        assert_eq!(positions(&text, &metadata).len(), 1, "{text}");
         let unplugs = positions(&text, &unplug);
         let dels = positions(&text, &link_del);
         let plugged = positions(&text, &plug)[0];

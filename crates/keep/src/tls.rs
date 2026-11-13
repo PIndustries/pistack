@@ -119,6 +119,118 @@ pub fn client_config(ca_pem: &str, client: Option<&Pki>) -> Result<ClientConfig>
     Ok(cfg)
 }
 
+/// Read a certificate fingerprint as a new server is given it: 64 hex
+/// digits of SHA-256, with or without colons, in either case, and with or
+/// without a leading `sha256:`.
+pub fn parse_fingerprint(text: &str) -> Result<[u8; 32]> {
+    let text = text.trim();
+    let hex = text
+        .strip_prefix("sha256:")
+        .or_else(|| text.strip_prefix("SHA256:"))
+        .unwrap_or(text);
+    let digits: Vec<u8> = hex.bytes().filter(|b| *b != b':').collect();
+    let bad = || KeepError::Invalid("a CA fingerprint is 64 hex digits of SHA-256".into());
+    if digits.len() != 64 {
+        return Err(bad());
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(digits.chunks(2)) {
+        let pair = std::str::from_utf8(pair).map_err(|_| bad())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| bad())?;
+    }
+    Ok(out)
+}
+
+/// Checks a server against a CA known only by the SHA-256 of its
+/// certificate. The server has to present that CA certificate in its chain;
+/// it then becomes the one trust anchor and the rest is the ordinary check:
+/// the leaf chains to it, is in date and is valid for the name dialled.
+#[derive(Debug)]
+struct PinnedCa {
+    pin: [u8; 32],
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCa {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        use subtle::ConstantTimeEq;
+        let anchor = intermediates
+            .iter()
+            .find(|cert| bool::from(Sha256::digest(cert.as_ref()).as_slice().ct_eq(&self.pin)))
+            .ok_or_else(|| {
+                rustls::Error::General(
+                    "the server did not present a CA certificate with the pinned fingerprint"
+                        .into(),
+                )
+            })?;
+        let mut roots = RootCertStore::empty();
+        roots.add(anchor.clone().into_owned())?;
+        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            self.provider.clone(),
+        )
+        .build()
+        .map_err(|e| rustls::Error::General(format!("pinned CA: {e}")))?;
+        inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Client side for a server that has nothing of the cloud yet but the
+/// fingerprint of its root CA. See [`parse_fingerprint`].
+pub fn client_config_pinned(pin: [u8; 32]) -> Result<ClientConfig> {
+    let verifier = PinnedCa {
+        pin,
+        provider: provider(),
+    };
+    Ok(ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth())
+}
+
 /// Peer identity recovered after a TLS handshake on the gateway listener.
 ///
 /// `common_name` is set when the client presented a certificate that chained
@@ -229,6 +341,119 @@ mod tests {
         let (cn, got) = srv.await.unwrap();
         assert_eq!(cn.as_deref(), Some("agent-7"));
         assert_eq!(&got, b"ping");
+    }
+
+    #[test]
+    fn a_fingerprint_is_read_in_the_forms_people_paste() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF";
+        let want = parse_fingerprint(hex).unwrap();
+        assert_eq!(want[1], 0x11);
+        assert_eq!(want[31], 0xff);
+        assert_eq!(parse_fingerprint(&format!("sha256:{hex}")).unwrap(), want);
+        let colons: Vec<String> = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect();
+        assert_eq!(parse_fingerprint(&colons.join(":")).unwrap(), want);
+        assert_eq!(parse_fingerprint(&format!("  {hex}\n")).unwrap(), want);
+        for bad in [
+            "",
+            "abcd",
+            &hex[..62],
+            &format!("{hex}00"),
+            &hex.replace('0', "g"),
+        ] {
+            assert!(parse_fingerprint(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// One TLS connection to a server holding `server`, dialled as `name`
+    /// by a client that knows only `pin`.
+    async fn dial_pinned(server: &Pki, name: &str, pin: [u8; 32]) -> bool {
+        let acceptor = TlsAcceptor::from(Arc::new(server_config_http(server).unwrap()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            if let Ok(mut tls) = acceptor.accept(tcp).await {
+                tls.shutdown().await.ok();
+            }
+        });
+        let connector = TlsConnector::from(Arc::new(client_config_pinned(pin).unwrap()));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connected = connector
+            .connect(ServerName::try_from(name.to_owned()).unwrap(), tcp)
+            .await;
+        let ok = connected.is_ok();
+        if let Ok(mut tls) = connected {
+            tls.shutdown().await.ok();
+        }
+        srv.await.unwrap();
+        ok
+    }
+
+    #[tokio::test]
+    async fn a_pinned_client_accepts_only_the_cloud_with_that_root() {
+        let store = Store::in_memory().unwrap();
+        let key = RootKey::load_or_create(&store).unwrap();
+        let ca = Ca::load_or_init(&store, &key).unwrap();
+        let pin =
+            parse_fingerprint(&crate::ca::root_fingerprint(&store).unwrap().unwrap()).unwrap();
+        let server = pki(&ca, "pistack", vec!["127.0.0.1".into()], CertUsage::Server);
+        assert!(dial_pinned(&server, "127.0.0.1", pin).await);
+        // The right cloud, but not a certificate for the address dialled.
+        assert!(!dial_pinned(&server, "10.9.9.9", pin).await);
+        assert!(!dial_pinned(&server, "other.example", pin).await);
+        // Any other fingerprint.
+        let mut wrong = pin;
+        wrong[0] ^= 1;
+        assert!(!dial_pinned(&server, "127.0.0.1", wrong).await);
+
+        // Another cloud, with a certificate for the same address.
+        let other_store = Store::in_memory().unwrap();
+        let other_key = RootKey::load_or_create(&other_store).unwrap();
+        let other = Ca::load_or_init(&other_store, &other_key).unwrap();
+        let imposter = pki(
+            &other,
+            "pistack",
+            vec!["127.0.0.1".into()],
+            CertUsage::Server,
+        );
+        assert!(!dial_pinned(&imposter, "127.0.0.1", pin).await);
+        // It cannot borrow the real root either: its leaf does not chain
+        // to it.
+        let mut borrowed = imposter.clone();
+        borrowed.ca_pem = ca.bundle_pem();
+        assert!(!dial_pinned(&borrowed, "127.0.0.1", pin).await);
+        // A client certificate is no server certificate.
+        let client = pki(&ca, "agent-7", vec!["127.0.0.1".into()], CertUsage::Client);
+        assert!(!dial_pinned(&client, "127.0.0.1", pin).await);
+    }
+
+    #[test]
+    fn the_trust_bundle_and_the_names_are_read_without_the_root_key() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(crate::ca::trust_bundle(&store).unwrap(), None);
+        assert_eq!(crate::ca::root_fingerprint(&store).unwrap(), None);
+        let key = RootKey::load_or_create(&store).unwrap();
+        let ca = Ca::load_or_init(&store, &key).unwrap();
+        assert_eq!(
+            crate::ca::trust_bundle(&store).unwrap().as_deref(),
+            Some(ca.bundle_pem().as_str())
+        );
+        let print = crate::ca::root_fingerprint(&store).unwrap().unwrap();
+        let root = crate::ca::pem_to_der(&ca.root_pem()).unwrap();
+        assert_eq!(print, crate::crypto::sha256_hex(&root));
+
+        let sans = vec![
+            "10.0.0.11".to_string(),
+            "pistack".to_string(),
+            "fd00::11".to_string(),
+        ];
+        let server = pki(&ca, "pistack", sans.clone(), CertUsage::Server);
+        let der = crate::ca::pem_to_der(&server.cert_pem).unwrap();
+        assert_eq!(crate::ca::names_from_der(&der).unwrap(), sans);
     }
 
     #[tokio::test]

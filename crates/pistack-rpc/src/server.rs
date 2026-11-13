@@ -269,7 +269,7 @@ fn check_node_name(name: &str) -> ApiResult<()> {
 /// certificate with the node name as its common name, so a verified peer
 /// may only speak for that node. Without a verified peer (plain HTTP with
 /// `PISTACK_RPC_INSECURE=1`) there is nothing to bind and the name stands.
-fn check_peer_node(ext: &axum::http::Extensions, node: &str) -> ApiResult<()> {
+pub fn check_peer_node(ext: &axum::http::Extensions, node: &str) -> ApiResult<()> {
     let peer = ext
         .get::<ConnectInfo<PeerIdentity>>()
         .map(|c| &c.0)
@@ -398,15 +398,7 @@ async fn results(
 ) -> ApiResult<Json<ReportAck>> {
     check_node_name(&node)?;
     check_peer_node(&ext, &node)?;
-    let mut ack = ReportAck::default();
-    for r in results {
-        let id = r.id;
-        match q.ack(&node, r) {
-            Ok(()) => ack.accepted += 1,
-            Err(_) => ack.unknown.push(id),
-        }
-    }
-    Ok(Json(ack))
+    Ok(Json(q.ack_all(&node, results)))
 }
 
 #[cfg(test)]
@@ -655,6 +647,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .await
             .unwrap();
@@ -742,6 +735,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         };
         let ack: HeartbeatAck = http
             .post(format!("{base}/agents/heartbeat"))
@@ -813,6 +807,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         };
         let http = reqwest::Client::new();
 
@@ -895,6 +890,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .send()
             .await
@@ -927,6 +923,7 @@ mod tests {
                 machines: vec![],
                 at: Utc::now(),
                 ovn: None,
+                usage: None,
             })
             .await
             .unwrap();

@@ -81,6 +81,7 @@ pub async fn run(c: impl Controller, ctx: ModuleContext) {
                         },
                     }
                     if let Err(e) = c.reconcile_once().await {
+                        pistack_types::tally::reconcile_failed("loom");
                         tracing::warn!(controller = name, error = %e, "loom: reconcile pass failed");
                     }
                 }

@@ -33,12 +33,36 @@ pi machine create web --image ubuntu-24.04 --size m.2x4 --network app
 
 | Resource | Notes |
 | --- | --- |
-| Network | `--kind overlay` (default) or `--kind provider` with `--physnet` and optionally `--vlan`. `--external` marks a network that routers use as their gateway and that floating IPs come from. |
+| Network | `--kind overlay` (default) or `--kind provider` with `--physnet` and optionally `--vlan`. `--external` marks a network that routers use as their gateway and that floating IPs come from. `--auto-floating-ip` is described below. |
 | Subnet | A CIDR on a network, with a gateway, allocation pools, DNS servers and DHCP on by default. |
 | Port | An address on a network, bound to a machine. Created for you when a machine names a network. |
 | Router | Connects subnets to each other and to one external network. |
 | Security group | Rules by direction, protocol, port range and remote CIDR or group. |
 | Floating IP | An address on an external network mapped to a port. |
+
+## Automatic floating IPs
+
+A machine gets no floating IP unless someone asks. Creating an external network changes nothing for the machines that exist.
+
+An admin can mark one external network so that every machine with an IPv4 address gets a floating IP from it:
+
+```sh
+pi network create public --external --auto-floating-ip
+pi network set public --auto-floating-ip true     # an existing network
+pi network set public --auto-floating-ip false
+```
+
+- Only an admin can turn it on. Anyone who may edit the network can turn it off.
+- Only an external network can carry it, and only one network in the cloud at a time. Marking a second one is refused until the first is turned off.
+- It applies to machines in every project. The floating IP is created in the machine's project, named after the machine, labelled `pistack.io/auto-fip=true`, and deleted with the machine.
+- A machine labelled `pistack.io/auto-fip=false` gets none: `pi machine create ... --label pistack.io/auto-fip=false`. A project with that label opts out all its machines; a machine in it labelled `pistack.io/auto-fip=true` still gets one. Setting the label later removes the automatic floating IP the machine or project already had.
+- It counts against the project's `floating_ips` quota. When the quota is full, or the pool has no free address, the machine keeps running without a floating IP and carries a condition of type `FloatingIp` with the reason (`QuotaExceeded`, `PoolExhausted`) and the message. The condition goes away when the floating IP could be created. `pi machine show <name> -o json` shows it under `status.conditions`.
+- Turning the setting off stops new floating IPs. The ones already given stay until their machine is deleted or you delete them with `pi fip delete`.
+- A floating IP you create and associate yourself is never touched, and a machine that has one is not given a second.
+
+Upgrading from a build without the setting: until then a network named `fleet`, or the only external network, handed a floating IP to every machine. Those floating IPs stay in place and keep working. No new ones are created until you mark a network. The server logs one warning when it becomes leader while such floating IPs exist and no network is marked. Run `pi fip list` and look for the label to see them.
+
+## Scheduling
 
 A machine that names a network is only scheduled on a host that reported an underlay address. The mock host of `--dev` mode reports none, so in dev mode such a machine stays `pending`. A pod that names no network uses its project's network if there is exactly one; with several you must name one.
 
@@ -89,7 +113,7 @@ On every host:
 
 The helper keeps its state in `/var/lib/pistack/overlay`.
 
-Instance metadata (`169.254.169.254`) is redirected to port 18880 on the host's loopback, where the server's metadata service listens. On a host that does not also run a server nothing listens there, so metadata does not work on agent-only hosts as far as the code shows.
+Instance metadata (`169.254.169.254`) is redirected to port 18880 on the host's loopback, where the server's metadata service listens. On a host that does not also run a server nothing listens there, so metadata does not work on agent-only hosts as far as the code shows. The guest is recognised by its source address alone, so two networks with the same subnet are not told apart here; OVN, below, does tell them apart.
 
 ## ovn
 
@@ -102,8 +126,8 @@ The server writes OVN's northbound database directly. It does not run `ovn-nbctl
 
 What the server creates:
 
-- a logical switch per network, with a `localnet` port for provider networks,
-- DHCP options per subnet,
+- a logical switch per network, with a `localnet` port for provider networks and a `localport` for metadata,
+- DHCP options per subnet, with an on-link route to the metadata address,
 - a switch port per port, with port security,
 - logical routers with a gateway port, a default route and SNAT,
 - port groups and ACLs for security groups, with a default drop,
@@ -116,12 +140,64 @@ What you have to provide:
 - OVN central (northbound and southbound databases, `ovn-northd`) reachable from the leader.
 - Open vSwitch and `ovn-controller` on every host, registered as a chassis with its encapsulation address. PiStack does not set this up.
 
-What is missing on the host side:
+On the host, the agent plugs pod interfaces into `br-int` with `ovs-vsctl`, and libvirt plugs a virtual machine's interface as an Open vSwitch port.
 
-- The agent plugs pod interfaces into `br-int` with `ovs-vsctl`. The libvirt runtime does not, so virtual machines are not attached to OVN ports yet.
-- There is no metadata service on this backend.
+### Metadata on OVN
 
-Treat `ovn` as work in progress. The northbound side is in place; the host side is not.
+A guest on an OVN network asks `http://169.254.169.254/` as on the other backends. The path there is different, because OVN gives a guest no way to an address on its host.
+
+- Every logical switch has a port named `pimeta-<network uuid>` of type `localport` that holds `169.254.169.254`. A localport exists on every host, and its traffic never crosses a tunnel, so each host answers the guests it runs.
+- The guest reaches that address on its own link, with no gateway in between. A virtual machine takes its addresses from the seed disk, not from DHCP, so the route is written there: each interface on an OVN network gets `to: 169.254.169.254/32` with `scope: link` in the seed's network config, beside its default route. A pod gets the same route when the agent plugs it. A guest that does ask DHCP is offered it too (option 121 with router `0.0.0.0`, with the default route repeated, because a client that is given option 121 ignores the router option).
+- On each host, for each network that has a guest there, the agent keeps a network namespace named like the port, a veth pair from `br-int` into it, and a listener on `169.254.169.254:80` inside the namespace. Nothing listens on an address of the host.
+- The agent passes the request on to the server over its own connection, the one it uses for everything else. It says which network the namespace belongs to and which address the connection came from. The server answers only when a machine placed on that host holds that address on that network. Nothing the guest sends is trusted: its headers are not read, and only the path is passed on. Two projects with the same subnet get their own answers.
+- The agent looks at every heartbeat and before it starts a machine. A network that lost its last guest on the host loses the namespace, the port on `br-int` and the listener. Namespaces left by an agent that was restarted are adopted or removed the same way.
+- A security group cannot cut a guest off from metadata: the port group every secured port joins allows TCP port 80 to `169.254.169.254`.
+
+What it needs:
+
+- The agent runs as root, as the packaged unit does. It creates namespaces and opens a socket inside each. An agent that is not root logs once that guests on OVN networks get no metadata from that host.
+- A leader. The agent asks the leader, so while the cluster has none the guest gets `503`.
+- A virtual machine created before this was in place keeps the network config it was first booted with, and so has no route. Add it by hand in the guest: `ip route replace 169.254.169.254 dev <interface>`. That lasts until the guest restarts; a machine created again gets it from its seed.
+
+A virtual machine still gets its name, keys and user data from the seed disk at first boot and does not depend on this. Metadata is what serves secrets (`/latest/meta-data/secrets/<name>`), the floating IP (`/latest/meta-data/public-ipv4`) and anything in the guest that asks the address.
+
+This path is tested against stand-ins for `ip`, `ovs-vsctl` and the northbound database, not on hosts. To check it on a lab with two OVN hosts, as an admin:
+
+```sh
+pi host label <host-a> metacheck=a
+pi host label <host-b> metacheck=b
+pi network create meta-check
+pi subnet create meta-check4 --network meta-check --cidr 10.77.0.0/24
+pi machine create mc-a --image ubuntu-24.04 --size s.1x1 --network meta-check \
+    --ssh-key @$HOME/.ssh/id_ed25519.pub --host-selector metacheck=a --wait
+pi machine create mc-b --image ubuntu-24.04 --size s.1x1 --network meta-check \
+    --ssh-key @$HOME/.ssh/id_ed25519.pub --host-selector metacheck=b --wait
+```
+
+Use an image and a size you have. Then, on each host, with `<uuid>` the network id from `pi network show meta-check` without its `net-` prefix:
+
+```sh
+ip netns list | grep pimeta-<uuid>                      # the namespace is there
+ip netns exec pimeta-<uuid> ip -4 addr show meta0       # 169.254.169.254/32
+ip netns exec pimeta-<uuid> ip route                    # 10.77.0.0/24 dev meta0
+ip netns exec pimeta-<uuid> ss -ltn                     # 169.254.169.254:80
+ovs-vsctl --columns=name,external_ids find Interface external_ids:iface-id=pimeta-<uuid>
+ovn-sbctl --columns=logical_port,type find Port_Binding logical_port=pimeta-<uuid>   # type localport
+ss -ltn | grep 169.254.169.254                          # nothing: the host itself does not listen
+```
+
+and in each guest:
+
+```sh
+ip route get 169.254.169.254                 # dev <nic>, no "via"
+curl -s http://169.254.169.254/latest/meta-data/hostname      # mc-a in mc-a, mc-b in mc-b
+curl -s http://169.254.169.254/latest/meta-data/local-ipv4    # the guest's own 10.77.0.x
+curl -s http://169.254.169.254/latest/meta-data/public-keys/0/openssh-key   # the key given above
+curl -s -H 'X-Forwarded-For: <address of the other guest>' \
+    http://169.254.169.254/latest/meta-data/hostname          # still this guest's own name
+```
+
+Delete `mc-a`, wait one heartbeat (15 seconds unless configured otherwise), and `ip netns list` on host a no longer shows the namespace while host b still serves `mc-b`. If `ip route get` in the guest shows `via` the gateway, the guest did not take the on-link route; `cat /etc/netplan/50-cloud-init.yaml` shows what the seed gave it. Answers are the bare value, with no newline after it.
 
 ## Load balancers
 

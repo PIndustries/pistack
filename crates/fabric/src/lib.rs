@@ -12,7 +12,7 @@
 //! * [`overlay`] — the per-host VXLAN plan. It does not change the host.
 //! * [`Client`] — validation and writes; the library API other modules use.
 //! * `reconcile` — turns spec into backend state and writes status.
-//! * `machine` — one automatic floating IP per machine IPv4.
+//! * `machine` — automatic floating IPs, for a network marked to give them.
 //! * `api` — HTTP, mounted at `/network`.
 //!
 //! Other modules never touch fabric's collections directly; they call
@@ -135,6 +135,7 @@ impl Module for Fabric {
                         }
                         tracing::info!(backend = backend_name, "fabric: initial reconcile");
                         client.reconcile_all().await;
+                        note_unmarked_auto_fips(&client);
                         run_auto_fips(&client);
 
                         let mut rx = events.subscribe();
@@ -148,7 +149,8 @@ impl Module for Fabric {
                                 }
                                 ev = rx.recv() => match ev {
                                     Ok(ev) => {
-                                        if ev.kind == kind::MACHINE {
+                                        // A network event may be the mark going on.
+                                        if ev.kind == kind::MACHINE || ev.kind == kind::NETWORK {
                                             run_auto_fips(&client);
                                         }
                                         client.handle_event(&ev).await;
@@ -174,6 +176,22 @@ impl Module for Fabric {
                 .await;
         });
         Ok(())
+    }
+}
+
+/// Say once per term that floating IPs handed out before networks had to
+/// be marked are still there.
+fn note_unmarked_auto_fips(client: &Client) {
+    match client.auto_fips_without_a_network() {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(
+            count,
+            "fabric: automatic floating IPs exist but no external network has \
+             auto_floating_ip set. They stay in place and no new ones are created. \
+             Mark the network with `pi network set <name> --auto-floating-ip true`, \
+             or delete the ones you do not want."
+        ),
+        Err(e) => tracing::warn!(error = %e, "fabric: could not count automatic floating IPs"),
     }
 }
 

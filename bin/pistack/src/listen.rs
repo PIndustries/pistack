@@ -5,7 +5,10 @@
 //!
 //! Certificate files live in `data_dir/tls/`. When `cert.pem`, `key.pem`,
 //! and `ca.pem` are all present and non-empty they are reused. Otherwise
-//! `keep` issues a server certificate for CN `pistack`.
+//! `keep` issues a server certificate for CN `pistack`, valid for the
+//! listen address and for the host agents and other servers are told to
+//! call. A certificate the cloud CA issued that lacks one of those names
+//! is issued again; one from another CA is the operator's and is left.
 //!
 //! The TLS listener requests client certificates and verifies any that are
 //! offered against the cloud CA. Verified peer identity is published as
@@ -47,6 +50,9 @@ pub struct TlsListen {
     pub addr: String,
     pub data_dir: PathBuf,
     pub store: Store,
+    /// Hosts the certificate must be valid for besides the listen address:
+    /// the one in `--agent-url`, which is where other servers call too.
+    pub names: Vec<String>,
 }
 
 pub struct BoundListeners {
@@ -163,7 +169,7 @@ pub async fn bind_listeners(
     let http = http_listener.local_addr()?;
 
     let (tls_listener, tls_bound, store) = if let (Some(spec), Some(addr)) = (tls, tls_addr) {
-        let pki = load_or_issue(&spec.data_dir, &spec.store, addr.ip())?;
+        let pki = load_or_issue(&spec.data_dir, &spec.store, addr.ip(), &spec.names)?;
         let cfg = keep::tls::server_config_http(&pki).context("building rustls server config")?;
         let acceptor = TlsAcceptor::from(Arc::new(cfg));
         let tcp = TcpListener::bind(addr)
@@ -231,18 +237,87 @@ fn parse_tls_addr(addr: &str) -> anyhow::Result<SocketAddr> {
     Ok(sock)
 }
 
-fn load_or_issue(data_dir: &Path, store: &Store, ip: IpAddr) -> anyhow::Result<keep::Pki> {
+/// What a server certificate must be valid for: the address it listens on,
+/// the name `pistack`, and any host other machines are told to call.
+fn wanted_names(ip: IpAddr, extra: &[String]) -> Vec<String> {
+    let mut names = vec![ip.to_string(), "pistack".to_string()];
+    for name in extra {
+        let name = name.trim().trim_matches(|c| c == '[' || c == ']');
+        if !name.is_empty() && !names.iter().any(|have| have == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+/// Whether the certificate on disk can stay.
+#[derive(Debug, PartialEq, Eq)]
+enum Existing {
+    Keep,
+    /// Not issued by this cloud's CA. It is the operator's; other servers
+    /// and agents cannot check it.
+    Foreign,
+    /// Issued by this cloud's CA but not valid for these names.
+    Lacks(Vec<String>),
+}
+
+fn judge_existing(pki: &keep::Pki, store: &Store, want: &[String]) -> anyhow::Result<Existing> {
+    let Some(cloud_root) = keep::ca::root_fingerprint(store)? else {
+        return Ok(Existing::Keep);
+    };
+    let chain = keep::tls::certs_from_pem(&pki.ca_pem)?;
+    let ours = chain
+        .iter()
+        .any(|cert| keep::crypto::sha256_hex(cert.as_ref()) == cloud_root);
+    if !ours {
+        return Ok(Existing::Foreign);
+    }
+    let leaf = keep::ca::pem_to_der(&pki.cert_pem)?;
+    let have = keep::ca::names_from_der(&leaf)?;
+    let missing: Vec<String> = want
+        .iter()
+        .filter(|name| !have.contains(name))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        Ok(Existing::Keep)
+    } else {
+        Ok(Existing::Lacks(missing))
+    }
+}
+
+fn load_or_issue(
+    data_dir: &Path,
+    store: &Store,
+    ip: IpAddr,
+    extra: &[String],
+) -> anyhow::Result<keep::Pki> {
     let dir = data_dir.join("tls");
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     let ca_path = dir.join("ca.pem");
+    let sans = wanted_names(ip, extra);
     if let Some(pki) = read_existing(&cert_path, &key_path, &ca_path)? {
-        restrict_key(&key_path)?;
-        tracing::info!("reusing tls certificate files");
-        return Ok(pki);
+        match judge_existing(&pki, store, &sans).context("reading the tls certificate files")? {
+            Existing::Keep => {
+                restrict_key(&key_path)?;
+                tracing::info!("reusing tls certificate files");
+                return Ok(pki);
+            }
+            Existing::Foreign => {
+                restrict_key(&key_path)?;
+                tracing::warn!(
+                    "reusing tls certificate files that this cloud's CA did not issue: other servers and agents check this server against the cloud CA and will refuse it. Remove the tls directory to have one issued"
+                );
+                return Ok(pki);
+            }
+            Existing::Lacks(missing) => tracing::info!(
+                missing = %missing.join(", "),
+                "the tls certificate is not valid for every address this server is called at; issuing a new one"
+            ),
+        }
     }
     let client = keep::Client::open(store).context("opening keep for the server certificate")?;
-    let sans = vec![ip.to_string(), "pistack".to_string()];
     let pki = client
         .issue_server_cert("pistack", &sans)
         .context("issuing server certificate")?;
@@ -346,6 +421,7 @@ mod tests {
                 addr: "127.0.0.1:0".into(),
                 data_dir: data.clone(),
                 store,
+                names: Vec::new(),
             }),
         )
         .await
@@ -416,6 +492,7 @@ mod tests {
                 addr: "127.0.0.1:0".into(),
                 data_dir: data.clone(),
                 store: store.clone(),
+                names: Vec::new(),
             }),
         )
         .await
@@ -502,5 +579,64 @@ mod tests {
             .parse()
             .unwrap_or(0);
         (status, text)
+    }
+
+    fn names_on_disk(dir: &Path) -> Vec<String> {
+        let pem = std::fs::read_to_string(dir.join("tls/cert.pem")).unwrap();
+        keep::ca::names_from_der(&keep::ca::pem_to_der(&pem).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_certificate_is_valid_for_every_address_the_server_is_called_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        keep::Client::open(&store).unwrap();
+        let ip: IpAddr = "10.0.0.11".parse().unwrap();
+
+        load_or_issue(dir.path(), &store, ip, &[]).unwrap();
+        assert_eq!(names_on_disk(dir.path()), ["10.0.0.11", "pistack"]);
+        let first = std::fs::read_to_string(dir.path().join("tls/cert.pem")).unwrap();
+        // Nothing changed: the same file is used again.
+        load_or_issue(dir.path(), &store, ip, &[]).unwrap();
+        let again = std::fs::read_to_string(dir.path().join("tls/cert.pem")).unwrap();
+        assert_eq!(first, again);
+
+        // Started with --agent-url: the host in it is added.
+        let extra = ["cloud.example".to_string(), "10.0.0.11".to_string()];
+        load_or_issue(dir.path(), &store, ip, &extra).unwrap();
+        assert_eq!(
+            names_on_disk(dir.path()),
+            ["10.0.0.11", "pistack", "cloud.example"]
+        );
+        // Moved to another address: issued for that one.
+        let moved: IpAddr = "10.0.0.21".parse().unwrap();
+        load_or_issue(dir.path(), &store, moved, &[]).unwrap();
+        assert_eq!(names_on_disk(dir.path()), ["10.0.0.21", "pistack"]);
+    }
+
+    #[test]
+    fn a_certificate_from_another_ca_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = Store::in_memory().unwrap();
+        let ip: IpAddr = "10.0.0.11".parse().unwrap();
+        let theirs = keep::Client::open(&other)
+            .unwrap()
+            .issue_server_cert("console", &["console.example".to_string()])
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("tls")).unwrap();
+        std::fs::write(dir.path().join("tls/cert.pem"), &theirs.cert_pem).unwrap();
+        std::fs::write(dir.path().join("tls/key.pem"), &theirs.key_pem).unwrap();
+        std::fs::write(dir.path().join("tls/ca.pem"), &theirs.ca_pem).unwrap();
+
+        let store = Store::in_memory().unwrap();
+        keep::Client::open(&store).unwrap();
+        let want = wanted_names(ip, &[]);
+        assert_eq!(
+            judge_existing(&theirs, &store, &want).unwrap(),
+            Existing::Foreign
+        );
+        let used = load_or_issue(dir.path(), &store, ip, &[]).unwrap();
+        assert_eq!(used.cert_pem, theirs.cert_pem);
+        assert_eq!(names_on_disk(dir.path()), ["console.example"]);
     }
 }

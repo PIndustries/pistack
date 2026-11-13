@@ -116,6 +116,30 @@ pi quota set <PROJECT> <RES=N>...
 | `quota set` | `<PROJECT>` | Project (name or id) |
 | `quota set` | `<RES=N>...` | Limit `resource=N`; `resource=unlimited` removes it (repeatable) |
 
+## pi audit
+
+The audit log (admin).
+
+```text
+pi audit list
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `audit list` | `--since <TIME>` | Records from this time on: an RFC 3339 time, or an age such as 30m, 2h or 7d |
+| `audit list` | `--until <TIME>` | Records before this time, given like --since |
+| `audit list` | `--principal <WHO>` | Principal name or id |
+| `audit list` | `--in-project <PROJECT>` | Project name or id of the token that made the request |
+| `audit list` | `--action <ACTION>` | Action: create, update, delete, login, drain, update_quotas, ... |
+| `audit list` | `--kind <KIND>` | Resource kind as in the path: machines, bindings, hosts, ... |
+| `audit list` | `--resource <ID>` | Resource id or name, as the request gave it |
+| `audit list` | `--outcome <OUTCOME>` | `success`, `failure`, or one status code such as 403 |
+| `audit list` | `--limit <LIMIT>` | Most records to print [default: 100] |
+| `audit list` | `--after <ID>` | Continue after this record id (the last one of the page before) |
+| `audit list` | `--oldest-first` | Oldest first instead of newest first |
+
+Records print newest first. The filter is `--in-project` because `--project` is the global option that sets the scope of the request. See [Identity and access](Identity-and-access#audit) for what a record holds.
+
 ## pi user
 
 Users and service accounts.
@@ -214,6 +238,8 @@ pi join-token create <NAME>
 pi join-token delete <NAME>
 ```
 
+`create` prints the token once, and under it `ca sha256`, the fingerprint of the cloud's root CA. A new control-plane server is given both; see [Running a cluster](Running-a-cluster#adding-servers). An agent needs only the token.
+
 | Command | Argument or option | Meaning |
 | --- | --- | --- |
 | `join-token create` | `--multi-use` | Allow more than one redemption |
@@ -232,6 +258,7 @@ pi machine delete <NAME>
 pi machine start <NAME>
 pi machine stop <NAME>
 pi machine reboot <NAME>
+pi machine stats <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -251,6 +278,8 @@ pi machine reboot <NAME>
 | `machine start` | `--wait` |  |
 | `machine stop` | `--wait` |  |
 | `machine reboot` | `--wait` |  |
+
+`machine stats` prints the current value of each of the machine's usage series, and for a counter how fast it is rising. A machine that is off, or one whose runtime does not measure, has none. See [Metrics and alarms](Metrics-and-alarms).
 
 ## pi pod
 
@@ -302,6 +331,7 @@ Hosts (admin).
 ```text
 pi host list
 pi host show <NAME>
+pi host stats <NAME>
 pi host label <NAME> [K=V]...
 pi host disable <NAME>
 pi host enable <NAME>
@@ -318,6 +348,8 @@ pi host evacuate <NAME>
 | `host drain` | `--reason <REASON>` | Why, shown by `pi host show` |
 | `host evacuate` | `--rebuild-from-image` | Accept that every evacuated machine loses its root disk and starts again from its image. Without it no machine is moved |
 | `host evacuate` | `--confirm-dead` | The host is disabled but may still be reporting, and you know it is dead. If it is not, its machines will run twice until it reports |
+
+`host stats` prints what the host is using now: load, memory, its data disk and how many machines it holds. See [Metrics and alarms](Metrics-and-alarms).
 
 `host disable` stops new placements; the machines on the host keep running. `host drain` disables the host and live-migrates what it can. `host evacuate` is for a host that is down. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 
@@ -354,6 +386,7 @@ pi network list
 pi network show <NAME>
 pi network create <NAME>
 pi network delete <NAME>
+pi network set <NAME> --auto-floating-ip <BOOL>
 ```
 
 | Command | Argument or option | Meaning |
@@ -365,7 +398,10 @@ pi network delete <NAME>
 | `network create` | `--physnet <PHYSNET>` | Physical network name (provider networks) [default: physnet1] |
 | `network create` | `--mtu <MTU>` | [default: 1500] |
 | `network create` | `--external` | External network: routers get gateways and floating IPs here |
+| `network create` | `--auto-floating-ip` | Give every machine a floating IP from this network without being asked. Admin only; needs `--external`; one network at a time |
 | `network create` | `--dns-domain <DNS_DOMAIN>` |  |
+| `network set` | `<NAME>` | Name or id |
+| `network set` | `--auto-floating-ip <BOOL>` | Turn automatic floating IPs from this external network on or off. Turning it off leaves the floating IPs already given in place [possible values: true, false] |
 
 ## pi subnet
 
@@ -749,7 +785,7 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | Buckets | `/silo/buckets` |
 | Shares | `/shelf` |
 | Volume backups | `/volume/backups` |
-| Metrics and alarms | `/gauge` |
+| Alarms and posted samples | `/gauge` |
 
 ```sh
 pi api GET /dns/zones

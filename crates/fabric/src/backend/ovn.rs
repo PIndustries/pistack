@@ -32,6 +32,12 @@
 //!   port has no chassis, outbound NAT and floating IPs do not leave the
 //!   cluster, and a warning says so.
 //!
+//! * Metadata: every switch has one more port, `pimeta-<net uuid>`, of
+//!   `type=localport`, holding `169.254.169.254`. A localport exists on
+//!   every chassis and its traffic never crosses a tunnel, so each host
+//!   answers its own guests. DHCP hands guests an on-link route to that
+//!   address. The host end is the agent's work; see `anvil`'s `ovnmeta`.
+//!
 //! On each host, OVS and `ovn-controller` realise the switches. The agent
 //! plugs a machine's tap or a pod's link into the integration bridge with
 //! `external_ids:iface-id=<port uuid>`; the port binding below tells it which
@@ -66,6 +72,10 @@ pub const GATEWAY_CHASSIS_ENV: &str = "PISTACK_OVN_GATEWAY_CHASSIS";
 /// Most chassis one gateway port is scheduled on. OVN keeps a BFD session
 /// between every pair, so the list is kept short.
 pub const MAX_GATEWAY_CHASSIS: usize = 5;
+/// The address guests ask for metadata.
+pub const METADATA_ADDRESS: &str = "169.254.169.254";
+/// `external_ids` key marking a switch port as the network's metadata port.
+const METADATA_TAG: &str = "pistack:metadata";
 /// `external_ids` key marking a router port as the router's gateway.
 const GATEWAY_TAG: &str = "pistack:gateway";
 /// The cluster term, as the cluster saves it in the store.
@@ -778,6 +788,23 @@ fn provnet_name(net: &Id) -> String {
     format!("provnet-{net}")
 }
 
+/// Name of the network's metadata port. The agent on each host binds its
+/// end to the port by this name.
+pub fn metadata_port_name(net: &Id) -> String {
+    format!("pimeta-{}", net.uuid)
+}
+
+/// A stable locally administered MAC for the metadata port, from the
+/// random tail of the network id. `06:` keeps it clear of the `02:` MACs
+/// fabric gives guests and DHCP servers.
+pub fn metadata_port_mac(net: &Id) -> String {
+    let b = net.uuid.as_bytes();
+    format!(
+        "06:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
 fn by_name(name: &str) -> Vec<Value> {
     vec![eq("name", json!(name))]
 }
@@ -835,17 +862,20 @@ fn dhcp_options(net: &Network, subnet: &Subnet) -> Vec<(String, String)> {
             o.push(("dns_server".into(), dns));
         }
         o.push(("mtu".into(), net.spec.mtu.to_string()));
-        let mut routes: Vec<String> = s
-            .host_routes
-            .iter()
-            .map(|r| format!("{},{}", r.destination, r.nexthop))
-            .collect();
-        if !routes.is_empty() {
-            if let Some(gw) = s.gateway {
-                routes.push(format!("0.0.0.0/0,{gw}"));
-            }
-            o.push(("classless_static_route".into(), braces(routes)));
+        // Router 0.0.0.0 is an on-link route (RFC 3442): the metadata port
+        // sits on the guest's own segment, so this holds with or without a
+        // gateway. A client given this option ignores the router option,
+        // which is why the default route is repeated here.
+        let mut routes = vec![format!("{METADATA_ADDRESS}/32,0.0.0.0")];
+        routes.extend(
+            s.host_routes
+                .iter()
+                .map(|r| format!("{},{}", r.destination, r.nexthop)),
+        );
+        if let Some(gw) = s.gateway {
+            routes.push(format!("0.0.0.0/0,{gw}"));
         }
+        o.push(("classless_static_route".into(), braces(routes)));
     } else {
         o.push(("server_id".into(), mac));
         if let Some(dns) = dns {
@@ -871,7 +901,7 @@ fn pick_dhcp(rows: &[Value], ips: &[IpAddr], v4: bool) -> Vec<Value> {
 
 /// Every port with port security joins this group. Its ACLs drop all IP
 /// traffic both ways at a lower priority than group rules, and let DHCP
-/// requests out.
+/// requests and metadata requests out whatever the port's groups say.
 const DROP_GROUP: &str = "pg_pistack_drop";
 const DROP_PRIORITY: i64 = 1001;
 const RULE_PRIORITY: i64 = 1002;
@@ -1015,6 +1045,14 @@ fn drop_acls() -> Vec<Acl> {
             format!("inport == @{g} && udp && udp.src == 546 && udp.dst == 547"),
             "allow",
         ),
+        acl(
+            "from-lport",
+            RULE_PRIORITY,
+            format!(
+                "inport == @{g} && ip4 && ip4.dst == {METADATA_ADDRESS} && tcp && tcp.dst == 80"
+            ),
+            "allow-related",
+        ),
     ]
 }
 
@@ -1115,6 +1153,10 @@ impl NetBackend for OvnBackend {
     /// * `external` networks additionally get
     ///   `external_ids:pistack:external=true` so routers can find them.
     /// * `other_config:vlan-passthru` stays unset (no Q-in-Q).
+    /// * Every network: a `Logical_Switch_Port` named `pimeta-<net uuid>`
+    ///   with `type=localport`,
+    ///   `addresses=["<stable 06: mac> 169.254.169.254"]` and
+    ///   `external_ids:pistack:metadata=true`.
     async fn ensure_network(&self, net: &Network) -> ApiResult<()> {
         let id = &net.meta.id;
         let name = switch_name(id);
@@ -1138,7 +1180,7 @@ impl NetBackend for OvnBackend {
                 "addresses": "unknown",
                 "options": map([("network_name", physnet.as_str())]),
                 "tag": tag,
-                "external_ids": map(ext),
+                "external_ids": map(ext.clone()),
             });
             self.ensure_row(
                 "Logical_Switch_Port",
@@ -1148,6 +1190,21 @@ impl NetBackend for OvnBackend {
             )
             .await?;
         }
+        let meta = metadata_port_name(id);
+        ext.push((METADATA_TAG.into(), "true".into()));
+        let row = json!({
+            "name": meta,
+            "type": "localport",
+            "addresses": format!("{} {METADATA_ADDRESS}", metadata_port_mac(id)),
+            "external_ids": map(ext),
+        });
+        self.ensure_row(
+            "Logical_Switch_Port",
+            by_name(&meta),
+            row,
+            onto_switch(&name),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1169,8 +1226,10 @@ impl NetBackend for OvnBackend {
     ///   `options:lease_time = 43200`, `options:router = <gateway>`,
     ///   `options:dns_server = {<dns_nameservers>}`,
     ///   `options:mtu = <network mtu>`,
-    ///   `options:classless_static_route = {<host_routes>, 0.0.0.0/0,<gw>}`
-    ///   when there are host routes.
+    ///   `options:classless_static_route =
+    ///   {169.254.169.254/32,0.0.0.0, <host_routes>, 0.0.0.0/0,<gw>}`:
+    ///   metadata on-link, then the subnet's own routes, then the default
+    ///   route when there is a gateway.
     /// * IPv6: `options:server_id` is the server mac, `options:dns_server`
     ///   as above; no router option.
     /// * `external_ids:pistack:subnet = <subnet id>`,
@@ -1680,6 +1739,14 @@ mod tests {
         }
     }
 
+    /// Switch ports other than the metadata port every network has.
+    fn guest_ports(db: &FakeDb) -> Vec<Value> {
+        db.rows("Logical_Switch_Port")
+            .into_iter()
+            .filter(|r| r["type"] != "localport")
+            .collect()
+    }
+
     fn ext(row: &Value, key: &str) -> Option<String> {
         let ps = row["external_ids"][1].as_array()?;
         ps.iter()
@@ -1724,6 +1791,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_network_has_a_metadata_localport_on_its_switch() {
+        let (db, b) = backend();
+        let n = net(NetworkKind::Overlay);
+        let other = net(NetworkKind::Overlay);
+        b.ensure_network(&n).await.unwrap();
+        b.ensure_network(&other).await.unwrap();
+        let writes = db.writes();
+        b.ensure_network(&n).await.unwrap();
+        assert_eq!(db.writes(), writes, "a repeat must not write");
+
+        let name = metadata_port_name(&n.meta.id);
+        assert_eq!(name, format!("pimeta-{}", n.meta.id.uuid));
+        let port = named(&db, "Logical_Switch_Port", &name).unwrap();
+        assert_eq!(port["type"], "localport");
+        let mac = metadata_port_mac(&n.meta.id);
+        assert!(mac.starts_with("06:") && mac.len() == 17, "{mac}");
+        assert_eq!(
+            ovsdb::canon(&port["addresses"]),
+            json!(format!("{mac} 169.254.169.254"))
+        );
+        assert_eq!(ext(&port, "pistack:metadata").as_deref(), Some("true"));
+        assert_eq!(ext(&port, "pistack:id"), Some(n.meta.id.to_string()));
+        // On its own network's switch, and only there.
+        let ls = named(&db, "Logical_Switch", &format!("ps-{}", n.meta.id)).unwrap();
+        assert_eq!(ovsdb::elems(ls.get("ports")), vec![port["_uuid"].clone()]);
+        assert_ne!(mac, metadata_port_mac(&other.meta.id));
+        assert_eq!(db.rows("Logical_Switch_Port").len(), 2);
+
+        b.delete_network(&n.meta.id).await.unwrap();
+        assert!(named(&db, "Logical_Switch_Port", &name).is_none());
+        assert_eq!(db.rows("Logical_Switch_Port").len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_provider_network_gets_a_localnet_uplink_on_its_switch() {
         let (db, b) = backend();
         let n = net(NetworkKind::Provider {
@@ -1732,7 +1833,7 @@ mod tests {
         });
         b.ensure_network(&n).await.unwrap();
         b.ensure_network(&n).await.unwrap();
-        let lsp = db.rows("Logical_Switch_Port");
+        let lsp = guest_ports(&db);
         assert_eq!(lsp.len(), 1);
         assert_eq!(lsp[0]["name"], json!(format!("provnet-{}", n.meta.id)));
         assert_eq!(lsp[0]["type"], "localnet");
@@ -1742,10 +1843,9 @@ mod tests {
         );
         assert_eq!(ovsdb::canon(&lsp[0]["tag"]), json!(42));
         let ls = db.rows("Logical_Switch");
-        assert_eq!(
-            ovsdb::elems(ls[0].get("ports")),
-            vec![lsp[0]["_uuid"].clone()]
-        );
+        let on_switch = ovsdb::elems(ls[0].get("ports"));
+        assert_eq!(on_switch.len(), 2, "the uplink and the metadata port");
+        assert!(on_switch.contains(&lsp[0]["_uuid"]));
     }
 
     #[tokio::test]
@@ -1780,7 +1880,7 @@ mod tests {
         );
         assert_eq!(
             opt(&d[0], "options", "classless_static_route").as_deref(),
-            Some("{192.168.5.0/24,10.20.0.254, 0.0.0.0/0,10.20.0.1}")
+            Some("{169.254.169.254/32,0.0.0.0, 192.168.5.0/24,10.20.0.254, 0.0.0.0/0,10.20.0.1}")
         );
         assert!(opt(&d[0], "options", "server_mac")
             .unwrap()
@@ -1817,7 +1917,7 @@ mod tests {
         assert_eq!(binding.vif_details["bridge"], "br-int");
         assert_eq!(binding.vif_details["iface_id"], p.meta.id.uuid.to_string());
 
-        let lsp = db.rows("Logical_Switch_Port");
+        let lsp = guest_ports(&db);
         assert_eq!(lsp.len(), 1);
         let want = "fa:16:3e:00:00:01 10.20.0.5 fd00:20::5";
         // Bare UUID: libvirt refuses any other iface-id.
@@ -1844,10 +1944,11 @@ mod tests {
             uuid_of("fd00:20::/64")
         );
         let ls = db.rows("Logical_Switch");
-        assert_eq!(
-            ovsdb::elems(ls[0].get("ports")),
-            vec![lsp[0]["_uuid"].clone()]
-        );
+        let meta = named(&db, "Logical_Switch_Port", &metadata_port_name(&n.meta.id)).unwrap();
+        let on_switch = ovsdb::elems(ls[0].get("ports"));
+        assert_eq!(on_switch.len(), 2);
+        assert!(on_switch.contains(&lsp[0]["_uuid"]));
+        assert!(on_switch.contains(&meta["_uuid"]));
 
         let writes = db.writes();
         b.ensure_port(&n, &p, &[]).await.unwrap();
@@ -1856,14 +1957,17 @@ mod tests {
         let mut open = p.clone();
         open.spec.port_security = false;
         b.ensure_port(&n, &open, &[]).await.unwrap();
-        let lsp = db.rows("Logical_Switch_Port");
+        let lsp = guest_ports(&db);
         assert_eq!(ovsdb::canon(&lsp[0]["port_security"]), json!(["set", []]));
 
         b.delete_port(&p.meta.id).await.unwrap();
         b.delete_port(&p.meta.id).await.unwrap();
-        assert!(db.rows("Logical_Switch_Port").is_empty());
+        assert!(guest_ports(&db).is_empty());
         let ls = db.rows("Logical_Switch");
-        assert!(ovsdb::elems(ls[0].get("ports")).is_empty());
+        assert_eq!(
+            ovsdb::elems(ls[0].get("ports")),
+            vec![meta["_uuid"].clone()]
+        );
     }
 
     #[tokio::test]
@@ -2466,6 +2570,7 @@ mod tests {
             "to-lport 1001 drop outport == @pg_pistack_drop && ip".to_string(),
             "from-lport 1002 allow inport == @pg_pistack_drop && udp && udp.src == 68 && udp.dst == 67".to_string(),
             "from-lport 1002 allow inport == @pg_pistack_drop && udp && udp.src == 546 && udp.dst == 547".to_string(),
+            "from-lport 1002 allow-related inport == @pg_pistack_drop && ip4 && ip4.dst == 169.254.169.254 && tcp && tcp.dst == 80".to_string(),
         ];
         want.sort();
         assert_eq!(acl_matches(&db, "pg_pistack_drop"), want);

@@ -1483,6 +1483,7 @@ impl Controller for PodController {
                 self.converge(pod, &machines).await
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(pod = %pod.meta.id, error = %e, "loom: pod reconcile failed");
             }
         }

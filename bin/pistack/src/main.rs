@@ -7,6 +7,8 @@
 //! pistack server                 private address, no store: discover, adopt, or found
 //! pistack server --init          found a new cluster even if peers answer
 //! pistack server --join URL      adopt that control plane and skip discovery
+//!                                (https with PISTACK_JOIN_CA_SHA256, or
+//!                                plain http with --insecure-join)
 //! pistack server                 existing store: stay in that cluster and announce
 //! pistack agent  --join URL      a host (anvil)
 //! pistack store dump             inspect state
@@ -25,6 +27,7 @@ mod fabricchoice;
 mod gateway;
 mod keepcmd;
 mod listen;
+mod metrics;
 mod restore;
 mod server;
 
@@ -54,6 +57,14 @@ enum Cmd {
         /// Adopt an existing control plane. Skips discovery.
         #[arg(long, conflicts_with = "init")]
         join: Option<String>,
+        /// SHA-256 of the cloud's root CA certificate, as `pi join-token
+        /// create` prints it. Needed for the first join over https.
+        #[arg(long = "join-ca-sha256", env = "PISTACK_JOIN_CA_SHA256")]
+        join_ca: Option<String>,
+        /// Let the first join go over plain http: the join token and the
+        /// whole store cross the network in the clear.
+        #[arg(long, env = "PISTACK_INSECURE_JOIN")]
+        insecure_join: bool,
         /// Listen address. A private IPv4 address with no store discovers its /24.
         /// `0.0.0.0` does not discover.
         #[arg(long, env = "PISTACK_LISTEN", default_value = "0.0.0.0:8443")]
@@ -154,6 +165,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Server {
             init,
             join,
+            join_ca,
+            insecure_join,
             listen,
             public_url,
             insecure_http,
@@ -161,10 +174,12 @@ async fn main() -> anyhow::Result<()> {
             agent_url,
             dev,
         } => {
-            server::run(server::ServerOpts {
+            let stopped = server::run(server::ServerOpts {
                 data_dir: cli.data_dir,
                 init,
                 join,
+                join_ca,
+                insecure_join,
                 listen,
                 public_url,
                 insecure_http,
@@ -172,7 +187,11 @@ async fn main() -> anyhow::Result<()> {
                 agent_url,
                 dev,
             })
-            .await
+            .await?;
+            match stopped {
+                server::Stopped::Shutdown => Ok(()),
+                server::Stopped::Restart => Err(start_again()),
+            }
         }
         Cmd::Agent { join, token } => {
             anvil::run_agent(anvil::AgentOpts {
@@ -197,4 +216,27 @@ async fn main() -> anyhow::Result<()> {
             KeepCmd::Rewrap => keepcmd::rewrap(&cli.data_dir),
         },
     }
+}
+
+/// Replace this process with a new one given the same arguments. It returns
+/// only when that failed, and the error ends the process with a failure
+/// status so a service manager starts it instead.
+fn start_again() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    tracing::info!("starting again on the new store");
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            return anyhow::anyhow!(
+                "the store was replaced and the server must be started again; it could not find its own binary: {err}"
+            )
+        }
+    };
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow::anyhow!(
+        "the store was replaced and the server must be started again; running {} failed: {err}",
+        exe.display()
+    )
 }
