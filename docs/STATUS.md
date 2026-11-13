@@ -34,6 +34,7 @@ Found by the three-server lab run, fixes in open pull requests or in progress:
 Done
 - Create, delete, start, stop, reboot
 - Sizes (flavors)
+- Quota per project on machines, vCPUs, RAM and root disk
 - cloud-init user data and SSH keys on libvirt
 - Metadata service, EC2 layout, on overlay and hostnat
 - Live migration on libvirt (no CLI)
@@ -53,7 +54,7 @@ Partial
 - Host aggregates: labels and a host selector only; no aggregate resource
 - Drain: live-migrates running virtual machines on libvirt hosts; everything else is reported and left
 - Evacuate off a dead host: machines start elsewhere from their image without the root disk; RBD volumes follow, local ones do not; no fencing
-- Compute quota: machine count only; no vCPU, RAM, disk or GPU quota
+- Compute quota: no GPU limit; a pod's machine is counted but a pod is not refused
 - NIC hot-plug: the agent can do it, nothing on the server asks it to
 - Boot from volume: the flag is stored, no runtime boots from one
 - Root disk: one copy-on-write disk on libvirt; no extra ephemeral or swap disks
@@ -78,6 +79,7 @@ Done
 - qcow2 safety checks; URL import blocks internal addresses
 - Private, shared with a project, or public (sharing has no CLI)
 - sha256 checked on every host download
+- Quota per project on image count and stored bytes; the bytes are checked once an upload is in
 
 Partial
 - Minimum disk and RAM are stored and never checked
@@ -86,7 +88,6 @@ Partial
 
 Missing
 - Image signing
-- Image quotas
 - Image from volume
 
 ## Network
@@ -102,6 +103,7 @@ Done
 - Provider networks, flat and VLAN
 - Geneve or VXLAN on OVN; VXLAN on overlay
 - DHCP on OVN and overlay
+- Quota per project on networks, subnets, routers, security groups, ports and floating IPs
 - OVN gateway HA across chassis; distributed floating IPs
 
 Partial
@@ -110,7 +112,6 @@ Partial
 - Static routes: OVN only; no CLI
 - Instance DNS: only through a labelled zone; guests are not pointed at it
 - Shared networks: cloud-wide or private, nothing between
-- Network quota: ports and floating IPs only
 - Overlay routers live on one host with no failover
 - CLI has no `update` for any network resource
 
@@ -167,12 +168,12 @@ Done
 - Snapshots, clone and volume from snapshot on local, LVM and RBD
 - Volume from image
 - Volume types
+- Quota per project on volume count and gigabytes, snapshots, and backup count and gigabytes; extend is checked
 - Backup to object storage and restore (no CLI)
 - Backends: local file, LVM thin, Ceph RBD
 
 Partial
 - Extend works; an attached guest is not told the disk grew
-- Quota: volume count only; size, snapshot and backup limits are written but not switched on
 - LVM and RBD have only been run against stand-in scripts, never real Ceph or LVM
 
 In progress (PR 109)
@@ -200,6 +201,7 @@ Done
 Partial
 - S3 has no bucket calls, batch delete, range GET, list v1, virtual-host style or tagging
 - Versioning keeps old bytes but cannot list or fetch them
+- Quota: bucket count per project only; no limit on bytes
 - No CLI
 
 In progress (PR 110)
@@ -209,7 +211,6 @@ Missing
 - ACLs and bucket policies
 - Lifecycle and expiry
 - Erasure coding
-- Quotas
 - Static websites
 
 ## Shared filesystems
@@ -231,7 +232,7 @@ Done
 - Users, service accounts, projects, roles, role bindings
 - JWT tokens with expiry; API keys
 - argon2id passwords
-- Quota framework
+- Quota framework: limits per project, set by an admin, read with usage by members (`pi quota`)
 
 Partial
 - Roles: admin, member, reader only; custom roles grant nothing; the policy engine is built and unused
@@ -337,5 +338,5 @@ Missing
 
 1. Merge and prove PRs 109 and 110 on real Ceph and LVM. Fix what the three-server run found. Cut the first build.
 2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, durable command queue, evacuation.
-3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, full quotas, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, metadata on OVN, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
+3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, metadata on OVN, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
 4. Long tail, on request: GPU and passthrough, UEFI and vTPM, bare metal deploy, trunks, QoS, VPN, BGP, DNSSEC, erasure coding, regions, billing.
