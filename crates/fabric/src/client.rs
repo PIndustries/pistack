@@ -12,6 +12,7 @@
 use crate::backend::NetBackend;
 use crate::ipam;
 use crate::types::*;
+use crate::usage::{self, admitted, released};
 use ipnet::IpNet;
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Id, Meta};
@@ -164,7 +165,10 @@ impl Client {
             spec,
             status: NetworkStatus::default(),
         };
-        self.networks().create(net).map_err(store_err)
+        let project = net.meta.project.clone();
+        admitted(&self.store, project.as_ref(), usage::NETWORKS, || {
+            self.networks().create(net).map_err(store_err)
+        })
     }
 
     pub fn update_network(
@@ -208,7 +212,9 @@ impl Client {
             )));
         }
         let _ = net;
-        self.networks().delete(id).map_err(store_err)
+        let net = self.networks().delete(id).map_err(store_err)?;
+        released(&self.store, net.meta.project.as_ref(), usage::NETWORKS);
+        Ok(net)
     }
 
     // ---- subnets ----------------------------------------------------------
@@ -231,7 +237,10 @@ impl Client {
             spec,
             status: SubnetStatus::default(),
         };
-        self.subnets().create(sub).map_err(store_err)
+        let project = sub.meta.project.clone();
+        admitted(&self.store, project.as_ref(), usage::SUBNETS, || {
+            self.subnets().create(sub).map_err(store_err)
+        })
     }
 
     pub fn update_subnet(
@@ -282,7 +291,9 @@ impl Client {
                 return Err(ApiError::conflict(format!("subnet {id} still has {what}")));
             }
         }
-        self.subnets().delete(id).map_err(store_err)
+        let sub = self.subnets().delete(id).map_err(store_err)?;
+        released(&self.store, sub.meta.project.as_ref(), usage::SUBNETS);
+        Ok(sub)
     }
 
     // ---- ports ------------------------------------------------------------
@@ -365,19 +376,18 @@ impl Client {
 
         // Gateway and interface ports belong to the router, not the tenant quota.
         let counted = !is_router_device(&spec.device);
-        if counted {
-            crate::usage::admit_port(&self.store, meta.project.as_ref())?;
-        }
         let port = Port {
             meta,
             spec,
             status: PortStatus::default(),
         };
-        let port = self.ports().create(port).map_err(store_err)?;
-        if counted {
-            crate::usage::note_port_create(&self.store, port.meta.project.as_ref());
+        if !counted {
+            return self.ports().create(port).map_err(store_err);
         }
-        Ok(port)
+        let project = port.meta.project.clone();
+        admitted(&self.store, project.as_ref(), usage::PORTS, || {
+            self.ports().create(port).map_err(store_err)
+        })
     }
 
     pub fn update_port(
@@ -454,7 +464,7 @@ impl Client {
         let counted = !port.is_router_port();
         let port = self.ports().delete(&port.meta.id).map_err(store_err)?;
         if counted {
-            crate::usage::note_port_delete(&self.store, port.meta.project.as_ref());
+            released(&self.store, port.meta.project.as_ref(), usage::PORTS);
         }
         Ok(port)
     }
@@ -510,14 +520,18 @@ impl Client {
             interfaces: Vec::new(),
             ..spec
         };
-        let router = self
-            .routers()
-            .create(Router {
-                meta,
-                spec,
-                status: RouterStatus::default(),
-            })
-            .map_err(store_err)?;
+        let project = meta.project.clone();
+        // Only the row is stored under the lock. The ports below are made
+        // through create_port, which takes it for a counted port.
+        let router = admitted(&self.store, project.as_ref(), usage::ROUTERS, || {
+            self.routers()
+                .create(Router {
+                    meta,
+                    spec,
+                    status: RouterStatus::default(),
+                })
+                .map_err(store_err)
+        })?;
         let plumb = (|| -> ApiResult<Router> {
             if let Some(net) = &ext {
                 self.create_gateway_port(&router, net)?;
@@ -663,7 +677,9 @@ impl Client {
             self.delete_port_unchecked(&p)?;
         }
         let _ = router;
-        self.routers().delete(id).map_err(store_err)
+        let router = self.routers().delete(id).map_err(store_err)?;
+        released(&self.store, router.meta.project.as_ref(), usage::ROUTERS);
+        Ok(router)
     }
 
     fn external_network(&self, id: &Id) -> ApiResult<Network> {
@@ -716,13 +732,21 @@ impl Client {
     ) -> ApiResult<SecurityGroup> {
         meta.id = Id::new(kind::SECGROUP);
         self.validate_rules(&meta, &spec.rules, Some(&meta.id))?;
-        self.security_groups()
-            .create(SecurityGroup {
-                meta,
-                spec,
-                status: SecurityGroupStatus::default(),
-            })
-            .map_err(store_err)
+        let project = meta.project.clone();
+        admitted(
+            &self.store,
+            project.as_ref(),
+            usage::SECURITY_GROUPS,
+            || {
+                self.security_groups()
+                    .create(SecurityGroup {
+                        meta,
+                        spec,
+                        status: SecurityGroupStatus::default(),
+                    })
+                    .map_err(store_err)
+            },
+        )
     }
 
     pub fn update_security_group(
@@ -800,7 +824,13 @@ impl Client {
                 )));
             }
         }
-        self.security_groups().delete(id).map_err(store_err)
+        let sg = self.security_groups().delete(id).map_err(store_err)?;
+        released(
+            &self.store,
+            sg.meta.project.as_ref(),
+            usage::SECURITY_GROUPS,
+        );
+        Ok(sg)
     }
 
     fn validate_rules(&self, meta: &Meta, rules: &[Rule], self_id: Option<&Id>) -> ApiResult<()> {
@@ -951,17 +981,16 @@ impl Client {
         if let Some(p) = &spec.port {
             self.validate_fip_target(&meta, &meta.id, p)?;
         }
-        crate::usage::admit_floating_ip(&self.store, meta.project.as_ref())?;
-        let fip = self
-            .floating_ips()
-            .create(FloatingIp {
-                meta,
-                spec,
-                status: FloatingIpStatus::default(),
-            })
-            .map_err(store_err)?;
-        crate::usage::note_floating_ip_create(&self.store, fip.meta.project.as_ref());
-        Ok(fip)
+        let project = meta.project.clone();
+        admitted(&self.store, project.as_ref(), usage::FLOATING_IPS, || {
+            self.floating_ips()
+                .create(FloatingIp {
+                    meta,
+                    spec,
+                    status: FloatingIpStatus::default(),
+                })
+                .map_err(store_err)
+        })
     }
 
     /// Point the floating IP at a machine's current IPv4.
@@ -1093,7 +1122,7 @@ impl Client {
 
     pub fn delete_floating_ip(&self, id: &Id) -> ApiResult<FloatingIp> {
         let fip = self.floating_ips().delete(id).map_err(store_err)?;
-        crate::usage::note_floating_ip_delete(&self.store, fip.meta.project.as_ref());
+        released(&self.store, fip.meta.project.as_ref(), usage::FLOATING_IPS);
         Ok(fip)
     }
 
