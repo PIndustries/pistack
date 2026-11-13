@@ -83,6 +83,9 @@ pub fn build(
     // is not Authorization: a bearer that is not a gate token is rejected by
     // `attach_caller` below.
     let store = (*ctx.store::<pistack_store::Store>()).clone();
+    // Keyed commands record their ids here, so they keep them when this
+    // server restarts or another one takes the lead.
+    asm.queue.attach_store(store.clone());
     // The image download sits on the same transport and behind the same
     // checks: an agent has a client certificate, not a gate token.
     let images = agent_image_routes(mold::Client::new(store.clone(), asm.images.clone()));

@@ -113,14 +113,23 @@ impl RpcDriver {
         }
     }
 
+    /// Send one command and wait for the host's answer. With `machine`
+    /// the command is keyed by that machine: the reconciler issues it again
+    /// after a leader change, it keeps its id, and the host runs it once.
     async fn call<T: serde::Serialize>(
         &self,
+        machine: Option<&Id>,
         kind: CommandKind,
         payload: &T,
     ) -> ApiResult<serde_json::Value> {
         let payload =
             serde_json::to_value(payload).map_err(|e| ApiError::internal(e.to_string()))?;
-        let ticket = self.queue.enqueue(&self.node, kind, payload)?;
+        let ticket = match machine {
+            Some(id) => self
+                .queue
+                .enqueue_keyed(&self.node, &machine_key(id), kind, payload)?,
+            None => self.queue.enqueue(&self.node, kind, payload)?,
+        };
         // Timeouts, queue-full and node-removed all map to `unavailable`
         // through `From<RpcError>`; the reconciler retries next pass.
         let result = ticket.wait().await?;
@@ -157,7 +166,7 @@ impl HostDriver for RpcDriver {
             for (node, plan) in &plans {
                 if node == &self.node {
                     req.overlay = Some(plan.clone());
-                } else if let Err(e) = self.call(CommandKind::SyncOverlay, plan).await {
+                } else if let Err(e) = self.call(None, CommandKind::SyncOverlay, plan).await {
                     tracing::warn!(
                         node,
                         error = %e,
@@ -178,7 +187,9 @@ impl HostDriver for RpcDriver {
                 m.meta.id
             )));
         }
-        let v = self.call(CommandKind::StartMachine, &req).await?;
+        let v = self
+            .call(Some(&m.meta.id), CommandKind::StartMachine, &req)
+            .await?;
         let rt: RunningMachine = serde_json::from_value(v).map_err(|e| {
             ApiError::internal(format!(
                 "host {} returned a bad start result: {e}",
@@ -189,15 +200,23 @@ impl HostDriver for RpcDriver {
     }
 
     async fn stop(&self, id: &Id) -> ApiResult<()> {
-        self.call(CommandKind::StopMachine, &MachineRef { id: id.clone() })
-            .await
-            .map(|_| ())
+        self.call(
+            Some(id),
+            CommandKind::StopMachine,
+            &MachineRef { id: id.clone() },
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn delete(&self, id: &Id) -> ApiResult<()> {
-        self.call(CommandKind::DeleteMachine, &MachineRef { id: id.clone() })
-            .await
-            .map(|_| ())
+        self.call(
+            Some(id),
+            CommandKind::DeleteMachine,
+            &MachineRef { id: id.clone() },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Always `Ok(empty)`: there is no list command on the wire. The agent
@@ -206,6 +225,13 @@ impl HostDriver for RpcDriver {
     async fn list(&self) -> ApiResult<Vec<MachineRuntime>> {
         Ok(Vec::new())
     }
+}
+
+/// The queue key of the commands that start, stop and delete one machine.
+/// One key for the three: a host has one of them outstanding per machine,
+/// and a different one replaces it.
+pub fn machine_key(id: &Id) -> String {
+    format!("machine/{id}")
 }
 
 /// Catalog row, read as JSON so forge does not depend on mold.
