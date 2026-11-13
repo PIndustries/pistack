@@ -281,13 +281,18 @@ Missing
 ## Telemetry
 
 Done
-- Threshold alarms
+- Host usage from the agent: load, memory used, free space on the data directory (`pi host stats`)
+- Machine usage on libvirt: CPU time, memory, disk and network counters per device (`pi machine stats`)
+- Control-plane health: role, term, commit index, follower lag, reconcile failures per module, commands queued per host, store size
+- Prometheus endpoint `/metrics` with stable names and labels, behind a scrape token or a cloud admin's token
+- Threshold alarms on any series, a machine's or a host's included
 - Pod logs
 
 Partial
-- Metrics: host capacity only; no usage, nothing per machine
-- Storage: 10,000 samples in memory on one server
-- Prometheus endpoint gives the latest value only
+- History: none; a server keeps the last 60 points per series in memory and Prometheus keeps the rest
+- Host and machine series are on the leader only and start empty after a failover
+- Machine usage: libvirt only; nothing for containers, cloud-hypervisor or bare metal
+- Alarms: `for_seconds` is ignored; no CLI
 - Events exist in-process with no API
 
 Missing
