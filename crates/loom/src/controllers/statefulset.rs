@@ -410,6 +410,7 @@ impl Controller for StatefulSetController {
                 self.converge(sts, &pods, &vols)
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(sts = %sts.meta.id, error = %e, "loom: statefulset reconcile failed");
             }
         }

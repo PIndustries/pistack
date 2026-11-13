@@ -1495,6 +1495,7 @@ impl Client {
         e: ApiError,
         clear_ref: bool,
     ) -> ApiResult<Volume> {
+        pistack_types::tally::reconcile_failed("slab");
         tracing::warn!(volume = %id, op, error = %e, "volume reconcile failed");
         Ok(self.volumes().modify(id, |v| {
             v.status.phase = Phase::Error;
@@ -1574,6 +1575,7 @@ impl Client {
     }
 
     fn fail_snapshot(&self, id: &Id, op: &str, e: ApiError) -> ApiResult<Snapshot> {
+        pistack_types::tally::reconcile_failed("slab");
         tracing::warn!(snapshot = %id, op, error = %e, "snapshot reconcile failed");
         Ok(self.snapshots().modify(id, |s| {
             s.status.phase = Phase::Error;

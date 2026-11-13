@@ -251,6 +251,7 @@ impl Controller for CronJobController {
                 self.converge(cron, &jobs, now)
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(cron = %cron.meta.id, error = %e, "loom: cronjob reconcile failed");
             }
         }

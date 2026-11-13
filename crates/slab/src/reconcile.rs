@@ -49,9 +49,11 @@ pub async fn run(
                         }
                         _ = tick.tick() => {
                             if let Err(e) = client.reconcile_stale_attaches().await {
+                                pistack_types::tally::reconcile_failed("slab");
                                 tracing::warn!(error = %e, "slab: stale attach reconcile failed");
                             }
                             if let Err(e) = client.reattach_evacuated(None).await {
+                                pistack_types::tally::reconcile_failed("slab");
                                 tracing::warn!(error = %e, "slab: evacuated attach reconcile failed");
                             }
                         }
@@ -76,6 +78,7 @@ async fn handle(client: &Client, ev: Event) {
     if ev.action == EventAction::Deleted {
         if ev.kind == kind::MACHINE {
             if let Err(e) = client.reconcile_stale_attaches().await {
+                pistack_types::tally::reconcile_failed("slab");
                 tracing::warn!(
                     machine = %ev.id,
                     error = %e,
@@ -94,6 +97,7 @@ async fn handle(client: &Client, ev: Event) {
         _ => Ok(()),
     };
     if let Err(e) = res {
+        pistack_types::tally::reconcile_failed("slab");
         tracing::warn!(kind = %ev.kind, id = %ev.id, error = %e, "slab: reconcile failed");
     }
 }

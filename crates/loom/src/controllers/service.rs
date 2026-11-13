@@ -295,6 +295,7 @@ impl Controller for ServiceController {
                 r
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(svc = %svc.meta.id, error = %e, "loom: service reconcile failed");
             }
         }
