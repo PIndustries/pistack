@@ -99,6 +99,46 @@ pub fn rotated_at(store: &Store) -> Result<Option<DateTime<Utc>>> {
     Ok(store.get_meta::<DateTime<Utc>>(META_ROOT_KEY_ROTATED_AT)?)
 }
 
+/// How old the root key is, and what an operator does about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootKeyAge {
+    /// When the key in use, or its wrapping, was last replaced.
+    pub since: DateTime<Utc>,
+    /// The command that replaces it for this store's backend.
+    pub remedy: &'static str,
+}
+
+/// Since when the root key has been what it is. For a software key: its
+/// last rotation, or for one never rotated the creation of the root CA,
+/// which the first start makes right after the key. For a key wrapped by
+/// Vault: when it was last rewrapped, since the Transit key is what
+/// rotates there. `None` for a store with no key.
+pub fn root_key_age(store: &Store) -> Result<Option<RootKeyAge>> {
+    match root_key_state(store)? {
+        RootKeyState::Empty => Ok(None),
+        RootKeyState::Wrapped(w) | RootKeyState::Both(w) => Ok(Some(RootKeyAge {
+            since: w.rewrapped_at.unwrap_or(w.created_at),
+            remedy: "rotate the Transit key in Vault, then stop the server and run \
+                     `pistack keep rewrap`",
+        })),
+        RootKeyState::Software => {
+            let since = match rotated_at(store)? {
+                Some(at) => Some(at),
+                None => store
+                    .collection::<crate::types::CertificateAuthority>()
+                    .list(None)?
+                    .iter()
+                    .map(|ca| ca.meta.created_at)
+                    .min(),
+            };
+            Ok(since.map(|since| RootKeyAge {
+                since,
+                remedy: "stop the server and run `pistack keep rotate-root-key`",
+            }))
+        }
+    }
+}
+
 /// Move every sealed payload to a new root key, or finish a rotation an
 /// earlier run started. `new_key` is the key to move to; without one a
 /// random key is made. A rotation already started keeps the key it
@@ -394,6 +434,22 @@ mod tests {
         assert!(e.to_string().contains(&id.to_string()), "{e}");
         assert_eq!(key_in(&store), before);
         assert!(in_progress(&store).unwrap());
+    }
+
+    #[test]
+    fn the_age_of_the_root_key_counts_from_its_last_rotation() {
+        let store = Store::in_memory().unwrap();
+        assert!(root_key_age(&store).unwrap().is_none());
+        cloud(&store, 1);
+        // Never rotated: as old as the cloud's CA.
+        let made = root_key_age(&store).unwrap().unwrap();
+        assert!(made.since <= Utc::now());
+        assert!(made.remedy.contains("rotate-root-key"));
+        let before = Utc::now();
+        rotate_root_key(&store, None).unwrap();
+        let rotated = root_key_age(&store).unwrap().unwrap();
+        assert!(rotated.since >= before);
+        assert!(rotated.since >= made.since);
     }
 
     #[test]

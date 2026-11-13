@@ -44,7 +44,9 @@ pub struct SecretSpec {
     /// When the payload stops being valid. Informational; nothing deletes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
-    /// Rotation hint: how often the owner intends to rotate. `None` = never.
+    /// How often the owner means to replace the payload. Nothing rotates
+    /// it: once the payload is older than this the leader logs a warning
+    /// (`sweep.rs`). `None` or `0` = never.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotate_after_days: Option<u32>,
 }
