@@ -58,6 +58,7 @@ pub mod multipart;
 pub mod replica;
 pub mod s3;
 pub mod sigv4;
+pub mod staging;
 pub mod types;
 pub mod usage;
 

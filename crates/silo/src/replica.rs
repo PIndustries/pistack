@@ -32,9 +32,7 @@
 //!   the first one that answers has fetched and checked them. See
 //!   [`Peers::push`]. `[modules.silo] put_copies = 1` turns the wait off.
 //!
-//! What this does not do: multipart staging is not copied; an upload in
-//! flight when the leader changes has to start again. The finished object
-//! is copied like any other.
+//! Multipart staging is copied by [`crate::staging`].
 
 use crate::client::Client;
 use crate::types::{Bucket, Object};
@@ -167,7 +165,7 @@ impl Peers {
     pub async fn push(&self, obj: &Object, wanted: usize) -> ApiResult<()> {
         let urls = self.urls();
         let wanted = wanted.min(urls.len());
-        let wait = PUSH_BASE + Duration::from_secs(obj.status.size_bytes / (1024 * 1024));
+        let wait = push_wait(obj.status.size_bytes);
         let mut taken = 0;
         let mut last = String::new();
         for base in &urls {
@@ -180,15 +178,9 @@ impl Peers {
                 obj.meta.id,
                 obj.status.sha256
             );
-            let mut req = self.http.post(&url);
-            if let Some(key) = self.peer_key() {
-                req = req.header(keep::peer::PEER_HEADER, key);
-            }
-            match tokio::time::timeout(wait, req.send()).await {
-                Ok(Ok(resp)) if resp.status().is_success() => taken += 1,
-                Ok(Ok(resp)) => last = format!("{base}: status {}", resp.status().as_u16()),
-                Ok(Err(e)) => last = format!("{base}: {e}"),
-                Err(_) => last = format!("{base}: no answer in {}s", wait.as_secs()),
+            match self.post(&url, wait).await {
+                Ok(()) => taken += 1,
+                Err(e) => last = format!("{base}: {e}"),
             }
         }
         if taken >= wanted {
@@ -202,6 +194,38 @@ impl Peers {
             taken,
             urls.len()
         )))
+    }
+
+    /// POST to a peer with the peer key and wait up to `wait` for it to
+    /// say it is done.
+    pub(crate) async fn post(&self, url: &str, wait: Duration) -> Result<(), String> {
+        let mut req = self.http.post(url);
+        if let Some(key) = self.peer_key() {
+            req = req.header(keep::peer::PEER_HEADER, key);
+        }
+        match tokio::time::timeout(wait, req.send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() => Ok(()),
+            Ok(Ok(resp)) => Err(format!("status {}", resp.status().as_u16())),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("no answer in {}s", wait.as_secs())),
+        }
+    }
+
+    /// GET from a peer with the peer key. An answer that is not a success
+    /// is an error.
+    pub(crate) async fn get(&self, url: &str) -> Result<reqwest::Response, String> {
+        let mut req = self.http.get(url);
+        if let Some(key) = self.peer_key() {
+            req = req.header(keep::peer::PEER_HEADER, key);
+        }
+        let resp = tokio::time::timeout(STALL, req.send())
+            .await
+            .map_err(|_| "no answer".to_owned())?
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("status {}", resp.status().as_u16()));
+        }
+        Ok(resp)
     }
 
     /// Download the bytes with checksum `sha256` to `dest`.
@@ -296,6 +320,11 @@ impl Peers {
         guard.disarm();
         Ok(())
     }
+}
+
+/// How long a peer asked to copy `size` bytes is given.
+pub(crate) fn push_wait(size: u64) -> Duration {
+    PUSH_BASE + Duration::from_secs(size / (1024 * 1024))
 }
 
 fn http_client() -> reqwest::Client {
@@ -530,6 +559,15 @@ pub async fn run(
             ),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "silo: syncing object bytes failed"),
+        }
+        match crate::staging::sync(&client).await {
+            Ok(report) if report != crate::staging::StagedReport::default() => tracing::info!(
+                fetched = report.fetched,
+                removed = report.removed,
+                "silo: multipart staging synced with the other servers"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "silo: syncing multipart staging failed"),
         }
     }
 }

@@ -69,6 +69,10 @@ impl Client {
         self
     }
 
+    pub(crate) fn put_copies(&self) -> u32 {
+        self.put_copies
+    }
+
     pub fn peers(&self) -> Option<&crate::replica::Peers> {
         self.peers.as_ref()
     }
