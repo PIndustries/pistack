@@ -3,24 +3,28 @@
 
 //! Metrics and alarms.
 //!
-//! Samples are a ring on [`Gauge`] ([`MAX_SAMPLES`], oldest dropped). When a
-//! data directory is attached they are also written under
-//! `$PISTACK_DATA_DIR/gauge/samples.json` so a restart keeps the same points.
-//! Alarms are store resources. A posted sample re-evaluates alarms on that
-//! metric: the latest value either crosses the threshold
-//! ([`AlarmPhase::Firing`]) or it does not ([`AlarmPhase::Ok`]).
-//! `GET /metrics` is Prometheus text.
+//! Samples are kept per series in a short window in memory ([`SampleRing`]):
+//! enough for the API, `pi machine stats` and alarms. They are not written
+//! to disk and not replicated, so each server has its own window and a
+//! restart empties it. History is Prometheus's job: it scrapes `/metrics`.
+//!
+//! Alarms are store resources. Recording a sample re-evaluates the alarms
+//! whose metric selects its series: the alarm is [`AlarmPhase::Firing`]
+//! while any selected series crosses the threshold.
 //!
 //! Every `Gauge` value, including `Arc::new(gauge::Gauge)` in the server
-//! and a heartbeat in another crate, shares one process-wide sample ring.
+//! and a heartbeat in another crate, shares one process-wide window.
 
 pub mod api;
+pub mod catalog;
 pub mod client;
+pub mod series;
 pub mod store;
 pub mod types;
 
-pub use client::{record_host, Client};
-pub use store::{data_root, SampleRing, SAMPLES_FILE};
+pub use client::{Client, Stat};
+pub use series::{series, Series};
+pub use store::{Reading, SampleRing};
 pub use types::*;
 
 use async_trait::async_trait;
@@ -40,7 +44,7 @@ impl Gauge {
         Self
     }
 
-    /// The process-wide sample ring.
+    /// The process-wide samples.
     pub fn buffer(&self) -> Arc<SampleRing> {
         samples()
     }
@@ -48,17 +52,10 @@ impl Gauge {
     pub fn client(&self, store: Store) -> GaugeClient {
         GaugeClient::new(store, self.buffer())
     }
-
-    /// Ensure the process ring is attached to [`data_root`].
-    pub fn attach_disk(&self) {
-        if let Err(e) = samples().attach(data_root()) {
-            tracing::warn!(error = %e, "gauge: could not attach sample store");
-        }
-    }
 }
 
-/// One ring for the process. The server, `GET /metrics`, and host
-/// heartbeats all write here.
+/// One window for the process. The server, `/metrics` and host heartbeats
+/// all use it.
 pub fn samples() -> Arc<SampleRing> {
     static SAMPLES: OnceLock<Arc<Ring>> = OnceLock::new();
     SAMPLES.get_or_init(|| Arc::new(Ring::memory())).clone()
@@ -76,28 +73,24 @@ impl Module for Gauge {
     }
 
     fn router(&self, ctx: ModuleContext) -> Router {
-        self.attach_disk();
         let store = ctx.store::<Store>();
         api::router(self.client((*store).clone()))
-    }
-
-    async fn start(&self, _ctx: ModuleContext) -> anyhow::Result<()> {
-        self.attach_disk();
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use client::record_host;
 
     #[test]
-    fn two_gauge_values_share_one_ring() {
-        record_host(Gauge.buffer().as_ref(), "gauge-shared-ring", 7, 1);
+    fn two_gauge_values_share_one_window() {
+        let key = series(catalog::HOST_VCPUS, &[("host", "gauge-shared")]);
+        Gauge
+            .client(Store::in_memory().unwrap())
+            .record_all(vec![(key, 7.0)]);
         let text = Gauge::new()
             .client(Store::in_memory().unwrap())
             .metrics_text();
-        assert!(text.contains("node=\"gauge-shared-ring\""), "{text}");
+        assert!(text.contains("host=\"gauge-shared\""), "{text}");
     }
 }

@@ -31,6 +31,7 @@ mod overlay;
 mod ovn;
 pub mod reconcile;
 pub mod scheduler;
+pub mod stats;
 pub mod types;
 mod usage;
 

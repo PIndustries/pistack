@@ -711,11 +711,11 @@ impl Registrar {
         // `status.free` stays with the reconciler, which recomputes it from
         // placements every pass; the agent's figure is informational.
         // Capacity is the host total from hello, not `resources_free`.
-        gauge::record_host(
-            gauge::samples().as_ref(),
-            &host.spec.node_name,
-            host.spec.capacity.memory_mib,
-            host.spec.capacity.vcpus,
+        crate::stats::record_heartbeat(
+            &gauge::Gauge.client(self.store.clone()),
+            &self.store,
+            &host,
+            hb,
         );
         tracing::trace!(node = %hb.node_name, free = ?hb.resources_free, "forge: heartbeat");
         for r in &hb.machines {
@@ -1026,7 +1026,7 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 l.contains("pistack_host_memory_mib")
-                    && l.contains("node=\"h1\"")
+                    && l.contains("host=\"h1\"")
                     && (l.contains(" 16384") || l.contains(" 16384.0"))
             }),
             "{text}"
@@ -1034,7 +1034,7 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 l.contains("pistack_host_vcpus")
-                    && l.contains("node=\"h1\"")
+                    && l.contains("host=\"h1\"")
                     && (l.ends_with(" 16") || l.ends_with(" 16.0"))
             }),
             "{text}"
@@ -1053,7 +1053,7 @@ mod tests {
         assert_eq!(store.collection::<Host>().list(None).unwrap().len(), 1);
         let text = gauge::Gauge.client(store).metrics_text();
         assert!(
-            !text.lines().any(|l| l.contains("node=\"ghost\"")),
+            !text.lines().any(|l| l.contains("host=\"ghost\"")),
             "{text}"
         );
     }
