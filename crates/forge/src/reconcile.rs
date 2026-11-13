@@ -142,6 +142,7 @@ impl Reconciler {
                 if e.to_string() == "not the leader" {
                     tracing::debug!(error = %e, "forge: reconcile stopped; not the leader");
                 } else {
+                    pistack_types::tally::reconcile_failed("forge");
                     tracing::warn!(error = %e, "forge: reconcile pass failed");
                 }
             }
@@ -203,6 +204,7 @@ impl Reconciler {
                 if e.to_string() == "not the leader" {
                     tracing::debug!(machine = %id, error = %e, "forge: machine reconcile stopped; not the leader");
                 } else {
+                    pistack_types::tally::reconcile_failed("forge");
                     tracing::warn!(machine = %id, error = %e, "forge: machine reconcile failed");
                 }
             }

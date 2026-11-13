@@ -224,6 +224,7 @@ impl Controller for JobController {
                 self.converge(job, &pods, now)
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(job = %job.meta.id, error = %e, "loom: job reconcile failed");
             }
         }

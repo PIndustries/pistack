@@ -289,6 +289,7 @@ impl Controller for DaemonSetController {
                 self.converge(ds, &pods, &hosts)
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(ds = %ds.meta.id, error = %e, "loom: daemonset reconcile failed");
             }
         }

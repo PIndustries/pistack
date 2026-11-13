@@ -66,6 +66,7 @@ impl Module for Shelf {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
             if let Err(e) = realize::reconcile_due(&store).await {
+                pistack_types::tally::reconcile_failed("shelf");
                 tracing::warn!(error = %e, "shelf: initial reconcile failed");
             }
             loop {
@@ -78,6 +79,7 @@ impl Module for Shelf {
                     ev = rx.recv() => match ev {
                         Ok(ev) if ev.kind == kind::SHARE => {
                             if let Err(e) = realize::reconcile_due(&store).await {
+                                pistack_types::tally::reconcile_failed("shelf");
                                 tracing::warn!(error = %e, "shelf: reconcile failed");
                             }
                         }
@@ -85,6 +87,7 @@ impl Module for Shelf {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(missed = n, "shelf reconciler lagged");
                             if let Err(e) = realize::reconcile_due(&store).await {
+                                pistack_types::tally::reconcile_failed("shelf");
                                 tracing::warn!(error = %e, "shelf: reconcile failed");
                             }
                         }
