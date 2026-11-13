@@ -122,7 +122,8 @@ if [ "$units" -eq 1 ]; then
 Installed. Nothing is running yet.
 
   Control plane: set PISTACK_SERVER_ARGS in /etc/pistack/server.env
-                 (--init on the first node, --join URL on the others), then
+                 (--init on the first node; --join URL on the others, with
+                 PISTACK_JOIN_TOKEN and PISTACK_JOIN_CA_SHA256), then
                    systemctl enable --now pistack-server
   Host agent:    set PISTACK_JOIN in /etc/pistack/agent.env, then
                    systemctl enable --now pistack-agent
