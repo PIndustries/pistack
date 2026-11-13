@@ -98,7 +98,13 @@ Any server answers reads. A write sent to a server that is not the leader is not
 {"error":{"code":"conflict","message":"not the leader","details":{"leader":"http://10.0.0.12:8443"}}}
 ```
 
-`pi` does not follow that address by itself. Point `pi` at the leader (`pi cluster status` shows which server that is), or put a proxy in front of the servers that sends traffic to whichever one reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
+`pi` follows that address once: it sends the same request, with the same token, to the leader it was told about and says so on stderr.
+
+```text
+http://10.0.0.11:8443 is not the leader; sending the request to http://10.0.0.12:8443
+```
+
+It does this only when the leader's address has the same scheme as the one `pi` was given, so a token sent over `https` is never repeated over `http`; otherwise it prints the refusal. It does not remember the leader. To save the extra request, point `pi` at the leader (`pi cluster status` shows which server that is). Other clients have to follow the address themselves, or go through a proxy that sends traffic to whichever server reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
 
 Agents do follow. An agent that loses its server tries the other servers it knows and registers with the new leader. An agent that joined over HTTPS only ever moves to another HTTPS address: it logs and skips a plain one, so every server it should fail over to needs `--tls-listen`.
 
