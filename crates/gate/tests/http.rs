@@ -242,8 +242,8 @@ async fn admin_creates_project_and_user_and_user_is_scoped() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["engine"], "builtin-rbac");
 
-    // Alice cannot log in scoped to the admin project with any role... she
-    // can, but gets no roles there.
+    // Alice has no role in the admin project, so she gets no token for it.
+    // One with no roles would still read everything that project holds.
     let (s, v) = call(
         &app,
         "POST",
@@ -252,8 +252,14 @@ async fn admin_creates_project_and_user_and_user_is_scoped() {
         Some(json!({"name": "alice", "password": "pw-alice", "project": "admin"})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["caller"]["roles"], json!([]));
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no role in project"),
+        "{v}"
+    );
 
     // API keys: alice makes one, logs in with it, admin sees it, alice deletes it.
     let (s, k) = call(
@@ -562,13 +568,23 @@ async fn a_token_stops_working_when_what_it_stood_on_is_gone() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["roles"], json!(["member"]));
 
-    // The binding is removed: the token says so on the next request.
+    // The binding is removed: alice has no role in web any more, and the
+    // token for web is refused on the next request.
     let path = format!("/bindings/{}", binding["id"].as_str().unwrap());
     let (s, _) = call(&app, "DELETE", &path, Some(&admin), None).await;
     assert!(s.is_success(), "{s}");
-    let (s, v) = who(by_password.clone()).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["roles"], json!([]));
+    let (s, v) = who(by_password).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["error"]["message"], "token revoked");
+
+    // She can still log in. Her default project is one she has no role in,
+    // so the new token has no project.
+    let (s, v) = login(&app, "alice", "pw-alice").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["project"], Value::Null);
+    assert_eq!(v["caller"]["roles"], json!([]));
+    let by_password = v["token"].as_str().unwrap().to_owned();
+    assert_eq!(who(by_password.clone()).await.0, StatusCode::OK);
 
     // The user is disabled: the token is refused.
     let (_, alice) = call(&app, "GET", "/principals/alice", Some(&admin), None).await;

@@ -251,9 +251,19 @@ fn issue_login(
         (p, None, None)
     };
 
+    // A project that was asked for, or that a key names, must be one the
+    // principal has a role in: `caller_for` refuses it otherwise. A default
+    // project it has no role in is only a stale setting, and the token is
+    // issued without a project.
     let project = match req.project.as_deref() {
         Some(p) => Some(crate::resolve_project(store, p)?.meta.id),
-        None => key_project.or_else(|| principal.spec.default_project.clone()),
+        None => match key_project {
+            Some(p) => Some(p),
+            None => match principal.spec.default_project.clone() {
+                Some(p) if has_role_in(store, &principal, &p)? => Some(p),
+                _ => None,
+            },
+        },
     };
     let ttl = match req.ttl_secs {
         Some(s) if s <= 0 => return Err(ApiError::bad_request("ttl_secs must be positive")),
@@ -288,8 +298,26 @@ pub fn issue_token(
     })
 }
 
+/// Whether a principal may hold a token for `project`: it has a role
+/// bound in that project, or a role at system scope.
+pub fn has_role_in(store: &Store, principal: &Principal, project: &Id) -> ApiResult<bool> {
+    Ok(store
+        .collection::<RoleBinding>()
+        .list(None)?
+        .iter()
+        .filter(|b| b.spec.principal == principal.meta.id)
+        .any(|b| match &b.spec.scope {
+            Scope::System => true,
+            Scope::Project { project: p } => p == project,
+        }))
+}
+
 /// Build the `Caller` for a principal: system roles always apply; project
 /// roles apply when the token is scoped to that project.
+///
+/// A project the principal has no role in is refused. A caller with no
+/// role may still read what its project holds, so a token for such a
+/// project would let anyone with a password read any project.
 pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> ApiResult<Caller> {
     if let Some(p) = &project {
         let proj = store.collection::<Project>().get(p)?;
@@ -303,6 +331,7 @@ pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> 
     let bindings = store.collection::<RoleBinding>().list(None)?;
     let mut roles: Vec<String> = Vec::new();
     let mut system = false;
+    let mut bound = false;
     for b in bindings
         .iter()
         .filter(|b| b.spec.principal == principal.meta.id)
@@ -316,9 +345,20 @@ pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> 
             }
             Scope::Project { project: p } => project.as_ref() == Some(p),
         };
+        bound |= applies;
         if applies && !roles.contains(&b.spec.role) {
             roles.push(b.spec.role.clone());
         }
+    }
+    if let (Some(p), false) = (&project, bound) {
+        let name = store
+            .collection::<Project>()
+            .try_get(p)?
+            .map_or_else(|| p.to_string(), |proj| proj.meta.name);
+        return Err(ApiError::forbidden(format!(
+            "'{}' has no role in project '{name}'",
+            principal.meta.name
+        )));
     }
     roles.sort();
     Ok(Caller {
