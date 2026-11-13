@@ -28,6 +28,7 @@ struct Mock {
     execs: Arc<Mutex<Vec<Value>>>,
     /// Each server removed, and the `force` it was asked with.
     removals: Arc<Mutex<Vec<(String, bool)>>>,
+    quotas: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -312,6 +313,62 @@ async fn cluster_status(h: HeaderMap) -> axum::response::Response {
     .into_response()
 }
 
+/// The report gate answers with: every limit set, plus `vcpus` usage.
+fn quota_report(m: &Mock) -> Value {
+    let mut lines = serde_json::Map::new();
+    lines.insert("vcpus".into(), json!({"limit": null, "used": 6}));
+    lines.insert("volumes_gib".into(), json!({"limit": null, "used": 0}));
+    for (resource, limit) in m.quotas.lock().unwrap().iter() {
+        let used = lines[resource]["used"].clone();
+        lines.insert(resource.clone(), json!({"limit": limit, "used": used}));
+    }
+    json!({
+        "project": "proj-0199a5e0-2222-7000-8000-000000000002",
+        "name": "web",
+        "quotas": lines,
+    })
+}
+
+async fn show_quotas(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    if id != "web" {
+        return err(StatusCode::NOT_FOUND, "not_found", "project not found");
+    }
+    Json(quota_report(&m)).into_response()
+}
+
+async fn set_quotas(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !authed(&h) || id != "web" {
+        return err(StatusCode::NOT_FOUND, "not_found", "project not found");
+    }
+    for (resource, limit) in body["quotas"].as_object().unwrap() {
+        if resource != "vcpus" && resource != "volumes_gib" {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                &format!("unknown quota resource '{resource}'"),
+            );
+        }
+        let mut quotas = m.quotas.lock().unwrap();
+        match limit.as_u64() {
+            Some(n) => quotas.insert(resource.clone(), n),
+            None => quotas.remove(resource),
+        };
+    }
+    Json(quota_report(&m)).into_response()
+}
+
 async fn serve() -> (String, Mock) {
     let mock = Mock::default();
     let app = Router::new()
@@ -319,6 +376,10 @@ async fn serve() -> (String, Mock) {
         .route("/identity/tokens", post(login))
         .route("/identity/tokens/self", get(whoami))
         .route("/cluster", get(cluster_status))
+        .route(
+            "/identity/projects/{id}/quotas",
+            get(show_quotas).put(set_quotas),
+        )
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
         .route("/compute/machines/{id}/start", post(start))
@@ -1025,4 +1086,74 @@ async fn a_server_is_removed_by_id_prefix_or_address() {
         *mock.removals.lock().unwrap(),
         [("srv-d".to_owned(), false), ("srv-b".to_owned(), true)]
     );
+}
+
+#[tokio::test]
+async fn quota_set_then_show() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // Set two limits; the answer is the project's report.
+    let r = pi(
+        &cfg,
+        "",
+        &["quota", "set", "web", "vcpus=16", "volumes_gib=500"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(mock.quotas.lock().unwrap()["vcpus"], 16);
+    let lines: Vec<Vec<&str>> = r
+        .out
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[0], ["RESOURCE", "LIMIT", "USED"]);
+    assert_eq!(lines[1], ["vcpus", "16", "6"]);
+    assert_eq!(lines[2], ["volumes_gib", "500", "0"]);
+
+    // `unlimited` removes one and leaves the other.
+    let r = pi(&cfg, "", &["quota", "set", "web", "volumes_gib=unlimited"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!mock.quotas.lock().unwrap().contains_key("volumes_gib"));
+    assert_eq!(mock.quotas.lock().unwrap()["vcpus"], 16);
+
+    let r = pi(&cfg, "", &["quota", "show", "web"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<Vec<&str>> = r
+        .out
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[1], ["vcpus", "16", "6"]);
+    assert_eq!(lines[2], ["volumes_gib", "-", "0"]);
+
+    let r = pi(&cfg, "", &["quota", "show", "web", "-o", "json"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v["quotas"]["vcpus"], json!({"limit": 16, "used": 6}));
+
+    // The global project is the default.
+    let r = pi(&cfg, "", &["--project", "web", "quota", "show"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("vcpus"), "{}", r.out);
+
+    // The server names a resource it does not know.
+    let r = pi(&cfg, "", &["quota", "set", "web", "vcpu=4"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("unknown quota resource 'vcpu'"), "{}", r.err);
+
+    // Not a number, and nothing to set.
+    let r = pi(&cfg, "", &["quota", "set", "web", "vcpus=lots"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("not a number"), "{}", r.err);
+    let r = pi(&cfg, "", &["quota", "set", "web"]).await;
+    assert_eq!(r.code, 2, "{r:?}");
 }
