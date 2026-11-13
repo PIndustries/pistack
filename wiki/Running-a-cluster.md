@@ -20,6 +20,10 @@ After the first start, `--init` is no longer needed. A server that finds an exis
 
 The certificate is valid for the IP address in `--tls-listen`, for the name `pistack`, and for the host in `--agent-url` when that is given. A server started with another `--tls-listen` or `--agent-url` than its certificate covers issues itself a new one. Files in `<data_dir>/tls` that the cloud CA did not issue are yours and are used as they are; the server warns that other servers and agents will not accept them.
 
+The certificate is valid for 365 days and the server renews it while it runs. It looks at it a minute after start and then every hour. Once two thirds of the lifetime have passed it makes a new key, has the cloud CA certify it, replaces the files in `<data_dir>/tls` and presents the new certificate from the next connection on. The listener is not restarted and open connections are not cut. The leader issues the certificate itself. A follower asks the leader for it and proves it is a member with the cluster key, because only the leader writes the store. The leader does not need to have seen the follower's certificate before; it goes by the cloud CA's signature on it and issues one with the same names. If the leader cannot be reached the follower keeps its certificate and asks again ten minutes later.
+
+A certificate in `<data_dir>/tls` that the cloud CA did not sign, one you installed yourself, is used as it is and never replaced. Once it is two thirds through its lifetime the server logs a warning every ten minutes, and you replace the files and restart. A server that was stopped until its certificate expired presents the expired one when it starts and renews it at the first look, a minute later.
+
 Each server writes the address of its HTTPS listener into its member record, as `agent_api`. That is the address agents on HTTPS are given for it, in the list of servers and when a follower names the leader. It is also where the other servers call it; see [TLS between servers](#tls-between-servers). So the address has to reach that one server, not a balancer in front of several. `--agent-url` overrides it. A server restarted with a different `--tls-listen` has the record corrected within a few seconds, and one restarted without it has the address removed.
 
 Until this is finished, put the API on a private network.
@@ -309,6 +313,8 @@ A `pistack` that is older than the store refuses to open it, says which version 
 
 Take a backup before replacing the binary. A migrated store cannot be opened by the old binary again; going back means restoring that backup with the old binary.
 
+The key servers recognise each other with is kept in the store on its own. It used to be derived from the token signing secret, and a cloud upgraded from such a build keeps exactly the value it had, so servers on the old and the new build go on recognising each other while they are upgraded one at a time. Rotating the token signing keys does not change it. Upgrade every server before the first rotation; [Identity and access](Identity-and-access#upgrading-from-a-build-without-key-ids) says what breaks otherwise. There is no command to change this key.
+
 Each server migrates its own copy of the store. Servers do not compare schema versions with each other, so when a release raises the version, stop every server, replace the binary on all of them, and start them again. A binary from before the version was recorded does not check it at all.
 
 ## Looking at the store
@@ -334,12 +340,12 @@ pistack --data-dir /var/lib/pistack store dump
 | `node.name` | The node name, chosen once. `PISTACK_NODE_NAME` overrides and rewrites it. |
 | `adopt.url` | The join target, present only while a join is in progress. |
 | `state.partial` | A snapshot download in progress, for a join or for a store replacement. |
-| `tls/` | Certificate, key and CA for `--tls-listen`. |
-| `agent/` | The agent's certificate, on a machine that also runs an agent. |
-| `images/`, `volumes/`, `silo/`, `shares/` | Module data. See [Storage](Storage). |
+| `tls/` | Certificate, key and CA for `--tls-listen`. `tls/next/` exists only while a renewed set is being moved into place. |
+| `agent/` | The agent's certificate, on a machine that also runs an agent. `agent/next/` is the same for the agent. |
+| `images/`, `volumes/`, `silo/`, `shares/`, `gauge/` | Module data. See [Storage](Storage). |
 
 ## Settings that must match across servers
 
 The network backend is cluster-wide. The leader saves `PISTACK_FABRIC_BACKEND` in the store and servers started without the variable use the saved value. Set it the same way on every server, or set it on the first and leave it unset on the rest.
 
-The root-key backend (`PISTACK_KEEP_BACKEND` and the Vault settings) must be the same on every server. The `pistack keep` commands change one server's store and have to be run on each.
+The root-key backend (`PISTACK_KEEP_BACKEND` and the Vault settings) must be the same on every server. The `pistack keep` commands change one server's store and have to be run on each. `pistack keep rotate-root-key` also has to be given the same key file on each; see [Identity and access](Identity-and-access#rotating-the-root-key).
