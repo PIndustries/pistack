@@ -194,7 +194,7 @@ async fn serve() -> (String, Mock) {
             "name": "rack1",
             "labels": {"pistack.io/agent": "true", "rack": "r1"},
             "spec": {"node_name": "rack1", "drivers": ["kvm", "libvirt"]},
-            "status": {"phase": "ready"},
+            "status": {"phase": "ready", "cert_expires": "2027-11-13T00:00:00Z"},
         }))),
         writes: Default::default(),
     };
@@ -445,4 +445,27 @@ async fn host_evacuate_is_loud_about_lost_disks() {
         "machine \"db\" skipped: volume scratch is on local storage on this host and cannot follow the machine"
     );
     assert_eq!(lines[3], "1 evacuated, 1 skipped");
+}
+
+#[tokio::test]
+async fn host_list_wide_and_show_give_the_certificate_expiry() {
+    let (url, _mock) = serve().await;
+
+    let r = pi(&url, &["host", "list", "-o", "wide"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    let mut lines = r.out.lines();
+    assert!(lines.next().unwrap().contains("CERT-EXPIRES"), "{}", r.out);
+    assert!(
+        lines.next().unwrap().contains("2027-11-13T00:00:00Z"),
+        "{}",
+        r.out
+    );
+    // The plain list stays as it was.
+    let r = pi(&url, &["host", "list"]).await;
+    assert!(!r.out.contains("CERT-EXPIRES"), "{}", r.out);
+
+    let r = pi(&url, &["host", "show", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("cert_expires"), "{}", r.out);
+    assert!(r.out.contains("2027-11-13T00:00:00Z"), "{}", r.out);
 }

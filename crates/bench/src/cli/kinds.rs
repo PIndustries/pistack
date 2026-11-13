@@ -400,6 +400,7 @@ pub static KINDS: &[KindDef] = &[
             col!("LAST-SEEN", "/status/last_seen"),
         ],
         wide: &[
+            col!("CERT-EXPIRES", "/status/cert_expires"),
             col!("MESSAGE", "/status/message"),
             col!("FULL-ID", full_id),
             col!("LABELS", labels),
