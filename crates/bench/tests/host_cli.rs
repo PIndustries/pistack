@@ -127,6 +127,49 @@ async fn drain(
     }))
 }
 
+async fn evacuate(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    m.writes
+        .lock()
+        .unwrap()
+        .push((format!("/compute/hosts/{id}/evacuate"), body.clone()));
+    let host = m.host.lock().unwrap().clone();
+    if host["spec"]["disabled"] != json!(true) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": {"code": "conflict", "message": "host rack1 is up", "details": {}}})),
+        )
+            .into_response();
+    }
+    let pod = json!({
+        "id": "mach-0199a5e0-aaaa-7000-8000-000000000003",
+        "name": "db",
+        "reason": "volume scratch is on local storage on this host and cannot follow the machine",
+    });
+    if body["rebuild_from_image"] != json!(true) {
+        let web = json!({
+            "id": "mach-0199a5e0-aaaa-7000-8000-000000000002",
+            "name": "web",
+            "reason": "its root disk is on this host",
+        });
+        return Json(json!({"host": host, "evacuated": [], "skipped": [web, pod]})).into_response();
+    }
+    Json(json!({
+        "host": host,
+        "evacuated": [{
+            "id": "mach-0199a5e0-aaaa-7000-8000-000000000002",
+            "name": "web",
+            "rebuilt_from": "ubuntu-24.04",
+            "volumes": ["blocks"],
+        }],
+        "skipped": [pod],
+    }))
+    .into_response()
+}
+
 async fn create_machine(
     State(m): State<Mock>,
     Json(body): Json<Value>,
@@ -163,6 +206,7 @@ async fn serve() -> (String, Mock) {
         .route("/compute/hosts/{id}/disable", post(disable))
         .route("/compute/hosts/{id}/enable", post(enable))
         .route("/compute/hosts/{id}/drain", post(drain))
+        .route("/compute/hosts/{id}/evacuate", post(evacuate))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -339,4 +383,66 @@ async fn host_drain_lists_what_moves_and_what_stays() {
     assert_eq!(r.code, 0, "{}", r.err);
     let v: Value = serde_json::from_str(&r.out).unwrap();
     assert!(v["migrating"].is_array(), "{}", r.out);
+}
+
+#[tokio::test]
+async fn host_evacuate_is_loud_about_lost_disks() {
+    let (url, mock) = serve().await;
+
+    // The server's refusal for a host that is up is shown as it is.
+    let r = pi(&url, &["host", "evacuate", "rack1", "--rebuild-from-image"]).await;
+    assert_ne!(r.code, 0);
+    assert!(r.err.contains("host rack1 is up"), "{}", r.err);
+
+    let r = pi(&url, &["host", "disable", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+
+    // Without the flag nothing is evacuated and nothing is warned about.
+    let r = pi(&url, &["host", "evacuate", "rack1", "--confirm-dead"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(
+        mock.last_write().1,
+        json!({"confirm_dead": true, "rebuild_from_image": false})
+    );
+    assert!(!r.out.contains("WARNING"), "{}", r.out);
+    assert!(
+        r.out
+            .contains("machine \"web\" skipped: its root disk is on this host"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("0 evacuated, 2 skipped"), "{}", r.out);
+
+    let r = pi(
+        &url,
+        &[
+            "host",
+            "evacuate",
+            "rack1",
+            "--confirm-dead",
+            "--rebuild-from-image",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(
+        mock.last_write().1,
+        json!({"confirm_dead": true, "rebuild_from_image": true})
+    );
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 4, "{}", r.out);
+    assert!(
+        lines[0].starts_with("WARNING: ROOT DISKS ARE LOST."),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        lines[1],
+        "machine \"web\" evacuated: root disk lost, starts from image ubuntu-24.04; volumes plugged back in when it runs: blocks"
+    );
+    assert_eq!(
+        lines[2],
+        "machine \"db\" skipped: volume scratch is on local storage on this host and cannot follow the machine"
+    );
+    assert_eq!(lines[3], "1 evacuated, 1 skipped");
 }
