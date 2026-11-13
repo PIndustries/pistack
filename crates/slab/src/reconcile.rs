@@ -36,6 +36,7 @@ pub async fn run(
                 if let Err(e) = client.reconcile_all().await {
                     tracing::warn!(error = %e, "slab: initial resync failed");
                 }
+                resume_attaches(&client);
                 let mut events = events.subscribe();
                 let mut tick = tokio::time::interval(STALE_ATTACH_EVERY);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -54,6 +55,7 @@ pub async fn run(
                             if let Err(e) = client.reattach_evacuated(None).await {
                                 tracing::warn!(error = %e, "slab: evacuated attach reconcile failed");
                             }
+                            resume_attaches(&client);
                         }
                         ev = events.recv() => match ev {
                             Ok(ev) => handle(&client, ev).await,
@@ -70,6 +72,19 @@ pub async fn run(
             }
         })
         .await;
+}
+
+/// Finish attaches an earlier leader left unfinished. On its own task: the
+/// host may take as long as a command timeout to answer, and volumes must
+/// keep being reconciled meanwhile. A volume already being finished is
+/// skipped, so starting this again on the next tick is safe.
+fn resume_attaches(client: &Client) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = client.resume_attaches().await {
+            tracing::warn!(error = %e, "slab: unfinished attaches were not resumed");
+        }
+    });
 }
 
 async fn handle(client: &Client, ev: Event) {

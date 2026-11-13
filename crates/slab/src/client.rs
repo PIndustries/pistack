@@ -16,9 +16,9 @@ use pistack_types::{ApiError, ApiResult, Id, Meta, Phase};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use silo::multipart::{CompletedPart, MAX_PART_NUMBER};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -111,6 +111,57 @@ pub struct Client {
     /// Test seam. After this many parts land, the upload returns an error
     /// and the multipart upload is aborted. `None` disables it.
     backup_fail_after_parts: Option<u32>,
+    /// Volumes with an attach under way in this process.
+    attaching: Arc<Mutex<BTreeSet<Id>>>,
+}
+
+/// Marks one volume as having an attach under way here, until dropped.
+struct InFlight {
+    set: Arc<Mutex<BTreeSet<Id>>>,
+    id: Option<Id>,
+}
+
+impl InFlight {
+    /// Mark `id`. When it is marked already the guard is empty, and
+    /// dropping it leaves the first mark in place.
+    fn enter(set: &Arc<Mutex<BTreeSet<Id>>>, id: &Id) -> Self {
+        let fresh = lock_set(set).insert(id.clone());
+        Self {
+            set: set.clone(),
+            id: fresh.then(|| id.clone()),
+        }
+    }
+
+    /// Mark `id`, or `None` when it is marked already.
+    fn try_enter(set: &Arc<Mutex<BTreeSet<Id>>>, id: &Id) -> Option<Self> {
+        let guard = Self::enter(set, id);
+        guard.id.is_some().then_some(guard)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(id) = &self.id {
+            lock_set(&self.set).remove(id);
+        }
+    }
+}
+
+fn lock_set(set: &Mutex<BTreeSet<Id>>) -> std::sync::MutexGuard<'_, BTreeSet<Id>> {
+    set.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The queue key of the commands that attach and detach one volume.
+pub fn volume_key(id: &Id) -> String {
+    format!("volume/{id}")
+}
+
+/// Whether the volume is claimed for an attach the host has not confirmed.
+fn attaching(vol: &Volume) -> bool {
+    vol.status
+        .conditions
+        .iter()
+        .any(|c| c.kind == "Attached" && !c.status && c.reason == "Attaching")
 }
 
 /// Host path and optional network target for one attach or detach.
@@ -279,6 +330,7 @@ impl Client {
             max_object_bytes: silo::MAX_OBJECT_BYTES,
             min_part_bytes: silo::MIN_PART_BYTES,
             backup_fail_after_parts: None,
+            attaching: Arc::default(),
         }
     }
 
@@ -810,10 +862,23 @@ impl Client {
         machine: &Id,
         device: Option<String>,
     ) -> ApiResult<Volume> {
+        // Held from before the claim is written, so the reconciler does not
+        // take this attach for one a dead leader left behind.
+        let _mine = InFlight::enter(&self.attaching, id);
         let pending = self.begin_attach(id, machine, device.clone())?;
         if condition_holds(&pending, "Attached") || !self.has_queue() {
             return Ok(pending);
         }
+        self.finish_attach(id, machine, device).await
+    }
+
+    /// Ask the host, then record what it answered.
+    async fn finish_attach(
+        &self,
+        id: &Id,
+        machine: &Id,
+        device: Option<String>,
+    ) -> ApiResult<Volume> {
         match self.plug_volume(id, machine, device).await {
             Ok(done) => self.confirm_from_agent(id, machine, done),
             Err(err) => {
@@ -848,7 +913,8 @@ impl Client {
         let volume_type = self.get_volume_type(&vol.spec.volume_type)?;
         req.fs_type = fs_type_param(&volume_type.spec.params);
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
-        let ticket = queue.enqueue(&node, CommandKind::AttachVolume, payload)?;
+        let ticket =
+            queue.enqueue_keyed(&node, &volume_key(id), CommandKind::AttachVolume, payload)?;
         serde_json::from_value(ticket.wait().await?.into_api_result()?)
             .map_err(|e| ApiError::internal(format!("host returned a bad attach result: {e}")))
     }
@@ -873,7 +939,8 @@ impl Client {
             .await?;
         let req = queue_detach(machine.clone(), id.clone(), device, &info)?;
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
-        let ticket = queue.enqueue(&node, CommandKind::DetachVolume, payload)?;
+        let ticket =
+            queue.enqueue_keyed(&node, &volume_key(id), CommandKind::DetachVolume, payload)?;
         ticket.wait().await?.into_api_result()?;
         Ok(())
     }
@@ -1699,6 +1766,41 @@ impl Client {
         Ok(())
     }
 
+    /// Finish attaches that were under way when the leader changed.
+    ///
+    /// An attach is claimed in the store (`Attaching`) before the host is
+    /// asked, by the request that started it. If that server stops, the
+    /// request is gone and nothing else would ever ask the host or clear
+    /// the claim. A volume that is `Attaching` with no request for it in
+    /// this process is such a leftover: the host is asked again. The
+    /// command keeps the id it had, so a host that already plugged the disk
+    /// answers with that result and does not plug it twice. A failure
+    /// clears the claim, as it does for the request.
+    pub async fn resume_attaches(&self) -> ApiResult<()> {
+        if !self.has_queue() {
+            return Ok(());
+        }
+        for vol in self.volumes().list(None)? {
+            let Some(machine) = vol.status.attached_to.clone() else {
+                continue;
+            };
+            if !attaching(&vol) {
+                continue;
+            }
+            let Some(_mine) = InFlight::try_enter(&self.attaching, &vol.meta.id) else {
+                continue;
+            };
+            tracing::info!(volume = %vol.meta.id, machine = %machine, "slab: finishing an attach left unfinished");
+            if let Err(e) = self
+                .finish_attach(&vol.meta.id, &machine, vol.status.device.clone())
+                .await
+            {
+                tracing::warn!(volume = %vol.meta.id, machine = %machine, error = %e, "slab: the unfinished attach failed");
+            }
+        }
+        Ok(())
+    }
+
     /// Drop attaches whose machine record is gone.
     ///
     /// An RBD host map on a live agent is unmapped first. When the agent or
@@ -1839,7 +1941,12 @@ impl Client {
         let req = self.stale_detach_request(vol, machine, node).await?;
         let payload = serde_json::to_value(&req).map_err(|e| ApiError::internal(e.to_string()))?;
         let ticket = queue
-            .enqueue(node, CommandKind::DetachVolume, payload)
+            .enqueue_keyed(
+                node,
+                &volume_key(&vol.meta.id),
+                CommandKind::DetachVolume,
+                payload,
+            )
             .map_err(ApiError::from)?;
         ticket
             .wait()
