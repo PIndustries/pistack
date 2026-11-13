@@ -134,6 +134,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: HostCmd,
     },
+    /// The control-plane servers (admin).
+    Cluster {
+        #[command(subcommand)]
+        cmd: ClusterCmd,
+    },
     /// Networks.
     Network {
         #[command(subcommand)]
@@ -596,6 +601,12 @@ pub enum HostCmd {
     /// Show a host.
     #[command(alias = "get")]
     Show(NameArg),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClusterCmd {
+    /// Show each server, its role and which one leads.
+    Status,
 }
 
 // ---- network -----------------------------------------------------------------

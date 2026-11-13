@@ -39,20 +39,37 @@ Cluster traffic between servers uses the same API port, under `/cluster`. Those 
 
 `PISTACK_REQUIRE_JOIN=0` opens the routes to anything that reaches the port. Servers older than this check send no key, so replacing them one at a time stops replication between old and new; set `PISTACK_REQUIRE_JOIN=0` on every server for that one upgrade, then take it out.
 
-`GET /cluster` on any server shows what it believes:
+`GET /cluster` is the one cluster route that also answers a cloud admin's token, so you can see what a server believes. `pi cluster status` prints it:
 
 ```sh
-curl -s http://10.0.0.11:8443/cluster
+pi --url http://10.0.0.11:8443 cluster status
+```
+
+```text
+SERVER                                ROLE   LEADER  API                    AGENT API
+019a7c1e-5f0a-7d31-9c55-1b0e8f6a2d10  voter  yes     http://10.0.0.11:8443  https://10.0.0.11:8444
+019a7c1e-9a44-7b02-8e17-6c3d2a9f4b71  voter          http://10.0.0.12:8443  https://10.0.0.12:8444
+019a7c1f-02be-7a90-b6d3-0f4e7c8a1e52  voter          http://10.0.0.13:8443  https://10.0.0.13:8444
+```
+
+The answer is that one server's view. Ask each server when they might disagree. `AGENT API` is empty for a server started without `--tls-listen`.
+
+`pi cluster status -o json`, or `pi api GET /cluster`, prints the whole answer. With `curl`, send an admin token:
+
+```sh
+curl -s -H "Authorization: Bearer $PI_TOKEN" http://10.0.0.11:8443/cluster
 ```
 
 ```json
 {"cluster_id":"...","node_id":"...","api":"http://10.0.0.11:8443",
- "leader_api":"http://10.0.0.11:8443","role":"Voter","leader":true,
- "members":[{"id":"...","api":"http://10.0.0.11:8443","role":"Voter"},
-            {"id":"...","api":"http://10.0.0.12:8443","role":"Voter"},
-            {"id":"...","api":"http://10.0.0.13:8443","role":"Voter"}],
+ "leader_api":"http://10.0.0.11:8443","leader_id":"...","role":"Voter","leader":true,
+ "members":[{"id":"...","api":"http://10.0.0.11:8443","role":"Voter","agent_api":"https://10.0.0.11:8444"},
+            {"id":"...","api":"http://10.0.0.12:8443","role":"Voter","agent_api":"https://10.0.0.12:8444"},
+            {"id":"...","api":"http://10.0.0.13:8443","role":"Voter","agent_api":"https://10.0.0.13:8444"}],
  "term":1,"commit":74}
 ```
+
+Without a token the answer is `401`, and a token that is not a cloud admin's gets `403`.
 
 ## Learners and voters
 
@@ -81,7 +98,7 @@ Any server answers reads. A write sent to a server that is not the leader is not
 {"error":{"code":"conflict","message":"not the leader","details":{"leader":"http://10.0.0.12:8443"}}}
 ```
 
-`pi` does not follow that address by itself. Point `pi` at the leader, or put a proxy in front of the servers that sends traffic to whichever one reports `"leader": true` on `/cluster`.
+`pi` does not follow that address by itself. Point `pi` at the leader (`pi cluster status` shows which server that is), or put a proxy in front of the servers that sends traffic to whichever one reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
 
 Agents do follow. An agent that loses its server tries the other servers it knows and registers with the new leader. An agent that joined over HTTPS only ever moves to another HTTPS address: it logs and skips a plain one, so every server it should fail over to needs `--tls-listen`.
 

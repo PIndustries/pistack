@@ -288,6 +288,16 @@ pi host list
 pi host show <NAME>
 ```
 
+## pi cluster
+
+The control-plane servers (admin).
+
+```text
+pi cluster status
+```
+
+`status` asks the server `pi` is pointed at and prints each server's id, its role, which one leads, and the addresses clients and agents use for it.
+
 ## pi network
 
 Networks.

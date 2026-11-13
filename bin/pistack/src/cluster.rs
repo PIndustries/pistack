@@ -45,7 +45,7 @@ use pistack_cluster::{
 };
 use pistack_rpc::{JOIN_HEADER, REQUIRE_JOIN_ENV};
 use pistack_store::{LogEntry, Store};
-use pistack_types::{ApiError, Leadership};
+use pistack_types::{ApiError, Caller, Leadership};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -737,9 +737,11 @@ fn fresh_leader(handle: &ClusterHandle) -> Option<String> {
 
 async fn show(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
+    caller: Option<axum::Extension<Caller>>,
     headers: HeaderMap,
 ) -> Result<Json<ClusterStatus>, ApiError> {
-    enforce_peer(&handle.store, &headers)?;
+    let caller = caller.as_ref().map(|axum::Extension(caller)| caller);
+    may_read_status(&handle.store, &headers, caller, peer_auth())?;
     let members = members_of(&handle.store)?;
     Ok(Json(status_of(&handle, &members)?))
 }
@@ -1867,6 +1869,29 @@ fn enforce_peer_with(store: &Store, headers: &HeaderMap, auth: PeerAuth) -> Resu
     keep::authorize_join_token(store, token)
         .map(|_| ())
         .map_err(ApiError::from)
+}
+
+/// Who may read `GET /cluster`: a member or a server with a join token, as
+/// on every cluster route, and a cloud admin, who has to be able to see
+/// which server leads. Only the status: the other routes hand out the
+/// store and change the membership, and stay closed to an admin token.
+fn may_read_status(
+    store: &Store,
+    headers: &HeaderMap,
+    caller: Option<&Caller>,
+    auth: PeerAuth,
+) -> Result<(), ApiError> {
+    if caller.is_some_and(Caller::is_admin) {
+        return Ok(());
+    }
+    let as_server = headers.contains_key(PEER_HEADER) || headers.contains_key(JOIN_HEADER);
+    match enforce_peer_with(store, headers, auth) {
+        // Signed in, but not as a cloud admin.
+        Err(_) if caller.is_some() && !as_server => {
+            Err(ApiError::forbidden("cluster status needs a cloud admin"))
+        }
+        other => other,
+    }
 }
 
 fn majority(voters: usize) -> usize {
@@ -3464,6 +3489,48 @@ mod tests {
         };
         assert!(!peer.leader);
         assert_eq!(peer.leader_api, "http://sim");
+    }
+
+    #[test]
+    fn a_cloud_admin_may_read_the_status_and_nothing_else_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        gate::Keys::load_or_create(&store).unwrap();
+        let caller = |system: bool, role: &str| Caller {
+            principal: pistack_types::Id::new(pistack_types::kind::PRINCIPAL),
+            principal_name: "someone".into(),
+            project: None,
+            roles: vec![role.into()],
+            system,
+        };
+        let none = HeaderMap::new();
+        let admin = caller(true, "admin");
+        may_read_status(&store, &none, Some(&admin), PeerAuth::Required).unwrap();
+
+        // `admin` inside one project is not a cloud admin.
+        let project_admin = caller(false, "admin");
+        let refused =
+            may_read_status(&store, &none, Some(&project_admin), PeerAuth::Required).unwrap_err();
+        assert_eq!(refused.code, pistack_types::error::ErrorCode::Forbidden);
+        assert_eq!(refused.message, "cluster status needs a cloud admin");
+        let anonymous = may_read_status(&store, &none, None, PeerAuth::Required).unwrap_err();
+        assert_eq!(
+            anonymous.code,
+            pistack_types::error::ErrorCode::Unauthorized
+        );
+
+        // Servers are let in as before, and a bad key is still a bad key.
+        let mut member = HeaderMap::new();
+        member.insert(PEER_HEADER, peer_key(&store).unwrap().parse().unwrap());
+        may_read_status(&store, &member, None, PeerAuth::Required).unwrap();
+        member.insert(PEER_HEADER, "wrong".parse().unwrap());
+        let wrong =
+            may_read_status(&store, &member, Some(&project_admin), PeerAuth::Required).unwrap_err();
+        assert_eq!(wrong.message, "not a member of this cluster");
+        may_read_status(&store, &none, None, PeerAuth::Open).unwrap();
+
+        // The admin token opens the status and only the status.
+        enforce_peer_with(&store, &none, PeerAuth::Required).unwrap_err();
     }
 
     #[test]

@@ -255,12 +255,44 @@ async fn discovery() -> Json<Value> {
     }))
 }
 
+async fn cluster_status(h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "cluster routes need a member or a join token",
+        );
+    }
+    Json(json!({
+        "cluster_id": "c1",
+        "node_id": "srv-b",
+        "api": "http://10.0.0.12:8443",
+        "leader_api": "http://10.0.0.13:8443",
+        "leader_id": "srv-c",
+        "role": "Voter",
+        "leader": false,
+        "members": [
+            {"id": "srv-a", "api": "http://10.0.0.11:8443", "role": "Voter",
+             "agent_api": "https://10.0.0.11:8444"},
+            {"id": "srv-b", "api": "http://10.0.0.12:8443", "role": "Voter",
+             "agent_api": "https://10.0.0.12:8444"},
+            {"id": "srv-c", "api": "http://10.0.0.13:8443", "role": "Voter",
+             "agent_api": "https://10.0.0.13:8444"},
+            {"id": "srv-d", "api": "http://10.0.0.14:8443", "role": "Learner"}
+        ],
+        "term": 7,
+        "commit": 74
+    }))
+    .into_response()
+}
+
 async fn serve() -> (String, Mock) {
     let mock = Mock::default();
     let app = Router::new()
         .route("/", get(discovery))
         .route("/identity/tokens", post(login))
         .route("/identity/tokens/self", get(whoami))
+        .route("/cluster", get(cluster_status))
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
         .route("/compute/machines/{id}/start", post(start))
@@ -537,6 +569,62 @@ async fn env_and_flags_override_profile() {
     .await;
     assert_eq!(r.code, 0, "{r:?}");
     assert!(r.out.is_empty(), "{}", r.out);
+}
+
+#[tokio::test]
+async fn cluster_status_lists_the_servers_and_marks_the_leader() {
+    let (url, _mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let r = pi(&cfg, "", &["--url", &url, "cluster", "status"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("pi login"), "{}", r.err);
+
+    let admin = ["--url", url.as_str(), "--token", TOKEN];
+    let r = pi(&cfg, "", &[&admin[..], &["cluster", "status"]].concat()).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<Vec<&str>> = r
+        .out
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        lines[0],
+        ["SERVER", "ROLE", "LEADER", "API", "AGENT", "API"]
+    );
+    assert_eq!(
+        lines[1],
+        [
+            "srv-a",
+            "voter",
+            "http://10.0.0.11:8443",
+            "https://10.0.0.11:8444"
+        ]
+    );
+    assert_eq!(
+        lines[3],
+        [
+            "srv-c",
+            "voter",
+            "yes",
+            "http://10.0.0.13:8443",
+            "https://10.0.0.13:8444"
+        ]
+    );
+    assert_eq!(lines[4], ["srv-d", "learner", "http://10.0.0.14:8443"]);
+    assert_eq!(lines.len(), 5);
+    assert_eq!(r.err, "");
+
+    let r = pi(
+        &cfg,
+        "",
+        &[&admin[..], &["cluster", "status", "-o", "json"]].concat(),
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v["leader_id"], "srv-c");
+    assert_eq!(v["members"].as_array().unwrap().len(), 4);
 }
 
 #[tokio::test]
