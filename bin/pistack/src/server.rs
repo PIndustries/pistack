@@ -23,6 +23,8 @@ pub struct ServerOpts {
     pub insecure_http: bool,
     /// Optional HTTPS listener. `None` keeps today's single plain listener.
     pub tls_listen: Option<String>,
+    /// What agents are told to call instead of `https://<tls_listen>`.
+    pub agent_url: Option<String>,
     /// Dev mode: a local mock host so machines "run" with no agent, and
     /// unauthenticated requests act as admin. Never on in production.
     pub dev: bool,
@@ -161,6 +163,24 @@ fn fabric_module() -> fabric::Fabric {
     }
 }
 
+/// Where host agents are told to reach this server: `--agent-url`, else the
+/// TLS listener's own address. `None` without a TLS listener. Agents show a
+/// client certificate, so the address is https or it is refused.
+fn agent_api(tls_listen: Option<&str>, agent_url: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(listen) = tls_listen.map(str::trim).filter(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(url) = agent_url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(Some(format!("https://{listen}")));
+    };
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("--agent-url '{url}' is not a URL"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("--agent-url '{url}' must be https: agents present a client certificate");
+    }
+    Ok(Some(url.trim_end_matches('/').to_owned()))
+}
+
 pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     std::fs::create_dir_all(&opts.data_dir)
         .with_context(|| format!("creating data dir {}", opts.data_dir.display()))?;
@@ -173,6 +193,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         let scheme = if opts.insecure_http { "http" } else { "https" };
         format!("{scheme}://{}", opts.listen.replace("0.0.0.0", "127.0.0.1"))
     });
+    let agent_api = agent_api(opts.tls_listen.as_deref(), opts.agent_url.as_deref())?;
     let boot = crate::cluster::prepare_store(&crate::cluster::BootRequest {
         data_dir: &opts.data_dir,
         init: opts.init,
@@ -229,28 +250,35 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
     let node_id = crate::cluster::load_or_create_node_id(&opts.data_dir)?;
     let allow_seed = !matches!(boot, crate::cluster::BootKind::Joined);
-    let established =
-        match crate::cluster::establish_local(&store, &node_id, &public_url, allow_seed) {
-            Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
-            Ok(crate::cluster::LocalRole::NeedJoin) => {
-                let hint = crate::cluster::leader_hint(&store, &node_id)?
+    let established = match crate::cluster::establish_local(
+        &store,
+        &node_id,
+        &public_url,
+        agent_api.as_deref(),
+        allow_seed,
+    ) {
+        Ok(crate::cluster::LocalRole::Ready(ready)) => ready,
+        Ok(crate::cluster::LocalRole::NeedJoin) => {
+            let hint = crate::cluster::leader_hint(&store, &node_id)?
                 .or_else(|| crate::cluster::remembered_leader(&opts.data_dir))
                 .context(
                     "store belongs to a cluster and no leader address is known; pass --join URL",
                 )?;
-                match crate::cluster::adopt(&store, &hint, &node_id, &public_url).await {
-                    Ok(ready) => ready,
-                    Err(err) => {
-                        if matches!(boot, crate::cluster::BootKind::Joined) {
-                            drop(store);
-                            let _ = std::fs::remove_file(&store_path);
-                        }
-                        return Err(err);
+            match crate::cluster::adopt(&store, &hint, &node_id, &public_url, agent_api.as_deref())
+                .await
+            {
+                Ok(ready) => ready,
+                Err(err) => {
+                    if matches!(boot, crate::cluster::BootKind::Joined) {
+                        drop(store);
+                        let _ = std::fs::remove_file(&store_path);
                     }
+                    return Err(err);
                 }
             }
-            Err(err) => return Err(err),
-        };
+        }
+        Err(err) => return Err(err),
+    };
     crate::cluster::clear_remembered_leader(&opts.data_dir);
     let cluster_id: String = store
         .get_meta("cluster_id")?
@@ -278,16 +306,19 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         shutdown.clone(),
         &fabric_choice,
     );
-    let cluster = std::sync::Arc::new(crate::cluster::handle_from(
-        node_id,
-        public_url.clone(),
-        cluster_id,
-        store.clone(),
-        store_path.clone(),
-        &established,
-        crate::cluster::advertise_ip(&opts.listen),
-        leadership.clone(),
-    ));
+    let cluster = std::sync::Arc::new(
+        crate::cluster::handle_from(
+            node_id,
+            public_url.clone(),
+            cluster_id,
+            store.clone(),
+            store_path.clone(),
+            &established,
+            crate::cluster::advertise_ip(&opts.listen),
+            leadership.clone(),
+        )
+        .with_agent_api(agent_api.clone()),
+    );
     crate::cluster::spawn_background(
         cluster.clone(),
         crate::cluster::advertise_ip(&opts.listen),
@@ -337,6 +368,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     tracing::info!(
         listen = %bound.http,
         public_url = %public_url,
+        agent_url = agent_api.as_deref().unwrap_or("none"),
         modules = asm.modules.len(),
         identity = asm.gate.info().version,
         agent_rpc = asm.forge.queue().is_some(),
@@ -396,7 +428,29 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::ovn_host_config;
+    use super::{agent_api, ovn_host_config};
+
+    #[test]
+    fn agents_are_sent_to_the_tls_listener_or_the_url_given_for_it() {
+        assert_eq!(agent_api(None, None).unwrap(), None);
+        assert_eq!(
+            agent_api(Some("10.0.0.10:8444"), None).unwrap().as_deref(),
+            Some("https://10.0.0.10:8444")
+        );
+        assert_eq!(
+            agent_api(Some("10.0.0.10:8444"), Some("https://cloud.example:8444/"))
+                .unwrap()
+                .as_deref(),
+            Some("https://cloud.example:8444")
+        );
+        assert!(agent_api(Some("10.0.0.10:8444"), Some("http://cloud.example:8443")).is_err());
+        assert!(agent_api(Some("10.0.0.10:8444"), Some("cloud.example")).is_err());
+        // The URL names the TLS listener; without one there is nothing to name.
+        assert_eq!(
+            agent_api(None, Some("https://cloud.example:8444")).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn agents_are_told_about_ovn_only_when_the_backend_is_ovn_and_has_an_address() {

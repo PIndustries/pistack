@@ -36,8 +36,8 @@ pub use proto::{
 };
 pub use queue::{CommandQueue, NodeInfo, PendingInfo, QueueConfig, Ticket};
 pub use server::{
-    router, router_with_auth, router_with_auth_and, router_with_extra, router_with_store, RpcAuth,
-    REQUIRE_JOIN_ENV, RPC_INSECURE_ENV,
+    agent_address, router, router_with_auth, router_with_auth_and, router_with_extra,
+    router_with_store, RpcAuth, REQUIRE_JOIN_ENV, RPC_INSECURE_ENV,
 };
 
 #[cfg(test)]

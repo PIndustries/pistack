@@ -324,27 +324,46 @@ async fn heartbeat(
     check_peer_node(&ext, &hb.node_name)?;
     let mut ack = q.heartbeat(&hb);
     if let Some(axum::Extension(store)) = store {
-        ack.servers = cluster_servers(&store);
+        let over_tls = ext.get::<PeerIdentity>().is_some_and(|peer| peer.tls);
+        ack.servers = cluster_servers(&store, over_tls);
     }
     Ok(Json(ack))
 }
 
-/// Only the field we need from a cluster member record.
+/// Only the fields we need from a cluster member record.
 #[derive(Deserialize)]
 struct MemberAddress {
     api: String,
+    #[serde(default)]
+    agent_api: Option<String>,
 }
 
-/// API addresses of the cluster's servers, from the replicated member list.
-fn cluster_servers(store: &Store) -> Vec<String> {
+/// The address an agent should use for a server whose member record holds
+/// `api` and `agent_api`.
+///
+/// An agent that called over TLS is sent to the server's TLS listener, the
+/// only one where its client certificate can be checked. A server with no
+/// TLS listener has only `api`. An agent that called over plain HTTP runs
+/// without a certificate and may not trust the cloud CA, so it stays on the
+/// plain listener.
+pub fn agent_address<'a>(api: &'a str, agent_api: Option<&'a str>, over_tls: bool) -> &'a str {
+    match agent_api.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(agent_api) if over_tls => agent_api,
+        _ => api.trim(),
+    }
+}
+
+/// Where an agent reaches each of the cluster's servers, from the replicated
+/// member list.
+fn cluster_servers(store: &Store, over_tls: bool) -> Vec<String> {
     store
         .get_meta::<Vec<MemberAddress>>("members")
         .ok()
         .flatten()
         .unwrap_or_default()
-        .into_iter()
-        .map(|m| m.api.trim().to_owned())
-        .filter(|api| !api.is_empty())
+        .iter()
+        .map(|m| agent_address(&m.api, m.agent_api.as_deref(), over_tls).to_owned())
+        .filter(|address| !address.is_empty())
         .collect()
 }
 
@@ -694,6 +713,7 @@ mod tests {
         let peer = PeerIdentity {
             addr: None,
             common_name: Some("n1".into()),
+            tls: true,
         };
         let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
         let http = reqwest::Client::new();
@@ -760,12 +780,96 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn an_agent_is_sent_to_the_listener_it_can_use() {
+        let tls = Some("https://10.0.0.10:8444");
+        let api = "http://10.0.0.10:8443";
+        assert_eq!(agent_address(api, tls, true), "https://10.0.0.10:8444");
+        assert_eq!(agent_address(api, tls, false), api);
+        // No TLS listener on record: the API address is all there is.
+        assert_eq!(agent_address(api, None, true), api);
+        assert_eq!(agent_address(api, Some("  "), true), api);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_over_tls_lists_the_tls_addresses() {
+        let store = Store::in_memory().unwrap();
+        store
+            .put_meta(
+                "members",
+                &serde_json::json!([
+                    {"id": "a", "api": "http://10.0.0.10:8443", "role": "Voter",
+                     "agent_api": "https://10.0.0.10:8444"},
+                    {"id": "b", "api": "http://10.0.0.11:8443", "role": "Voter",
+                     "agent_api": "https://10.0.0.11:8444"},
+                    // Written by a server older than the field.
+                    {"id": "c", "api": "http://10.0.0.12:8443", "role": "Learner"},
+                ]),
+            )
+            .unwrap();
+        let beat = Heartbeat {
+            node_name: "n1".into(),
+            resources_free: Resources::default(),
+            machines: vec![],
+            at: Utc::now(),
+            ovn: None,
+        };
+        let http = reqwest::Client::new();
+
+        let peer = PeerIdentity {
+            addr: None,
+            common_name: Some("n1".into()),
+            tls: true,
+        };
+        let (base, server) = serve_auth(store.clone(), RpcAuth::mtls_only(), Some(peer)).await;
+        let ack: HeartbeatAck = http
+            .post(format!("{base}/agents/heartbeat"))
+            .json(&beat)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            ack.servers,
+            vec![
+                "https://10.0.0.10:8444",
+                "https://10.0.0.11:8444",
+                "http://10.0.0.12:8443"
+            ]
+        );
+        server.abort();
+
+        // An agent on the plain listener is not moved to one it may not trust.
+        let (base, server) = serve_auth(store, RpcAuth::open(), None).await;
+        let ack: HeartbeatAck = http
+            .post(format!("{base}/agents/heartbeat"))
+            .json(&beat)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            ack.servers,
+            vec![
+                "http://10.0.0.10:8443",
+                "http://10.0.0.11:8443",
+                "http://10.0.0.12:8443"
+            ]
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn client_cert_speaks_only_for_its_own_node() {
         let store = Store::in_memory().unwrap();
         let peer = PeerIdentity {
             addr: None,
             common_name: Some("n1".into()),
+            tls: true,
         };
         let (base, server) = serve_auth(store, RpcAuth::mtls_only(), Some(peer)).await;
         let http = reqwest::Client::new();

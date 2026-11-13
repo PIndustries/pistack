@@ -21,30 +21,56 @@ pub const ELECTION_TIMEOUT_SPAN: Duration = Duration::from_millis(1_200);
 pub struct JoinRequest {
     pub node_id: String,
     pub api: String,
+    /// The joiner's address for host agents, when it has a TLS listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_api: Option<String>,
 }
 
 pub fn should_discover(existing_store: bool, init: bool, join: Option<&str>) -> bool {
     !existing_store && !init && join.map(str::trim).filter(|url| !url.is_empty()).is_none()
 }
 
-pub fn seed_membership(node_id: &str, api: &str) -> Vec<Member> {
-    vec![Member::voter(node_id, api)]
+pub fn seed_membership(node_id: &str, api: &str, agent_api: Option<&str>) -> Vec<Member> {
+    vec![Member::voter(node_id, api).with_agent_api(agent_api)]
 }
 
 /// A server that asks to join is a learner, new or not. A member that comes
 /// back through join has a store it cannot vouch for (a downloaded snapshot
-/// or a copy), so it is demoted and its api updated; no duplicate is added.
-/// The leader promotes learners with [`plan_promotions`] once they caught up.
-pub fn join_membership(members: &[Member], node_id: &str, api: &str) -> Vec<Member> {
+/// or a copy), so it is demoted and its addresses updated; no duplicate is
+/// added. The leader promotes learners with [`plan_promotions`] once they
+/// caught up.
+pub fn join_membership(
+    members: &[Member],
+    node_id: &str,
+    api: &str,
+    agent_api: Option<&str>,
+) -> Vec<Member> {
     let mut next = members.to_vec();
     match next.iter_mut().find(|member| member.id == node_id) {
         Some(member) => {
             member.api = api.to_owned();
+            member.agent_api = agent_api.map(str::to_owned);
             member.role = Role::Learner;
         }
-        None => next.push(Member::learner(node_id, api)),
+        None => next.push(Member::learner(node_id, api).with_agent_api(agent_api)),
     }
     next
+}
+
+/// The membership with `node_id`'s agent address set to `agent_api`, or
+/// `None` when it already is or the server is not a member.
+pub fn with_agent_address(
+    members: &[Member],
+    node_id: &str,
+    agent_api: Option<&str>,
+) -> Option<Vec<Member>> {
+    let at = members.iter().position(|member| member.id == node_id)?;
+    if members[at].agent_api.as_deref() == agent_api {
+        return None;
+    }
+    let mut next = members.to_vec();
+    next[at].agent_api = agent_api.map(str::to_owned);
+    Some(next)
 }
 
 /// How many voters a membership should have: three once three servers are
@@ -383,11 +409,11 @@ mod tests {
 
     #[test]
     fn every_join_is_a_learner_and_a_returning_voter_is_demoted() {
-        let members = seed_membership("a", "http://a");
-        let two = join_membership(&members, "b", "http://b");
+        let members = seed_membership("a", "http://a", None);
+        let two = join_membership(&members, "b", "http://b", None);
         assert_eq!(two[0], Member::voter("a", "http://a"));
         assert_eq!(two[1], Member::learner("b", "http://b"));
-        let three = join_membership(&two, "c", "http://c");
+        let three = join_membership(&two, "c", "http://c", None);
         assert_eq!(three.len(), 3);
         assert_eq!(three[2], Member::learner("c", "http://c"));
         assert_eq!(
@@ -400,11 +426,40 @@ mod tests {
             Member::voter("b", "http://b"),
             Member::voter("c", "http://c"),
         ];
-        let again = join_membership(&voters, "c", "http://c2");
+        let again = join_membership(&voters, "c", "http://c2", None);
         assert_eq!(again.len(), 3);
         assert_eq!(again[2], Member::learner("c", "http://c2"));
         assert_eq!(again[0].role, Role::Voter);
         assert_eq!(again[1].role, Role::Voter);
+    }
+
+    #[test]
+    fn a_member_carries_its_agent_address_and_an_old_record_has_none() {
+        let tls = Some("https://a:8444");
+        let members = seed_membership("a", "http://a", tls);
+        assert_eq!(members[0].agent_api.as_deref(), tls);
+        let two = join_membership(&members, "b", "http://b", Some("https://b:8444"));
+        assert_eq!(two[1].agent_api.as_deref(), Some("https://b:8444"));
+        // Coming back through join without a TLS listener clears it.
+        let back = join_membership(&two, "b", "http://b", None);
+        assert_eq!(back[1].agent_api, None);
+        assert_eq!(back[0].agent_api.as_deref(), tls);
+
+        assert_eq!(with_agent_address(&two, "a", tls), None);
+        assert_eq!(with_agent_address(&two, "nobody", tls), None);
+        let moved = with_agent_address(&two, "a", Some("https://a:9444")).unwrap();
+        assert_eq!(moved[0].agent_api.as_deref(), Some("https://a:9444"));
+        assert_eq!(moved[0].role, Role::Voter);
+        assert_eq!(moved[1], two[1]);
+
+        // A record from a server older than the field loads, and a member
+        // without the address is written as it always was.
+        let old = r#"[{"id":"a","api":"http://a","role":"Voter"}]"#;
+        let loaded: Vec<Member> = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded, vec![Member::voter("a", "http://a")]);
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), old);
+        let new = serde_json::to_string(&members).unwrap();
+        assert!(new.contains(r#""agent_api":"https://a:8444""#), "{new}");
     }
 
     #[test]

@@ -18,6 +18,8 @@ After the first start, `--init` is no longer needed. A server that finds an exis
 
 `--tls-listen ADDR` adds an HTTPS listener next to the plain one. The address must be specific, not `0.0.0.0`. The certificate is issued by the cloud CA and kept in `<data_dir>/tls`. Clients do not have that CA in their trust store, so `pi` needs `--insecure` to use it today.
 
+Each server writes the address of its HTTPS listener into its member record, as `agent_api`. That is the address agents on HTTPS are given for it, in the list of servers and when a follower names the leader. `--agent-url` overrides it. A server restarted with a different `--tls-listen` has the record corrected within a few seconds, and one restarted without it has the address removed.
+
 Until this is finished, put the API on a private network.
 
 ## Adding servers
@@ -81,7 +83,7 @@ Any server answers reads. A write sent to a server that is not the leader is not
 
 `pi` does not follow that address by itself. Point `pi` at the leader, or put a proxy in front of the servers that sends traffic to whichever one reports `"leader": true` on `/cluster`.
 
-Agents do follow. An agent that loses its server tries the other servers it knows and registers with the new leader.
+Agents do follow. An agent that loses its server tries the other servers it knows and registers with the new leader. An agent that joined over HTTPS only ever moves to another HTTPS address: it logs and skips a plain one, so every server it should fail over to needs `--tls-listen`.
 
 ### Durability of a write
 
