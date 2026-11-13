@@ -414,3 +414,114 @@ async fn unschedulable_machine_stays_pending_with_reason() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// A project with limits, and a member of it calling the API.
+#[tokio::test]
+async fn a_member_is_refused_at_the_projects_limit_and_a_delete_frees_it() {
+    use gate::{Project, ProjectSpec, ProjectStatus};
+    use pistack_types::{kind, Caller, Id, Meta};
+
+    let store = Store::in_memory().unwrap();
+    let shutdown = CancellationToken::new();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: shutdown.clone(),
+        public_url: "http://test".into(),
+        node_name: "testbox".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    let forge = Forge::default();
+    let app = forge.router(ctx.clone());
+    forge.start(ctx).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while store.collection::<Size>().list(None).unwrap().len() < 4 {
+        assert!(tokio::time::Instant::now() < deadline, "sizes never seeded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut spec = ProjectSpec::default();
+    spec.quotas.insert("vcpus".into(), 3);
+    spec.quotas.insert("memory_mib".into(), 8192);
+    let project = store
+        .collection::<Project>()
+        .create(Project {
+            meta: Meta::new(kind::PROJECT, "research", None),
+            spec,
+            status: ProjectStatus::default(),
+        })
+        .unwrap()
+        .meta
+        .id;
+    let member = Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "alice".into(),
+        project: Some(project.clone()),
+        roles: vec!["member".into()],
+        system: false,
+    };
+    let send = |method: &'static str, path: String, body: Option<serde_json::Value>| {
+        let (app, member) = (app.clone(), member.clone());
+        async move {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .extension(member);
+            let body = match body {
+                Some(v) => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(serde_json::to_vec(&v).unwrap())
+                }
+                None => Body::empty(),
+            };
+            let resp = app.oneshot(req.body(body).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, v)
+        }
+    };
+    let machine = |name: &str, size: &str| serde_json::json!({"name": name, "spec": {"size": size, "image": "ubuntu"}});
+    let usage = |resource: &str| {
+        let p = store.collection::<Project>().get(&project).unwrap();
+        p.status.usage.get(resource).copied().unwrap_or(0)
+    };
+
+    // m.2x4 is 2 vcpus and 4096 MiB; s.1x1 is 1 and 1024.
+    let (st, first) = send("POST", "/machines".into(), Some(machine("a", "m.2x4"))).await;
+    assert_eq!(st, StatusCode::CREATED, "{first}");
+    assert_eq!(usage("vcpus"), 2);
+    assert_eq!(usage("memory_mib"), 4096);
+    assert_eq!(usage("machines"), 1);
+
+    // Two more vcpus do not fit under three.
+    let (st, e) = send("POST", "/machines".into(), Some(machine("b", "m.2x4"))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"]["code"], "quota_exceeded");
+    assert_eq!(
+        e["error"]["message"],
+        "quota exceeded for vcpus in project 'research': 2 used + 2 requested > 3"
+    );
+    assert_eq!(
+        e["error"]["details"],
+        serde_json::json!({"resource": "vcpus", "limit": 3, "used": 2, "requested": 2})
+    );
+    let (_, list) = send("GET", "/machines".into(), None).await;
+    assert_eq!(list["total"], 1);
+
+    // One more does.
+    let (st, small) = send("POST", "/machines".into(), Some(machine("b", "s.1x1"))).await;
+    assert_eq!(st, StatusCode::CREATED, "{small}");
+    assert_eq!(usage("vcpus"), 3);
+
+    // Deleting the first frees its share at once.
+    let path = format!("/machines/{}", first["id"].as_str().unwrap());
+    let (st, _) = send("DELETE", path, None).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    assert_eq!(usage("vcpus"), 1);
+    assert_eq!(usage("machines"), 1);
+    let (st, again) = send("POST", "/machines".into(), Some(machine("c", "m.2x4"))).await;
+    assert_eq!(st, StatusCode::CREATED, "{again}");
+
+    shutdown.cancel();
+}
