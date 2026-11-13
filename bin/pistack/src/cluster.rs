@@ -495,19 +495,30 @@ pub fn forget_membership(store: &Store) -> anyhow::Result<usize> {
 }
 
 pub fn leader_hint(store: &Store, self_id: &str) -> anyhow::Result<Option<String>> {
+    Ok(leader_addresses(store, self_id)?.map(|(api, _)| api))
+}
+
+/// The leader's API address and, when it has one, its TLS address, as
+/// [`PeerNet::send`] takes them. As [`leader_hint`]: the leader this server
+/// knows of, else another voter.
+pub fn leader_addresses(
+    store: &Store,
+    self_id: &str,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
     let members: Vec<Member> = store.get_meta("members")?.unwrap_or_default();
     let leader_id: Option<String> = store.get_meta("cluster_leader_id")?;
+    let addresses = |member: &Member| (member.api.clone(), member.agent_api.clone());
     if let Some(id) = leader_id.as_deref() {
         if id != self_id {
             if let Some(member) = members.iter().find(|member| member.id == id) {
-                return Ok(Some(member.api.clone()));
+                return Ok(Some(addresses(member)));
             }
         }
     }
     Ok(members
-        .into_iter()
+        .iter()
         .find(|member| member.role == Role::Voter && member.id != self_id)
-        .map(|member| member.api))
+        .map(addresses))
 }
 
 pub fn remembered_leader(data_dir: &Path) -> Option<String> {
@@ -707,7 +718,7 @@ pub fn admin_router(handle: std::sync::Arc<ClusterHandle>) -> Router {
 /// it carries a peer key or a join token: the status and the removal of a
 /// member are also an administrator's, who sends neither.
 fn is_peer_call(path: &str, as_server: bool) -> bool {
-    if path.starts_with("/silo/peer/") {
+    if path.starts_with("/silo/peer/") || path.starts_with("/secrets/peer/") {
         return true;
     }
     if path == "/cluster" || path.starts_with("/cluster/members") {
@@ -5741,6 +5752,7 @@ mod tests {
             "/cluster/join",
             "/cluster/agent-address",
             "/silo/peer/blobs/b/abc",
+            "/secrets/peer/renew-certificate",
         ] {
             assert!(is_peer_call(path, false), "{path}");
             assert!(is_peer_call(path, true), "{path}");
