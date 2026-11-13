@@ -295,3 +295,56 @@ async fn labels_set_through_the_api_steer_the_scheduler() {
         .await;
     assert_eq!(h.ready_on(&m.meta.id).await, a.meta.id);
 }
+
+#[tokio::test]
+async fn a_machine_zone_is_a_selector_on_the_zone_label() {
+    let h = harness().await;
+    let (_, _) = h.add_host("a");
+    let (b, _) = h.add_host("b");
+    let (st, _) = raw(
+        &h.app,
+        &admin(),
+        "PUT",
+        "/hosts/b/labels",
+        Some(json!({"labels": {"zone": "west"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let m = h.machine("in-zone", vm(json!({"zone": "west"}))).await;
+    assert_eq!(m.spec.zone.as_deref(), Some("west"));
+    assert_eq!(h.ready_on(&m.meta.id).await, b.meta.id);
+
+    // A zone no host has leaves the machine pending and says why.
+    let lost = h.machine("nowhere", vm(json!({"zone": "north"}))).await;
+    let lost = h
+        .wait(&lost.meta.id, |m| {
+            m.status
+                .conditions
+                .iter()
+                .any(|c| c.kind == "Scheduled" && !c.status)
+        })
+        .await;
+    assert_eq!(lost.status.phase, Phase::Pending);
+    assert!(
+        lost.status.message.contains("selector"),
+        "{}",
+        lost.status.message
+    );
+
+    // A zone that disagrees with the selector can match nothing.
+    for spec in [
+        vm(json!({"zone": "west", "host_selector": {"zone": "east"}})),
+        vm(json!({"zone": " "})),
+    ] {
+        let (st, _) = raw(
+            &h.app,
+            &admin(),
+            "POST",
+            "/machines",
+            Some(json!({"name": "torn", "spec": spec})),
+        )
+        .await;
+        assert!(st.is_client_error(), "{st}");
+    }
+}
