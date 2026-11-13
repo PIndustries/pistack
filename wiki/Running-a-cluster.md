@@ -35,7 +35,7 @@ A new server needs a join token, in `PISTACK_JOIN_TOKEN`, to download the snapsh
 
 With neither `--init` nor `--join`, a server with an empty data directory tries discovery, but only when `--listen` is a private IPv4 address. It probes every address in its /24 on UDP port 18445. If no cluster answers it founds one. If exactly one answers it joins it. If more than one answers it stops and asks for `--join`. With `--listen 0.0.0.0:8443` (the default) there is no discovery and the server exits, asking for `--init` or `--join`.
 
-Cluster traffic between servers uses the same API port, under `/cluster`. Those routes hand out the whole store, so they answer only a member or a server holding a valid join token. Members prove themselves with a key derived from the token signing secret, which is in every member's store and in every snapshot; nothing has to be handed to them and it does not expire. A server that is refused says so and names `PISTACK_JOIN_TOKEN`.
+Cluster traffic between servers uses the same API port, under `/cluster`. Those routes hand out the whole store, so they answer only a member or a server holding a valid join token. Members prove themselves with a key derived from the token signing secret, which is in every member's store and in every snapshot; nothing has to be handed to them and it does not expire. Each server also states its id on these calls, which is how one that was removed is refused. A server that is refused says so and names `PISTACK_JOIN_TOKEN`.
 
 `PISTACK_REQUIRE_JOIN=0` opens the routes to anything that reaches the port. Servers older than this check send no key, so replacing them one at a time stops replication between old and new; set `PISTACK_REQUIRE_JOIN=0` on every server for that one upgrade, then take it out.
 
@@ -155,7 +155,24 @@ pistack --data-dir /var/lib/pistack server --join http://10.0.0.12:8443 --listen
 
 Leave `node.id` in place so the server keeps its member identity. It comes back as a learner and is promoted again when it has caught up.
 
-There is no command to remove a member from the cluster. A server that is gone for good stays in the member list.
+## Removing and replacing a server
+
+```sh
+pi cluster status
+pi server remove http://10.0.0.13:8443
+```
+
+`pi server remove` takes a server out of the member list. It names the server by id or by API address, as `pi cluster status` prints them, and needs the cloud admin. Only the leader makes the change. The change goes through the log like any other write and the answer waits for a majority of the voters that are left, so every server agrees on it. From then on the removed server does not count toward the majority.
+
+The leader does not remove itself. Stop it, wait for another server to take over, and remove it from there.
+
+A removal that would leave too few voters answering to form a majority is refused. A voter counts as answering when it pulled from the leader in the last three seconds. `--force` skips that check and nothing else. If the voters that are left really cannot form a majority, writes stop until they come back. Removing a learner is never refused for this reason.
+
+To replace a server that is gone for good, remove it and then add a new one as in [Adding servers](#adding-servers). After one of three voters is removed there are two, and both must be up for a write to be confirmed. That lasts until the new server has caught up and been promoted, so do the two steps together.
+
+The other servers refuse a removed server from then on, and it logs that it was removed. It does not come back by being restarted. To bring the same machine back, stop it, move `state.redb` aside and start it with `--join` and a join token, as for a new server. The token is needed even with `PISTACK_REQUIRE_JOIN=0`.
+
+Two things removal does not do. It needs a leader: when the majority of voters is gone there is no leader, and the dead servers cannot be removed until enough of them return. And it does not take back what the removed server holds. Its `state.redb` still has the cluster's secrets, including the key members prove themselves with, and the others tell it apart only by the id it states. Destroy that file if the machine leaves your hands.
 
 ## Backup
 

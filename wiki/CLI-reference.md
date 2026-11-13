@@ -316,6 +316,20 @@ pi cluster status
 
 `status` asks the server `pi` is pointed at and prints each server's id, its role, which one leads, and the addresses clients and agents use for it.
 
+## pi server
+
+Take a control-plane server out of the cluster (admin). `pi cluster status` lists the servers.
+
+```text
+pi server remove <SERVER>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `server remove` | `<SERVER>` | Server id, the start of one, or its API address |
+| `server remove` | `--force` | Remove it even if the servers left could not form a majority |
+| `server remove` | `-y, --yes` | Do not ask for confirmation |
+
 ## pi network
 
 Networks.
