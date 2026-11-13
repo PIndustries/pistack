@@ -16,7 +16,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 ## Control plane
 
 - **A write is durable on the leader only.** The leader answers before any follower has the entry. Losing the leader's disk at the wrong moment loses the write. Also addressed by #103.
-- **`pi` does not follow the leader.** A write sent to a follower fails with `409` and the leader's address. You have to point `pi` at the leader.
+- **Only `pi` follows the leader.** A write sent to a follower is refused with `409` and the leader's address. `pi` sends it again to that address, once. Any other client has to do the same itself, and `pi` does not follow an address on a different scheme than the one it was given.
 - **At most three voters.** Further servers are learners. Two servers give one voter and one learner, with no failover.
 - **Removing a server needs a leader.** When the majority of voters is gone there is no leader, and the dead servers cannot be removed.
 - **Removal does not revoke secrets.** A removed server's store still holds the member key. The others refuse it by the id it states.
@@ -80,5 +80,5 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 ## Packaging and documents
 
-- **No releases, packages, container images or service units.** Build from source.
+- **No distribution packages.** A release is a tarball for Linux x86_64 and aarch64 with the binaries, the systemd units and an install script, and two container images. There are no `.deb` or `.rpm` packages and nothing for macOS. See `docs/RELEASING.md`.
 - **`docs/ROADMAP.md` in the repository is out of date** in both directions. Trust the code and this page over it.
