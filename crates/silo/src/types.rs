@@ -42,6 +42,11 @@ pub struct SiloConfig {
     pub multipart_ttl_secs: u64,
     /// Region name accepted in SigV4 credentials (default [`DEFAULT_REGION`]).
     pub region: String,
+    /// Seconds between pulls of object bytes this server lacks from the
+    /// other control-plane servers (default
+    /// [`crate::replica::REPLICATE_INTERVAL_SECS`]). `0` turns the pull
+    /// off; a read still fetches what it needs.
+    pub replicate_interval_secs: u64,
 }
 
 impl Default for SiloConfig {
@@ -50,6 +55,7 @@ impl Default for SiloConfig {
             max_object_bytes: MAX_OBJECT_BYTES,
             multipart_ttl_secs: MULTIPART_TTL_SECS,
             region: DEFAULT_REGION.to_owned(),
+            replicate_interval_secs: crate::replica::REPLICATE_INTERVAL_SECS,
         }
     }
 }

@@ -47,6 +47,62 @@ pub fn default_image_dir() -> PathBuf {
         })
 }
 
+/// Module settings under `[modules.mold]` / `PISTACK__MODULES__MOLD__*`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MoldConfig {
+    /// Where image bytes are kept: `local` (the image directory on this
+    /// server, the default) or `silo` (a silo bucket, which the other
+    /// control-plane servers copy).
+    pub store: String,
+    /// Bucket for `store = "silo"`. Empty selects `pistack-images`.
+    pub bucket: String,
+}
+
+impl Default for MoldConfig {
+    fn default() -> Self {
+        Self {
+            store: "local".to_owned(),
+            bucket: String::new(),
+        }
+    }
+}
+
+impl MoldConfig {
+    /// Reject a `store` that is neither `local` nor `silo`.
+    pub fn validate(&self) -> Result<(), pistack_config::ConfigError> {
+        match self.store.trim() {
+            "local" | "silo" => Ok(()),
+            other => Err(pistack_config::ConfigError::Module {
+                module: "mold".into(),
+                message: format!("store must be 'local' or 'silo', not '{other}'"),
+            }),
+        }
+    }
+
+    /// Read `[modules.mold]` from a loaded config. Missing section → defaults.
+    pub fn from_config(cfg: &pistack_config::Config) -> Result<Self, pistack_config::ConfigError> {
+        let mold: Self = cfg.module("mold")?;
+        mold.validate()?;
+        Ok(mold)
+    }
+
+    /// Load process config (file + `PISTACK__*`) and take `[modules.mold]`.
+    pub fn load() -> Result<Self, pistack_config::ConfigError> {
+        let cfg = pistack_config::Config::load(None)?;
+        Self::from_config(&cfg)
+    }
+
+    /// The blob store these settings name. `silo` is the client used for
+    /// `store = "silo"`; images already in the other store are not moved.
+    pub fn image_store(&self, silo: ::silo::Client) -> Arc<dyn ImageStore> {
+        match self.store.trim() {
+            "silo" => Arc::new(SiloStore::new(silo, self.bucket.trim())),
+            _ => Arc::new(LocalDirStore::new(default_image_dir())),
+        }
+    }
+}
+
 impl Default for Mold {
     fn default() -> Self {
         Self::new(Arc::new(LocalDirStore::new(default_image_dir())))
@@ -90,5 +146,33 @@ impl Module for Mold {
             tracing::info!("qemu-img not found; image inspection falls back to header parsing");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn the_store_is_local_unless_silo_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let silo = ::silo::Client::new(Store::in_memory().unwrap(), dir.path());
+
+        let cfg = pistack_config::Config::from_toml("").unwrap();
+        let mold = MoldConfig::from_config(&cfg).unwrap();
+        assert_eq!(mold, MoldConfig::default());
+        assert_eq!(mold.image_store(silo.clone()).name(), "local");
+
+        let cfg = pistack_config::Config::from_toml(
+            "[modules.mold]\nstore = \"silo\"\nbucket = \"golden\"\n",
+        )
+        .unwrap();
+        let mold = MoldConfig::from_config(&cfg).unwrap();
+        assert_eq!(mold.bucket, "golden");
+        assert_eq!(mold.image_store(silo).name(), "silo");
+
+        let cfg = pistack_config::Config::from_toml("[modules.mold]\nstore = \"ceph\"\n").unwrap();
+        let err = MoldConfig::from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("'local' or 'silo'"), "{err}");
     }
 }

@@ -49,7 +49,7 @@ pub trait Module {
 | fabric | Network, Subnet, Port, Router, SecurityGroup, FloatingIp | OVN northbound DB |
 | slab | Volume, Snapshot, Backup, VolumeType | storage backends via anvil |
 | mold | Image, ImageMember | silo or local store |
-| silo | Bucket, Object (S3 API) | local disks |
+| silo | Bucket, Object (S3 API) | local disks, copied between servers |
 | shelf | Share, ShareAccess | CephFS / NFS |
 | beacon | Zone, RecordSet | its own authoritative server (hickory) |
 | relay | Balancer, Listener, Pool, Member, HealthMonitor | OVN LB (L4), Pingora (L7) |
@@ -90,6 +90,12 @@ ubuntu ALL=(root) NOPASSWD: /sbin/losetup, /sbin/blkid, /sbin/mkfs.ext4, /bin/mo
 ```
 
 Replace `ubuntu` and the paths with the agent user and the binaries on the host. A volume type that sets `fs_type` to something other than `ext4` needs that `mkfs` binary on the same line.
+
+Object bytes are files on a control-plane server's disk, under `<data_dir>/silo/<bucket-id>/<key>`. The records replicate through the cluster store; the bytes follow separately. A put is taken by the leader and lands on its disk. Every server asks the others for what it lacks: on a read that finds the record but not the bytes (leader first, then the other members), and in the background every `[modules.silo] replicate_interval_secs` (60 by default, `0` turns the background pull off). One server serves another from `GET /silo/peer/blobs/<bucket-id>/<sha256>`, under the same rule as `/cluster`: the asking server must be a member and proves it with the cluster's peer key. `PISTACK_REQUIRE_JOIN=0` opens this route along with the cluster routes. A fetched body goes to a temp file and becomes the object only when its length and SHA-256 match the record. Beside each object file silo keeps a marker with the checksum of what the file holds, so after a key is overwritten a server does not serve the bytes it fetched earlier; it fetches again. A follower removes bytes whose record has been gone for fifteen minutes.
+
+The limits: a put is acknowledged before any other server has the bytes, so losing the leader within one pull interval of a put loses that object's bytes while the record survives, and a read of it answers `unavailable`. Multipart staging is not copied, so an upload in flight when the leader changes starts again. Every server holds a full copy, so each needs the disk for all of it. A site that already runs Ceph for volumes would rather keep the bytes there; that is not built.
+
+Images and volume backups sit on top of this. Backups are objects in a silo bucket, so a backup taken under one leader restores under the next. `mold` keeps images in a directory on the server that took the upload unless `[modules.mold] store = "silo"` is set; with it, an image is an object in the `pistack-images` bucket (or `[modules.mold] bucket`) and every control-plane server can serve it. The upload is streamed to disk, hashed on the way, and never held in memory. Images already in one store are not moved when the setting changes.
 
 ## Security
 

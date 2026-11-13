@@ -40,10 +40,12 @@ pub struct Assembly {
 
 /// Every module in the binary, in mount order. Adding a module = one line.
 /// `listen` is the server `--listen` address; beacon uses it as the cluster
-/// hint when `PISTACK_DNS_LISTEN` is unset.
+/// hint when `PISTACK_DNS_LISTEN` is unset. `images` is where mold keeps
+/// image bytes; slab and the agent download read the same store.
 pub fn assemble(
     dev: bool,
     silo_cfg: silo::SiloConfig,
+    images: Arc<dyn mold::ImageStore>,
     listen: &str,
     data_dir: &std::path::Path,
 ) -> Assembly {
@@ -67,8 +69,6 @@ pub fn assemble(
             .dev_admin(dev),
     );
 
-    let images: Arc<dyn mold::ImageStore> =
-        Arc::new(mold::LocalDirStore::new(mold::default_image_dir()));
     let modules: Vec<Arc<dyn Module>> = vec![
         gate_m.clone(),
         forge_m.clone(),
@@ -310,7 +310,11 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         region = %silo_cfg.region,
         "silo: max object size"
     );
-    let asm = assemble(opts.dev, silo_cfg, &opts.listen, &opts.data_dir);
+    let mold_cfg = mold::MoldConfig::load().context("mold config")?;
+    let images =
+        mold_cfg.image_store(silo::Silo::configured(silo_cfg.clone()).client(store.clone()));
+    tracing::info!(store = images.name(), "mold: image store");
+    let asm = assemble(opts.dev, silo_cfg, images, &opts.listen, &opts.data_dir);
 
     // Start modules first so gate has generated its signing key before the
     // gateway asks for the verifier.

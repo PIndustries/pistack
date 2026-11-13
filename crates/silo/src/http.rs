@@ -14,7 +14,14 @@
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}  (POST: multipart create/complete)
 //! GET                       /{bucket}?list-type=2&…
 //! GET                       /{bucket}?uploads&…  (ListMultipartUploads)
+//!
+//! Between control-plane servers (join token instead of a caller):
+//! GET  /peer/blobs/{bucket-id}/{sha256}   bytes this server holds
 //! ```
+//!
+//! `/peer/blobs/…` is matched before the S3 routes, so a bucket named
+//! `peer` cannot serve keys under `blobs/` on the S3 path. The native
+//! `/buckets/{id}/objects/…` routes still reach them.
 //!
 //! `{id}` is a bucket id or name. Object puts stream the body to disk and
 //! refuse anything larger than the client's configured max (default 5 GiB).
@@ -93,6 +100,10 @@ pub fn router_with(client: Client, keep: Option<keep::Client>, region: String) -
         .head(s3::head_object)
         .layer(DefaultBodyLimit::disable());
 
+    let peer = Router::new()
+        .route("/peer/blobs/{bucket}/{sha256}", get(peer_blob))
+        .with_state(state.clone());
+
     Router::new()
         .route("/", get(info))
         .route("/buckets", get(list_buckets).post(create_bucket))
@@ -109,6 +120,57 @@ pub fn router_with(client: Client, keep: Option<keep::Client>, region: String) -
             sigv4::middleware,
         ))
         .with_state(state)
+        // After the layers: a peer has a join token, not a Caller.
+        .merge(peer)
+}
+
+/// Serve bytes to another control-plane server.
+///
+/// Same rule as `/cluster`: the caller must be a member, proved with the
+/// peer key, unless `PISTACK_REQUIRE_JOIN=0` has opened the cluster routes.
+async fn peer_blob(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Path((bucket, sha256)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let required = std::env::var(pistack_rpc::REQUIRE_JOIN_ENV).ok();
+    authorize_peer(c.store(), &headers, required.as_deref())?;
+    let bad = || ApiError::not_found("no such bytes on this server");
+    let bucket = Id::parse(BucketSpec::KIND, &bucket).ok_or_else(bad)?;
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    let (file, size) = c.open_blob(&bucket, &sha256.to_ascii_lowercase()).await?;
+    let mut resp = Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(len) = HeaderValue::from_str(&size.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, len);
+    }
+    Ok(resp)
+}
+
+/// `required` is the value of `PISTACK_REQUIRE_JOIN`. Only `0` lets a
+/// caller through without the peer key. A join token is not enough here:
+/// a server that is still joining has no object records to ask about.
+pub(crate) fn authorize_peer(
+    store: &pistack_store::Store,
+    headers: &HeaderMap,
+    required: Option<&str>,
+) -> ApiResult<()> {
+    if required.map(str::trim) == Some("0") {
+        return Ok(());
+    }
+    match headers.get(keep::peer::PEER_HEADER) {
+        Some(offered) if keep::peer::is_member(store, offered.as_bytes()) => Ok(()),
+        Some(_) => Err(ApiError::unauthorized("not a member of this cluster")),
+        None => Err(ApiError::unauthorized(
+            "object bytes are served only to a member of this cluster",
+        )),
+    }
 }
 
 async fn require_caller(req: Request, next: Next) -> Response {
@@ -388,4 +450,44 @@ async fn delete_object(
     let bucket = load_bucket(&c, &caller(ext)?, &id)?;
     c.delete_object(&bucket.meta.id, &key).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod peer_auth_tests {
+    use super::authorize_peer;
+    use axum::http::{HeaderMap, HeaderValue};
+    use pistack_store::Store;
+    use pistack_types::error::ErrorCode;
+
+    #[test]
+    fn only_a_member_is_served_unless_the_routes_are_open() {
+        let store = Store::in_memory().unwrap();
+        store
+            .put_meta(gate::token::META_JWT_SECRET, &"c2VjcmV0".to_owned())
+            .unwrap();
+        let (_tok, clear) =
+            keep::create_join_token(&store, "servers", "admin", true, None).unwrap();
+        let mut member = HeaderMap::new();
+        member.insert(
+            keep::peer::PEER_HEADER,
+            HeaderValue::from_str(&keep::peer::peer_key(&store).unwrap()).unwrap(),
+        );
+        let mut guess = HeaderMap::new();
+        guess.insert(keep::peer::PEER_HEADER, HeaderValue::from_static("guess"));
+        let mut joining = HeaderMap::new();
+        joining.insert(
+            pistack_rpc::JOIN_HEADER,
+            HeaderValue::from_str(&clear).unwrap(),
+        );
+        let none = HeaderMap::new();
+
+        for required in [None, Some("1"), Some("")] {
+            authorize_peer(&store, &member, required).unwrap();
+            for refused in [&none, &guess, &joining] {
+                let err = authorize_peer(&store, refused, required).unwrap_err();
+                assert_eq!(err.code, ErrorCode::Unauthorized, "{err}");
+            }
+        }
+        authorize_peer(&store, &none, Some(" 0 ")).unwrap();
+    }
 }

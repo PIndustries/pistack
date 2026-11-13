@@ -13,6 +13,10 @@
 //!
 //! Puts stream the request body to a temp file (hashing as they go), then
 //! rename into place. Gets can stream the file back without buffering it.
+//!
+//! A put lands on one server's disk. With [`Client::with_peers`], a read
+//! on a server that has the record but not the bytes fetches them from
+//! another server first; see [`crate::replica`].
 
 use crate::types::*;
 use bytes::Bytes;
@@ -32,6 +36,8 @@ pub struct Client {
     root: PathBuf,
     max_object_bytes: usize,
     min_part_bytes: usize,
+    /// Other servers to ask for bytes this one lacks.
+    peers: Option<crate::replica::Peers>,
 }
 
 impl Client {
@@ -41,7 +47,18 @@ impl Client {
             root: root.into(),
             max_object_bytes: MAX_OBJECT_BYTES,
             min_part_bytes: MIN_PART_BYTES,
+            peers: None,
         }
+    }
+
+    /// Fetch bytes this server lacks from `peers` when an object is read.
+    pub fn with_peers(mut self, peers: crate::replica::Peers) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    pub fn peers(&self) -> Option<&crate::replica::Peers> {
+        self.peers.as_ref()
     }
 
     /// Cap for a single PUT. Used by HTTP and by [`Self::put_object`].
@@ -229,6 +246,11 @@ impl Client {
             expected_sha256,
         )
         .await?;
+        // Before the record: a file with a marker is never taken for
+        // another generation of the key, whatever happens to the write.
+        crate::replica::write_marker(&self.root, &bucket.meta.id, key, &written.sha256)
+            .await
+            .map_err(io_err)?;
 
         if bucket.spec.versioning {
             if let Some(prev) = existing {
@@ -289,6 +311,10 @@ impl Client {
 
     /// Open the object file for streaming. Verifies size matches status;
     /// SHA-256 is checked by callers that buffer, or left to disk integrity.
+    ///
+    /// When this server does not hold the current bytes and the client has
+    /// peers, they are fetched and checked first. `unavailable` when no
+    /// peer returned them; `not_found` when there is nobody to ask.
     pub async fn open_object(
         &self,
         bucket_id: &Id,
@@ -300,6 +326,12 @@ impl Client {
             .find_current(&bucket, key)?
             .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))?;
         let path = self.key_path(&bucket.meta.id, key)?;
+        match self.ensure_bytes(&obj).await {
+            Ok(_) => {}
+            // Nobody to ask. The open below reports the missing file.
+            Err(e) if e.code == pistack_types::error::ErrorCode::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -316,6 +348,87 @@ impl Client {
             )));
         }
         Ok((obj, file))
+    }
+
+    /// Make sure this server holds the bytes of `obj`, fetching them from
+    /// a peer when it does not. Returns whether anything was fetched.
+    ///
+    /// The current generation of a key is the file at the key path, and
+    /// is stale when its marker names another checksum. An older
+    /// generation is a file under `.blobs`, named by its checksum.
+    pub async fn ensure_bytes(&self, obj: &Object) -> ApiResult<bool> {
+        let bucket = &obj.spec.bucket;
+        let sha = &obj.status.sha256;
+        if !obj.status.latest {
+            let Some(path) = blob_file(&self.root, bucket, sha) else {
+                return Ok(false);
+            };
+            if tokio::fs::try_exists(&path).await.map_err(io_err)? {
+                return Ok(false);
+            }
+            let Some(peers) = &self.peers else {
+                return Ok(false);
+            };
+            peers
+                .fetch(bucket, sha, obj.status.size_bytes, &path)
+                .await?;
+            return Ok(true);
+        }
+        let path = self.key_path(bucket, &obj.spec.key)?;
+        let held = tokio::fs::try_exists(&path).await.map_err(io_err)?;
+        let marker = crate::replica::read_marker(&self.root, bucket, &obj.spec.key).await;
+        if held && marker.is_none_or(|m| &m.sha256 == sha) {
+            return Ok(false);
+        }
+        let Some(peers) = &self.peers else {
+            return Ok(false);
+        };
+        peers
+            .fetch(bucket, sha, obj.status.size_bytes, &path)
+            .await?;
+        crate::replica::write_marker(&self.root, bucket, &obj.spec.key, sha)
+            .await
+            .map_err(io_err)?;
+        Ok(true)
+    }
+
+    /// Open bytes this server holds for an object of `bucket_id` with
+    /// checksum `sha256`, and their length. Reads this disk only; it is
+    /// what a peer is served, so it never asks a peer itself.
+    pub async fn open_blob(
+        &self,
+        bucket_id: &Id,
+        sha256: &str,
+    ) -> ApiResult<(tokio::fs::File, u64)> {
+        let missing = || ApiError::not_found("no such bytes on this server");
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let mut paths = Vec::new();
+        let mut size = None;
+        for obj in self.objects_for_bucket(&bucket)? {
+            if obj.status.sha256 != sha256 {
+                continue;
+            }
+            size = Some(obj.status.size_bytes);
+            if obj.status.latest {
+                let marker =
+                    crate::replica::read_marker(&self.root, &bucket.meta.id, &obj.spec.key).await;
+                // A file marked with another checksum is not these bytes.
+                if marker.is_none_or(|m| m.sha256 == sha256) {
+                    paths.push(self.key_path(&bucket.meta.id, &obj.spec.key)?);
+                }
+            }
+        }
+        let size = size.ok_or_else(missing)?;
+        paths.extend(blob_file(&self.root, &bucket.meta.id, sha256));
+        for path in paths {
+            let Ok(file) = tokio::fs::File::open(&path).await else {
+                continue;
+            };
+            if file.metadata().await.map_err(io_err)?.len() == size {
+                return Ok((file, size));
+            }
+        }
+        Err(missing())
     }
 
     /// Object metadata only (no body). Used by HEAD.
@@ -342,6 +455,7 @@ impl Client {
             self.store.collection::<Object>().delete(&obj.meta.id)?;
         }
         remove_file(&self.key_path(&bucket.meta.id, key)?).await?;
+        crate::replica::remove_marker(&self.root, &bucket.meta.id, key).await;
         for obj in &doomed {
             if !keep.contains(&obj.status.sha256) {
                 if let Some(blob) = blob_file(&self.root, &bucket.meta.id, &obj.status.sha256) {

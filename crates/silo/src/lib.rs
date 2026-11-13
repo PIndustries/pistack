@@ -5,7 +5,9 @@
 //!
 //! Not a full S3 server. Buckets are store resources; object bytes live on
 //! local disk under `$PISTACK_DATA_DIR/silo/{bucket-id}/{key}`, and
-//! `status.sha256` is the content address of those bytes. Object puts stream
+//! `status.sha256` is the content address of those bytes. A put lands on
+//! the leader's disk; the other control-plane servers pull the bytes in
+//! the background and on a read that misses ([`replica`]). Object puts stream
 //! to a temp file then rename; the default size cap is 5 GiB
 //! ([`MAX_OBJECT_BYTES`]), overridable via [`SiloConfig`] /
 //! `[modules.silo] max_object_bytes`.
@@ -33,6 +35,7 @@
 //! * [`s3`] — path-style S3-compatible handlers on the same router.
 //! * [`multipart`] — Create/Upload/Complete/Abort/List multipart helpers.
 //! * [`gc`] — the abandoned-upload sweep.
+//! * [`replica`] — object bytes on more than one control-plane server.
 //! * [`sigv4`] — AWS Signature Version 4 verification (in-process via keep).
 //! * [`copy`] — UploadPartCopy source/range/conditional helpers.
 //! * [`delimiter`] — shared ListObjectsV2 / ListMultipartUploads delimiter helpers.
@@ -51,11 +54,13 @@ pub mod delimiter;
 pub mod gc;
 pub mod http;
 pub mod multipart;
+pub mod replica;
 pub mod s3;
 pub mod sigv4;
 pub mod types;
 
 pub use client::Client;
+pub use replica::Peers;
 pub use types::*;
 
 /// Object storage module.
@@ -87,9 +92,12 @@ impl Silo {
         &self.config
     }
 
-    /// Client using this module's config and [`Self::data_root`].
+    /// Client using this module's config and [`Self::data_root`]. It
+    /// fetches bytes this server lacks from the other cluster members.
     pub fn client(&self, store: Store) -> Client {
-        Client::new(store, Self::data_root()).with_max_object_bytes(self.config.max_object_bytes)
+        Client::new(store.clone(), Self::data_root())
+            .with_max_object_bytes(self.config.max_object_bytes)
+            .with_peers(Peers::from_cluster(store))
     }
 }
 
@@ -125,6 +133,17 @@ impl Module for Silo {
         let ttl = self.config.multipart_ttl();
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
+        // Every server pulls, leader or not: after a failover the new
+        // leader may still lack bytes the old one holds.
+        if self.config.replicate_interval_secs > 0 {
+            let leadership = ctx.leadership.clone();
+            tokio::spawn(replica::run(
+                client.clone(),
+                std::time::Duration::from_secs(self.config.replicate_interval_secs),
+                move || leadership.is_leader(),
+                ctx.shutdown.clone(),
+            ));
+        }
         tokio::spawn(async move {
             leadership
                 .run_while_leader(shutdown, move |active| gc::run(client.clone(), ttl, active))
