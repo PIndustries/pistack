@@ -22,7 +22,10 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Removal does not revoke secrets.** A removed server's store still holds the member key. The others refuse it by the id it states.
 - **A live migration does not survive a change of leader.** If the leader restarts or is replaced before the source host has the command, the machine stays `updating` with the message `migrating <host>` and is not migrated. Machine start, stop and delete and volume attach and detach are carried over; see [Agents and hosts](Agents-and-hosts).
 - **A request in flight fails when the leader changes.** `pi pod exec`, pod logs, and a volume attach or detach that was waiting for the host return an error. The attach is finished by the new leader. A detach is not: the volume stays attached until you detach it again, which is safe to repeat.
-- **Rejoining a server that fell behind is manual.** See [Running a cluster](Running-a-cluster).
+- **A server that cannot follow the log starts again.** A member that fell behind what the leader keeps, or that holds entries no majority confirmed, replaces its store with a snapshot and runs its binary again. The swap is not done inside the running process. See [Running a cluster](Running-a-cluster).
+- **Unconfirmed writes on a deposed leader are set aside, not merged.** They stay in `state.redb.replaced-<time>` on that server. Nothing applies them again.
+- **A store is replaced at most once in ten minutes.** A server the leader refuses again inside that time waits. The limit is not configurable.
+- **Store replacement was tried on three local servers, not on separate machines.** The download is the same code a join uses.
 - **Restore brings back one server.** `pistack store restore` puts a backup in place and that server becomes the only member. The other servers are emptied and joined again by hand. See [Running a cluster](Running-a-cluster).
 - **Restore rolls back the store only.** Machines and volumes made after the backup are unknown to the restored store, and deleted ones are back in it. What the control plane does about the difference with the hosts has not been tested.
 - **Servers do not compare schema versions.** Each store checks its own. A release that raises the version needs every server stopped and upgraded together.
