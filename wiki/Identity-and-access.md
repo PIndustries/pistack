@@ -56,7 +56,18 @@ Every token is scoped to one project, fixed when the token is issued. The projec
 
 A token is only issued for a project the principal has a role in, or to a principal with a role at system scope. Asking for any other project is refused with `403`: a token with no role can still read, so one for a project you are not in would show you what it holds. A default project the principal has no role in is skipped, and the token has no project. A token for a project stops working when the principal's last role in it is removed.
 
-The scope decides which resources the token sees and where new resources go. There is no header or path segment to switch project on a single request. To work in another project, log in again with `--scope-project`, usually into a second profile:
+The scope decides which resources the token sees and where new resources go. There is no header or path segment to switch project on a single request.
+
+A caller can ask which projects they may work in and trade their token for one in another of them, without the password:
+
+```sh
+pi api GET /identity/tokens/self/projects
+pi api POST /identity/tokens/self/switch -d '{"project": "research"}'
+```
+
+The first lists each project with the project it sits under and the roles the caller has there. Any caller may ask; listing every project is still for a cloud admin. The second returns a new token. It ends when the old one would have, so switching does not keep a session alive, and the old token goes on working until then. A token that came from an API key cannot be moved: the key names its project. The web console uses these two calls for the project box in its header.
+
+With `pi`, log in again with `--scope-project`, usually into a second profile:
 
 ```sh
 pi --profile research login http://10.0.0.11:8443 --name alice --scope-project research
