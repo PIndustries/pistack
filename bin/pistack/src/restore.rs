@@ -293,6 +293,9 @@ mod tests {
         ];
         store.put_meta("members", &members).unwrap();
         store
+            .put_meta("cluster_removed", &vec!["gone".to_owned()])
+            .unwrap();
+        store
             .put_meta("cluster_leader_id", &"b".to_owned())
             .unwrap();
         store
@@ -349,6 +352,9 @@ mod tests {
             // The old servers are gone from it and the term moved on.
             assert_eq!(store.get_meta::<Vec<Member>>("members").unwrap(), None);
             assert_eq!(store.get_meta::<String>("node_id").unwrap(), None);
+            // Nor does it hold the old cluster's removed servers against anyone.
+            let removed: Option<Vec<String>> = store.get_meta("cluster_removed").unwrap();
+            assert_eq!(removed, None);
             assert_eq!(store.get_meta::<u64>("cluster_term").unwrap(), Some(5));
 
             // A server with an id the backup never saw starts on it and leads.

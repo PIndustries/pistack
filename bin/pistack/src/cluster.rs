@@ -440,9 +440,11 @@ pub fn forget_membership(store: &Store) -> anyhow::Result<usize> {
     let members: Vec<Member> = store.get_meta("members")?.unwrap_or_default();
     let term = store.get_meta::<u64>("cluster_term")?.unwrap_or(0);
     store.set_record_log(false);
+    // The removed ids go too: they were servers of the old cluster.
     for key in [
         "node_id",
         "members",
+        REMOVED_KEY,
         "cluster_leader_id",
         "cluster_voted_for",
     ] {
