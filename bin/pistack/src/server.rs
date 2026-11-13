@@ -179,6 +179,13 @@ fn agent_api(tls_listen: Option<&str>, agent_url: Option<&str>) -> anyhow::Resul
     Ok(Some(url.trim_end_matches('/').to_owned()))
 }
 
+/// The host of a URL, without the brackets of an IPv6 address.
+fn host_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(host.trim_matches(|c| c == '[' || c == ']').to_owned())
+}
+
 /// How a server came to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
@@ -379,6 +386,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
             addr,
             data_dir: opts.data_dir.clone(),
             store: store.clone(),
+            names: agent_api.as_deref().and_then(host_of).into_iter().collect(),
         });
     let bound = crate::listen::bind_listeners(app, &opts.listen, tls).await?;
     tracing::info!(
@@ -472,7 +480,24 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_api, ovn_host_config};
+    use super::{agent_api, host_of, ovn_host_config};
+
+    #[test]
+    fn the_certificate_host_is_read_from_the_agent_url() {
+        assert_eq!(
+            host_of("https://cloud.example:8444").as_deref(),
+            Some("cloud.example")
+        );
+        assert_eq!(
+            host_of("https://10.0.0.11:8444").as_deref(),
+            Some("10.0.0.11")
+        );
+        assert_eq!(
+            host_of("https://[fd00::11]:8444").as_deref(),
+            Some("fd00::11")
+        );
+        assert_eq!(host_of("cloud.example"), None);
+    }
 
     #[test]
     fn agents_are_sent_to_the_tls_listener_or_the_url_given_for_it() {
