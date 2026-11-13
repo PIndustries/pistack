@@ -163,15 +163,48 @@ There is no command to remove a member from the cluster. A server that is gone f
 pistack --data-dir /var/lib/pistack store backup --to /backup/pistack-2026-11-12.redb
 ```
 
-This copies `state.redb` to the file, opens the copy to check it, and prints the path. The destination must not exist. It can be run while the server is up.
+This copies `state.redb` to the file, checks the copy, and prints the path. The destination must not exist. It can be run while the server is up.
 
-When the server is running, the store is locked and the command copies the file without holding a write transaction. The copy is checked by opening it, but for a backup you intend to rely on, take it from a follower you have stopped, or stop the server briefly.
+The check opens the copy, verifies its checksums and reads every row. A copy that fails is deleted and the command fails. The store's schema version is printed on standard error and is recorded in the backup.
+
+When the server is running, the store is locked and the command copies the file without holding a write transaction. The copy is checked as above, but for a backup you intend to rely on, take it from a follower you have stopped, or stop the server briefly.
 
 The backup holds everything in the store, including secrets and the signing key for tokens. With the default `software` root-key backend it also holds the key that encrypts the secrets. Treat the file accordingly.
 
-There is no restore command. To restore, stop the server, put the backup in place as `<data_dir>/state.redb`, and start it. On a single server this brings back the state as of the backup, and tokens issued before it still work. If the file came from a different server, this server notices that the store was written by another node, forgets the vote stored in it and rejoins the leader as a learner. If there is no cluster left to rejoin, start it with the backup taken from that same server.
-
 The store does not hold image files, local volume files or object data. Those are files under the data directory; see [Storage](Storage).
+
+## Restore
+
+```sh
+# with no pistack server running on the data directory
+pistack --data-dir /var/lib/pistack store restore --from /backup/pistack-2026-11-12.redb
+pistack --data-dir /var/lib/pistack server --listen 10.0.0.11:8443
+```
+
+`store restore` copies the backup into the data directory, checks the copy the way `store backup` does, and only then puts it in place as `state.redb`. A backup that is cut short or damaged, that was written by a newer `pistack`, or that is not the store of a server that has run is refused, and the data directory is left as it was. The backup file itself is never changed.
+
+The data directory must be empty or absent. With `--force` the command restores into a directory that has things in it: the `state.redb` and `admin-password` that are there are renamed to `state.redb.before-restore-<time>` and `admin-password.before-restore-<time>`, `adopt.url` and `state.partial` are removed, and everything else is left alone. It refuses while a server has the store open. Delete the renamed files yourself once you no longer want them.
+
+A restore founds the cluster again with one server. The member list in the backup is dropped, so the server you start on the restored store is the only member and the leader, whether it is the machine the backup came from or a new one. It keeps the cluster id, so tokens, API keys and the admin password are those of the backup. `--init` and `--join` are not needed.
+
+What a restore does not put back:
+
+- **Other servers.** Restore one server and start it. On every other server, stop `pistack`, empty the data directory or move `state.redb` aside, and start it with `--join` as a new server. Do this before they can reach the restored server: a server still running on its old store holds writes from after the backup and the same cluster key. The restored server raises the term so that such a server is told its log has diverged, but this has not been tried on a real cluster.
+- **Anything written after the backup.** Machines, volumes and addresses created since are unknown to the restored store, and ones deleted since are back in it. What is running on the hosts is not rolled back with it, and what the control plane then does about the difference has not been tested.
+- **The root key in Vault.** With the default `software` backend the root key is in the backup. With the `vault` backend the backup holds the wrapped key and the server needs the same Vault settings and a Transit key version that can still unwrap it. `store restore` prints which of the two the backup holds; run `pistack keep status` to check before starting.
+- **Files outside the store.** `tls/`, `agent/` and the module directories are not touched. A certificate in `tls/` is reused as it is. If the cloud CA was made after the backup was taken, remove `tls/` so the server issues a new one, and enroll the agents again.
+
+## Upgrades
+
+The store records a schema version. A server writes it when it first opens a store and checks it on every start. It is 1 today, and a store written before the version existed counts as 1.
+
+A `pistack` that is older than the store refuses to open it, says which version the store is at, and changes nothing. A `pistack` that is newer runs its migration steps in order when it opens the store and records the new version. Every command that opens the store does this: `server`, `store stats`, `store dump`, `store restore` and `keep`. `store backup` copies the file and reports its version without migrating it. No release has needed a migration yet.
+
+`pistack store stats`, `pi version` and the `/` document of a running server show the version.
+
+Take a backup before replacing the binary. A migrated store cannot be opened by the old binary again; going back means restoring that backup with the old binary.
+
+Each server migrates its own copy of the store. Servers do not compare schema versions with each other, so when a release raises the version, stop every server, replace the binary on all of them, and start them again. A binary from before the version was recorded does not check it at all.
 
 ## Looking at the store
 
@@ -187,6 +220,9 @@ pistack --data-dir /var/lib/pistack store dump
 | Path | What it is |
 | --- | --- |
 | `state.redb` | The state store: all resources, cluster membership and the replication log. |
+| `state.redb.before-restore-<time>` | The store that was here before `store restore --force`. |
+| `state.restore` | A backup being checked by `store restore`. |
+| `admin-password` | The generated admin password, written when the cluster was founded. |
 | `node.id` | This server's member id. Keep it across a rejoin. |
 | `node.name` | The node name, chosen once. `PISTACK_NODE_NAME` overrides and rewrites it. |
 | `adopt.url` | The join target, present only while a join is in progress. |

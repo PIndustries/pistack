@@ -44,7 +44,8 @@ A server with `--tls-listen` also records an agent URL in its member record. An 
 | Command | Meaning |
 | --- | --- |
 | `pistack store backup --to <FILE>` | Copy the store to a new file and check the copy. Works while the server runs. |
-| `pistack store stats` | Rows and bytes per table, and the log range. Server must be stopped. |
+| `pistack store restore --from <FILE>` | Check a backup and put it in the data directory as `state.redb`. The directory must be empty unless `--force` is given, which renames the store that is there. Server must be stopped. |
+| `pistack store stats` | The schema version, rows and bytes per table, and the log range. Server must be stopped. |
 | `pistack store dump` | Every resource as a line of JSON. Server must be stopped. |
 
 ### pistack keep
