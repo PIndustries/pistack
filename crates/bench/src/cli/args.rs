@@ -606,6 +606,19 @@ pub enum HostCmd {
     Show(NameArg),
     /// Set or remove labels on a host. `zone` is the availability zone.
     Label(HostLabelArgs),
+    /// Stop placing machines on a host. Its machines keep running.
+    Disable(HostDisableArgs),
+    /// Let the scheduler use a host again.
+    Enable(NameArg),
+}
+
+#[derive(Args, Debug)]
+pub struct HostDisableArgs {
+    /// Name or id.
+    pub name: String,
+    /// Why, shown by `pi host show`.
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Args, Debug)]
