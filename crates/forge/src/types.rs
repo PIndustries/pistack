@@ -102,6 +102,13 @@ pub struct HostSpec {
     /// any overlay segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlay_ip: Option<String>,
+    /// Set by an operator, not by the agent. The scheduler places nothing
+    /// new on a disabled host. Machines already there keep running.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Why the host is disabled, in the operator's words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub disabled_reason: String,
 }
 
 /// What is true about a host right now. Written by the reconciler.
@@ -188,7 +195,7 @@ pub fn new_host(
             node_name: node_name.into(),
             capacity,
             drivers,
-            underlay_ip: None,
+            ..Default::default()
         },
         status: HostStatus {
             free: capacity,

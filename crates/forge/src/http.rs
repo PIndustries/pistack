@@ -61,6 +61,8 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts", get(list_hosts))
         .route("/hosts/{id}", get(get_host))
         .route("/hosts/{id}/labels", put(set_host_labels))
+        .route("/hosts/{id}/disable", post(disable_host))
+        .route("/hosts/{id}/enable", post(enable_host))
         .route("/sizes", get(list_sizes).post(create_size))
         .route(
             "/sizes/{id}",
@@ -623,6 +625,72 @@ async fn set_host_labels(
             .labels
             .retain(|k, _| k.starts_with(SYSTEM_LABEL_PREFIX));
         h.meta.labels.extend(body.labels.clone());
+        Ok(())
+    })?;
+    Ok(Json(host))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DisableHost {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The JSON body of an action that can also be posted with no body.
+fn optional_body<T: DeserializeOwned + Default>(bytes: &[u8]) -> ApiResult<T> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(bytes).map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+fn clean_reason(reason: Option<String>) -> ApiResult<Option<String>> {
+    let reason = reason
+        .map(|r| r.trim().to_owned())
+        .filter(|r| !r.is_empty());
+    if reason.as_ref().is_some_and(|r| r.chars().count() > 256) {
+        return Err(ApiError::bad_request(
+            "reason must be at most 256 characters",
+        ));
+    }
+    Ok(reason)
+}
+
+/// Stop placing machines on a host. Calling it again changes the reason
+/// when one is given and is otherwise a no-op.
+fn set_disabled(s: &AppState, id: &Id, reason: Option<String>) -> ApiResult<Host> {
+    Ok(hosts(s).modify(id, |h| {
+        h.spec.disabled = true;
+        if let Some(r) = &reason {
+            h.spec.disabled_reason = r.clone();
+        }
+        Ok(())
+    })?)
+}
+
+async fn disable_host(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Host>> {
+    scope.require_admin()?;
+    let body: DisableHost = optional_body(&body)?;
+    let reason = clean_reason(body.reason)?;
+    let host = hosts(&s).resolve(None, &id)?;
+    Ok(Json(set_disabled(&s, &host.meta.id, reason)?))
+}
+
+async fn enable_host(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Host>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let host = hosts(&s).modify(&host.meta.id, |h| {
+        h.spec.disabled = false;
+        h.spec.disabled_reason.clear();
         Ok(())
     })?;
     Ok(Json(host))
