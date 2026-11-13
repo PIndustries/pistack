@@ -26,6 +26,8 @@ struct Mock {
     polls: Arc<Mutex<u32>>,
     pods: Arc<Mutex<BTreeMap<String, Value>>>,
     execs: Arc<Mutex<Vec<Value>>>,
+    /// Each server removed, and the `force` it was asked with.
+    removals: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -245,6 +247,30 @@ async fn exec_pod(
     .into_response()
 }
 
+async fn remove_server(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let force = q.get("force").is_some_and(|v| v == "true");
+    if id == "srv-c" {
+        return err(
+            StatusCode::CONFLICT,
+            "conflict",
+            "this server is the leader",
+        );
+    }
+    if id == "srv-b" && !force {
+        return err(StatusCode::CONFLICT, "conflict", "not a majority");
+    }
+    m.removals.lock().unwrap().push((id, force));
+    Json(json!({"members": []})).into_response()
+}
+
 async fn discovery() -> Json<Value> {
     Json(json!({
         "name": "pistack", "version": "0.1.0-test", "public_url": "http://mock", "dev_mode": false,
@@ -298,6 +324,10 @@ async fn serve() -> (String, Mock) {
         .route("/compute/machines/{id}/start", post(start))
         .route("/loom/pods/{id}", get(show_pod))
         .route("/loom/pods/{id}/exec", post(exec_pod))
+        .route(
+            "/cluster/members/{id}",
+            axum::routing::delete(remove_server),
+        )
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -947,5 +977,47 @@ async fn pod_exec_prints_output_and_returns_the_exit_code() {
     assert_eq!(
         mock.execs.lock().unwrap().last().unwrap()["body"]["container"],
         "app"
+    );
+}
+
+#[tokio::test]
+async fn a_server_is_removed_by_id_prefix_or_address() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let admin = ["--url", url.as_str(), "--token", TOKEN, "server"];
+    let run = |rest: &[&'static str]| {
+        let args = [&admin[..], rest].concat();
+        let cfg = cfg.clone();
+        async move { pi(&cfg, "", &args).await }
+    };
+
+    // No terminal to confirm on, and nothing is sent.
+    let r = run(&["remove", "http://10.0.0.14:8443"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("--yes"), "{}", r.err);
+    // A name that is no server, and one that is four.
+    let r = run(&["remove", "nope", "-y"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("no server 'nope'"), "{}", r.err);
+    let r = run(&["remove", "srv-", "-y"]).await;
+    assert!(r.err.contains("more than one"), "{}", r.err);
+    assert!(mock.removals.lock().unwrap().is_empty());
+
+    // By address, then what the server refuses, then forced by id.
+    let r = run(&["remove", "http://10.0.0.14:8443", "-y"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out, "server srv-d (http://10.0.0.14:8443) removed\n");
+    let r = run(&["rm", "srv-b", "--yes"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("not a majority"), "{}", r.err);
+    let r = run(&["rm", "srv-c", "--yes", "--force"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("is the leader"), "{}", r.err);
+    let r = run(&["rm", "srv-b", "--yes", "--force"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        *mock.removals.lock().unwrap(),
+        [("srv-d".to_owned(), false), ("srv-b".to_owned(), true)]
     );
 }
