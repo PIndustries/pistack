@@ -378,6 +378,7 @@ pub static KINDS: &[KindDef] = &[
             col!("MEMORY-MIB", "/spec/capacity/memory_mib"),
             col!("FREE-MIB", "/status/free/memory_mib"),
             col!("DRIVERS", list "/spec/drivers"),
+            col!("ZONE", "/labels/zone"),
             col!("LAST-SEEN", "/status/last_seen"),
         ],
         wide: &[

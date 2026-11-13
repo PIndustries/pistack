@@ -1277,6 +1277,29 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
     match cmd {
         HostCmd::List(a) => do_list(ctx, io, k, a).await,
         HostCmd::Show(a) => do_show(ctx, io, k, a).await,
+        HostCmd::Label(a) => {
+            let c = ctx.client()?;
+            let mut labels = Map::new();
+            if !a.replace {
+                // The server replaces the whole set, so start from what the
+                // host has. Labels under pistack.io/ are the server's own.
+                let cur = c.get_value(&k.item_path(&a.name)).await?;
+                if let Some(m) = cur.pointer("/labels").and_then(Value::as_object) {
+                    for (key, v) in m {
+                        if !key.starts_with("pistack.io/") {
+                            labels.insert(key.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            labels.extend(parse_kv(&a.labels, "label")?);
+            for key in &a.remove {
+                labels.remove(key.trim());
+            }
+            let path = format!("{}/labels", k.item_path(&a.name));
+            let v = c.put(&path, &json!({ "labels": labels })).await?;
+            report(ctx, io, k, &v, "labelled")
+        }
     }
 }
 
