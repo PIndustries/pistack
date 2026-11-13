@@ -148,7 +148,7 @@ mod tests {
         }
         assert_eq!(
             text.matches("<button type=\"button\" data-view=\"").count(),
-            29
+            30
         );
         assert!(text.contains("Needs attention"));
         assert!(text.contains("Control plane"));
@@ -156,6 +156,8 @@ mod tests {
         assert!(text.contains("Launch a machine"));
         assert!(text.contains("Recent activity"));
         assert!(text.contains("/gauge/samples"));
+        assert!(text.contains("renderTopology"));
+        assert!(text.contains("/interfaces"));
         assert!(!text.contains("10.66.66."));
         assert!(!text.contains("pistack0"));
         assert!(!text.to_ascii_lowercase().contains("ovn"));

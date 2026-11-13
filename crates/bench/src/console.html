@@ -202,7 +202,7 @@
   .scope:not([hidden]) { display: flex; align-items: center; gap: 0.6rem; }
   .scope label { display: flex; align-items: center; gap: 0.35rem; margin: 0; }
   .scope label > span { font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
-  .scope select { width: auto; max-width: 11rem; padding: 0.35rem 1.6rem 0.35rem 0.6rem; font-weight: 550; text-overflow: ellipsis; }
+  .scope select { width: auto; max-width: 8.5rem; padding: 0.35rem 1.6rem 0.35rem 0.6rem; font-weight: 550; text-overflow: ellipsis; }
   #who { color: var(--muted); font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16rem; }
   #menu { display: none; }
   header button { white-space: nowrap; }
@@ -230,6 +230,26 @@
   #login-err:not(:empty) { background: var(--bad-bg); color: var(--bad); }
   #note { color: var(--muted); border-left: 3px solid var(--line-strong); border-radius: 0; padding: 0.1rem 0 0.1rem 0.8rem; max-width: 70ch; }
   #note:empty { display: none; }
+  .muted { color: var(--muted); }
+  .topo-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); padding: 0.5rem; }
+  .topo text { fill: var(--text); font-size: 12px; }
+  .topo text.dim { fill: var(--muted); font-size: 11px; }
+  .topo text.head { font-weight: 600; font-size: 13px; }
+  .topo rect.box { fill: var(--panel); stroke: var(--line-strong); }
+  .topo rect.outside { fill: var(--active); stroke: var(--accent); }
+  .topo rect.router { fill: var(--panel); stroke: var(--accent); }
+  .topo path.wire, .topo line.wire { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  .topo path.up { stroke: var(--accent); }
+  .topo circle.ready { fill: var(--ok); }
+  .topo circle.error { fill: var(--bad); }
+  .topo circle.other { fill: var(--wait); }
+  .topo .hit { cursor: pointer; }
+  .topo .hit:hover text.head, .topo .hit:hover text.name { text-decoration: underline; }
+  .topo-key { color: var(--muted); font-size: 0.8rem; margin: 0.6rem 0 0; }
+  .rules li button.x, .taglist button.x { padding: 0 0.3rem; margin-left: 0.35rem; line-height: 1.2; font-size: 0.8rem; }
+  .taglist { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+  .taglist .tag { border: 1px solid var(--line-strong); border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.8rem; white-space: nowrap; }
+  .taglist select { width: auto; padding: 0.15rem 1.4rem 0.15rem 0.4rem; font-size: 0.8rem; }
   .tools { display: flex; gap: 0.5rem; align-items: center; margin: 0 0 1rem; flex-wrap: wrap; }
   .tools .grow { flex: 1; }
   .chip { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 999px; padding: 0.05rem 0.55rem; font-variant-numeric: tabular-nums; }
@@ -391,6 +411,7 @@
       <div class="group" data-group="Network">
         <button type="button" class="group-head" aria-expanded="true">Network</button>
         <div class="group-items">
+          <button type="button" data-view="topology">Topology</button>
           <button type="button" data-view="networks">Networks</button>
           <button type="button" data-view="subnets">Subnets</button>
           <button type="button" data-view="ports">Ports</button>
@@ -495,6 +516,7 @@ const VIEWS = {
       ["Drivers", i => ((i.spec && i.spec.drivers) || []).join(", ")],
     ],
   },
+  topology: { title: "Topology" },
   networks: {
     title: "Networks",
     path: "/network/networks",
@@ -3311,8 +3333,214 @@ async function render(soft) {
   applyFilter();
 }
 
+
+// Pages whose rows are not deleted from here: a host leaves by being
+// drained and removed, and these pages draw their own rows.
+const NO_DELETE = new Set(["hosts", "dns", "balancers", "overview", "topology"]);
+
+// The subnets a router joins, each with a way to take it off, and a box to
+// add another. The whole list is sent each time.
+function routerSubnetCell(router, subnets) {
+  const td = el("td");
+  const wrap = el("div", null, "taglist");
+  const joined = ((router.spec && router.spec.interfaces) || []).map(String);
+  const send = async (list) => {
+    setErr("");
+    try { await api("PUT", "/network/routers/" + router.id + "/interfaces", { subnets: list }); await render(); }
+    catch (e) { setErr(e.message); }
+  };
+  for (const id of joined) {
+    const sub = subnets.find(x => String(x.id) === id);
+    const tag = el("span", sub ? sub.name + " " + ((sub.spec && sub.spec.cidr) || "") : shortId(id), "tag");
+    if (!readOnly) {
+      const x = el("button", "×", "x"); x.type = "button";
+      x.title = "Take this subnet off the router";
+      x.setAttribute("aria-label", "Detach " + (sub ? sub.name : id));
+      x.addEventListener("click", () => {
+        if (confirm("Detach " + (sub ? sub.name : id) + " from " + router.name + "? Machines on it lose their way out.")) send(joined.filter(j => j !== id));
+      });
+      tag.append(x);
+    }
+    wrap.append(tag);
+  }
+  if (!joined.length) wrap.append(el("span", "none", "muted"));
+  // A router can only join a subnet that has a gateway address.
+  const free = subnets.filter(x => !joined.includes(String(x.id)) && x.spec && x.spec.gateway);
+  if (!readOnly && free.length) {
+    const pick = el("select");
+    pick.setAttribute("aria-label", "Attach a subnet to " + router.name);
+    pick.append(option("", "Attach subnet…"));
+    for (const x of free) pick.append(option(String(x.id), x.name + " " + ((x.spec && x.spec.cidr) || "")));
+    pick.addEventListener("change", () => { if (pick.value) send(joined.concat([pick.value])); });
+    wrap.append(pick);
+  }
+  td.append(wrap);
+  return td;
+}
+
+// ---- topology --------------------------------------------------------------
+
+function clip(text, n) {
+  const t = String(text == null ? "" : text);
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+function svgText(x, y, text, cls, anchor) {
+  const t = svgEl("text", { x, y });
+  if (cls) t.setAttribute("class", cls);
+  if (anchor) t.setAttribute("text-anchor", anchor);
+  t.textContent = text;
+  return t;
+}
+// Outside networks along the top, routers under them, then one column per
+// network with the machines that have a port on it.
+async function renderTopology(root, gen) {
+  const tools = el("div"); tools.className = "tools";
+  tools.append(el("h2", "Topology"), el("span", null, "grow"));
+  const refresh = el("button", "Refresh"); refresh.type = "button";
+  refresh.addEventListener("click", () => render());
+  tools.append(refresh);
+  root.append(tools);
+  const paths = ["/network/networks", "/network/subnets", "/network/ports", "/network/routers", "/network/floating-ips", "/compute/machines"];
+  let lists;
+  try {
+    const first = await api("GET", paths[0]);
+    const rest = await Promise.all(paths.slice(1).map(p => api("GET", p).catch(() => null)));
+    lists = [first].concat(rest).map(p => (p ? itemsOf(p) : []));
+  } catch (e) {
+    if (gen !== renderGen) return;
+    setErr(e.message);
+    return;
+  }
+  if (gen !== renderGen) return;
+  const [nets, subs, ports, routers, fips, machines] = lists;
+  if (!nets.length) {
+    root.append(el("p", "No networks yet. Create one under Networks, give it a subnet, and it shows here.", "muted"));
+    return;
+  }
+  const same = (a, b) => a != null && b != null && String(a) === String(b);
+  const outside = nets.filter(n => n.spec && n.spec.external);
+  const inner = nets.filter(n => !(n.spec && n.spec.external));
+  const COL = 220, BOXW = 200, ROW = 30, HEAD = 54;
+  const cols = Math.max(inner.length, routers.length, 1);
+  const W = Math.max(720, cols * COL + 20);
+  const colX = i => 10 + i * COL + Math.max(0, (W - 20 - cols * COL) / 2);
+  const netCx = new Map();
+  inner.forEach((n, i) => netCx.set(String(n.id), colX(i) + BOXW / 2));
+
+  // Where each router sits: over the middle of the networks it joins.
+  const want = routers.map((r, i) => {
+    const joins = ((r.spec && r.spec.interfaces) || [])
+      .map(id => subs.find(x => same(x.id, id)))
+      .filter(Boolean)
+      .map(x => String(x.spec && x.spec.network))
+      .filter(id => netCx.has(id));
+    const uniq = [...new Set(joins)];
+    const cx = uniq.length ? uniq.reduce((a, id) => a + netCx.get(id), 0) / uniq.length : colX(i) + BOXW / 2;
+    return { r, joins: uniq, cx };
+  }).sort((a, b) => a.cx - b.cx);
+  for (let i = 1; i < want.length; i++) want[i].cx = Math.max(want[i].cx, want[i - 1].cx + 170);
+  const spill = want.length ? want[want.length - 1].cx + 85 - (W - 10) : 0;
+  if (spill > 0) for (const w of want) w.cx -= spill;
+
+  const topY = 10, topH = 46, rY = 104, rH = 44, nY = 196;
+  const rowsOf = n => ports.filter(p => same(p.spec && p.spec.network, n.id) && p.spec.device && !routers.some(r => same(r.id, p.spec.device)));
+  const tallest = Math.max(1, ...inner.map(n => rowsOf(n).length));
+  const H = nY + HEAD + tallest * ROW + 24;
+  const svg = svgEl("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, role: "img", class: "topo" });
+  svg.setAttribute("aria-label", "Networks, routers and the machines on them");
+  const wires = svgEl("g", {});
+  const boxes = svgEl("g", {});
+  svg.append(wires, boxes);
+  const hit = (g, view, after) => {
+    g.setAttribute("class", "hit");
+    g.setAttribute("tabindex", "0");
+    g.setAttribute("role", "link");
+    const open = () => { go(view); if (after) after(); };
+    g.addEventListener("click", open);
+    g.addEventListener("keydown", ev => { if (ev.key === "Enter") open(); });
+  };
+
+  // Outside networks.
+  const span = (W - 20) / Math.max(outside.length, 1);
+  const outBox = new Map();
+  outside.forEach((n, i) => {
+    const x = 10 + i * span, w = span - (outside.length > 1 ? 10 : 0);
+    outBox.set(String(n.id), { x, w });
+    const g = svgEl("g", {});
+    g.append(svgEl("rect", { x, y: topY, width: w, height: topH, rx: 10, class: "outside" }));
+    g.append(svgText(x + 14, topY + 20, clip(n.name, 40), "head"));
+    const cidrs = subs.filter(x2 => same(x2.spec && x2.spec.network, n.id)).map(x2 => x2.spec.cidr).join("  ");
+    const direct = rowsOf(n).length;
+    g.append(svgText(x + 14, topY + 37, "outside network" + (cidrs ? "  " + cidrs : "") + (direct ? "  ·  " + direct + " machine ports" : ""), "dim"));
+    hit(g, "networks");
+    boxes.append(g);
+  });
+  if (!outside.length) boxes.append(svgText(14, topY + 28, "No outside network. Machines here cannot reach beyond their own networks.", "dim"));
+
+  // Routers and their wires.
+  for (const w of want) {
+    const r = w.r;
+    const x = w.cx - 75;
+    const g = svgEl("g", {});
+    g.append(svgEl("rect", { x, y: rY, width: 150, height: rH, rx: 22, class: "router" }));
+    g.append(svgText(w.cx, rY + 19, clip(r.name, 20), "head", "middle"));
+    g.append(svgText(w.cx, rY + 35, (r.status && r.status.external_ip) ? String(r.status.external_ip) : "router", "dim", "middle"));
+    hit(g, "routers");
+    boxes.append(g);
+    const out = r.spec && r.spec.external_network && outBox.get(String(r.spec.external_network));
+    if (out) {
+      const ux = Math.min(Math.max(w.cx, out.x + 12), out.x + out.w - 12);
+      wires.append(svgEl("path", { d: "M" + w.cx + " " + rY + " V" + (rY - 22) + " H" + ux + " V" + (topY + topH), class: "wire up" }));
+    }
+    w.joins.forEach((id, k) => {
+      const nx = netCx.get(id);
+      const mid = rY + rH + 14 + (k % 3) * 6;
+      wires.append(svgEl("path", { d: "M" + w.cx + " " + (rY + rH) + " V" + mid + " H" + nx + " V" + nY, class: "wire" }));
+    });
+  }
+
+  // One column per network.
+  inner.forEach((n, i) => {
+    const x = colX(i);
+    const rows = rowsOf(n);
+    const h = HEAD + Math.max(1, rows.length) * ROW + 8;
+    boxes.append(svgEl("rect", { x, y: nY, width: BOXW, height: h, rx: 10, class: "box" }));
+    const head = svgEl("g", {});
+    head.append(svgEl("rect", { x, y: nY, width: BOXW, height: HEAD, rx: 10, fill: "transparent" }));
+    head.append(svgText(x + 12, nY + 21, clip(n.name, 24), "head"));
+    const cidrs = subs.filter(x2 => same(x2.spec && x2.spec.network, n.id)).map(x2 => x2.spec.cidr);
+    head.append(svgText(x + 12, nY + 39, cidrs.length ? clip(cidrs.join("  "), 30) : "no subnet", "dim"));
+    hit(head, "networks");
+    boxes.append(head);
+    boxes.append(svgEl("line", { x1: x, y1: nY + HEAD, x2: x + BOXW, y2: nY + HEAD, class: "wire", "stroke-opacity": 0.35 }));
+    if (!rows.length) boxes.append(svgText(x + 12, nY + HEAD + 20, "nothing attached", "dim"));
+    rows.forEach((p, k) => {
+      const y = nY + HEAD + k * ROW + 20;
+      const m = machines.find(mm => same(mm.id, p.spec.device));
+      const phase = String((m && m.status && m.status.phase) || (p.status && p.status.phase) || "").toLowerCase();
+      const fip = fips.find(f => same(f.spec && f.spec.port, p.id));
+      const g = svgEl("g", {});
+      g.append(svgEl("circle", { cx: x + 16, cy: y - 4, r: 4, class: phase === "ready" ? "ready" : phase === "error" ? "error" : "other" }));
+      g.append(svgText(x + 28, y, clip(m ? m.name : (p.name || shortId(String(p.spec.device))), 13), "name"));
+      const ip = ((p.spec && p.spec.fixed_ips) || [])[0];
+      g.append(svgText(x + BOXW - 10, y, (fip && fip.spec && fip.spec.address ? "↗ " : "") + (ip ? String(ip) : ""), "dim", "end"));
+      const tip = svgEl("title", {});
+      tip.textContent = (m ? m.name : "port " + (p.name || p.id)) + (ip ? "  " + ip : "") + (fip && fip.spec && fip.spec.address ? "  floating IP " + fip.spec.address : "") + (phase ? "  " + phase : "");
+      g.append(tip);
+      if (m) hit(g, "machines", () => { openMachine = m.id; render(); });
+      boxes.append(g);
+    });
+  });
+
+  const wrap = el("div", null, "topo-wrap");
+  wrap.append(svg);
+  root.append(wrap);
+  root.append(el("p", "A line from a router up is its way outside; lines down are the subnets it joins. ↗ marks a machine with a floating IP. Select a machine, router or network to open it.", "topo-key"));
+}
+
 async function renderInto(root, view, gen) {
   if (current === "overview") { await renderOverview(root, gen); return; }
+  if (current === "topology") { await renderTopology(root, gen); return; }
   const form = readOnly ? null : createForm();
   const tools = el("div"); tools.className = "tools";
   tools.append(el("h2", view.title));
@@ -3369,12 +3597,23 @@ async function renderInto(root, view, gen) {
     }
   }
   const items = itemsOf(page);
+  let routerSubnets = [];
+  if (current === "routers") {
+    try { routerSubnets = itemsOf(await api("GET", "/network/subnets")); }
+    catch (e) { routerSubnets = []; }
+    if (gen !== renderGen) return;
+  }
   setCount(current, items.length);
   chip.textContent = String(items.length);
   root.append(simpleTable(view.cols, items));
   const table = root.lastElementChild;
   const body = table.querySelector("tbody");
-  const rowAction = !!(view.actions || view.apply);
+  if (current === "routers" && items.length) {
+    table.querySelector("tr").append(el("th", "Subnets"));
+    body.querySelectorAll("tr").forEach((tr, idx) => tr.append(routerSubnetCell(items[idx], routerSubnets)));
+  }
+  const canDelete = !readOnly && !view.actions && !NO_DELETE.has(current);
+  const rowAction = !!(view.actions || view.apply || canDelete);
   if (rowAction || view.rules) {
     const head = table.querySelector("tr");
     if (rowAction) head.append(el("th", ""));
@@ -3404,7 +3643,22 @@ async function renderInto(root, view, gen) {
             cell.replaceChildren(document.createTextNode(String(rules.length)));
             if (rules.length) {
               const ul = el("ul"); ul.className = "rules";
-              for (const r of rules) ul.append(el("li", ruleLine(r)));
+              for (const r of rules) {
+                const li = el("li", ruleLine(r));
+                if (!readOnly && r.id) {
+                  const x = el("button", "×", "x"); x.type = "button";
+                  x.title = "Remove this rule";
+                  x.setAttribute("aria-label", "Remove rule " + ruleLine(r));
+                  x.addEventListener("click", async () => {
+                    if (!confirm("Remove the rule " + ruleLine(r) + " from " + item.name + "?")) return;
+                    setErr("");
+                    try { await api("DELETE", view.path + "/" + item.id + "/rules/" + r.id); await render(); }
+                    catch (e) { setErr(e.message); }
+                  });
+                  li.append(x);
+                }
+                ul.append(li);
+              }
               cell.append(ul);
             }
           }
@@ -3446,6 +3700,18 @@ async function renderInto(root, view, gen) {
             });
             if (td.childNodes.length) td.append(document.createTextNode(" "));
             td.append(apply);
+          }
+          if (canDelete) {
+            const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
+            del.addEventListener("click", async () => {
+              if (!confirm("Delete " + (item.name || item.id) + "? This cannot be undone.")) return;
+              setErr("");
+              del.disabled = true;
+              try { await api("DELETE", view.path + "/" + item.id); await render(); }
+              catch (e) { setErr(e.message); del.disabled = false; }
+            });
+            if (td.childNodes.length) td.append(document.createTextNode(" "));
+            td.append(del);
           }
           const history = (item.status && item.status.history) || [];
           if (view.rollback && history.length > 1) {
