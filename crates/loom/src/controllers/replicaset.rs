@@ -136,6 +136,7 @@ impl Controller for ReplicaSetController {
                 self.converge(rs, &pods)
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(rs = %rs.meta.id, error = %e, "loom: replicaset reconcile failed");
             }
         }

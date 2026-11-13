@@ -27,6 +27,22 @@
 //! logged write, confirmed like any other, so every server agrees. From then
 //! on the `/cluster` routes refuse that id, on every server, until it joins
 //! again with a join token.
+//!
+//! A member the leader can no longer feed from its log, because the two
+//! logs differ or the leader trimmed what the member needs, replaces its
+//! own store with a snapshot and starts again ([`resync`]).
+//!
+//! Servers call each other over TLS when they can. A member with a TLS
+//! listener has its address in its record, and a call to it goes there and
+//! checks the certificate against the cloud CA in the store ([`Peer`],
+//! [`peer_send`]). `PISTACK_CLUSTER_TLS=required` leaves no other way. A
+//! server with no store yet has no CA: it joins over https only against a
+//! fingerprint of the CA it was given, and over plain http only when told
+//! to ([`first_contact`]).
+
+mod resync;
+
+pub use resync::{auto_resync_value, AUTO_RESYNC_ENV};
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -42,6 +58,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, Router};
+use keep::peer::{PeerNet, TlsMode};
 use pistack_cluster::{
     accepts_writes, check_advertise, check_follower_tip, classify, consider_pre_vote,
     consider_vote, election_seed, election_timeout, follow_candidate, in_leader_lease, is_voter,
@@ -105,6 +122,10 @@ pub struct BootRequest<'a> {
     pub join: Option<&'a str>,
     pub listen: &'a str,
     pub public_url: &'a str,
+    /// `PISTACK_JOIN_CA_SHA256`: the fingerprint of the cloud's root CA.
+    pub ca_pin: Option<&'a str>,
+    /// `--insecure-join`: the first download may go over plain http.
+    pub insecure_join: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +205,20 @@ pub struct ClusterHandle {
     pub membership: Mutex<()>,
     /// Set when another server answered that this one was removed.
     pub removed: AtomicBool,
+    /// Replace the store by itself when the leader cannot feed it from the
+    /// log. `PISTACK_AUTO_RESYNC=0` turns it off.
+    pub auto_resync: AtomicBool,
+    pub resync: Mutex<resync::ResyncState>,
+    /// The store is not replaced again this soon; ten minutes outside tests.
+    pub resync_gap: Mutex<Duration>,
+    /// Set once the store file was replaced under this process. No vote is
+    /// given and no term taken after it: they would go to the old file.
+    pub sealed: AtomicBool,
+    /// The store file was replaced and the process must start again on it.
+    pub restart: AtomicBool,
+    /// How the other servers are called: their TLS address or their plain
+    /// one, and the CA their certificate is checked against.
+    pub peers: PeerNet,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -254,6 +289,7 @@ pub fn load_or_create_node_id(data_dir: &Path) -> anyhow::Result<String> {
 /// [`BootKind::Keep`] without opening a socket.
 pub async fn prepare_store(req: &BootRequest<'_>) -> anyhow::Result<BootKind> {
     let path = req.data_dir.join("state.redb");
+    resync::finish_interrupted(req.data_dir);
     if path.exists() {
         return Ok(BootKind::Keep);
     }
@@ -261,8 +297,9 @@ pub async fn prepare_store(req: &BootRequest<'_>) -> anyhow::Result<BootKind> {
         return Ok(BootKind::Init);
     }
     if let Some(url) = req.join.map(str::trim).filter(|s| !s.is_empty()) {
+        let via = first_contact(url, req.ca_pin, req.insecure_join)?;
         remember_leader(req.data_dir, url);
-        fetch_snapshot(url, &path).await?;
+        fetch_snapshot(&via, &path).await?;
         return Ok(BootKind::Joined);
     }
     let Some(ip) = advertise_ip(req.listen) else {
@@ -278,8 +315,11 @@ pub async fn prepare_store(req: &BootRequest<'_>) -> anyhow::Result<BootKind> {
             if ann.api.trim().is_empty() {
                 anyhow::bail!("peer announced an empty api address; pass --join URL");
             }
+            // Discovery announces the API address, which is plain http
+            // unless a proxy stands in front of it.
+            let via = first_contact(ann.api.trim(), req.ca_pin, req.insecure_join)?;
             remember_leader(req.data_dir, ann.api.trim());
-            fetch_snapshot(ann.api.trim(), &path).await?;
+            fetch_snapshot(&via, &path).await?;
             Ok(BootKind::Joined)
         }
         Formation::Wait => anyhow::bail!(
@@ -489,20 +529,23 @@ fn remember_leader(data_dir: &Path, api: &str) {
 /// This process does not become leader.
 pub async fn adopt(
     store: &Store,
+    net: &PeerNet,
     leader_api: &str,
     node_id: &str,
     self_api: &str,
     agent_api: Option<&str>,
 ) -> anyhow::Result<Established> {
-    let url = format!("{}/cluster/join", leader_api.trim_end_matches('/'));
+    // The store is the snapshot, so it names the leader's TLS address and
+    // holds the CA to check it with.
+    let leader = Peer::at(store, leader_api);
     let body = JoinRequest {
         node_id: node_id.to_owned(),
         api: self_api.to_owned(),
         agent_api: agent_api.map(str::to_owned),
     };
-    let status: ClusterStatus = post_json(&url, node_id, &body)
+    let status: ClusterStatus = post_json(net, &leader, "/cluster/join", node_id, &body)
         .await
-        .with_context(|| format!("joining {url}"))?;
+        .with_context(|| format!("joining {leader_api}"))?;
     store.set_record_log(false);
     forget_copied_vote(store)?;
     store.put_meta("members", &status.members)?;
@@ -582,6 +625,12 @@ pub fn handle_from(
         confirm_wait: Mutex::new(CONFIRM_WAIT),
         membership: Mutex::new(()),
         removed: AtomicBool::new(false),
+        auto_resync: AtomicBool::new(true),
+        resync: Mutex::new(resync::ResyncState::default()),
+        resync_gap: Mutex::new(resync::RESYNC_GAP),
+        sealed: AtomicBool::new(false),
+        restart: AtomicBool::new(false),
+        peers: PeerNet::plain(),
     }
 }
 
@@ -591,6 +640,25 @@ impl ClusterHandle {
     pub fn with_agent_api(mut self, agent_api: Option<String>) -> Self {
         self.agent_api = agent_api;
         self
+    }
+
+    /// Set before the handle is shared. Without it every server is called
+    /// at its API address as recorded.
+    pub fn with_peers(mut self, peers: PeerNet) -> Self {
+        self.peers = peers;
+        self
+    }
+
+    /// Set before the handle is shared. See [`resync`].
+    pub fn with_auto_resync(self, on: bool) -> Self {
+        self.auto_resync.store(on, Ordering::Relaxed);
+        self
+    }
+
+    /// True when the follow loop replaced the store file and stopped the
+    /// server so that it starts again on the new one.
+    pub fn wants_restart(&self) -> bool {
+        self.restart.load(Ordering::Acquire)
     }
 }
 
@@ -633,6 +701,46 @@ pub fn admin_router(handle: std::sync::Arc<ClusterHandle>) -> Router {
     Router::new()
         .route("/cluster/members/{id}", axum::routing::delete(remove))
         .with_state(handle)
+}
+
+/// Whether a request is one server calling another. `as_server` is whether
+/// it carries a peer key or a join token: the status and the removal of a
+/// member are also an administrator's, who sends neither.
+fn is_peer_call(path: &str, as_server: bool) -> bool {
+    if path.starts_with("/silo/peer/") {
+        return true;
+    }
+    if path == "/cluster" || path.starts_with("/cluster/members") {
+        return as_server;
+    }
+    path.starts_with("/cluster/")
+}
+
+/// Under `PISTACK_CLUSTER_TLS=required`, refuse a call from another server
+/// that arrives on the plain listener. The caller has already sent its key
+/// in the clear by then; refusing it makes a server that still does so
+/// fail where it is seen.
+pub async fn refuse_plain_peers(
+    State(mode): State<TlsMode>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if mode == TlsMode::Required {
+        let over_tls = req
+            .extensions()
+            .get::<keep::PeerIdentity>()
+            .is_some_and(|peer| peer.tls);
+        let headers = req.headers();
+        let as_server = headers.contains_key(PEER_HEADER) || headers.contains_key(JOIN_HEADER);
+        if !over_tls && is_peer_call(req.uri().path(), as_server) {
+            return ApiError::forbidden(format!(
+                "this server takes calls from other servers only on its TLS listener ({}=required)",
+                keep::peer::CLUSTER_TLS_ENV
+            ))
+            .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 pub async fn reject_follower_writes(
@@ -1121,6 +1229,9 @@ async fn vote(
     }
     let (before, response) = {
         let _ballot = guard(&handle.ballot);
+        if handle.sealed.load(Ordering::Acquire) {
+            return Ok(refuse(&handle));
+        }
         let mut ballot = load_ballot(&handle.store).map_err(store_err)?;
         if req.pre {
             return Ok(Json(consider_pre_vote(&ballot, &req)));
@@ -1153,10 +1264,8 @@ pub async fn pull_log(leader: &str, store: &Store) -> anyhow::Result<()> {
         .map(|_| ())
 }
 
-/// One page of entries after our commit index. Returns how many were applied.
-/// Naming that index tells the leader we hold everything through it.
-/// `current_term` is this server's term (0 leaves it unsaid), and `wait` is
-/// how long the leader may hold an empty answer for a new entry.
+/// [`pull_from`] a server known only by its plain address.
+#[cfg(test)]
 async fn pull_page(
     leader: &str,
     store: &Store,
@@ -1164,22 +1273,37 @@ async fn pull_page(
     current_term: u64,
     wait: Duration,
 ) -> anyhow::Result<usize> {
+    let net = PeerNet::plain();
+    pull_from(&net, &Peer::plain(leader), store, node, current_term, wait).await
+}
+
+/// One page of entries after our commit index. Returns how many were applied.
+/// Naming that index tells the leader we hold everything through it.
+/// `current_term` is this server's term (0 leaves it unsaid), and `wait` is
+/// how long the leader may hold an empty answer for a new entry.
+async fn pull_from(
+    net: &PeerNet,
+    leader: &Peer,
+    store: &Store,
+    node: &str,
+    current_term: u64,
+    wait: Duration,
+) -> anyhow::Result<usize> {
     let after = store.commit_index()?;
     let term = store.log_term_at(after)?.unwrap_or(0);
-    let url = format!(
-        "{}/cluster/log?after={after}&term={term}&node={node}&fterm={current_term}&wait={}",
-        leader.trim_end_matches('/'),
+    let path = format!(
+        "/cluster/log?after={after}&term={term}&node={node}&fterm={current_term}&wait={}",
         wait.as_millis()
     );
-    let response = as_node(with_join(rpc_client().get(&url)), node)
-        .timeout(RPC_TIMEOUT)
-        .send()
-        .await?;
+    let response = peer_send(net, leader, RPC_CONNECT_TIMEOUT, |client, base| {
+        as_node(with_join(client.get(format!("{base}{path}"))), node).timeout(RPC_TIMEOUT)
+    })
+    .await?;
     if response.status().as_u16() == StatusCode::CONFLICT.as_u16() {
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("leader refused the pull: {body}");
     }
-    let entries: Vec<LogEntry> = checked(&url, response).await?.json().await?;
+    let entries: Vec<LogEntry> = checked(response).await?.json().await?;
     if entries.is_empty() {
         return Ok(0);
     }
@@ -1204,7 +1328,16 @@ fn start_pull(handle: &std::sync::Arc<ClusterHandle>, leader: &str) {
                 break Ok(());
             }
             let term = handle.term.load(Ordering::Relaxed);
-            match pull_page(&leader, &handle.store, &handle.node_id, term, LOG_WAIT).await {
+            let from = Peer::at(&handle.store, &leader);
+            let pulled = pull_from(
+                &handle.peers,
+                &from,
+                &handle.store,
+                &handle.node_id,
+                term,
+                LOG_WAIT,
+            );
+            match pulled.await {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => break Ok(()),
                 Err(err) => break Err(err),
@@ -1270,6 +1403,18 @@ async fn follow(handle: std::sync::Arc<ClusterHandle>, shutdown: CancellationTok
                         note_refusal(&handle, &err);
                         tracing::debug!(leader = %found, error = %err, "leader check failed")
                     }
+                }
+            }
+        }
+        // Here and not in a task of its own: this loop is the only place a
+        // server becomes leader, so it cannot become one while its store is
+        // being replaced.
+        if resync::due(&handle) {
+            if let Some(leader) = fresh_leader(&handle) {
+                if resync::run(&handle, &leader).await {
+                    handle.restart.store(true, Ordering::Release);
+                    shutdown.cancel();
+                    break;
                 }
             }
         }
@@ -1377,13 +1522,16 @@ fn report_agent_address(handle: &ClusterHandle, leader: &str) {
         }
         *last = Some(Instant::now());
     }
-    let url = format!("{}/cluster/agent-address", leader.trim_end_matches('/'));
+    let leader = Peer::at(&handle.store, leader);
+    let net = handle.peers.clone();
     let body = AgentAddress {
         node_id: handle.node_id.clone(),
         agent_api: handle.agent_api.clone(),
     };
     tokio::spawn(async move {
-        let sent = rpc_post_json::<_, ClusterStatus>(&url, &body.node_id, &body).await;
+        let path = "/cluster/agent-address";
+        let sent =
+            rpc_post_json::<_, ClusterStatus>(&net, &leader, path, &body.node_id, &body).await;
         if let Err(err) = sent {
             tracing::warn!(
                 error = %err,
@@ -1507,10 +1655,11 @@ async fn probe_voters(handle: &ClusterHandle) -> Vec<ClusterStatus> {
         .into_iter()
         .filter(|member| member.role == Role::Voter && member.id != handle.node_id)
     {
-        let url = format!("{}/cluster", member.api.trim_end_matches('/'));
+        let peer = Peer::of(&member);
+        let net = handle.peers.clone();
         let node = handle.node_id.clone();
         probes.spawn(async move {
-            let probe = rpc_get_json::<ClusterStatus>(&url, &node);
+            let probe = rpc_get_json::<ClusterStatus>(&net, &peer, "/cluster", &node);
             match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
                 Ok(Ok(status)) if status.node_id == member.id => Ok(Some(status)),
                 Ok(Err(err)) if says_removed(&err) => Err(()),
@@ -1533,8 +1682,9 @@ async fn probe_voters(handle: &ClusterHandle) -> Vec<ClusterStatus> {
 /// renews the lease and the election timer; a failed pull after it does not
 /// undo either.
 async fn refresh(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow::Result<()> {
-    let url = format!("{}/cluster", leader.trim_end_matches('/'));
-    let status: ClusterStatus = rpc_get_json(&url, &handle.node_id).await?;
+    let peer = Peer::at(&handle.store, leader);
+    let status: ClusterStatus =
+        rpc_get_json(&handle.peers, &peer, "/cluster", &handle.node_id).await?;
     if !status.leader {
         anyhow::bail!("peer is not the leader");
     }
@@ -1607,16 +1757,27 @@ fn note_pull(handle: &ClusterHandle, leader: &str, pulled: anyhow::Result<()>) {
     let mut last = guard(&handle.pull_error);
     match pulled {
         Ok(()) => {
+            guard(&handle.resync).wanted = None;
             if last.take().is_some() {
                 tracing::info!(leader = %leader, "replication caught up");
             }
         }
         Err(err) => {
             let text = format!("{err:#}");
+            let heals = handle.auto_resync.load(Ordering::Relaxed);
+            if heals && !text.contains(REMOVED_MARK) {
+                guard(&handle.resync).wanted = resync::why(&text);
+            }
             if text.contains(REMOVED_MARK) {
                 note_removed(handle);
             } else if last.as_deref() == Some(text.as_str()) {
                 tracing::debug!(leader = %leader, error = %text, "replication pull failed");
+            } else if heals && resync::why(&text).is_some() {
+                tracing::warn!(
+                    leader = %leader,
+                    error = %text,
+                    "replication stopped: the leader cannot feed this store from its log. This server will replace its store with a snapshot from the leader and start again"
+                );
             } else if text.contains("compacted") {
                 tracing::warn!(
                     leader = %leader,
@@ -1644,6 +1805,9 @@ fn since_contact(handle: &ClusterHandle) -> Option<Duration> {
 /// Move to `term` when it is newer than ours and clear our vote.
 fn adopt_term(handle: &ClusterHandle, term: u64) -> anyhow::Result<bool> {
     let _ballot = guard(&handle.ballot);
+    if handle.sealed.load(Ordering::Acquire) {
+        return Ok(false);
+    }
     let mut ballot = load_ballot(&handle.store)?;
     if term <= ballot.current_term {
         return Ok(false);
@@ -1717,10 +1881,10 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
         return Ok(());
     }
     let need = majority(voters.len());
-    let peers: Vec<String> = voters
+    let peers: Vec<Peer> = voters
         .iter()
         .filter(|peer| peer.id != handle.node_id)
-        .map(|peer| format!("{}/cluster/vote", peer.api.trim_end_matches('/')))
+        .map(|peer| Peer::of(peer))
         .collect();
     let ballot = {
         let _ballot = guard(&handle.ballot);
@@ -1735,7 +1899,7 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
         last_term: ballot.last_term,
         pre: true,
     };
-    let (grants, newest) = ask_votes(&peers, &request, need).await;
+    let (grants, newest) = ask_votes(&handle.peers, &peers, &request, need).await;
     if newest > current {
         adopt_term(handle, newest)?;
         return Ok(());
@@ -1763,7 +1927,7 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
     }
     request.pre = false;
     tracing::info!(node = %handle.node_id, term, "starting election");
-    let (grants, newest) = ask_votes(&peers, &request, need).await;
+    let (grants, newest) = ask_votes(&handle.peers, &peers, &request, need).await;
     if newest > term {
         adopt_term(handle, newest)?;
         return Ok(());
@@ -1788,17 +1952,29 @@ async fn campaign(handle: &ClusterHandle) -> anyhow::Result<()> {
 /// Send `request` to every peer at once. Returns the grants including our
 /// own, and the newest term any peer reported. Stops waiting once `need`
 /// grants are in.
-async fn ask_votes(peers: &[String], request: &VoteRequest, need: usize) -> (usize, u64) {
+async fn ask_votes(
+    net: &PeerNet,
+    peers: &[Peer],
+    request: &VoteRequest,
+    need: usize,
+) -> (usize, u64) {
     let mut grants = 1usize;
     let mut newest = 0u64;
     let mut votes = tokio::task::JoinSet::new();
-    for url in peers {
-        let url = url.clone();
+    for peer in peers {
+        let peer = peer.clone();
+        let net = net.clone();
         let request = request.clone();
         votes.spawn(async move {
-            let result: anyhow::Result<VoteResponse> =
-                rpc_post_json(&url, &request.candidate_id, &request).await;
-            (url, result)
+            let result: anyhow::Result<VoteResponse> = rpc_post_json(
+                &net,
+                &peer,
+                "/cluster/vote",
+                &request.candidate_id,
+                &request,
+            )
+            .await;
+            (peer.api, result)
         });
     }
     while let Some(joined) = votes.join_next().await {
@@ -1847,6 +2023,7 @@ fn become_leader(handle: &ClusterHandle, term: u64) -> anyhow::Result<()> {
     *guard(&handle.last_heard) = Instant::now();
     *guard(&handle.leader_contact) = Some(Instant::now());
     *guard(&handle.pull_error) = None;
+    guard(&handle.resync).wanted = None;
     // Acknowledgements from an earlier time leading say nothing about what
     // followers hold now.
     guard(&handle.progress).clear();
@@ -2142,6 +2319,7 @@ fn locked<T: Clone>(mutex: &Mutex<T>) -> T {
     guard(mutex).clone()
 }
 
+#[cfg(test)]
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -2195,12 +2373,72 @@ fn as_node(builder: reqwest::RequestBuilder, node: &str) -> reqwest::RequestBuil
 
 /// A 403 keeps its body in the error: it is how a removed server learns
 /// what happened to it.
-async fn checked(url: &str, response: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+async fn checked(response: reqwest::Response) -> anyhow::Result<reqwest::Response> {
     if response.status() == reqwest::StatusCode::FORBIDDEN {
+        let url = response.url().clone();
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("{url} returned 403: {body}");
     }
     Ok(response.error_for_status()?)
+}
+
+/// A member as another server calls it: its API address and, when it has a
+/// TLS listener, the address of that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Peer {
+    api: String,
+    tls: Option<String>,
+}
+
+impl Peer {
+    fn of(member: &Member) -> Self {
+        Self {
+            api: member.api.clone(),
+            tls: member.agent_api.clone(),
+        }
+    }
+
+    /// A server known only by a plain address.
+    fn plain(url: &str) -> Self {
+        Self {
+            api: url.to_owned(),
+            tls: None,
+        }
+    }
+
+    /// The member that `url` is an address of, by the member list in
+    /// `store`. An https address no record holds is still a server of this
+    /// cloud and is checked against its CA; any other address is called as
+    /// it is.
+    fn at(store: &Store, url: &str) -> Self {
+        let url = url.trim().trim_end_matches('/');
+        let same = |held: &str| held.trim().trim_end_matches('/') == url;
+        let members = members_of(store).unwrap_or_default();
+        let found = members
+            .iter()
+            .find(|member| same(&member.api) || member.agent_api.as_deref().is_some_and(same));
+        match found {
+            Some(member) => Self::of(member),
+            None if url.starts_with("https://") => Self {
+                api: url.to_owned(),
+                tls: Some(url.to_owned()),
+            },
+            None => Self::plain(url),
+        }
+    }
+}
+
+/// Send one request to another server. `request` builds it for the client
+/// and base address it is given. See [`PeerNet::send`] for where it goes.
+async fn peer_send(
+    net: &PeerNet,
+    peer: &Peer,
+    connect: Duration,
+    request: impl Fn(reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    net.send(&peer.api, peer.tls.as_deref(), connect, request)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 /// What to tell the operator when another server refuses this one.
@@ -2212,6 +2450,7 @@ const REFUSED_HINT: &str = "the server refused this one: start it with PISTACK_J
 const REMOVED_HINT: &str = "this server was removed from the cluster: start it with \
      PISTACK_JOIN_TOKEN set to a join token (`pi join-token create`) to join again";
 
+#[cfg(test)]
 fn rpc_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(RPC_TIMEOUT)
@@ -2227,40 +2466,66 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-/// GET `url` as server `node`.
-async fn rpc_get_json<T: serde::de::DeserializeOwned>(url: &str, node: &str) -> anyhow::Result<T> {
-    let response = as_node(with_join(rpc_client().get(url)), node)
-        .timeout(RPC_TIMEOUT)
-        .send()
-        .await?;
-    Ok(checked(url, response).await?.json().await?)
+/// GET `path` from `peer` as server `node`.
+async fn rpc_get_json<T: serde::de::DeserializeOwned>(
+    net: &PeerNet,
+    peer: &Peer,
+    path: &str,
+    node: &str,
+) -> anyhow::Result<T> {
+    let response = peer_send(net, peer, RPC_CONNECT_TIMEOUT, |client, base| {
+        as_node(with_join(client.get(format!("{base}{path}"))), node).timeout(RPC_TIMEOUT)
+    })
+    .await?;
+    Ok(checked(response).await?.json().await?)
 }
 
-/// POST `body` to `url` as server `node`.
-async fn rpc_post_json<B, T>(url: &str, node: &str, body: &B) -> anyhow::Result<T>
+/// POST `body` to `path` on `peer` as server `node`.
+async fn rpc_post_json<B, T>(
+    net: &PeerNet,
+    peer: &Peer,
+    path: &str,
+    node: &str,
+    body: &B,
+) -> anyhow::Result<T>
 where
     B: serde::Serialize + ?Sized,
     T: serde::de::DeserializeOwned,
 {
-    let response = as_node(with_join(rpc_client().post(url)), node)
-        .timeout(RPC_TIMEOUT)
-        .json(body)
-        .send()
-        .await?;
-    Ok(checked(url, response).await?.json().await?)
+    let response = peer_send(net, peer, RPC_CONNECT_TIMEOUT, |client, base| {
+        as_node(with_join(client.post(format!("{base}{path}"))), node)
+            .timeout(RPC_TIMEOUT)
+            .json(body)
+    })
+    .await?;
+    Ok(checked(response).await?.json().await?)
 }
 
 /// The join call, as server `node`. Retries a leader that is not up yet.
-async fn post_json<B, T>(url: &str, node: &str, body: &B) -> anyhow::Result<T>
+async fn post_json<B, T>(
+    net: &PeerNet,
+    peer: &Peer,
+    path: &str,
+    node: &str,
+    body: &B,
+) -> anyhow::Result<T>
 where
     B: serde::Serialize + ?Sized,
     T: serde::de::DeserializeOwned,
 {
+    let url = &format!("{}{path}", peer.tls.as_deref().unwrap_or(&peer.api));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
-        let request = as_node(with_key_and_token(http_client().post(url)), node);
-        match request.json(body).send().await {
+        let sent = peer_send(net, peer, Duration::from_secs(5), |client, base| {
+            as_node(
+                with_key_and_token(client.post(format!("{base}{path}"))),
+                node,
+            )
+            .timeout(Duration::from_secs(10))
+            .json(body)
+        });
+        match sent.await {
             Ok(response) if response.status().is_success() => return Ok(response.json().await?),
             Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
                 anyhow::bail!("{url} returned 401; {REFUSED_HINT}");
@@ -2275,7 +2540,7 @@ where
                 let status = response.status();
                 last = Some(anyhow::anyhow!("{url} returned {status}"));
             }
-            Err(err) => last = Some(err.into()),
+            Err(err) => last = Some(err),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -2324,10 +2589,116 @@ enum Attempt {
     Refused(anyhow::Error),
 }
 
-async fn fetch_snapshot(api: &str, dest: &Path) -> anyhow::Result<()> {
-    fetch_snapshot_with(api, dest, &SnapshotFetch::default())
+/// How a snapshot download reaches the leader and what it trusts.
+enum Via<'a> {
+    /// A member asking the leader, as for any other call between servers.
+    Member(&'a PeerNet, Peer),
+    /// A new server on https: the leader must show a certificate that
+    /// chains to the CA with this SHA-256.
+    Pinned(String, [u8; 32]),
+    /// A new server on plain http, which the operator accepted.
+    Plain(String),
+}
+
+impl Via<'_> {
+    /// The address, for messages.
+    fn url(&self) -> String {
+        let base = match self {
+            Via::Member(_, peer) => peer.tls.as_deref().unwrap_or(&peer.api),
+            Via::Pinned(base, _) | Via::Plain(base) => base,
+        };
+        format!("{}/cluster/snapshot", base.trim_end_matches('/'))
+    }
+
+    async fn get(&self, node: &str) -> anyhow::Result<reqwest::Response> {
+        let connect = Duration::from_secs(5);
+        let path = "/cluster/snapshot";
+        match self {
+            Via::Member(net, peer) => {
+                peer_send(net, peer, connect, |client, base| {
+                    as_node(with_join(client.get(format!("{base}{path}"))), node)
+                })
+                .await
+            }
+            Via::Pinned(_, pin) => {
+                let tls = keep::tls::client_config_pinned(*pin)?;
+                let client = reqwest::Client::builder()
+                    .connect_timeout(connect)
+                    .use_preconfigured_tls(tls)
+                    .build()?;
+                let sent = as_node(with_join(client.get(self.url())), node).send();
+                sent.await
+                    .map_err(|err| anyhow::anyhow!(keep::peer::error_chain(&err)))
+            }
+            Via::Plain(_) => {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(connect)
+                    .build()?;
+                Ok(as_node(with_join(client.get(self.url())), node)
+                    .send()
+                    .await?)
+            }
+        }
+    }
+}
+
+/// Variable a new server reads the fingerprint of the cloud's root CA from.
+pub const JOIN_CA_ENV: &str = "PISTACK_JOIN_CA_SHA256";
+
+/// Decide how a server with no store may download its first snapshot from
+/// `url`. It has no CA to check the leader with, so:
+///
+/// * over https it needs the fingerprint of the cloud's root CA, and the
+///   leader must show a certificate that chains to it. With no fingerprint
+///   it does not connect at all: sending the join token to whoever answers
+///   is what the fingerprint is there to prevent.
+/// * over plain http nothing can be checked and everything, the token and
+///   the store, crosses the network in the clear. That needs
+///   `--insecure-join`.
+fn first_contact(url: &str, pin: Option<&str>, insecure: bool) -> anyhow::Result<Via<'static>> {
+    let url = url.trim().trim_end_matches('/');
+    let pin = pin.map(str::trim).filter(|pin| !pin.is_empty());
+    if url.starts_with("https://") {
+        let Some(pin) = pin else {
+            anyhow::bail!(
+                "joining {url} over https needs the fingerprint of the cloud's CA in {JOIN_CA_ENV}; `pi join-token create` prints it with the token"
+            );
+        };
+        let pin = keep::tls::parse_fingerprint(pin)
+            .map_err(|err| anyhow::anyhow!("{JOIN_CA_ENV}: {err}"))?;
+        return Ok(Via::Pinned(url.to_owned(), pin));
+    }
+    if pin.is_some() {
+        anyhow::bail!(
+            "{JOIN_CA_ENV} is set but {url} is plain http, where it cannot be checked; join the https address of the leader's --tls-listen"
+        );
+    }
+    if !insecure {
+        anyhow::bail!(
+            "joining {url} over plain http sends the join token and downloads the whole store, secrets included, in the clear. Join the https address of the leader's --tls-listen with {JOIN_CA_ENV} set, or pass --insecure-join to accept plain http"
+        );
+    }
+    tracing::warn!(
+        leader = %url,
+        "--insecure-join: the join token and the store snapshot cross the network in the clear"
+    );
+    Ok(Via::Plain(url.to_owned()))
+}
+
+async fn fetch_snapshot(via: &Via<'_>, dest: &Path) -> anyhow::Result<()> {
+    fetch_snapshot_as(via, dest, &SnapshotFetch::default(), "")
         .await
         .map(|_| ())
+}
+
+/// [`fetch_snapshot_as`] from a plain address, as nobody in particular.
+#[cfg(test)]
+pub async fn fetch_snapshot_with(
+    api: &str,
+    dest: &Path,
+    limits: &SnapshotFetch,
+) -> anyhow::Result<Downloaded> {
+    fetch_snapshot_as(&Via::Plain(api.to_owned()), dest, limits, "").await
 }
 
 /// Download the leader's snapshot to `dest`. The body is written to
@@ -2336,21 +2707,25 @@ async fn fetch_snapshot(api: &str, dest: &Path) -> anyhow::Result<()> {
 /// a stall. A broken transfer starts again from the beginning on a truncated
 /// partial file. The file is synced, opened once to check it, and only then
 /// renamed to `dest`, so `dest` is either absent or complete.
-pub async fn fetch_snapshot_with(
-    api: &str,
+///
+/// `node` is the server asking. A member names itself, so a leader that
+/// removed it refuses; a server joining for the first time has no standing
+/// yet and passes "".
+async fn fetch_snapshot_as(
+    via: &Via<'_>,
     dest: &Path,
     limits: &SnapshotFetch,
+    node: &str,
 ) -> anyhow::Result<Downloaded> {
     if dest.exists() {
         anyhow::bail!("{} already exists", dest.display());
     }
-    let url = format!("{}/cluster/snapshot", api.trim_end_matches('/'));
     let partial = dest.with_extension("partial");
     let started = tokio::time::Instant::now();
     let mut restarts = 0u32;
     let result = loop {
         let _ = tokio::fs::remove_file(&partial).await;
-        match download_once(&url, &partial, limits.stall).await {
+        match download_once(via, &partial, limits.stall, node).await {
             Ok(done) => match check_and_install(&partial, dest).await {
                 Ok(()) => break Ok(done),
                 Err(err) => {
@@ -2384,26 +2759,35 @@ pub async fn fetch_snapshot_with(
     result
 }
 
-async fn download_once(url: &str, partial: &Path, stall: Duration) -> Result<Downloaded, Attempt> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+async fn download_once(
+    via: &Via<'_>,
+    partial: &Path,
+    stall: Duration,
+    node: &str,
+) -> Result<Downloaded, Attempt> {
+    let url = &via.url();
     // The leader writes its copy before the first byte, so the wait for
     // headers is a stall too.
-    let response = match tokio::time::timeout(stall, with_join(client.get(url)).send()).await {
+    let response = match tokio::time::timeout(stall, via.get(node)).await {
         Err(_) => {
             return Err(Attempt::NotStarted(anyhow::anyhow!(
                 "snapshot {url}: no answer for {stall:?}"
             )))
         }
-        Ok(Err(err)) => return Err(Attempt::NotStarted(err.into())),
+        Ok(Err(err)) => return Err(Attempt::NotStarted(err)),
         Ok(Ok(response)) => response,
     };
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(Attempt::Refused(anyhow::anyhow!(
             "snapshot {url} returned 401; {REFUSED_HINT}"
+        )));
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // The body says when this server was removed.
+        let body = response.text().await.unwrap_or_default();
+        return Err(Attempt::Refused(anyhow::anyhow!(
+            "snapshot {url} returned 403: {body}"
         )));
     }
     if status.is_client_error() {
@@ -2649,9 +3033,16 @@ mod tests {
             members_of(&copy).unwrap()[0].agent_api.as_deref(),
             founder_tls
         );
-        let adopted = adopt(&copy, &base, "node-b", "http://b", Some("https://b:8444"))
-            .await
-            .unwrap();
+        let adopted = adopt(
+            &copy,
+            &PeerNet::plain(),
+            &base,
+            "node-b",
+            "http://b",
+            Some("https://b:8444"),
+        )
+        .await
+        .unwrap();
         assert_eq!(adopted.role, Role::Learner);
         assert!(!adopted.leader);
         // Both stores hold both servers' agent addresses after the join.
@@ -4088,9 +4479,11 @@ mod tests {
 
         // Boot as the server does with an existing store (Keep).
         let established = match establish_local(&copy, "sim3", &sim3_api, None, true).unwrap() {
-            LocalRole::NeedJoin => adopt(&copy, &sim.api, "sim3", &sim3_api, None)
-                .await
-                .unwrap(),
+            LocalRole::NeedJoin => {
+                adopt(&copy, &PeerNet::plain(), &sim.api, "sim3", &sim3_api, None)
+                    .await
+                    .unwrap()
+            }
             LocalRole::Ready(_) => panic!("a copied store was trusted as this server's own"),
         };
         assert_eq!(established.role, Role::Learner);
@@ -4773,9 +5166,16 @@ mod tests {
         assert_eq!(refused.status().as_u16(), 403);
         assert!(refused.text().await.unwrap().contains(REMOVED_MARK));
         assert_eq!(join(Some("pij_nope".into())).await.status().as_u16(), 401);
-        let err = adopt(&sim3.handle.store, &sim.api, "sim3", &sim3.api, None)
-            .await
-            .unwrap_err();
+        let err = adopt(
+            &sim3.handle.store,
+            &PeerNet::plain(),
+            &sim.api,
+            "sim3",
+            &sim3.api,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{err:#}").contains("PISTACK_JOIN_TOKEN"), "{err:#}");
         assert_eq!(members_of(&sim.handle.store).unwrap().len(), 2);
 
@@ -4933,5 +5333,876 @@ mod tests {
         assert_eq!(after.members, [Member::voter("sim", &api)]);
         assert_eq!(removed_of(&sim.handle.store).unwrap(), ["sim2"]);
         sim.kill();
+    }
+
+    /// What a restart does after the follow loop replaced the store: a new
+    /// process opens `state.redb` in the same data directory, on the same
+    /// address, with no flags and no operator step.
+    async fn start_again(voter: LiveVoter) -> LiveVoter {
+        voter.kill();
+        let id = voter.handle.node_id.clone();
+        let LiveVoter { addr, dir, api, .. } = voter;
+        let store = open_store(dir.path());
+        let ready = match establish_local(&store, &id, &api, None, true).unwrap() {
+            LocalRole::Ready(ready) => ready,
+            LocalRole::NeedJoin => panic!("the new store was not taken as this server's own"),
+        };
+        assert!(!ready.leader);
+        let listener = loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let back = start_voter(&id, listener, store, dir, &ready);
+        run(&back);
+        back
+    }
+
+    /// Replaced stores in `dir`.
+    fn set_aside(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                name.starts_with("state.redb.replaced-")
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Three voters; `sim` leads, loses its API, and writes five entries
+    /// nobody copies. A survivor wins and writes on. Returns the deposed
+    /// leader, the winner and the other survivor once `sim` has stood down.
+    async fn a_deposed_leader_with_unconfirmed_entries(
+        heal: bool,
+    ) -> (LiveVoter, LiveVoter, LiveVoter) {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        sim.handle.auto_resync.store(heal, Ordering::Relaxed);
+        assert_eq!(post_write(&sim.api, "kept").await, 200);
+        wait_for("followers copy", Duration::from_secs(3), || {
+            marker(&sim2.handle.store, "kept").is_some()
+                && marker(&sim3.handle.store, "kept").is_some()
+        })
+        .await;
+
+        // The API goes dark and open pulls drain; the process lives on and
+        // still believes it leads.
+        sim.serve_stop.cancel();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(sim.leads());
+        for n in 0..5 {
+            sim.handle
+                .store
+                .put_meta(&format!("unconfirmed-{n}"), &"yes".to_string())
+                .unwrap();
+        }
+        wait_for("a survivor wins", Duration::from_secs(8), || {
+            sim2.leads() || sim3.leads()
+        })
+        .await;
+        let (winner, other) = if sim2.leads() {
+            (sim2, sim3)
+        } else {
+            (sim3, sim2)
+        };
+        for n in 0..3 {
+            assert_eq!(post_write(&winner.api, &format!("after-{n}")).await, 200);
+        }
+        wait_for("the old leader stands down", Duration::from_secs(5), || {
+            !sim.leads()
+        })
+        .await;
+        (sim, winner, other)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deposed_leader_with_unconfirmed_entries_heals_itself() {
+        let (sim, winner, other) = a_deposed_leader_with_unconfirmed_entries(true).await;
+        let old_tip = sim.handle.store.commit_index().unwrap();
+        let old_term = sim.handle.store.log_term_at(old_tip).unwrap();
+        assert_eq!(old_term, Some(6));
+
+        wait_for(
+            "the old leader replaces its store",
+            Duration::from_secs(10),
+            || sim.handle.wants_restart(),
+        )
+        .await;
+        assert!(sim.loop_stop.is_cancelled(), "the server was not stopped");
+        assert!(!sim.leads());
+        // Sealed: it gives no vote on the store it set aside.
+        let vote = VoteRequest {
+            term: winner.term() + 5,
+            candidate_id: other.handle.node_id.clone(),
+            last_index: u64::MAX,
+            last_term: u64::MAX,
+            pre: false,
+        };
+        *guard(&sim.handle.leader_contact) = None;
+        let Json(answer) = super::vote(State(sim.handle.clone()), HeaderMap::new(), Json(vote))
+            .await
+            .unwrap();
+        assert!(!answer.granted);
+        assert_eq!(answer.term, sim.term());
+
+        let aside = set_aside(sim.dir.path());
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(!sim.dir.path().join("state.resync").exists());
+        assert!(!sim.dir.path().join("state.partial").exists());
+        // The old store is whole, with the writes nobody else has.
+        let copy = sim.dir.path().join("look.redb");
+        std::fs::copy(&aside[0], &copy).unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        let old = Store::open(&copy, events).unwrap();
+        for n in 0..5 {
+            let key = format!("unconfirmed-{n}");
+            assert_eq!(marker(&old, &key).as_deref(), Some("yes"));
+        }
+        assert_eq!(old.commit_index().unwrap(), old_tip);
+        assert!(entry_for(&old, "unconfirmed-4").is_some());
+        drop(old);
+
+        let back = start_again(sim).await;
+        assert_eq!(*guard(&back.handle.role), Role::Voter);
+        assert_eq!(back.term(), winner.term());
+        assert_eq!(post_write(&winner.api, "later").await, 200);
+        wait_for("the old leader converges", Duration::from_secs(5), || {
+            marker(&back.handle.store, "later").is_some()
+        })
+        .await;
+        let store = &back.handle.store;
+        let tip = store.commit_index().unwrap();
+        assert_eq!(tip, winner.handle.store.commit_index().unwrap());
+        assert_eq!(
+            store.log_term_at(tip).unwrap(),
+            winner.handle.store.log_term_at(tip).unwrap()
+        );
+        assert_eq!(marker(store, "kept").as_deref(), Some("yes"));
+        assert_eq!(marker(store, "after-2").as_deref(), Some("yes"));
+        for n in 0..5 {
+            let key = format!("unconfirmed-{n}");
+            assert_eq!(marker(store, &key), None, "{key} is still in the store");
+            assert!(entry_for(store, &key).is_none(), "{key} is still logged");
+        }
+        // The same member as before, on every server, and nothing stuck.
+        for view in [&winner, &other, &back] {
+            let members = members_of(&view.handle.store).unwrap();
+            assert_eq!(members.len(), 3);
+            assert!(is_voter(&members, "sim"));
+        }
+        assert!(guard(&back.handle.pull_error).is_none());
+        assert!(!back.handle.wants_restart());
+        assert!(winner.leads() && !back.leads() && !other.leads());
+        // It counts toward the majority again: the other follower can go.
+        other.kill();
+        assert_eq!(post_write(&winner.api, "two-of-three").await, 200);
+        winner.kill();
+        back.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_auto_resync_off_a_diverged_server_waits_for_the_operator() {
+        let (sim, winner, other) = a_deposed_leader_with_unconfirmed_entries(false).await;
+        wait_for("the pull is refused", Duration::from_secs(5), || {
+            locked(&sim.handle.pull_error).is_some_and(|text| text.contains("diverged"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(!sim.handle.wants_restart());
+        assert!(!sim.loop_stop.is_cancelled());
+        assert!(!sim.handle.sealed.load(Ordering::Relaxed));
+        assert!(set_aside(sim.dir.path()).is_empty());
+        assert!(!sim.dir.path().join("state.resync").exists());
+        assert!(guard(&sim.handle.resync).wanted.is_none());
+        assert_eq!(
+            marker(&sim.handle.store, "unconfirmed-0").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(marker(&sim.handle.store, "after-0"), None);
+        sim.kill();
+        winner.kill();
+        other.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_the_leader_trimmed_past_heals_itself_and_stays_a_voter() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        assert_eq!(post_write(&sim.api, "early").await, 200);
+        wait_for("followers copy", Duration::from_secs(3), || {
+            marker(&sim3.handle.store, "early").is_some()
+        })
+        .await;
+        sim3.kill();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let behind = sim3.handle.store.commit_index().unwrap();
+        for n in 0..300 {
+            sim.handle.store.put_meta(&format!("k{n}"), &n).unwrap();
+        }
+        // The leader stops holding rows for a server it has not seen.
+        guard(&sim.handle.progress).remove("sim3");
+        sim.handle.log_keep.store(50, Ordering::Relaxed);
+        wait_for("sim2 is current", Duration::from_secs(5), || {
+            sim2.handle.store.get_meta::<i32>("k299").unwrap() == Some(299)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        guard(&sim.handle.progress).remove("sim3");
+        assert!(compact_now(&sim.handle).unwrap() > 0);
+        assert!(sim.handle.store.log_start().unwrap() > behind + 1);
+
+        // sim3 comes back on its old store.
+        let store = sim3.handle.store.clone();
+        let ready = match establish_local(&store, "sim3", &sim3.api, None, true).unwrap() {
+            LocalRole::Ready(ready) => ready,
+            LocalRole::NeedJoin => panic!("sim3 lost its membership"),
+        };
+        let LiveVoter { addr, dir, .. } = sim3;
+        let listener = loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let sim3 = start_voter("sim3", listener, store, dir, &ready);
+        run(&sim3);
+        wait_for("sim3 replaces its store", Duration::from_secs(10), || {
+            sim3.handle.wants_restart()
+        })
+        .await;
+        assert_eq!(set_aside(sim3.dir.path()).len(), 1);
+        assert_eq!(sim3.handle.store.commit_index().unwrap(), behind);
+
+        let back = start_again(sim3).await;
+        assert_eq!(*guard(&back.handle.role), Role::Voter);
+        sim.handle.store.put_meta("later", &"yes").unwrap();
+        wait_for("sim3 converges", Duration::from_secs(5), || {
+            marker(&back.handle.store, "later").is_some()
+        })
+        .await;
+        assert_eq!(
+            back.handle.store.get_meta::<i32>("k299").unwrap(),
+            Some(299)
+        );
+        assert_eq!(
+            back.handle.store.commit_index().unwrap(),
+            sim.handle.store.commit_index().unwrap()
+        );
+        assert!(is_voter(&members_of(&sim.handle.store).unwrap(), "sim3"));
+        assert!(sim.leads() && !back.leads());
+        assert_eq!(sim.term(), 6, "the term moved");
+        assert!(guard(&back.handle.pull_error).is_none());
+        sim.kill();
+        sim2.kill();
+        back.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_never_replaces_its_store() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        assert_eq!(post_write(&sim.api, "kept").await, 200);
+        // As if a refused pull from an earlier time following were left over.
+        guard(&sim.handle.resync).wanted = Some(resync::Why::Diverged);
+        assert!(!resync::due(&sim.handle));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(sim.leads());
+        assert!(!sim.handle.wants_restart());
+        assert!(!sim.handle.sealed.load(Ordering::Relaxed));
+        assert!(set_aside(sim.dir.path()).is_empty());
+        assert!(!sim.dir.path().join("state.resync").exists());
+        assert_eq!(post_write(&sim.api, "still-leading").await, 200);
+
+        // A follower that wants it is held to the leader it follows: with
+        // none answering it does nothing.
+        sim.kill();
+        sim3.kill();
+        guard(&sim2.handle.resync).wanted = Some(resync::Why::Diverged);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!sim2.handle.wants_restart());
+        assert!(set_aside(sim2.dir.path()).is_empty());
+        sim2.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_removed_server_does_not_heal_itself_back_in() {
+        let (sim, sim2, sim3) = three_voters(6).await;
+        assert_eq!(post_write(&sim.api, "kept").await, 200);
+        wait_for("followers pull", Duration::from_secs(3), || {
+            guard(&sim.handle.progress).len() == 2
+        })
+        .await;
+        remove_member(&sim.handle, "sim3", false).await.unwrap();
+        wait_for("sim3 learns it was removed", Duration::from_secs(5), || {
+            sim3.handle.removed.load(Ordering::Relaxed)
+        })
+        .await;
+        guard(&sim3.handle.resync).wanted = Some(resync::Why::Diverged);
+        assert!(!resync::due(&sim3.handle));
+        // Even asked directly, the leader refuses it the snapshot.
+        sim3.handle.removed.store(false, Ordering::Relaxed);
+        assert!(!resync::run(&sim3.handle, &sim.api).await);
+        assert!(sim3.handle.removed.load(Ordering::Relaxed));
+        assert!(!sim3.handle.sealed.load(Ordering::Relaxed));
+        assert!(set_aside(sim3.dir.path()).is_empty());
+        assert!(!sim3.dir.path().join("state.resync").exists());
+        sim.kill();
+        sim2.kill();
+        sim3.kill();
+    }
+
+    #[test]
+    fn a_store_replaced_a_moment_ago_is_not_replaced_again() {
+        let members = [
+            Member::voter("a", "http://a"),
+            Member::voter("b", "http://b"),
+        ];
+        let (handle, dir) = bare_handle("b", "http://b", None, &members, false, "http://a");
+        let want = || {
+            *guard(&handle.resync) = resync::ResyncState::default();
+            guard(&handle.resync).wanted = Some(resync::Why::Diverged);
+        };
+        assert!(!resync::due(&handle), "nothing was refused");
+        want();
+        assert!(resync::due(&handle));
+
+        // Each of these holds it off on its own.
+        for flag in [&handle.removed, &handle.sealed, &handle.leader] {
+            flag.store(true, Ordering::Release);
+            assert!(!resync::due(&handle));
+            flag.store(false, Ordering::Release);
+        }
+        handle.auto_resync.store(false, Ordering::Relaxed);
+        assert!(!resync::due(&handle));
+        handle.auto_resync.store(true, Ordering::Relaxed);
+        assert!(resync::due(&handle));
+
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let earlier = dir.path().join(format!("state.redb.replaced-{stamp}"));
+        std::fs::write(&earlier, b"an earlier store").unwrap();
+        assert!(!resync::due(&handle));
+        assert!(!resync::due(&handle));
+        // Once the wait is over it may go ahead.
+        *guard(&handle.resync_gap) = Duration::ZERO;
+        want();
+        assert!(resync::due(&handle));
+    }
+
+    // ---- TLS between servers ----------------------------------------------
+
+    #[test]
+    fn a_new_server_joins_over_https_with_a_pin_or_over_http_when_told_to() {
+        let pin = "ab".repeat(32);
+        let https = "https://10.0.0.11:8444/";
+        let http = "http://10.0.0.11:8443";
+        let refused = |url, pin, insecure| match first_contact(url, pin, insecure) {
+            Ok(_) => panic!("{url} was accepted"),
+            Err(err) => err.to_string(),
+        };
+
+        match first_contact(https, Some(&pin), false).unwrap() {
+            Via::Pinned(base, got) => {
+                assert_eq!(base, "https://10.0.0.11:8444");
+                assert_eq!(got, [0xab; 32]);
+            }
+            _ => panic!("https with a fingerprint is checked against it"),
+        }
+        // https with nothing to check it against never connects, whatever
+        // else was said.
+        for insecure in [false, true] {
+            for none in [None, Some("  ")] {
+                let err = refused(https, none, insecure);
+                assert!(err.contains(JOIN_CA_ENV), "{err}");
+                assert!(err.contains("pi join-token create"), "{err}");
+            }
+        }
+        assert!(refused(https, Some("abcd"), false).contains("64 hex digits"));
+        // A fingerprint cannot be checked over plain http.
+        let err = refused(http, Some(&pin), true);
+        assert!(err.contains("plain http"), "{err}");
+        // Plain http is a choice the operator states.
+        let err = refused(http, None, false);
+        assert!(err.contains("--insecure-join"), "{err}");
+        assert!(err.contains("in the clear"), "{err}");
+        assert!(matches!(
+            first_contact(http, None, true).unwrap(),
+            Via::Plain(base) if base == http
+        ));
+    }
+
+    #[test]
+    fn a_call_from_another_server_is_told_from_an_administrators() {
+        for path in [
+            "/cluster/log",
+            "/cluster/snapshot",
+            "/cluster/vote",
+            "/cluster/join",
+            "/cluster/agent-address",
+            "/silo/peer/blobs/b/abc",
+        ] {
+            assert!(is_peer_call(path, false), "{path}");
+            assert!(is_peer_call(path, true), "{path}");
+        }
+        // The status and a removal are an administrator's unless the
+        // caller shows a server's credentials.
+        for path in ["/cluster", "/cluster/members/n1"] {
+            assert!(!is_peer_call(path, false), "{path}");
+            assert!(is_peer_call(path, true), "{path}");
+        }
+        for path in ["/", "/healthz", "/silo/buckets", "/clusters", "/rpc/agents"] {
+            assert!(!is_peer_call(path, true), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_address_is_matched_to_the_member_it_belongs_to() {
+        let store = Store::in_memory().unwrap();
+        let members = vec![
+            Member::voter("a", "http://10.0.0.11:8443")
+                .with_agent_api(Some("https://10.0.0.11:8444")),
+            Member::voter("b", "http://10.0.0.12:8443"),
+        ];
+        store.put_meta("members", &members).unwrap();
+        let a = Peer {
+            api: "http://10.0.0.11:8443".into(),
+            tls: Some("https://10.0.0.11:8444".into()),
+        };
+        // By either of its addresses, with or without a trailing slash.
+        assert_eq!(Peer::at(&store, "http://10.0.0.11:8443"), a);
+        assert_eq!(Peer::at(&store, "http://10.0.0.11:8443/"), a);
+        assert_eq!(Peer::at(&store, "https://10.0.0.11:8444"), a);
+        assert_eq!(Peer::at(&store, "http://10.0.0.12:8443").tls, None);
+        // An https address no record holds is checked against the cloud CA.
+        let unknown = Peer::at(&store, "https://10.0.0.19:8444");
+        assert_eq!(unknown.tls.as_deref(), Some("https://10.0.0.19:8444"));
+        assert_eq!(Peer::at(&store, "http://10.0.0.19:8443").tls, None);
+    }
+
+    /// A server with a plain and a TLS listener, as `pistack server
+    /// --tls-listen` has them. `tls_api` is what its member record names.
+    struct TlsVoter {
+        voter: LiveVoter,
+        tls_api: String,
+    }
+
+    /// What one server of [`tls_cluster`] is like.
+    #[derive(Clone, Copy)]
+    struct TlsSpec {
+        mode: TlsMode,
+        /// Its member record names its TLS listener.
+        recorded: bool,
+        /// Its certificate is from some other CA.
+        foreign_cert: bool,
+    }
+
+    impl TlsSpec {
+        fn good(mode: TlsMode) -> Self {
+            Self {
+                mode,
+                recorded: true,
+                foreign_cert: false,
+            }
+        }
+    }
+
+    /// Three voters at term 6, `sim` leading, each with both listeners and
+    /// stores that hold one cloud CA, as after a join. Every loop runs.
+    async fn tls_cluster(specs: [TlsSpec; 3]) -> Vec<TlsVoter> {
+        use tower::ServiceExt;
+        let ids = ["sim", "sim2", "sim3"];
+        let founder_dir = tempfile::tempdir().unwrap();
+        let founder = open_store(founder_dir.path());
+        keep::Client::open(&founder).unwrap();
+        let mut dirs = vec![founder_dir];
+        let mut stores = vec![founder.clone()];
+        for _ in 1..3 {
+            let dir = tempfile::tempdir().unwrap();
+            founder
+                .snapshot_file(
+                    &dirs[0].path().join("state.redb"),
+                    &dir.path().join("state.redb"),
+                )
+                .unwrap();
+            stores.push(open_store(dir.path()));
+            dirs.push(dir);
+        }
+
+        // Bind first: the member list needs every address.
+        let mut bound = Vec::new();
+        let mut slots = Vec::new();
+        for n in 0..3 {
+            if specs[n].foreign_cert {
+                let other = Store::in_memory().unwrap();
+                let theirs = keep::Client::open(&other)
+                    .unwrap()
+                    .issue_server_cert("pistack", &["127.0.0.1".to_string()])
+                    .unwrap();
+                let tls = dirs[n].path().join("tls");
+                std::fs::create_dir_all(&tls).unwrap();
+                std::fs::write(tls.join("cert.pem"), &theirs.cert_pem).unwrap();
+                std::fs::write(tls.join("key.pem"), &theirs.key_pem).unwrap();
+                std::fs::write(tls.join("ca.pem"), &theirs.ca_pem).unwrap();
+            }
+            let slot: Arc<std::sync::OnceLock<Router>> = Arc::new(std::sync::OnceLock::new());
+            let late = slot.clone();
+            let app = Router::new().fallback(move |req: axum::extract::Request| {
+                let late = late.clone();
+                async move {
+                    match late.get() {
+                        Some(app) => app.clone().oneshot(req).await.into_response(),
+                        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    }
+                }
+            });
+            let tls = crate::listen::TlsListen {
+                addr: "127.0.0.1:0".into(),
+                data_dir: dirs[n].path().to_path_buf(),
+                store: stores[n].clone(),
+                names: Vec::new(),
+            };
+            let listeners = crate::listen::bind_listeners(app, "127.0.0.1:0", Some(tls))
+                .await
+                .unwrap();
+            bound.push(listeners);
+            slots.push(slot);
+        }
+        let apis: Vec<String> = bound.iter().map(|b| format!("http://{}", b.http)).collect();
+        let tls_apis: Vec<String> = bound
+            .iter()
+            .map(|b| format!("https://{}", b.tls.unwrap()))
+            .collect();
+        let members: Vec<Member> = (0..3)
+            .map(|n| {
+                let recorded = specs[n].recorded.then_some(tls_apis[n].as_str());
+                Member::voter(ids[n], &apis[n]).with_agent_api(recorded)
+            })
+            .collect();
+
+        let mut voters = Vec::new();
+        let mut dirs = dirs.into_iter();
+        for (n, listeners) in bound.into_iter().enumerate() {
+            let dir = dirs.next().unwrap();
+            let store = stores[n].clone();
+            let leader = n == 0;
+            seed_voter(&store, ids[n], &members, 6);
+            store
+                .put_meta("cluster_leader_id", &"sim".to_string())
+                .unwrap();
+            store
+                .put_meta("cluster_voted_for", &Some("sim".to_string()))
+                .unwrap();
+            store.set_log_term(6);
+            store.set_record_log(leader);
+            let ready = Established {
+                role: Role::Voter,
+                leader,
+                leader_api: apis[0].clone(),
+                term: 6,
+                members: members.clone(),
+            };
+            let handle = Arc::new(
+                handle_from(
+                    ids[n].into(),
+                    apis[n].clone(),
+                    "c1".into(),
+                    store.clone(),
+                    dir.path().join("state.redb"),
+                    &ready,
+                    None,
+                    Leadership::new(leader),
+                )
+                .with_agent_api(specs[n].recorded.then(|| tls_apis[n].clone()))
+                .with_peers(PeerNet::new(specs[n].mode, store.clone())),
+            );
+            let app = router(handle.clone())
+                .route(
+                    "/write/{key}",
+                    axum::routing::post({
+                        let store = store.clone();
+                        move |axum::extract::Path(key): axum::extract::Path<String>| async move {
+                            match store.put_meta(&key, &"yes".to_string()) {
+                                Ok(()) => StatusCode::OK,
+                                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                            }
+                        }
+                    }),
+                )
+                .layer(middleware::from_fn_with_state(
+                    handle.clone(),
+                    reject_follower_writes,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    specs[n].mode,
+                    refuse_plain_peers,
+                ));
+            assert!(slots[n].set(app).is_ok());
+            let serve_stop = CancellationToken::new();
+            let addr = listeners.http;
+            let stop = serve_stop.clone();
+            tokio::spawn(async move {
+                listeners.serve(stop).await.ok();
+            });
+            voters.push(TlsVoter {
+                voter: LiveVoter {
+                    handle,
+                    api: apis[n].clone(),
+                    addr,
+                    serve_stop,
+                    loop_stop: CancellationToken::new(),
+                    dir,
+                },
+                tls_api: tls_apis[n].clone(),
+            });
+        }
+        *guard(&voters[1].voter.handle.election_timeout) = Duration::from_millis(80);
+        *guard(&voters[2].voter.handle.election_timeout) = Duration::from_millis(700);
+        for v in &voters {
+            run(&v.voter);
+        }
+        voters
+    }
+
+    /// The status a plain or TLS call to `base` gets. `tls` checks the
+    /// server against the cloud CA in `store`.
+    async fn peer_status(
+        store: &Store,
+        base: &str,
+        tls: bool,
+        method: reqwest::Method,
+        path: &str,
+        as_server: bool,
+    ) -> u16 {
+        let net = PeerNet::new(TlsMode::Required, store.clone());
+        let route = if tls {
+            net.route("http://unused", Some(base)).unwrap()
+        } else {
+            PeerNet::plain().route(base, None).unwrap()
+        };
+        let client = net.client(&route, Duration::from_secs(2)).unwrap();
+        let mut request = client
+            .request(method, format!("{}{path}", route.base))
+            .timeout(Duration::from_secs(5))
+            .json(&serde_json::json!({}));
+        if as_server {
+            request = request.header(PEER_HEADER, "a-key");
+        }
+        request.send().await.unwrap().status().as_u16()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_servers_replicate_and_elect_over_tls_when_it_is_required() {
+        let all = tls_cluster([TlsSpec::good(TlsMode::Required); 3]).await;
+        let (sim, sim2, sim3) = (&all[0].voter, &all[1].voter, &all[2].voter);
+        // A client's write on the plain listener is not a server's call.
+        // It is answered once a majority pulled it, and under `required`
+        // a pull has no way to the leader but TLS.
+        assert_eq!(post_write(&sim.api, "over-tls").await, 200);
+        wait_for("followers copy", Duration::from_secs(5), || {
+            marker(&sim2.handle.store, "over-tls").is_some()
+                && marker(&sim3.handle.store, "over-tls").is_some()
+        })
+        .await;
+        for v in &all {
+            let route = v.voter.handle.peers.route(&sim.api, Some(&all[0].tls_api));
+            assert!(route.unwrap().tls);
+        }
+
+        // On the plain listener every call between servers is refused.
+        let store = &sim2.handle.store;
+        let get = reqwest::Method::GET;
+        let post = reqwest::Method::POST;
+        for (method, path) in [
+            (get.clone(), "/cluster/log?after=0"),
+            (get.clone(), "/cluster/snapshot"),
+            (post.clone(), "/cluster/vote"),
+            (post.clone(), "/cluster/join"),
+            (post.clone(), "/cluster/agent-address"),
+            (get.clone(), "/silo/peer/blobs/b/abc"),
+        ] {
+            for target in [sim, sim2] {
+                let status =
+                    peer_status(store, &target.api, false, method.clone(), path, true).await;
+                assert_eq!(
+                    status, 403,
+                    "{path} on the plain listener of {}",
+                    target.api
+                );
+            }
+        }
+        // The status too, when a server asks. An administrator still gets it.
+        assert_eq!(
+            peer_status(store, &sim.api, false, get.clone(), "/cluster", true).await,
+            403
+        );
+        assert_eq!(
+            peer_status(store, &sim.api, false, get.clone(), "/cluster", false).await,
+            200
+        );
+        // The same calls are answered on the TLS listener.
+        assert_eq!(
+            peer_status(store, &all[0].tls_api, true, get.clone(), "/cluster", true).await,
+            200
+        );
+        let log = "/cluster/log?after=0";
+        assert_eq!(
+            peer_status(store, &all[0].tls_api, true, get.clone(), log, true).await,
+            200
+        );
+        // A client that trusts another CA does not get that far.
+        let stranger = Store::in_memory().unwrap();
+        keep::Client::open(&stranger).unwrap();
+        let net = PeerNet::new(TlsMode::Required, stranger);
+        let route = net.route("http://unused", Some(&all[0].tls_api)).unwrap();
+        let client = net.client(&route, Duration::from_secs(2)).unwrap();
+        let refused = client.get(format!("{}/cluster", route.base)).send().await;
+        assert!(refused.unwrap_err().is_connect());
+
+        // Lose the leader: the vote and everything after it go over TLS.
+        sim.kill();
+        wait_for("a survivor wins", Duration::from_secs(8), || {
+            sim2.leads() || sim3.leads()
+        })
+        .await;
+        let (winner, other) = if sim2.leads() {
+            (sim2, sim3)
+        } else {
+            (sim3, sim2)
+        };
+        assert!(winner.term() > 6);
+        assert_eq!(post_write(&winner.api, "after-the-election").await, 200);
+        wait_for("the other survivor copies", Duration::from_secs(5), || {
+            marker(&other.handle.store, "after-the-election").is_some()
+        })
+        .await;
+        // The failed pulls from the stopped leader are cleared by the pull
+        // that follows the one that brought the entry.
+        wait_for("replication settles", Duration::from_secs(5), || {
+            guard(&other.handle.pull_error).is_none()
+        })
+        .await;
+        sim2.kill();
+        sim3.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn under_preferred_a_server_tls_cannot_reach_is_called_in_the_clear() {
+        // The leader's certificate is from another CA, sim2's record names
+        // no TLS listener (a server started without one, or one older than
+        // this), and sim3 is as it should be.
+        let preferred = TlsSpec::good(TlsMode::Preferred);
+        let all = tls_cluster([
+            TlsSpec {
+                foreign_cert: true,
+                ..preferred
+            },
+            TlsSpec {
+                recorded: false,
+                ..preferred
+            },
+            preferred,
+        ])
+        .await;
+        let (sim, sim2, sim3) = (&all[0].voter, &all[1].voter, &all[2].voter);
+        assert_eq!(post_write(&sim.api, "mixed").await, 200);
+        wait_for("followers copy", Duration::from_secs(5), || {
+            marker(&sim2.handle.store, "mixed").is_some()
+                && marker(&sim3.handle.store, "mixed").is_some()
+        })
+        .await;
+        // The followers tried the leader's TLS listener, could not check
+        // it, and remember to use the plain address for now.
+        for follower in [sim2, sim3] {
+            let route = follower.handle.peers.route(&sim.api, Some(&all[0].tls_api));
+            assert!(!route.unwrap().tls);
+        }
+        // sim3 is still called over TLS, and sim2 never was.
+        let net = &sim.handle.peers;
+        assert!(net.route(&sim3.api, Some(&all[2].tls_api)).unwrap().tls);
+        assert!(!net.route(&sim2.api, None).unwrap().tls);
+        assert!(sim.leads());
+
+        // A server set to `required` does not follow them into the clear.
+        let strict = PeerNet::new(TlsMode::Required, sim3.handle.store.clone());
+        let leader = Peer {
+            api: sim.api.clone(),
+            tls: Some(all[0].tls_api.clone()),
+        };
+        let err = rpc_get_json::<ClusterStatus>(&strict, &leader, "/cluster", "sim3")
+            .await
+            .unwrap_err();
+        assert!(!format!("{err:#}").is_empty());
+        let no_listener = Peer::plain(&sim2.api);
+        let err = rpc_get_json::<ClusterStatus>(&strict, &no_listener, "/cluster", "sim3")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no TLS address"), "{err:#}");
+        for v in &all {
+            v.voter.kill();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_server_takes_the_snapshot_only_from_the_cloud_it_was_given() {
+        let all = tls_cluster([TlsSpec::good(TlsMode::Required); 3]).await;
+        let sim = &all[0].voter;
+        assert_eq!(post_write(&sim.api, "in-the-snapshot").await, 200);
+        let print = keep::ca::root_fingerprint(&sim.handle.store)
+            .unwrap()
+            .unwrap();
+        let quick = SnapshotFetch {
+            startup: Duration::ZERO,
+            restarts: 0,
+            ..SnapshotFetch::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state.redb");
+
+        // A fingerprint of some other CA: nothing is sent and nothing kept.
+        let wrong = "0".repeat(64);
+        let via = first_contact(&all[0].tls_api, Some(&wrong), false).unwrap();
+        let err = fetch_snapshot_as(&via, &dest, &quick, "")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("pinned fingerprint"), "{err:#}");
+        assert!(!dest.exists() && !dir.path().join("state.partial").exists());
+        // The plain listener of a server set to `required` refuses.
+        let via = first_contact(&sim.api, None, true).unwrap();
+        let err = fetch_snapshot_as(&via, &dest, &quick, "")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
+        assert!(!dest.exists());
+
+        // The right one.
+        let via = first_contact(&all[0].tls_api, Some(&print), false).unwrap();
+        fetch_snapshot_as(&via, &dest, &quick, "").await.unwrap();
+        let copy = open_store(dir.path());
+        assert_eq!(marker(&copy, "in-the-snapshot").as_deref(), Some("yes"));
+        assert_eq!(
+            keep::ca::root_fingerprint(&copy).unwrap().as_deref(),
+            Some(print.as_str())
+        );
+        // From here it has the CA, and joins over TLS by the address the
+        // snapshot records for the leader.
+        let net = PeerNet::new(TlsMode::Required, copy.clone());
+        let joined = adopt(
+            &copy,
+            &net,
+            &sim.api,
+            "new",
+            "http://new:1",
+            Some("https://new:2"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined.role, Role::Learner);
+        assert!(members_of(&sim.handle.store)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == "new"));
+        for v in &all {
+            v.voter.kill();
+        }
     }
 }

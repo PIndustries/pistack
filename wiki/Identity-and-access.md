@@ -211,4 +211,61 @@ pistack keep rewrap
 
 ## Audit
 
-Every request that changes something is recorded in the store with its method, path, principal and response status. Request bodies, query strings and headers are not recorded. There is no API to read the records yet; `pistack store dump` on a stopped server prints them with everything else.
+The server keeps an audit log in the store. It replicates with everything else and survives a restart.
+
+### What is recorded
+
+One record is written after the response for:
+
+- every request that changes something: `POST`, `PUT`, `PATCH` and `DELETE` on any module, a login (`POST /identity/tokens`), and removing a control-plane server;
+- three reads that hand out a secret or control of a resource: a secret's payload, a certificate's private key and a machine console ticket;
+- an agent enrolling with a join token.
+
+A request that was refused is recorded like one that worked, with the status it got. That includes a failed login, a write by a `reader`, and a request with a bad body.
+
+Each record holds:
+
+| Field | Meaning |
+| --- | --- |
+| `created_at` | When the response was sent. |
+| `principal`, `principal_id` | Who made the request. For a failed password login, the name that was tried and no id. |
+| `api_key` | The API key behind the token, when the token came from a key. |
+| `project` | The project the caller's token is scoped to. |
+| `client` | The address the connection came from, as the server saw it. Behind a proxy or load balancer this is the proxy; forwarding headers are not read. |
+| `method`, `path` | The request line, without the query string. |
+| `action` | What it did: `create`, `update`, `delete`, `login`, `enroll`, the name of an action route such as `drain`, `evacuate`, `start` or `revoke`, or a verb and the part it touched, such as `update_quotas`, `update_labels` or `read_payload`. |
+| `kind`, `resource` | The collection in the path (`machines`, `bindings`, `hosts`) and the resource as the request named it, by id or by name. For a create, the id of what was made. |
+| `status` | The HTTP status of the answer. |
+| `request_id` | The `x-request-id` of the request, the same one the server log shows. |
+
+Request bodies, query strings and headers are never stored, so a record cannot hold a password, a token or a secret value.
+
+What is not recorded: ordinary reads; agent traffic under `/rpc` other than enrolment; object uploads and deletes in a bucket (creating and deleting the bucket is recorded); and what servers say to each other under `/cluster`, which includes a server joining.
+
+### Reading it
+
+Only a cloud admin can read the log. A project member cannot read the records of their own project: a record carries the project of the token that made the request, not of what the request touched, so a view by project would leave out what an admin did to that project.
+
+```sh
+pi audit list
+pi audit list --since 2h --outcome failure
+pi audit list --action login --principal alice
+pi audit list --kind hosts --resource rack1 -o json
+```
+
+`pi audit list` prints the newest hundred records. `--since` and `--until` take an RFC 3339 time or an age such as `30m`, `2h` or `7d`. `--outcome` is `success` (a status below 400), `failure`, or one status code. When there are more records than `--limit`, `pi` prints the `--after` value that continues the list. `-o wide` adds the project, the API key, the method, the path and the record id.
+
+The API is `GET /identity/audit` with the query parameters `since`, `until`, `principal`, `project`, `action`, `kind`, `resource`, `outcome`, `order` (`asc`, the default, or `desc`), `limit` (100 by default, at most 1000) and `after`. It answers like every other list: `items`, `total`, and `next` when there is another page.
+
+A secret read is answered by the leader only. A follower cannot write the record, so it refuses the read with `409` and the leader's address, as it does for a write; `pi` follows that.
+
+### Retention
+
+The log is bounded by age and by count. Every five minutes the leader deletes records older than the age limit and, if there are still more than the count limit, the oldest of them.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_AUDIT_MAX_AGE_DAYS` | `90` | Days a record is kept. `0` turns the age limit off. |
+| `PISTACK_AUDIT_MAX_RECORDS` | `50000` | Most records kept. It cannot be turned off. |
+
+Set them the same on every server, since whichever leads does the deleting. A busy cloud reaches the count before the age: 50,000 records is about 35 days at one change a minute. Every query reads the whole log, so a much larger count makes `pi audit list` slower and the store bigger. To keep records longer than the limits allow, export them on a schedule with `pi audit list --since 1d --oldest-first -o json`.

@@ -60,10 +60,12 @@ pub fn router(state: AppState) -> Router {
         .route("/machines/{id}/stop", post(stop_machine))
         .route("/machines/{id}/reboot", post(reboot_machine))
         .route("/machines/{id}/migrate", post(migrate_machine))
+        .route("/machines/{id}/stats", get(machine_stats))
         .route("/machines/{id}/console", get(console))
         .route("/machines/{id}/console/vnc", get(console_vnc))
         .route("/hosts", get(list_hosts))
         .route("/hosts/{id}", get(get_host))
+        .route("/hosts/{id}/stats", get(host_stats))
         .route("/hosts/{id}/labels", put(set_host_labels))
         .route("/hosts/{id}/disable", post(disable_host))
         .route("/hosts/{id}/enable", post(enable_host))
@@ -391,6 +393,18 @@ async fn get_machine(
     Ok(Json(load_machine(&s, &scope, &id)?))
 }
 
+/// What the machine is using now, as its host last reported it. Anyone who
+/// may see the machine may see this.
+async fn machine_stats(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::stats::Stats>> {
+    let machine = load_machine(&s, &scope, &id)?;
+    let gauge = gauge::Gauge.client(s.store.clone());
+    Ok(Json(crate::stats::machine_stats(&gauge, &machine)))
+}
+
 async fn update_machine(
     State(s): State<AppState>,
     scope: Scope,
@@ -604,6 +618,18 @@ async fn get_host(
     Ok(Json(hosts(&s).resolve(None, &id)?))
 }
 
+/// What the host is using now, as its agent last reported it.
+async fn host_stats(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::stats::Stats>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let gauge = gauge::Gauge.client(s.store.clone());
+    Ok(Json(crate::stats::host_stats(&gauge, &host)))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetHostLabels {
     pub labels: BTreeMap<String, String>,
@@ -755,6 +781,14 @@ async fn evacuate_host(
     let opts: crate::maintain::EvacuateOptions = optional_body(&body)?;
     let host = hosts(&s).resolve(None, &id)?;
     let (evacuated, skipped) = crate::maintain::evacuate(&s.store, &host, opts)?;
+    // What was asked of the host no longer applies. If it comes back it
+    // must not be handed a start or an attach from before.
+    if let Some(queue) = &s.queue {
+        let dropped = queue.drop_commands(&host.spec.node_name);
+        if dropped > 0 {
+            tracing::info!(host = %host.meta.id, dropped, "forge: commands for the evacuated host dropped");
+        }
+    }
     Ok(Json(crate::maintain::EvacuateReport {
         host,
         evacuated,

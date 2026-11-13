@@ -322,6 +322,7 @@ impl Controller for DeploymentController {
                 self.converge(d, &sets, &pods)
             };
             if let Err(e) = res {
+                pistack_types::tally::reconcile_failed("loom");
                 tracing::warn!(deploy = %d.meta.id, error = %e, "loom: deployment reconcile failed");
             }
         }

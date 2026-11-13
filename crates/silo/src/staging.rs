@@ -32,6 +32,7 @@
 
 use crate::client::Client;
 use crate::multipart::{io_err, scan_staged, UploadMeta};
+use crate::replica::Target;
 use crate::types::Bucket;
 use md5::{Digest, Md5};
 use pistack_types::{ApiError, ApiResult, Id, Spec};
@@ -179,9 +180,14 @@ impl Client {
         Ok((file, size))
     }
 
-    /// Take from the peer at `base` the files of `upload` this server
+    /// Take from the peer `from` the files of `upload` this server
     /// lacks. Returns how many parts were fetched.
-    async fn take(&self, base: &str, upload: &StagedUpload, want: Want) -> Result<usize, String> {
+    async fn take(
+        &self,
+        from: &Target,
+        upload: &StagedUpload,
+        want: Want,
+    ) -> Result<usize, String> {
         let peers = self.peers().ok_or("no peers")?;
         let bucket =
             Id::parse(crate::types::BucketSpec::KIND, &upload.bucket).ok_or("not a bucket id")?;
@@ -221,15 +227,12 @@ impl Client {
             if !stale {
                 continue;
             }
-            let url = format!(
-                "{}/silo/peer/uploads/{}/{}/{}",
-                base.trim_end_matches('/'),
-                upload.bucket,
-                upload.upload_id,
-                part.number
+            let path = format!(
+                "/silo/peer/uploads/{}/{}/{}",
+                upload.bucket, upload.upload_id, part.number
             );
             let dest = dir.join(format!("part-{}", part.number));
-            let resp = peers.get(&url).await?;
+            let resp = peers.get(from, &path).await?;
             download(resp, part, &dest).await?;
             tokio::fs::write(dir.join(format!("part-{}.md5", part.number)), &part.md5)
                 .await
@@ -247,12 +250,10 @@ impl Client {
             .peers()
             .ok_or_else(|| ApiError::unavailable("this server has no peers to fetch from"))?;
         let mut last = String::from("no other server");
-        for base in peers.urls() {
-            let url = format!(
-                "{}/silo/peer/uploads/{bucket}/{upload_id}",
-                base.trim_end_matches('/')
-            );
-            let found = match peers.get(&url).await {
+        for from in peers.targets() {
+            let base = &from.0;
+            let path = format!("/silo/peer/uploads/{bucket}/{upload_id}");
+            let found = match peers.get(&from, &path).await {
                 Ok(resp) => resp.json::<Staged>().await.map_err(|e| e.to_string()),
                 Err(e) => Err(e),
             };
@@ -271,7 +272,7 @@ impl Client {
                 Want::Part(n) => upload.parts.iter().find(|p| p.number == n).cloned(),
                 _ => None,
             };
-            if let Err(e) = self.take(&base, &upload, want).await {
+            if let Err(e) = self.take(&from, &upload, want).await {
                 last = format!("{base}: {e}");
                 continue;
             }
@@ -326,7 +327,7 @@ impl Client {
         let Some(peers) = self.peers() else {
             return Ok(());
         };
-        let urls = peers.urls();
+        let urls = peers.targets();
         let wanted = (self.put_copies().saturating_sub(1) as usize).min(urls.len());
         if wanted == 0 {
             return Ok(());
@@ -334,20 +335,17 @@ impl Client {
         let wait = crate::replica::push_wait(size);
         let mut taken = 0;
         let mut last = String::new();
-        for base in &urls {
+        for to in &urls {
             if taken >= wanted {
                 break;
             }
-            let mut url = format!(
-                "{}/silo/peer/uploads/{bucket}/{upload_id}",
-                base.trim_end_matches('/')
-            );
+            let mut path = format!("/silo/peer/uploads/{bucket}/{upload_id}");
             if let Some(n) = part {
-                url.push_str(&format!("/{n}"));
+                path.push_str(&format!("/{n}"));
             }
-            match peers.post(&url, wait).await {
+            match peers.post(to, &path, wait).await {
                 Ok(()) => taken += 1,
-                Err(e) => last = format!("{base}: {e}"),
+                Err(e) => last = format!("{}: {e}", to.0),
             }
         }
         if taken >= wanted {
@@ -373,9 +371,9 @@ pub async fn sync(client: &Client) -> ApiResult<StagedReport> {
     let Some(peers) = client.peers() else {
         return Ok(report);
     };
-    for base in peers.urls() {
-        let url = format!("{}/silo/peer/uploads", base.trim_end_matches('/'));
-        let list = match peers.get(&url).await {
+    for from in peers.targets() {
+        let base = &from.0;
+        let list = match peers.get(&from, "/silo/peer/uploads").await {
             Ok(resp) => match resp.json::<Staged>().await {
                 Ok(list) => list,
                 Err(e) => {
@@ -413,7 +411,7 @@ pub async fn sync(client: &Client) -> ApiResult<StagedReport> {
             }
         }
         for upload in &list.uploads {
-            match client.take(&base, upload, Want::All).await {
+            match client.take(&from, upload, Want::All).await {
                 Ok(n) => report.fetched += n,
                 Err(e) => tracing::debug!(
                     peer = %base,

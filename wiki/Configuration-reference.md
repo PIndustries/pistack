@@ -20,11 +20,13 @@ These go before the subcommand: `pistack --data-dir /srv/pistack server ...`.
 | Flag | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--init` | | | Found a new cluster. Ignored when the data directory already has a store. |
-| `--join <URL>` | | | Join the cluster whose leader is at this URL. Cannot be combined with `--init`. |
+| `--join <URL>` | | | Join the cluster whose leader is at this URL: the `https://` address of its `--tls-listen`, with `--join-ca-sha256`. Cannot be combined with `--init`. |
+| `--join-ca-sha256 <HEX>` | `PISTACK_JOIN_CA_SHA256` | none | SHA-256 of the cloud's root CA certificate, as `pi join-token create` prints it. Needed to join an `https://` address. 64 hex digits; colons and a leading `sha256:` are accepted. |
+| `--insecure-join` | `PISTACK_INSECURE_JOIN` | off | Let the first join go to an `http://` address. The join token and the store are sent in the clear. |
 | `--listen <ADDR>` | `PISTACK_LISTEN` | `0.0.0.0:8443` | API listener. Plain HTTP. A private IPv4 address here enables discovery. |
 | `--public-url <URL>` | `PISTACK_PUBLIC_URL` | derived from `--listen` | The URL clients, agents and other servers use to reach this server. |
 | `--insecure-http` | | | Acknowledge that `--listen` is plain HTTP. Makes the default public URL `http://`. |
-| `--tls-listen <ADDR>` | `PISTACK_TLS_LISTEN` | none | Additional HTTPS listener. Must be a specific address. |
+| `--tls-listen <ADDR>` | `PISTACK_TLS_LISTEN` | none | Additional HTTPS listener. Must be a specific address. Agents and the other servers call this one. |
 | `--agent-url <URL>` | `PISTACK_AGENT_URL` | `https://<tls-listen>` | The URL agents are told to use for the HTTPS listener. Must be `https://`. Needs `--tls-listen`. |
 | `--dev` | | | Dev mode: a mock local host, and requests without credentials act as admin. |
 
@@ -110,6 +112,23 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 | `PISTACK_CORS_ORIGINS` | none | Comma-separated origins whose pages may call the API from a browser, such as `https://portal.example`. With none, no cross-origin access is allowed; the console is same-origin and needs none. |
 | `PISTACK_ADMIN_PASSWORD` | generated | Password of the bootstrap `admin` principal. Read only when the store has no principals. A generated one is written to `<data_dir>/admin-password`. |
 
+### Audit log
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_AUDIT_MAX_AGE_DAYS` | `90` | Days an audit record is kept. `0` keeps records until the count limit drops them. |
+| `PISTACK_AUDIT_MAX_RECORDS` | `50000` | Most audit records kept; the oldest are deleted first. Zero or a value that is not a number keeps the default. |
+
+The leader enforces both every five minutes. See [Identity and access](Identity-and-access#audit).
+
+### Metrics
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_METRICS_TOKEN` | none | A bearer token that may read `/metrics` and nothing else, for a Prometheus server. At least 16 characters; a shorter one is ignored with a warning. Without it `/metrics` takes a cloud admin's token only. |
+
+See [Metrics and alarms](Metrics-and-alarms).
+
 ### Cluster and agent transport
 
 | Variable | Default | Meaning |
@@ -117,8 +136,10 @@ Note the two underscores after `PISTACK`. These are different from the single-un
 | `PISTACK_RPC_INSECURE` | off | `1` stops `/rpc` from requiring a client certificate. Needed for agents today; see [Agents and hosts](Agents-and-hosts). |
 | `PISTACK_REQUIRE_JOIN` | unset | `/cluster` always needs a member or a join token unless this is `0`, which opens it. `1` also makes every `/rpc` call carry a valid join token. |
 | `PISTACK_JOIN_TOKEN` | none | The join token a new server sends on its first start. Also `pistack agent --token`. |
+| `PISTACK_CLUSTER_TLS` | `preferred` | How servers call each other. `preferred` uses TLS to a server that has an HTTPS address and plain HTTP otherwise. `required` uses TLS only and refuses `/cluster/*` and `/silo/peer/*` on the plain listener; it needs `--tls-listen`. See [Running a cluster](Running-a-cluster#tls-between-servers). |
+| `PISTACK_AUTO_RESYNC` | on | `0` stops a member from replacing its own store when the leader cannot bring it up to date from the log. It then logs what to do and waits. See [Running a cluster](Running-a-cluster#when-a-server-cannot-follow-the-log). |
 
-Both switches accept only the exact value `1`.
+`PISTACK_RPC_INSECURE` and `PISTACK_REQUIRE_JOIN=1` accept only the exact value `1`.
 
 ### Networking
 

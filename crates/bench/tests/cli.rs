@@ -29,6 +29,7 @@ struct Mock {
     /// Each server removed, and the `force` it was asked with.
     removals: Arc<Mutex<Vec<(String, bool)>>>,
     quotas: Arc<Mutex<BTreeMap<String, u64>>>,
+    networks: Arc<Mutex<BTreeMap<String, Value>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -369,6 +370,120 @@ async fn set_quotas(
     Json(quota_report(&m)).into_response()
 }
 
+async fn create_network(
+    State(m): State<Mock>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let name = body["name"].as_str().unwrap().to_owned();
+    let row = json!({
+        "id": "net-00000001",
+        "name": name,
+        "revision": 1,
+        "spec": body["spec"],
+        "status": {"phase": "ready"},
+    });
+    m.networks.lock().unwrap().insert(name, row.clone());
+    (StatusCode::CREATED, Json(row)).into_response()
+}
+
+async fn show_network(State(m): State<Mock>, Path(id): Path<String>) -> axum::response::Response {
+    match m.networks.lock().unwrap().get(&id) {
+        Some(row) => Json(row.clone()).into_response(),
+        None => err(StatusCode::NOT_FOUND, "not_found", "network not found"),
+    }
+}
+
+/// Replaces the spec, as the server does, and insists on the revision.
+async fn update_network(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let mut networks = m.networks.lock().unwrap();
+    let Some(row) = networks.get_mut(&id) else {
+        return err(StatusCode::NOT_FOUND, "not_found", "network not found");
+    };
+    let sent = h.get("if-match").and_then(|v| v.to_str().ok());
+    if sent.map(|v| v.trim_matches('"')) != Some(row["revision"].to_string().as_str()) {
+        return err(StatusCode::CONFLICT, "conflict", "revision mismatch");
+    }
+    row["spec"] = body["spec"].clone();
+    row["revision"] = json!(row["revision"].as_u64().unwrap() + 1);
+    Json(row.clone()).into_response()
+}
+
+#[tokio::test]
+async fn automatic_floating_ips_are_set_on_create_and_changed_later() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // The flag makes no sense on a network that is not external.
+    let r = pi(&cfg, "", &["network", "create", "in", "--auto-floating-ip"]).await;
+    assert_eq!(r.code, 2, "{r:?}");
+
+    let r = pi(
+        &cfg,
+        "",
+        &["network", "create", "public", "--external", "--mtu", "1400"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let spec = |m: &Mock| m.networks.lock().unwrap()["public"]["spec"].clone();
+    assert_eq!(spec(&mock)["auto_floating_ip"], false);
+
+    let r = pi(
+        &cfg,
+        "",
+        &["network", "set", "public", "--auto-floating-ip", "true"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(spec(&mock)["auto_floating_ip"], true);
+    // The rest of the spec went back as it was.
+    assert_eq!(spec(&mock)["external"], true);
+    assert_eq!(spec(&mock)["mtu"], 1400);
+
+    let r = pi(
+        &cfg,
+        "",
+        &["network", "set", "public", "--auto-floating-ip", "false"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(spec(&mock)["auto_floating_ip"], false);
+
+    // Saying nothing is a usage error, not a silent no-op.
+    let r = pi(&cfg, "", &["network", "set", "public"]).await;
+    assert_eq!(r.code, 2, "{r:?}");
+
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "network",
+            "create",
+            "edge",
+            "--external",
+            "--auto-floating-ip",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        mock.networks.lock().unwrap()["edge"]["spec"]["auto_floating_ip"],
+        true
+    );
+}
+
 async fn serve() -> (String, Mock) {
     let mock = Mock::default();
     let app = Router::new()
@@ -379,6 +494,11 @@ async fn serve() -> (String, Mock) {
         .route(
             "/identity/projects/{id}/quotas",
             get(show_quotas).put(set_quotas),
+        )
+        .route("/network/networks", post(create_network))
+        .route(
+            "/network/networks/{id}",
+            get(show_network).put(update_network),
         )
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))

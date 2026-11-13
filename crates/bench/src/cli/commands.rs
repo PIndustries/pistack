@@ -45,6 +45,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
 
         Cmd::Project { cmd } => project(ctx, cmd, io).await,
         Cmd::Quota { cmd } => quota(ctx, cmd, io).await,
+        Cmd::Audit { cmd } => audit(ctx, cmd, io).await,
         Cmd::User { cmd } => user(ctx, cmd, io).await,
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
@@ -1081,6 +1082,140 @@ async fn quota(ctx: &Ctx, cmd: QuotaCmd, io: &mut Io<'_>) -> CliResult<()> {
     Ok(())
 }
 
+/// `--since` and `--until`: an RFC 3339 time as it is, or an age such as
+/// `90s`, `30m`, `2h`, `7d` counted back from `now`.
+fn audit_time(raw: &str, now: chrono::DateTime<chrono::Utc>) -> CliResult<String> {
+    let raw = raw.trim();
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(t.with_timezone(&chrono::Utc).to_rfc3339());
+    }
+    let bad = || {
+        CliError::usage(format!(
+            "'{raw}' is not a time: give an RFC 3339 time such as 2026-11-12T08:00:00Z, or an age such as 30m, 2h or 7d"
+        ))
+    };
+    let split = raw.len().checked_sub(1).ok_or_else(bad)?;
+    let (n, unit) = raw.split_at_checked(split).ok_or_else(bad)?;
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return Err(bad()),
+    };
+    Ok((now - chrono::Duration::seconds(secs)).to_rfc3339())
+}
+
+fn query_escape(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let AuditCmd::List(a) = cmd;
+    let now = chrono::Utc::now();
+    let mut query = vec![
+        ("limit", a.limit.clamp(1, 1000).to_string()),
+        (
+            "order",
+            if a.oldest_first { "asc" } else { "desc" }.to_owned(),
+        ),
+    ];
+    if let Some(t) = &a.since {
+        query.push(("since", audit_time(t, now)?));
+    }
+    if let Some(t) = &a.until {
+        query.push(("until", audit_time(t, now)?));
+    }
+    for (key, value) in [
+        ("principal", a.principal),
+        ("project", a.in_project),
+        ("action", a.action),
+        ("kind", a.kind),
+        ("resource", a.resource),
+        ("outcome", a.outcome),
+        ("after", a.after),
+    ] {
+        if let Some(value) = value {
+            query.push((key, value));
+        }
+    }
+    let query: Vec<String> = query
+        .iter()
+        .map(|(k, v)| format!("{k}={}", query_escape(v)))
+        .collect();
+    let c = ctx.client()?;
+    let page = c
+        .get_value(&format!("/identity/audit?{}", query.join("&")))
+        .await?;
+    let items = page
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    match ctx.fmt.output {
+        Output::Table | Output::Wide => {
+            let wide = ctx.fmt.output == Output::Wide;
+            let rows: Vec<Vec<String>> = items
+                .iter()
+                .map(|r| {
+                    let who = match str_at(r, "/spec/principal") {
+                        p if p.is_empty() => "-".to_owned(),
+                        p => p,
+                    };
+                    let mut row = vec![
+                        str_at(r, "/created_at"),
+                        who,
+                        str_at(r, "/spec/client"),
+                        str_at(r, "/spec/action"),
+                        str_at(r, "/spec/kind"),
+                        str_at(r, "/spec/resource"),
+                        str_at(r, "/spec/status"),
+                    ];
+                    if wide {
+                        row.extend([
+                            str_at(r, "/spec/project"),
+                            str_at(r, "/spec/api_key"),
+                            str_at(r, "/spec/method"),
+                            str_at(r, "/spec/path"),
+                            str_at(r, "/id"),
+                        ]);
+                    }
+                    row
+                })
+                .collect();
+            let mut headers = vec![
+                "when", "who", "from", "action", "kind", "resource", "status",
+            ];
+            if wide {
+                headers.extend(["project", "api key", "method", "path", "id"]);
+            }
+            write!(
+                io.stdout,
+                "{}",
+                output::table(&headers, &rows, ctx.fmt.no_headers)
+            )?;
+            if let Some(next) = page.get("next").and_then(Value::as_str) {
+                writeln!(io.stderr, "more records: --after {next}")?;
+            }
+        }
+        Output::Name => {
+            for r in &items {
+                writeln!(io.stdout, "{}", str_at(r, "/id"))?;
+            }
+        }
+        _ => print_value(io.stdout, ctx.fmt, &page)?,
+    }
+    Ok(())
+}
+
 async fn user(ctx: &Ctx, cmd: UserCmd, io: &mut Io<'_>) -> CliResult<()> {
     let k = kind("user");
     match cmd {
@@ -1245,6 +1380,12 @@ async fn join_token(ctx: &Ctx, cmd: JoinTokenCmd, io: &mut Io<'_>) -> CliResult<
                 Output::Table | Output::Wide => {
                     report(ctx, io, k, &jt, "created")?;
                     writeln!(io.stdout, "token (shown once): {}", str_at(&v, "/token"))?;
+                    // What a new server checks the leader against when it
+                    // joins over https. An older server does not send it.
+                    let ca = str_at(&v, "/ca_sha256");
+                    if !ca.is_empty() {
+                        writeln!(io.stdout, "ca sha256: {ca}")?;
+                    }
                 }
                 Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/token"))?,
                 _ => print_one(io.stdout, ctx.fmt, &v)?,
@@ -1288,7 +1429,114 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
         MachineCmd::Start(a) => power(ctx, io, k, a, "start").await,
         MachineCmd::Stop(a) => power(ctx, io, k, a, "stop").await,
         MachineCmd::Reboot(a) => power(ctx, io, k, a, "reboot").await,
+        MachineCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
     }
+}
+
+/// `1536` -> `1.5 KiB`. Whole bytes below 1024.
+fn human_bytes(n: f64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if n.abs() < 1024.0 {
+        return format!("{n:.0} B");
+    }
+    let mut value = n / 1024.0;
+    let mut unit = 0;
+    while value.abs() >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// A metric name without the prefix every one of a machine's or a host's
+/// series shares, with the disk or interface it is about.
+fn stat_name(series: &Value) -> String {
+    let metric = str_at(series, "/metric");
+    let short = metric
+        .strip_prefix("pistack_machine_")
+        .or_else(|| metric.strip_prefix("pistack_host_"))
+        .or_else(|| metric.strip_prefix("pistack_"))
+        .unwrap_or(&metric);
+    let of = ["device", "interface"]
+        .iter()
+        .map(|label| str_at(series, &format!("/labels/{label}")))
+        .find(|v| !v.is_empty());
+    match of {
+        Some(of) => format!("{short} ({of})"),
+        None => short.to_owned(),
+    }
+}
+
+/// A value in the unit its metric name ends in.
+fn stat_value(metric: &str, value: f64) -> String {
+    let name = metric.strip_suffix("_total").unwrap_or(metric);
+    if name.ends_with("_bytes") {
+        human_bytes(value)
+    } else if name.ends_with("_seconds") {
+        format!("{value:.1} s")
+    } else if name.ends_with("_mib") {
+        human_bytes(value * 1024.0 * 1024.0)
+    } else if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// `pi machine stats` and `pi host stats`: the current value of each
+/// series, and for a counter how fast it is rising.
+async fn stats(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, name: &str) -> CliResult<()> {
+    let c = ctx.client()?;
+    let report = c.get_value(&format!("{}/stats", k.item_path(name))).await?;
+    let series = report
+        .get("series")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    match ctx.fmt.output {
+        Output::Table | Output::Wide => {
+            if series.is_empty() {
+                writeln!(
+                    io.stderr,
+                    "no usage reported for {} \"{name}\" in the last five minutes",
+                    k.noun
+                )?;
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = series
+                .iter()
+                .map(|s| {
+                    let metric = str_at(s, "/metric");
+                    let value = s.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+                    let rate = match s.get("rate").and_then(Value::as_f64) {
+                        Some(rate) => {
+                            let per = metric.strip_suffix("_total").unwrap_or(&metric);
+                            if per.ends_with("_seconds") {
+                                // Seconds of CPU per second: CPUs in use.
+                                format!("{rate:.2} cpus")
+                            } else {
+                                format!("{}/s", stat_value(&metric, rate))
+                            }
+                        }
+                        None => String::new(),
+                    };
+                    vec![stat_name(s), stat_value(&metric, value), rate]
+                })
+                .collect();
+            write!(
+                io.stdout,
+                "{}",
+                output::table(&["metric", "value", "rate"], &rows, ctx.fmt.no_headers)
+            )?;
+        }
+        Output::Name => {
+            for s in &series {
+                writeln!(io.stdout, "{}", str_at(s, "/metric"))?;
+            }
+        }
+        _ => print_value(io.stdout, ctx.fmt, &report)?,
+    }
+    Ok(())
 }
 
 async fn power(
@@ -1354,6 +1602,7 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
     match cmd {
         HostCmd::List(a) => do_list(ctx, io, k, a).await,
         HostCmd::Show(a) => do_show(ctx, io, k, a).await,
+        HostCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
         HostCmd::Label(a) => {
             let c = ctx.client()?;
             let mut labels = Map::new();
@@ -1576,10 +1825,28 @@ async fn network(ctx: &Ctx, cmd: NetworkCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "kind": kind_v,
                 "mtu": a.mtu,
                 "external": a.external,
+                "auto_floating_ip": a.auto_floating_ip,
                 "dns_domain": opt(a.dns_domain),
             });
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, false).await.map(|_| ())
+        }
+        NetworkCmd::Set(a) => {
+            // The update replaces the spec, so send back what is there.
+            let c = ctx.client()?;
+            let path = k.item_path(&a.name);
+            let cur = c.get_value(&path).await?;
+            let mut spec = cur.get("spec").cloned().unwrap_or_else(|| json!({}));
+            if let Some(fields) = spec.as_object_mut() {
+                fields.insert("auto_floating_ip".into(), json!(a.auto_floating_ip));
+            }
+            let body = json!({ "spec": spec });
+            let revision = cur.get("revision").map(|r| r.to_string());
+            let v = match revision {
+                Some(rev) => c.put_if_match(&path, &body, &rev).await?,
+                None => c.put(&path, &body).await?,
+            };
+            report(ctx, io, k, &v, "updated")
         }
     }
 }

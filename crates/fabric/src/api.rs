@@ -270,6 +270,35 @@ fn created<T: Serialize>(t: T) -> Response {
     (StatusCode::CREATED, Json(t)).into_response()
 }
 
+// ---- what only an admin may put in a spec ---------------------------------
+
+/// Checked before a create (`cur` is `None`) or an update.
+trait Guarded: Sized {
+    fn guard(&self, _caller: &Caller, _cur: Option<&Self>) -> ApiResult<()> {
+        Ok(())
+    }
+}
+
+impl Guarded for NetworkSpec {
+    /// Turning automatic floating IPs on makes machines in every project
+    /// reachable from outside, so it is an admin's call. Anyone who may
+    /// edit the network can turn it off.
+    fn guard(&self, caller: &Caller, cur: Option<&Self>) -> ApiResult<()> {
+        let was_on = cur.is_some_and(|c| c.auto_floating_ip);
+        if self.auto_floating_ip && !was_on && !caller.is_admin() {
+            return Err(ApiError::forbidden(
+                "only an admin may turn on auto_floating_ip",
+            ));
+        }
+        Ok(())
+    }
+}
+impl Guarded for SubnetSpec {}
+impl Guarded for PortSpec {}
+impl Guarded for RouterSpec {}
+impl Guarded for SecurityGroupSpec {}
+impl Guarded for FloatingIpSpec {}
+
 // ---- one macro per kind for the uniform CRUD ------------------------------
 
 macro_rules! crud {
@@ -295,6 +324,7 @@ macro_rules! crud {
             Json(body): Json<Create<$spec>>,
         ) -> ApiResult<Response> {
             let project = create_project(&caller, &body.project)?;
+            body.spec.guard(&caller, None)?;
             let meta = new_meta($kind, &body, project)?;
             Ok(created(c.$c_create(meta, body.spec)?))
         }
@@ -323,6 +353,7 @@ macro_rules! crud {
             let project = scope(&caller, &sq)?;
             let cur = visible(&caller, c.$col().resolve(project.as_ref(), &id)?)?;
             let rev = if_match(&headers)?;
+            body.spec.guard(&caller, Some(&cur.spec))?;
             Ok(Json(c.$c_update(&cur.meta.id, rev, |r| {
                 apply_meta(&mut r.meta, &body);
                 r.spec = body.spec.clone();

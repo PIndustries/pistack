@@ -31,6 +31,7 @@ mod overlay;
 mod ovn;
 pub mod reconcile;
 pub mod scheduler;
+pub mod stats;
 pub mod types;
 mod usage;
 
@@ -39,6 +40,7 @@ pub use driver::{
     ChannelDriver, DriverCommand, DriverRegistry, DriverReply, DriverRequest, HostDriver,
     MachineRuntime, MockDriver,
 };
+pub use metadata::agent_routes as agent_metadata_routes;
 pub use overlay::{
     ServiceEndpointView, ServicePortView, ServiceRecord, ServiceStatusView, ServiceView,
 };

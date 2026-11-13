@@ -577,6 +577,10 @@ async fn join_tokens_over_http() {
     assert_eq!(t["join_token"]["spec"]["multi_use"], false);
     assert_eq!(t["join_token"]["spec"]["created_by"], "admin");
     assert_ne!(t["join_token"]["spec"]["hash"], clear);
+    // With the token comes what a new server checks the cloud by.
+    let print = keep::ca::root_fingerprint(&store).unwrap().unwrap();
+    assert_eq!(t["ca_sha256"], print.as_str());
+    assert_eq!(print.len(), 64);
 
     let (st, page) = call(&app, "GET", "/join-tokens", Some("admin"), None).await;
     assert_eq!(st, StatusCode::OK);

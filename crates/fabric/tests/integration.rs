@@ -1164,6 +1164,48 @@ async fn http_scopes_non_admin_callers() {
     assert_eq!(created["project"], h.project.to_string());
 }
 
+#[tokio::test]
+async fn only_an_admin_turns_automatic_floating_ips_on() {
+    let h = harness();
+    let member = pistack_types::Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "alice".into(),
+        project: Some(h.project.clone()),
+        roles: vec!["member".into()],
+        system: false,
+    };
+    let as_member = api::router(h.client.clone()).layer(axum::Extension(member));
+    let as_admin = api::router(h.client.clone()).layer(axum::Extension(admin_caller()));
+    let on = serde_json::json!({"external": true, "auto_floating_ip": true});
+    let off = serde_json::json!({"external": true});
+
+    let body = serde_json::json!({"name": "public", "spec": on});
+    let (st, refused) = call(&as_member, "POST", "/networks", Some(body), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(
+        refused["error"]["message"],
+        "only an admin may turn on auto_floating_ip"
+    );
+    let body = serde_json::json!({"name": "public", "spec": off});
+    let (st, made) = call(&as_member, "POST", "/networks", Some(body), None).await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert!(made["spec"].get("auto_floating_ip").is_none(), "{made}");
+
+    let put = |spec: &serde_json::Value| Some(serde_json::json!({"spec": spec}));
+    let (st, _) = call(&as_member, "PUT", "/networks/public", put(&on), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let path = format!("/networks/public?project={}", h.project);
+    let (st, marked) = call(&as_admin, "PUT", &path, put(&on), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(marked["spec"]["auto_floating_ip"], true);
+    // A member may leave it on while editing something else, and turn it off.
+    let (st, _) = call(&as_member, "PUT", "/networks/public", put(&on), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, cleared) = call(&as_member, "PUT", "/networks/public", put(&off), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(cleared["spec"].get("auto_floating_ip").is_none());
+}
+
 fn admin_caller() -> Caller {
     Caller {
         principal: Id::new(kind::PRINCIPAL),

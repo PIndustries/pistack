@@ -793,6 +793,12 @@ pub struct JoinTokenResponse {
     /// Shown once. Give it to `pistack agent --join`.
     pub token: String,
     pub join_token: JoinToken,
+    /// SHA-256 of the cloud's root CA certificate. A new server joining
+    /// over https is given it as `PISTACK_JOIN_CA_SHA256` and takes the
+    /// snapshot only from a server whose certificate chains to that CA.
+    /// Not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,7 +841,12 @@ async fn create_join_token_h(
         },
         c.limits(),
     )?;
-    Ok(created(JoinTokenResponse { token, join_token }))
+    let ca_sha256 = crate::ca::root_fingerprint(c.store())?;
+    Ok(created(JoinTokenResponse {
+        token,
+        join_token,
+        ca_sha256,
+    }))
 }
 
 async fn get_join_token(

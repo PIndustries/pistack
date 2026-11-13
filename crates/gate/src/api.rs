@@ -16,6 +16,7 @@
 //! GET|POST /bindings, GET|DELETE /bindings/{id}           (admin)
 //! GET|POST /keys, GET|DELETE /keys/{id}                   (own keys, or any as admin)
 //! GET    /policy                 the RBAC document
+//! GET    /audit                  the audit log, filtered and paged (admin)
 //! ```
 //!
 //! `{id}` accepts a name or an id. `PUT` honours `If-Match: <revision>`.
@@ -67,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/keys", get(list_keys).post(create_key))
         .route("/keys/{id}", get(get_key).delete(delete_key))
         .route("/policy", get(get_policy))
+        .route("/audit", get(list_audit))
         .fallback(|| async { ApiError::not_found("no such identity endpoint") })
         .with_state(state)
 }
@@ -178,10 +180,27 @@ pub struct TokenResponse {
     pub caller: Caller,
 }
 
-async fn login(
-    State(st): State<AppState>,
-    Body(req): Body<TokenRequest>,
-) -> ApiResult<Json<TokenResponse>> {
+/// A login has no caller, so the handler says who it was for. The audit
+/// layer reads this off the response: the principal and key once they are
+/// known, or the name that was tried. Never the password or the key secret.
+async fn login(State(st): State<AppState>, Body(req): Body<TokenRequest>) -> Response {
+    let mut subject = crate::audit::Subject {
+        principal: req.name.clone().filter(|_| req.api_key.is_none()),
+        ..Default::default()
+    };
+    let mut response = match issue_login(&st, req, &mut subject) {
+        Ok(token) => Json(token).into_response(),
+        Err(err) => err.into_response(),
+    };
+    response.extensions_mut().insert(subject);
+    response
+}
+
+fn issue_login(
+    st: &AppState,
+    req: TokenRequest,
+    subject: &mut crate::audit::Subject,
+) -> ApiResult<TokenResponse> {
     let store = &st.store;
     let invalid = || ApiError::unauthorized("invalid credentials");
 
@@ -193,6 +212,8 @@ async fn login(
             .into_iter()
             .find(|k| k.spec.hash == hash)
             .ok_or_else(invalid)?;
+        subject.api_key = Some(key.meta.id.clone());
+        subject.principal_id = Some(key.spec.principal.clone());
         if key.is_expired(Utc::now()) {
             return Err(ApiError::unauthorized("api key expired"));
         }
@@ -231,7 +252,10 @@ async fn login(
         Some(s) => Duration::seconds(s).min(MAX_TTL),
         None => DEFAULT_TTL,
     };
-    Ok(Json(issue_token(&st, &principal, project, key, ttl)?))
+    subject.principal = Some(principal.meta.name.clone());
+    subject.principal_id = Some(principal.meta.id.clone());
+    subject.project = project.clone();
+    issue_token(st, &principal, project, key, ttl)
 }
 
 /// Resolve roles from bindings and sign a token. Library entry point so
@@ -1035,6 +1059,27 @@ async fn delete_key(
 }
 
 // ---- policy ----------------------------------------------------------------
+
+/// The audit log. Cloud admin only: a record carries the project of the
+/// token that made the request, not of everything the request touched, so
+/// a per-project view would leave out what an admin did to the project.
+async fn list_audit(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    query: Result<Query<crate::audit::AuditQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Json<Page<crate::audit::AuditEvent>>> {
+    policy::authorize(&caller, "audit.list", None)?;
+    let Query(mut q) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    // A project may be given by name.
+    if let Some(project) = q.project.as_deref() {
+        if let Ok(found) = crate::resolve_project(&st.store, project) {
+            q.project = Some(found.meta.id.to_string());
+        }
+    }
+    crate::audit::list(&st.store, &q)
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
 
 async fn get_policy(AuthCaller(_caller): AuthCaller) -> Json<policy::PolicyDocument> {
     Json(policy::document())

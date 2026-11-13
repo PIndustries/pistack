@@ -113,14 +113,23 @@ impl RpcDriver {
         }
     }
 
+    /// Send one command and wait for the host's answer. With `machine`
+    /// the command is keyed by that machine: the reconciler issues it again
+    /// after a leader change, it keeps its id, and the host runs it once.
     async fn call<T: serde::Serialize>(
         &self,
+        machine: Option<&Id>,
         kind: CommandKind,
         payload: &T,
     ) -> ApiResult<serde_json::Value> {
         let payload =
             serde_json::to_value(payload).map_err(|e| ApiError::internal(e.to_string()))?;
-        let ticket = self.queue.enqueue(&self.node, kind, payload)?;
+        let ticket = match machine {
+            Some(id) => self
+                .queue
+                .enqueue_keyed(&self.node, &machine_key(id), kind, payload)?,
+            None => self.queue.enqueue(&self.node, kind, payload)?,
+        };
         // Timeouts, queue-full and node-removed all map to `unavailable`
         // through `From<RpcError>`; the reconciler retries next pass.
         let result = ticket.wait().await?;
@@ -157,7 +166,7 @@ impl HostDriver for RpcDriver {
             for (node, plan) in &plans {
                 if node == &self.node {
                     req.overlay = Some(plan.clone());
-                } else if let Err(e) = self.call(CommandKind::SyncOverlay, plan).await {
+                } else if let Err(e) = self.call(None, CommandKind::SyncOverlay, plan).await {
                     tracing::warn!(
                         node,
                         error = %e,
@@ -178,7 +187,9 @@ impl HostDriver for RpcDriver {
                 m.meta.id
             )));
         }
-        let v = self.call(CommandKind::StartMachine, &req).await?;
+        let v = self
+            .call(Some(&m.meta.id), CommandKind::StartMachine, &req)
+            .await?;
         let rt: RunningMachine = serde_json::from_value(v).map_err(|e| {
             ApiError::internal(format!(
                 "host {} returned a bad start result: {e}",
@@ -189,15 +200,23 @@ impl HostDriver for RpcDriver {
     }
 
     async fn stop(&self, id: &Id) -> ApiResult<()> {
-        self.call(CommandKind::StopMachine, &MachineRef { id: id.clone() })
-            .await
-            .map(|_| ())
+        self.call(
+            Some(id),
+            CommandKind::StopMachine,
+            &MachineRef { id: id.clone() },
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn delete(&self, id: &Id) -> ApiResult<()> {
-        self.call(CommandKind::DeleteMachine, &MachineRef { id: id.clone() })
-            .await
-            .map(|_| ())
+        self.call(
+            Some(id),
+            CommandKind::DeleteMachine,
+            &MachineRef { id: id.clone() },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Always `Ok(empty)`: there is no list command on the wire. The agent
@@ -206,6 +225,13 @@ impl HostDriver for RpcDriver {
     async fn list(&self) -> ApiResult<Vec<MachineRuntime>> {
         Ok(Vec::new())
     }
+}
+
+/// The queue key of the commands that start, stop and delete one machine.
+/// One key for the three: a host has one of them outstanding per machine,
+/// and a different one replaces it.
+pub fn machine_key(id: &Id) -> String {
+    format!("machine/{id}")
 }
 
 /// Catalog row, read as JSON so forge does not depend on mold.
@@ -519,6 +545,9 @@ impl Registrar {
     /// Consume agent events until `shutdown`.
     pub async fn run(self, shutdown: CancellationToken) {
         let mut rx = self.queue.subscribe_agent_events();
+        // An agent may have said hello to the queue before this started
+        // listening, as one does when it reaches a new leader first.
+        self.resync();
         loop {
             let ev = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -549,9 +578,17 @@ impl Registrar {
         }
     }
 
-    /// After a lag, treat every node the queue knows as freshly announced.
+    /// Treat every node that said hello to the queue a moment ago as
+    /// freshly announced: those are the hellos that may have been missed.
+    /// An older hello is left alone. Its host is registered already, and
+    /// the node may have gone since; announcing it again would mark a dead
+    /// host ready.
     fn resync(&self) {
+        let recent = Utc::now() - crate::reconcile::HOST_STALE_AFTER;
         for n in self.queue.nodes() {
+            if n.last_hello.is_none_or(|at| at < recent) {
+                continue;
+            }
             let hello = AgentHello {
                 node_name: n.name,
                 capabilities: n.capabilities,
@@ -674,11 +711,11 @@ impl Registrar {
         // `status.free` stays with the reconciler, which recomputes it from
         // placements every pass; the agent's figure is informational.
         // Capacity is the host total from hello, not `resources_free`.
-        gauge::record_host(
-            gauge::samples().as_ref(),
-            &host.spec.node_name,
-            host.spec.capacity.memory_mib,
-            host.spec.capacity.vcpus,
+        crate::stats::record_heartbeat(
+            &gauge::Gauge.client(self.store.clone()),
+            &self.store,
+            &host,
+            hb,
         );
         tracing::trace!(node = %hb.node_name, free = ?hb.resources_free, "forge: heartbeat");
         for r in &hb.machines {
@@ -977,6 +1014,7 @@ mod tests {
             }],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
         let m = store.collection::<Machine>().get(&m.meta.id).unwrap();
@@ -988,7 +1026,7 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 l.contains("pistack_host_memory_mib")
-                    && l.contains("node=\"h1\"")
+                    && l.contains("host=\"h1\"")
                     && (l.contains(" 16384") || l.contains(" 16384.0"))
             }),
             "{text}"
@@ -996,7 +1034,7 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 l.contains("pistack_host_vcpus")
-                    && l.contains("node=\"h1\"")
+                    && l.contains("host=\"h1\"")
                     && (l.ends_with(" 16") || l.ends_with(" 16.0"))
             }),
             "{text}"
@@ -1009,12 +1047,13 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
         assert_eq!(store.collection::<Host>().list(None).unwrap().len(), 1);
         let text = gauge::Gauge.client(store).metrics_text();
         assert!(
-            !text.lines().any(|l| l.contains("node=\"ghost\"")),
+            !text.lines().any(|l| l.contains("host=\"ghost\"")),
             "{text}"
         );
     }
@@ -1056,6 +1095,7 @@ mod tests {
             }],
             at: Utc::now(),
             ovn: None,
+            usage: None,
         })
         .unwrap();
         let stored = store.collection::<Machine>().get(&m.meta.id).unwrap();
@@ -1079,6 +1119,7 @@ mod tests {
             machines: vec![],
             at: Utc::now(),
             ovn,
+            usage: None,
         };
 
         let down = pistack_rpc::OvnReport {
@@ -1166,6 +1207,37 @@ mod tests {
         reg.resync();
         let kept = store.collection::<Host>().get(&host.meta.id).unwrap();
         assert_eq!(kept.spec.underlay_ip.as_deref(), Some("192.168.5.9"));
+    }
+
+    #[tokio::test]
+    async fn a_hello_from_before_the_registrar_listened_is_registered() {
+        let store = Store::in_memory().unwrap();
+        let drivers = Arc::new(DriverRegistry::new());
+        let queue = CommandQueue::default();
+        queue.hello(&hello("early"));
+        // A node that has only polled has announced nothing to register.
+        let _ = queue.next("silent", std::time::Duration::ZERO, 1).await;
+        let stop = CancellationToken::new();
+        let registrar = Registrar::new(store.clone(), drivers, queue);
+        let run = tokio::spawn(registrar.run(stop.clone()));
+        let nodes = || -> Vec<String> {
+            store
+                .collection::<Host>()
+                .list(None)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.spec.node_name.clone())
+                .collect()
+        };
+        for _ in 0..100 {
+            if !nodes().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        stop.cancel();
+        run.await.unwrap();
+        assert_eq!(nodes(), vec!["early"]);
     }
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1544,6 +1616,7 @@ mod tests {
                 .collect(),
             at: Utc::now(),
             ovn: None,
+            usage: None,
         }
     }
 

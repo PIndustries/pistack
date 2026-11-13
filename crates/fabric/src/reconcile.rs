@@ -114,6 +114,7 @@ fn finish<K: Observed>(
     match res {
         Ok(_) => {
             if phase == Phase::Error {
+                pistack_types::tally::reconcile_failed("fabric");
                 tracing::warn!(kind = K::KIND, %id, error = %msg, "reconcile failed");
             } else {
                 tracing::debug!(kind = K::KIND, %id, "reconciled");

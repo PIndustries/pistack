@@ -420,6 +420,7 @@ pub static KINDS: &[KindDef] = &[
             col!("VLAN", "/spec/kind/vlan"),
             col!("MTU", "/spec/mtu"),
             col!("EXTERNAL", "/spec/external"),
+            col!("AUTO-FIP", "/spec/auto_floating_ip"),
             col!("SEGMENT", "/status/segment_id"),
             col!("AGE", created),
         ],

@@ -70,7 +70,7 @@ Because the name is kept in the file, renaming the machine does not change the h
 
 ## What the host reports
 
-At registration the agent reports the node name, vCPUs, memory, free disk, its runtimes and its underlay address. It then sends a heartbeat every 15 seconds with the machines it runs.
+At registration the agent reports the node name, vCPUs, memory, free disk, its runtimes and its underlay address. It then sends a heartbeat every 15 seconds with the machines it runs and what the host and those machines are using. See [Metrics and alarms](Metrics-and-alarms).
 
 ```sh
 pi host list
@@ -89,6 +89,25 @@ A host that has not reported for 30 seconds goes to phase `error` with the messa
 The underlay address is the address other hosts use to reach this one for overlay networking. The agent takes it from `PISTACK_UNDERLAY_IP`, or else from the source address of the route to the server. It must be a private address (10/8, 172.16/12, 192.168/16 or 100.64/10). A machine that names a network is only placed on a host that reported one.
 
 The agent reads memory from `/proc/meminfo`. On a system without it the host reports 0 MiB and nothing fits.
+
+## Commands and a change of leader
+
+The leader tells a host what to do by putting a command on that host's queue. The agent fetches commands with its long poll, runs them in order, and posts the results. A command that gets no answer within 120 seconds fails, and a host can have at most 1024 commands waiting to be fetched. Further ones are refused until it polls.
+
+The queue is memory on the leader, so it is empty after the leader restarts or another server takes over. Nothing is lost by that for a machine start, stop or delete, or for a volume attach or detach:
+
+- The new leader works out what is outstanding from the resources themselves. A machine that is `creating` is started, one that is `deleting` is deleted, one whose power differs from what was asked is stopped or started, and a volume that is `Attaching` is attached.
+- Each of these commands has an id that is written to the store when it is issued and removed when it is answered. The command sent again by the new leader has the id the first one had.
+- The agent keeps the result of each such command for an hour, at most 256 of them, in `commands-done.json` in its data directory, so it still has them after it restarts. When an id it has completed arrives a second time, it does not run the command again. It answers with the result it kept.
+- A result the agent could not deliver, because the server was gone, is sent to the server it reaches next.
+
+So a start that the old leader sent and the host ran is reported to the new leader and is not run twice.
+
+The store holds one small record for each command that is waiting for its answer: the id, the kind and the time, under `rpc/commands/<node>/` in the meta table. A record lives no longer than its command, 120 seconds. A host that is down for a long time therefore leaves nothing behind, and what was asked of it is asked again when the reconcilers next find it outstanding.
+
+Evacuating a host drops every command that was waiting for it.
+
+Not covered: a live migration, and `pi pod exec` and pod logs, which fail and have to be asked for again. See [Known limits](Known-limits). An overlay plan is not carried over either and does not need to be: every new leader sends each host its current plan.
 
 ## Host maintenance
 

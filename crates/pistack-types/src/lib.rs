@@ -15,6 +15,7 @@ pub mod error;
 pub mod module;
 pub mod node;
 pub mod resource;
+pub mod tally;
 
 pub use error::{ApiError, ApiResult};
 pub use module::{CancellationToken, Leadership, Module, ModuleContext, ModuleInfo};

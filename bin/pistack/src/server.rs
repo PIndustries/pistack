@@ -18,6 +18,10 @@ pub struct ServerOpts {
     pub data_dir: PathBuf,
     pub init: bool,
     pub join: Option<String>,
+    /// The fingerprint of the cloud's root CA, for a first join over https.
+    pub join_ca: Option<String>,
+    /// Accept a first join over plain http.
+    pub insecure_join: bool,
     pub listen: String,
     pub public_url: Option<String>,
     pub insecure_http: bool,
@@ -179,7 +183,41 @@ fn agent_api(tls_listen: Option<&str>, agent_url: Option<&str>) -> anyhow::Resul
     Ok(Some(url.trim_end_matches('/').to_owned()))
 }
 
-pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
+/// The host of a URL, without the brackets of an IPv6 address.
+fn host_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(host.trim_matches(|c| c == '[' || c == ']').to_owned())
+}
+
+/// After a join over https: the store that came down holds the root CA
+/// whose fingerprint the operator gave. Nothing to check without one.
+fn joined_the_pinned_cloud(store: &Store, pin: Option<&str>) -> anyhow::Result<()> {
+    let Some(pin) = pin.map(str::trim).filter(|pin| !pin.is_empty()) else {
+        return Ok(());
+    };
+    let pin = keep::tls::parse_fingerprint(pin)
+        .map_err(|err| anyhow::anyhow!("{}: {err}", crate::cluster::JOIN_CA_ENV))?;
+    let root = keep::ca::root_fingerprint(store)?.context("the joined store has no cloud CA")?;
+    if keep::tls::parse_fingerprint(&root).ok() != Some(pin) {
+        anyhow::bail!(
+            "the joined store's CA is not the one {} names",
+            crate::cluster::JOIN_CA_ENV
+        );
+    }
+    Ok(())
+}
+
+/// How a server came to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// It was told to.
+    Shutdown,
+    /// It replaced its own store and has to start again on the new file.
+    Restart,
+}
+
+pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
     std::fs::create_dir_all(&opts.data_dir)
         .with_context(|| format!("creating data dir {}", opts.data_dir.display()))?;
     // Modules that keep files default under PISTACK_DATA_DIR.
@@ -192,12 +230,23 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         format!("{scheme}://{}", opts.listen.replace("0.0.0.0", "127.0.0.1"))
     });
     let agent_api = agent_api(opts.tls_listen.as_deref(), opts.agent_url.as_deref())?;
+    let tls_mode =
+        keep::peer::tls_mode_value(std::env::var(keep::peer::CLUSTER_TLS_ENV).ok().as_deref())
+            .map_err(anyhow::Error::msg)?;
+    if tls_mode == keep::peer::TlsMode::Required && agent_api.is_none() {
+        anyhow::bail!(
+            "{}=required needs --tls-listen: the other servers could not call this one",
+            keep::peer::CLUSTER_TLS_ENV
+        );
+    }
     let boot = crate::cluster::prepare_store(&crate::cluster::BootRequest {
         data_dir: &opts.data_dir,
         init: opts.init,
         join: opts.join.as_deref(),
         listen: &opts.listen,
         public_url: &public_url,
+        ca_pin: opts.join_ca.as_deref(),
+        insecure_join: opts.insecure_join,
     })
     .await?;
     // Keep never sweeps. Joined has already downloaded a snapshot. Init has
@@ -214,6 +263,17 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     };
     crate::cluster::set_peer_store(&store);
     crate::cluster::warn_if_open();
+    let peers = keep::peer::PeerNet::new(tls_mode, store.clone());
+    if matches!(boot, crate::cluster::BootKind::Joined) {
+        // The download was checked against this fingerprint on the way; the
+        // store it brought must be of the same cloud.
+        if let Err(err) = joined_the_pinned_cloud(&store, opts.join_ca.as_deref()) {
+            drop(peers);
+            drop(store);
+            let _ = std::fs::remove_file(&store_path);
+            return Err(err);
+        }
+    }
 
     // One stable node name for this machine, shared with an agent that uses
     // the same data dir. Kept in <data_dir>/node.name across restarts.
@@ -262,9 +322,15 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
                 .context(
                     "store belongs to a cluster and no leader address is known; pass --join URL",
                 )?;
-            match crate::cluster::adopt(&store, &hint, &node_id, &public_url, agent_api.as_deref())
-                .await
-            {
+            let adopted = crate::cluster::adopt(
+                &store,
+                &peers,
+                &hint,
+                &node_id,
+                &public_url,
+                agent_api.as_deref(),
+            );
+            match adopted.await {
                 Ok(ready) => ready,
                 Err(err) => {
                     if matches!(boot, crate::cluster::BootKind::Joined) {
@@ -315,7 +381,13 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
             crate::cluster::advertise_ip(&opts.listen),
             leadership.clone(),
         )
-        .with_agent_api(agent_api.clone()),
+        .with_agent_api(agent_api.clone())
+        .with_peers(peers)
+        .with_auto_resync(crate::cluster::auto_resync_value(
+            std::env::var(crate::cluster::AUTO_RESYNC_ENV)
+                .ok()
+                .as_deref(),
+        )),
     );
     crate::cluster::spawn_background(
         cluster.clone(),
@@ -356,7 +428,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
     }
 
     let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
-    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster));
+    let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster.clone()));
 
     let tls = opts
         .tls_listen
@@ -365,6 +437,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
             addr,
             data_dir: opts.data_dir.clone(),
             store: store.clone(),
+            names: agent_api.as_deref().and_then(host_of).into_iter().collect(),
         });
     let bound = crate::listen::bind_listeners(app, &opts.listen, tls).await?;
     tracing::info!(
@@ -386,8 +459,28 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         tracing::info!("shutting down");
         sd.cancel();
     });
-    bound.serve(shutdown).await?;
-    Ok(())
+    let served = bound.serve(shutdown.clone());
+    tokio::pin!(served);
+    tokio::select! {
+        done = &mut served => done?,
+        // Open requests get a moment to finish and no more: the store
+        // they read is no longer the one in the data directory.
+        _ = restart_grace(&cluster, &shutdown) => {}
+    }
+    if cluster.wants_restart() {
+        return Ok(Stopped::Restart);
+    }
+    Ok(Stopped::Shutdown)
+}
+
+/// Ends five seconds after the cluster loop stopped the server to start it
+/// again. Never ends on an ordinary shutdown.
+async fn restart_grace(cluster: &crate::cluster::ClusterHandle, shutdown: &CancellationToken) {
+    shutdown.cancelled().await;
+    if !cluster.wants_restart() {
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 }
 
 pub fn backup(data_dir: PathBuf, to: PathBuf) -> anyhow::Result<()> {
@@ -438,7 +531,40 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_api, ovn_host_config};
+    use super::{agent_api, host_of, joined_the_pinned_cloud, ovn_host_config};
+
+    #[test]
+    fn the_certificate_host_is_read_from_the_agent_url() {
+        assert_eq!(
+            host_of("https://cloud.example:8444").as_deref(),
+            Some("cloud.example")
+        );
+        assert_eq!(
+            host_of("https://10.0.0.11:8444").as_deref(),
+            Some("10.0.0.11")
+        );
+        assert_eq!(
+            host_of("https://[fd00::11]:8444").as_deref(),
+            Some("fd00::11")
+        );
+        assert_eq!(host_of("cloud.example"), None);
+    }
+
+    #[test]
+    fn a_joined_store_must_hold_the_ca_that_was_pinned() {
+        let store = pistack_store::Store::in_memory().unwrap();
+        // No fingerprint given: nothing to compare.
+        joined_the_pinned_cloud(&store, None).unwrap();
+        joined_the_pinned_cloud(&store, Some(" ")).unwrap();
+        let zeros = "0".repeat(64);
+        assert!(joined_the_pinned_cloud(&store, Some(&zeros)).is_err());
+        keep::Client::open(&store).unwrap();
+        let print = keep::ca::root_fingerprint(&store).unwrap().unwrap();
+        joined_the_pinned_cloud(&store, Some(&print)).unwrap();
+        joined_the_pinned_cloud(&store, Some(&print.to_uppercase())).unwrap();
+        assert!(joined_the_pinned_cloud(&store, Some(&zeros)).is_err());
+        assert!(joined_the_pinned_cloud(&store, Some("abcd")).is_err());
+    }
 
     #[test]
     fn agents_are_sent_to_the_tls_listener_or_the_url_given_for_it() {
