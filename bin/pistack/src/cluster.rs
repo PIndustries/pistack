@@ -414,6 +414,33 @@ fn forget_copied_vote(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Make a restored backup a store no server has claimed, so the server that
+/// starts on it seeds itself as the only member and leads (see
+/// [`establish_local`]). The members in a backup are the servers of the
+/// cluster it was taken from; none of them holds this state any more, and
+/// waiting for them to elect a leader would wait for ever. Returns how many
+/// members the backup named.
+///
+/// The term goes up by one. Entries written after the restore then never
+/// share an index and a term with entries the old cluster wrote after the
+/// backup, so an old server that was not wiped is told its log has
+/// diverged and cannot quietly follow on.
+pub fn forget_membership(store: &Store) -> anyhow::Result<usize> {
+    let members: Vec<Member> = store.get_meta("members")?.unwrap_or_default();
+    let term = store.get_meta::<u64>("cluster_term")?.unwrap_or(0);
+    store.set_record_log(false);
+    for key in [
+        "node_id",
+        "members",
+        "cluster_leader_id",
+        "cluster_voted_for",
+    ] {
+        store.delete_meta(key)?;
+    }
+    store.put_meta("cluster_term", &(term + 1))?;
+    Ok(members.len())
+}
+
 pub fn leader_hint(store: &Store, self_id: &str) -> anyhow::Result<Option<String>> {
     let members: Vec<Member> = store.get_meta("members")?.unwrap_or_default();
     let leader_id: Option<String> = store.get_meta("cluster_leader_id")?;
