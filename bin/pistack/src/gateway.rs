@@ -93,7 +93,7 @@ pub fn build(
 
     let discovery = Discovery {
         name: "pistack",
-        version: env!("CARGO_PKG_VERSION"),
+        version: pistack_types::BUILD,
         store_schema: store
             .schema_version()
             .unwrap_or(pistack_store::SCHEMA_VERSION),

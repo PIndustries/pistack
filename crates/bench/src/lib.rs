@@ -31,7 +31,7 @@ impl Module for Bench {
             name: "bench",
             prefix: "console",
             summary: "The pi CLI and web console",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
     fn router(&self, _ctx: ModuleContext) -> Router {

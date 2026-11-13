@@ -42,7 +42,7 @@ impl Module for Shelf {
             name: "shelf",
             prefix: "shelf",
             summary: "Shared filesystems",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

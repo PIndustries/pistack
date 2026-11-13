@@ -167,7 +167,7 @@ impl Module for Relay {
             name: "relay",
             prefix: "balancers",
             summary: "Load balancers",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

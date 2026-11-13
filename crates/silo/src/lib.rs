@@ -108,7 +108,7 @@ impl Module for Silo {
             name: "silo",
             prefix: "silo",
             summary: "Object storage, S3 API",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

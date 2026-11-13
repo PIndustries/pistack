@@ -33,7 +33,6 @@ pub struct ServerOpts {
 /// Everything the binary assembles before serving.
 pub struct Assembly {
     pub modules: Vec<Arc<dyn Module>>,
-    pub gate: Arc<gate::Gate>,
     pub forge: Arc<forge::Forge>,
     pub queue: CommandQueue,
     /// Image bytes, for the agent download under `/rpc`.
@@ -72,7 +71,7 @@ pub fn assemble(
     );
 
     let modules: Vec<Arc<dyn Module>> = vec![
-        gate_m.clone(),
+        gate_m,
         forge_m.clone(),
         Arc::new(loom::Loom::configured(loom::LoomConfig::production(
             dev,
@@ -97,7 +96,6 @@ pub fn assemble(
     ];
     Assembly {
         modules,
-        gate: gate_m,
         forge: forge_m,
         queue,
         images,
@@ -374,7 +372,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<()> {
         public_url = %public_url,
         agent_url = agent_api.as_deref().unwrap_or("none"),
         modules = asm.modules.len(),
-        identity = asm.gate.info().version,
+        build = pistack_types::BUILD,
         store_schema = store.schema_version()?,
         agent_rpc = asm.forge.queue().is_some(),
         "pistack server up"

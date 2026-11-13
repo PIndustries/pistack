@@ -154,7 +154,7 @@ impl Module for Slab {
             name: "slab",
             prefix: "volume",
             summary: "Block volumes, snapshots, backups",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

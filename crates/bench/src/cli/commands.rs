@@ -705,7 +705,7 @@ async fn cluster(ctx: &Ctx, cmd: ClusterCmd, io: &mut Io<'_>) -> CliResult<()> {
 }
 
 async fn version(ctx: &Ctx, io: &mut Io<'_>) -> CliResult<()> {
-    let client_v = env!("CARGO_PKG_VERSION");
+    let client_v = pistack_types::BUILD;
     let server = match ctx.client() {
         Ok(c) => c.get_value("/").await.ok(),
         Err(_) => None,

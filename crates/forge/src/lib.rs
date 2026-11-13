@@ -205,7 +205,7 @@ impl Module for Forge {
             name: "forge",
             prefix: "compute",
             summary: "Machines: VMs, containers and bare metal as one resource",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

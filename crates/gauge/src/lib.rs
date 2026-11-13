@@ -71,7 +71,7 @@ impl Module for Gauge {
             name: "gauge",
             prefix: "gauge",
             summary: "Metrics, events, alarms, metering",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

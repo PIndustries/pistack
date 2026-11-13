@@ -20,3 +20,16 @@ pub use error::{ApiError, ApiResult};
 pub use module::{CancellationToken, Leadership, Module, ModuleContext, ModuleInfo};
 pub use resource::Spec;
 pub use resource::*;
+
+/// The build number a user sees: `pistack --version`, `pi version`, the
+/// gateway root document, what an agent reports, the HTTP user agents.
+///
+/// A release build is numbered by its date, `<year>.<month>.<day>.<build>`
+/// with a two-digit year and the build counting from 1 each day, as in
+/// `26.11.12.1`. The release workflow passes it in as `PISTACK_BUILD` when it
+/// compiles. Any other build is `dev`. The version in `Cargo.toml` is only
+/// there because cargo wants one and is shown nowhere.
+pub const BUILD: &str = match option_env!("PISTACK_BUILD") {
+    Some(build) if !build.is_empty() => build,
+    _ => "dev",
+};

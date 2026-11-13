@@ -133,7 +133,7 @@ impl Module for Mold {
             name: "mold",
             prefix: "image",
             summary: "Boot images and templates",
-            version: env!("CARGO_PKG_VERSION"),
+            version: pistack_types::BUILD,
         }
     }
 

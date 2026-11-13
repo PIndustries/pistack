@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "pi",
-    version,
+    version = pistack_types::BUILD,
     about = "PiStack command-line client",
     long_about = "pi talks to a PiStack control plane. Log in once with `pi login URL --name USER`; \
                   the token is kept in ~/.config/pistack/config.toml under a named profile.",

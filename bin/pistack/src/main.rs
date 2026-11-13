@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "pistack", version, about = "PiStack private cloud")]
+#[command(name = "pistack", version = pistack_types::BUILD, about = "PiStack private cloud")]
 struct Cli {
     /// Data directory for the state store and keys.
     #[arg(long, env = "PISTACK_DATA_DIR", default_value = "/var/lib/pistack")]

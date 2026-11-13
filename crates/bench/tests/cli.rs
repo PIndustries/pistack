@@ -273,10 +273,10 @@ async fn remove_server(
 
 async fn discovery() -> Json<Value> {
     Json(json!({
-        "name": "pistack", "version": "0.1.0-test", "public_url": "http://mock", "dev_mode": false,
+        "name": "pistack", "version": "26.11.12.1", "public_url": "http://mock", "dev_mode": false,
         "modules": [
-            {"name": "gate", "prefix": "identity", "summary": "Identity", "version": "0.1.0", "url": "http://mock/identity"},
-            {"name": "forge", "prefix": "compute", "summary": "Machines", "version": "0.1.0", "url": "http://mock/compute"}
+            {"name": "gate", "prefix": "identity", "summary": "Identity", "version": "26.11.12.1", "url": "http://mock/identity"},
+            {"name": "forge", "prefix": "compute", "summary": "Machines", "version": "26.11.12.1", "url": "http://mock/compute"}
         ]
     }))
 }
@@ -543,7 +543,12 @@ async fn login_then_machines_end_to_end() {
     assert!(r.out.contains("\"name\": \"pistack\""));
     let r = pi(&cfg, "", &["version"]).await;
     assert_eq!(r.code, 0);
-    assert!(r.out.contains("pistack 0.1.0-test"), "{}", r.out);
+    assert!(
+        r.out.contains(&format!("pi {}", pistack_types::BUILD)),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("pistack 26.11.12.1"), "{}", r.out);
 }
 
 #[tokio::test]

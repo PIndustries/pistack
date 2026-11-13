@@ -115,7 +115,7 @@ impl AgentClient {
     ) -> Result<Self, RpcError> {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("pistack-anvil/{}", pistack_types::BUILD))
             .build()?;
         Self::with_http(http, base_url, node_name)
     }
@@ -423,7 +423,7 @@ fn mtls_http_client(ca_pem: &str, client: &keep::Pki) -> Result<reqwest::Client,
     let identity = reqwest::Identity::from_pem(identity.as_bytes()).map_err(RpcError::Http)?;
     let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .user_agent(concat!("pistack-anvil/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("pistack-anvil/{}", pistack_types::BUILD))
         .identity(identity);
     for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).map_err(RpcError::Http)? {
         builder = builder.add_root_certificate(cert);
