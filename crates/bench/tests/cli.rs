@@ -19,6 +19,8 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 const TOKEN: &str = "tok-secret-123";
+const SWITCHED_TOKEN: &str = "tok-secret-456";
+const BACK_TOKEN: &str = "tok-secret-789";
 
 #[derive(Clone, Default)]
 struct Mock {
@@ -32,6 +34,8 @@ struct Mock {
     networks: Arc<Mutex<BTreeMap<String, Value>>>,
     /// Paths of the identity writes that take no body.
     identity_posts: Arc<Mutex<Vec<String>>>,
+    /// Bodies of the project switches asked for.
+    switches: Arc<Mutex<Vec<Value>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -43,9 +47,13 @@ fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
 }
 
 fn authed(h: &HeaderMap) -> bool {
+    bearer(h) == Some(TOKEN)
+}
+
+fn bearer(h: &HeaderMap) -> Option<&str> {
     h.get("authorization")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {TOKEN}"))
+        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 async fn login(Json(body): Json<Value>) -> axum::response::Response {
@@ -84,6 +92,28 @@ async fn whoami(h: HeaderMap) -> axum::response::Response {
         "system": true
     }))
     .into_response()
+}
+
+/// Only a token a switch handed out is good here.
+async fn needs_switched(h: HeaderMap) -> axum::response::Response {
+    let who = match bearer(&h) {
+        Some(SWITCHED_TOKEN) => json!({
+            "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+            "principal_name": "admin",
+            "project": "proj-0199a5e0-4444-7000-8000-000000000004",
+            "roles": ["reader"],
+            "system": false
+        }),
+        Some(BACK_TOKEN) => json!({
+            "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+            "principal_name": "admin",
+            "project": null,
+            "roles": ["admin"],
+            "system": true
+        }),
+        _ => return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials"),
+    };
+    Json(who).into_response()
 }
 
 async fn list(State(m): State<Mock>, h: HeaderMap) -> axum::response::Response {
@@ -314,6 +344,70 @@ async fn identity_post(
     Json(signing_keys(&m)).into_response()
 }
 
+async fn my_projects(h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    Json(json!([
+        {"id": "proj-0199a5e0-2222-7000-8000-000000000002", "name": "acme-web",
+         "parent": "proj-0199a5e0-3333-7000-8000-000000000003", "parent_name": "acme",
+         "roles": ["member"], "current": true},
+        {"id": "proj-0199a5e0-4444-7000-8000-000000000004", "name": "acme-data",
+         "parent": "proj-0199a5e0-3333-7000-8000-000000000003", "parent_name": "acme",
+         "roles": ["reader"], "current": false}
+    ]))
+    .into_response()
+}
+
+async fn switch_project(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    // A token from a switch keeps working until it expires, so either can
+    // ask to move again.
+    if !matches!(bearer(&h), Some(TOKEN) | Some(SWITCHED_TOKEN)) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let project = body["project"].as_str().unwrap_or("").to_owned();
+    m.switches.lock().unwrap().push(body);
+    if project == "system" {
+        return Json(json!({
+            "token": BACK_TOKEN,
+            "token_type": "Bearer",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "caller": {
+                "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+                "principal_name": "admin",
+                "project": null,
+                "roles": ["admin"],
+                "system": true
+            }
+        }))
+        .into_response();
+    }
+    if project != "acme-data" {
+        return err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            &format!("'alice' has no role in project '{project}'"),
+        );
+    }
+    Json(json!({
+        "token": SWITCHED_TOKEN,
+        "token_type": "Bearer",
+        "expires_at": "2030-01-01T00:00:00Z",
+        "caller": {
+            "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+            "principal_name": "admin",
+            "project": "acme-data",
+            "roles": ["reader"],
+            "system": false
+        }
+    }))
+    .into_response()
+}
+
 async fn discovery() -> Json<Value> {
     Json(json!({
         "name": "pistack", "version": "26.11.12.1", "public_url": "http://mock", "dev_mode": false,
@@ -531,6 +625,9 @@ async fn serve() -> (String, Mock) {
         .route("/", get(discovery))
         .route("/identity/tokens", post(login))
         .route("/identity/tokens/self", get(whoami))
+        .route("/identity/tokens/self/projects", get(my_projects))
+        .route("/identity/tokens/self/switch", post(switch_project))
+        .route("/identity/switched-only", get(needs_switched))
         .route("/cluster", get(cluster_status))
         .route(
             "/identity/projects/{id}/quotas",
@@ -1372,5 +1469,81 @@ async fn signing_keys_are_listed_rotated_and_retired() {
     assert_eq!(
         mock.identity_posts.lock().unwrap().last().unwrap(),
         "/identity/principals/bob/revoke-tokens"
+    );
+}
+
+#[tokio::test]
+async fn a_token_lists_its_projects_and_moves_between_them() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    let r = pi(&cfg, "", &["project", "mine"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("acme-web"), "{}", r.out);
+    assert!(r.out.contains("acme-data"), "{}", r.out);
+    let r = pi(&cfg, "", &["project", "mine", "-o", "json"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+
+    // The switch trades the token and the profile keeps the rest.
+    let r = pi(&cfg, "", &["project", "switch", "acme-data"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out, "now in project acme-data\n");
+    let saved = cli::Config::load(&cfg).unwrap();
+    assert_eq!(
+        saved.current().unwrap().token.as_deref(),
+        Some(SWITCHED_TOKEN)
+    );
+    assert_eq!(
+        saved.current().unwrap().project.as_deref(),
+        Some("acme-data")
+    );
+    assert_eq!(saved.current().unwrap().url, url);
+    assert_eq!(saved.current().unwrap().principal.as_deref(), Some("admin"));
+
+    // What comes next is sent with the new token.
+    let r = pi(&cfg, "", &["api", "GET", "/identity/switched-only"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v["project"], "proj-0199a5e0-4444-7000-8000-000000000004");
+
+    // A refused switch: the server's message, and the old token stays.
+    let refused = pi(&cfg, "", &["project", "switch", "secret"]).await;
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(
+        refused.err.contains("has no role in project 'secret'"),
+        "{}",
+        refused.err
+    );
+    let still = cli::Config::load(&cfg).unwrap();
+    assert_eq!(
+        still.current().unwrap().token.as_deref(),
+        Some(SWITCHED_TOKEN)
+    );
+
+    // A switch to system scope drops the project from the profile. The
+    // route behind it answers to the old token too, the way a real server
+    // lets a token work until it expires.
+    let r = pi(&cfg, "", &["project", "switch", "system"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out, "now in project system scope\n");
+    let saved = cli::Config::load(&cfg).unwrap();
+    assert_eq!(saved.current().unwrap().token.as_deref(), Some(BACK_TOKEN));
+    assert!(saved.current().unwrap().project.is_none());
+
+    assert_eq!(
+        mock.switches.lock().unwrap().len(),
+        3,
+        "{:?}",
+        mock.switches.lock().unwrap()
     );
 }

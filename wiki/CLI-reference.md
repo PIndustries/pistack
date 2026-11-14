@@ -91,6 +91,8 @@ pi project list
 pi project show <NAME>
 pi project create <NAME>
 pi project delete <NAME>
+pi project mine
+pi project switch <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -100,6 +102,7 @@ pi project delete <NAME>
 | `project create` | `--parent <PARENT>` | Parent project (name or id) |
 | `project create` | `--quota <RES=N>` | Quota `resource=limit` (repeatable) |
 | `project create` | `--disabled` |  |
+| `project switch` | `<NAME>` | Project name or id to move to |
 
 ## pi quota
 
