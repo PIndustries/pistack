@@ -27,8 +27,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The host capability that can live-migrate a guest. The agent's migrate
-/// command is `virsh migrate`, whatever else the host runs.
-const LIVE_MIGRATION_DRIVER: &str = "libvirt";
+/// command is `virsh migrate`, whatever else the host runs, and it is
+/// reached only when the agent reports this capability.
+pub const LIVE_MIGRATION_DRIVER: &str = "libvirt";
+
+/// Whether `host`'s agent can take part in a live migration, as source or
+/// as destination.
+pub fn can_live_migrate(host: &Host) -> bool {
+    host.spec
+        .drivers
+        .iter()
+        .any(|d| d.trim().eq_ignore_ascii_case(LIVE_MIGRATION_DRIVER))
+}
 
 /// A machine that is on its way to another host.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,13 +119,15 @@ pub fn drain(
         .collect();
 
     // Other hosts a guest can be migrated to. The scheduler applies the
-    // rest: ready, enabled, selector, zone, room.
-    let dests: Vec<Host> = hosts
+    // rest: ready, enabled, selector, zone, room. `others` is every other
+    // host, so a report can say when none of them can take a migration at
+    // all rather than that placement found nothing.
+    let others: Vec<&Host> = hosts.iter().filter(|h| h.meta.id != host.meta.id).collect();
+    let dests: Vec<Host> = others
         .iter()
-        .filter(|h| h.meta.id != host.meta.id)
-        .filter(|h| h.spec.drivers.iter().any(|d| d == LIVE_MIGRATION_DRIVER))
+        .filter(|h| can_live_migrate(h))
         .filter(|h| usable_underlay(h.spec.underlay_ip.as_deref()).is_some())
-        .cloned()
+        .map(|h| (*h).clone())
         .collect();
 
     // Names on each host for the affinity hints, and the room in-flight
@@ -133,7 +145,7 @@ pub fn drain(
         }
     }
 
-    let can_migrate = host.spec.drivers.iter().any(|d| d == LIVE_MIGRATION_DRIVER);
+    let can_migrate = can_live_migrate(host);
     let mut moving = Vec::new();
     let mut left = Vec::new();
     let mut here: Vec<&Machine> = machines
@@ -212,8 +224,14 @@ pub fn drain(
         };
         let dest = match scheduler::place_networked(&m.spec, &size, &dests, &alloc, strategy) {
             Ok(id) => id,
-            Err(e) => {
-                leave(e.message);
+            Err(_) => {
+                leave(no_destination(
+                    host,
+                    &others,
+                    &dests.iter().collect::<Vec<_>>(),
+                    size,
+                    &alloc,
+                ));
                 continue;
             }
         };
@@ -238,6 +256,56 @@ pub fn drain(
 
 fn phase_word(phase: Phase) -> String {
     format!("{phase:?}").to_lowercase()
+}
+
+/// Why the drain found no destination. The scheduler saw only the hosts
+/// that can take a live migration and answers in a tally of the whole fleet;
+/// an operator needs host names, so this names one host per reason, in the
+/// order the placement checks them.
+fn no_destination(
+    host: &Host,
+    others: &[&Host],
+    tried: &[&Host],
+    size: Resources,
+    alloc: &Allocations,
+) -> String {
+    if others.is_empty() {
+        return format!(
+            "host {} is the only host here, so there is nowhere to migrate to",
+            host.meta.name
+        );
+    }
+    if tried.is_empty() {
+        return format!(
+            "none of the {} other {} here can take a live migration",
+            others.len(),
+            if others.len() == 1 { "host" } else { "hosts" }
+        );
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(h) = tried.iter().find(|h| h.status.phase != Phase::Ready) {
+        parts.push(format!("{} is not ready", h.meta.name));
+    }
+    if let Some(h) = tried.iter().find(|h| h.spec.disabled) {
+        parts.push(format!("{} is disabled", h.meta.name));
+    }
+    if let Some(h) = tried
+        .iter()
+        .find(|h| !size.fits_in(&h.status.free.saturating_sub(&alloc.used_on(&h.meta.id))))
+    {
+        parts.push(format!(
+            "{} has no room for {} vcpus and {} MiB",
+            h.meta.name, size.vcpus, size.memory_mib
+        ));
+    }
+    if parts.is_empty() {
+        return format!(
+            "none of the {} hosts that could take it fits its networks, affinity or \
+             host_selector",
+            tried.len()
+        );
+    }
+    parts.join(", ")
 }
 
 // ---- evacuate ----------------------------------------------------------------

@@ -486,29 +486,36 @@ pub fn begin_migration(
             Ok(())
         })
         .map_err(ApiError::from)?;
-    // The HTTP handler must return now. A failed or timed-out command
-    // leaves `Error` on the source host. Success stays `Updating` until
-    // the destination reports the machine.
+    // The HTTP handler must return now. The agent answers when the domain is
+    // on the destination; until then the machine stays `Updating` and the
+    // store still names its old host, because that is the only host forge
+    // has heard from. Whatever the answer is, it is not proof the guest
+    // stopped running, so the machine goes back to `Ready` on the host the
+    // store holds and a later drain starts the move again. A report from
+    // either host settles which one it is on.
     let store = store.clone();
     let machine_id = machine.meta.id.clone();
     let expect = format!("migrating {}", dest.meta.id);
     tokio::spawn(async move {
-        let failed = match ticket.wait().await {
-            Ok(result) if result.ok => None,
-            Ok(result) => Some(if result.message.is_empty() {
-                "migration failed".to_owned()
-            } else {
-                result.message
-            }),
-            Err(e) => Some(e.to_string()),
-        };
-        let Some(message) = failed else {
-            return;
+        let word = match ticket.wait().await {
+            Ok(result) if result.ok => return,
+            Ok(result) if result.message.is_empty() => "the host refused it".to_owned(),
+            Ok(result) => result.message,
+            Err(e) => {
+                // No answer. The guest may still be copying, or may be
+                // running on the destination with the answer lost. The host
+                // the store names is the last one forge heard from, so the
+                // machine is left ready there, which is where it can be
+                // reached. A report from either host settles it, and a later
+                // drain can start the move again.
+                tracing::warn!(machine = %machine_id, error = %e, "forge: no answer to a live migration");
+                format!("the host never answered ({e})")
+            }
         };
         let _ = store.collection::<Machine>().modify(&machine_id, |m| {
             if m.status.phase == Phase::Updating && m.status.message == expect {
-                m.status.phase = Phase::Error;
-                m.status.message = message.clone();
+                m.status.phase = Phase::Ready;
+                m.status.message = format!("migrate did not happen: {word}");
             }
             Ok(())
         });
@@ -1860,16 +1867,20 @@ mod tests {
                 CommandResult::failed(cmds[0].id, "virsh migrate failed"),
             )
             .unwrap();
+        // The guest was running before the command and a refusal changes
+        // nothing on the host, so the machine is ready where it has always
+        // been. Only the message says the move did not happen.
         let mut failed = None;
         for _ in 0..50 {
             let cur = machines.get(&named.meta.id).unwrap();
-            if cur.status.phase == Phase::Error {
+            if cur.status.phase != Phase::Updating {
                 failed = Some(cur);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let failed = failed.expect("a failed migrate leaves Error");
+        let failed = failed.expect("a failed migrate leaves the machine on its host");
+        assert_eq!(failed.status.phase, Phase::Ready);
         assert_eq!(failed.status.host.as_ref(), Some(&src.meta.id));
         assert!(failed.status.message.contains("virsh migrate failed"));
     }
