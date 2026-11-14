@@ -159,7 +159,7 @@ Only the leader:
 - serves joins and snapshots,
 - promotes learners.
 
-Any server answers reads. A write sent to a server that is not the leader is not forwarded. It is refused with `409` and the leader's address:
+Any server answers reads. A write sent to a server that is not the leader is refused with `409` and the leader's address, unless the client asks for it to be carried there (below):
 
 ```json
 {"error":{"code":"conflict","message":"not the leader","details":{"leader":"http://10.0.0.12:8443"}}}
@@ -172,6 +172,8 @@ http://10.0.0.11:8443 is not the leader; sending the request to http://10.0.0.12
 ```
 
 It does this only when the leader's address has the same scheme as the one `pi` was given, so a token sent over `https` is never repeated over `http`; otherwise it prints the refusal. It does not remember the leader. To save the extra request, point `pi` at the leader (`pi cluster status` shows which server that is). Other clients have to follow the address themselves, or go through a proxy that sends traffic to whichever server reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
+
+A client that cannot go to another address asks the server to do it. With the header `X-PiStack-Forward: leader`, a server that does not lead carries the request to the leader over the same link the servers use between themselves, and hands back the leader's answer. The token goes with the request and the leader checks it as usual. After a write the server waits, up to two seconds, for its own copy to reach that write, so a read sent to it next already shows the change. The console sends this header on every request, so it works the same on any server. A body over 8 MiB is not carried: the answer names the leader instead. The leader's audit record of a carried request shows the address of the server that carried it, not the client's.
 
 Agents do follow. An agent that loses its server tries the other servers it knows and registers with the new leader. An agent that joined over HTTPS only ever moves to another HTTPS address: it logs and skips a plain one, so every server it should fail over to needs `--tls-listen`.
 

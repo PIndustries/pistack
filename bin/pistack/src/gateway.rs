@@ -351,6 +351,9 @@ async fn reads_at_leader(
     {
         return next.run(req).await;
     }
+    if crate::cluster::wants_forward(req.headers()) {
+        return crate::cluster::forward_to_leader(&handle, req).await;
+    }
     let leader = handle
         .leader_api
         .lock()

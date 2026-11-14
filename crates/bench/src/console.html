@@ -845,7 +845,9 @@ function setToken(t) { sessionStorage.setItem("pistack.token", t); }
 function clearToken() { sessionStorage.removeItem("pistack.token"); }
 
 async function api(method, path, body, auth) {
-  const headers = {};
+  // A browser cannot be sent to another server the way pi can, so a
+  // server that does not lead is asked to carry the request there.
+  const headers = { "X-PiStack-Forward": "leader" };
   if (auth !== false && token()) headers.Authorization = "Bearer " + token();
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
