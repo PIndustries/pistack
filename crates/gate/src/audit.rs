@@ -69,9 +69,14 @@ pub struct AuditSpec {
     /// The project of the caller's token, or of the resource a create made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<Id>,
-    /// The peer address of the connection, as the gateway saw it.
+    /// The peer address of the connection, as the gateway saw it. Carried
+    /// requests name the client behind the server that carried them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+    /// The node id of the server that carried a request here, when another
+    /// server of the cluster brought it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_by: Option<String>,
     pub status: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
@@ -90,6 +95,15 @@ pub type AuditEvent = Resource<AuditSpec, AuditStatus>;
 /// sets it from the socket; a proxy in front shows up as the proxy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientAddr(pub IpAddr);
+
+/// Request extension the gateway sets when a server of this cluster carried
+/// the request: the client behind it and the node id of the carrier. The
+/// record keeps the client's address and notes the carrier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Carried {
+    pub client: IpAddr,
+    pub by: String,
+}
 
 /// Request extension set by `attach_caller`: the API key in the token.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +203,9 @@ pub struct Entry {
     pub subject: Option<Subject>,
     pub api_key: Option<Id>,
     pub client: Option<IpAddr>,
+    /// Set when a server of this cluster carried the request: the client's
+    /// address and the node id of the carrier.
+    pub carried_by: Option<String>,
     pub status: u16,
     pub request_id: Option<String>,
     /// Id and project of the resource a create returned.
@@ -240,6 +257,7 @@ pub fn record(store: &Store, e: Entry) {
             api_key: e.api_key.or(subject.api_key),
             project,
             client: e.client.map(|ip| ip.to_string()),
+            carried_by: e.carried_by,
             status: e.status,
             request_id: e.request_id,
         },
@@ -263,6 +281,7 @@ pub async fn layer(State(store): State<Store>, req: Request, next: Next) -> Resp
     let caller = ext.get::<Caller>().cloned();
     let api_key = ext.get::<TokenKey>().map(|k| k.0.clone());
     let client = ext.get::<ClientAddr>().map(|c| c.0);
+    let carried = ext.get::<Carried>().map(|c| (c.client, c.by.clone()));
     let request_id = request_id(req.headers());
     let response = next.run(req).await;
     let status = response.status();
@@ -280,7 +299,8 @@ pub async fn layer(State(store): State<Store>, req: Request, next: Next) -> Resp
             caller,
             subject,
             api_key,
-            client,
+            client: carried.as_ref().map_or(client, |c| Some(c.0)),
+            carried_by: carried.map(|c| c.1),
             status: status.as_u16(),
             request_id,
             created,
@@ -592,6 +612,31 @@ mod tests {
         assert!(!audited_read("/compute/machines/mach-1"));
         let actions: Vec<String> = all(&store).into_iter().map(|r| r.spec.action).collect();
         assert_eq!(actions, ["read_payload", "read_key", "read_console"]);
+    }
+
+    #[test]
+    fn a_carried_request_keeps_the_client_and_notes_the_carrier() {
+        let store = Store::in_memory().unwrap();
+        record(
+            &store,
+            Entry {
+                client: Some("10.0.0.9".parse().unwrap()),
+                carried_by: Some("n2".into()),
+                ..entry("POST", "/compute/machines", 201)
+            },
+        );
+        record(
+            &store,
+            Entry {
+                client: Some("10.0.0.9".parse().unwrap()),
+                ..entry("POST", "/compute/machines/m1/start", 200)
+            },
+        );
+        let items = all(&store);
+        assert_eq!(items[0].spec.client.as_deref(), Some("10.0.0.9"));
+        assert_eq!(items[0].spec.carried_by.as_deref(), Some("n2"));
+        assert_eq!(items[1].spec.client.as_deref(), Some("10.0.0.9"));
+        assert_eq!(items[1].spec.carried_by, None);
     }
 
     #[test]

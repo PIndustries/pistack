@@ -146,7 +146,17 @@ pub fn build(
         ctx.shutdown.clone(),
     );
 
-    app = guarded(app, store);
+    app = guarded(app, store.clone());
+
+    // The headers a server puts on a request it carries for a client are
+    // taken off anything else that sends them, above every other layer. A
+    // server with no peer key in its store yet has no member to prove,
+    // which is right: no server can carry for it, and every route checks
+    // its caller with this same store.
+    app = app.layer(middleware::from_fn_with_state(
+        store,
+        crate::cluster::strip_carrier_headers,
+    ));
 
     if let Some(handle) = cluster {
         app = app.merge(crate::cluster::router(handle.clone()));
@@ -300,10 +310,10 @@ async fn enforce_write_role(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// The role check and the audit log around every route in `app`. Both are
-/// inner to authentication, so the `Caller`, when there is one, is already
-/// attached. The role check is inner to the audit, so a refused write is
-/// recorded.
+/// The role check and the audit log around every route in `app`. All three
+/// are inner to authentication, so the `Caller`, when there is one, is
+/// already attached. The role check is inner to the audit, so a refused
+/// write is recorded.
 fn guarded(app: Router, store: pistack_store::Store) -> Router {
     app.layer(middleware::from_fn(enforce_write_role))
         .layer(middleware::from_fn_with_state(store, gate::audit::layer))
@@ -705,6 +715,70 @@ mod tests {
         assert_eq!(log[2].principal.as_deref(), Some("root"));
         for record in &log {
             assert_eq!(record.client.as_deref(), Some("10.0.0.9"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_from_a_client_does_not_choose_the_recorded_address() {
+        let store = Store::in_memory().unwrap();
+        gate::Keys::load_or_create(&store).unwrap();
+        let key = keep::peer::peer_key(&store).unwrap();
+        let peer = keep::PeerIdentity::plain("10.0.0.9:51234".parse().unwrap());
+        let app = Router::new()
+            .fallback(|| async { "ok" })
+            .layer(middleware::from_fn_with_state(
+                store.clone(),
+                crate::cluster::strip_carrier_headers,
+            ))
+            .layer(middleware::from_fn_with_state(
+                store.clone(),
+                gate::audit::layer,
+            ))
+            .layer(middleware::from_fn(super::note_client))
+            .layer(Extension(peer));
+        // A client sending what a carrier sends: a key from another cloud,
+        // and an address it would like recorded.
+        let forged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compute/machines")
+                    .header(crate::cluster::PEER_HEADER, "0".repeat(64))
+                    .header(crate::cluster::NODE_HEADER, "sim9")
+                    .header(keep::peer::CLIENT_ADDR_HEADER, "203.0.113.99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::OK);
+        // The same from a server of this cluster, whose key checks out.
+        // This is the leader's own edge: a write answered here is audited
+        // inside the cluster layer, which is what reads the carrier's
+        // headers, so at this edge the connection's address stands and
+        // nothing is forged either way.
+        let carried = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compute/hosts/rack1/drain")
+                    .header(crate::cluster::PEER_HEADER, key)
+                    .header(crate::cluster::NODE_HEADER, "sim2")
+                    .header(keep::peer::CLIENT_ADDR_HEADER, "203.0.113.7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(carried.status(), StatusCode::OK);
+
+        let log = records(&store);
+        assert_eq!(log.len(), 2);
+        for record in &log {
+            assert_eq!(record.client.as_deref(), Some("10.0.0.9"));
+            assert_eq!(record.carried_by, None);
         }
     }
 

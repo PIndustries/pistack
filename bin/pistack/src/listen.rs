@@ -46,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Local wrapper so we can implement axum `Connected` (orphan rules).
 #[derive(Clone, Debug)]
-struct GatewayPeer {
+pub(crate) struct GatewayPeer {
     peer: PeerIdentity,
     /// The client's leaf certificate, when it offered one that chained to
     /// the cloud CA. Kept so each request can check it is not revoked.

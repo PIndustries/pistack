@@ -20,6 +20,11 @@ use subtle::ConstantTimeEq;
 /// Header a member sends on every call to another server: the peer key.
 pub const PEER_HEADER: &str = "x-pistack-cluster";
 
+/// Header a member adds when it carries a client's request on to the
+/// leader: the address the client connected to it on. A leader takes it
+/// only from a caller the peer key vouches for.
+pub const CLIENT_ADDR_HEADER: &str = "x-pistack-client-addr";
+
 /// The key members prove themselves with. `None` before the identity
 /// module has made its first signing key, which is when the secret is made.
 pub fn peer_key(store: &Store) -> Option<String> {
