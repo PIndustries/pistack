@@ -159,7 +159,7 @@ pub fn gateway_candidates(store: &Store) -> ApiResult<Vec<String>> {
     let hosts = store
         .collection::<HostRecord>()
         .list(None)
-        .map_err(|e| ApiError::unavailable(format!("ovn: listing hosts: {e}")))?;
+        .map_err(|e| ApiError::unavailable(format!("listing hosts: {e}")))?;
     let mut chassis: Vec<String> = hosts
         .into_iter()
         .filter(|h| h.status.phase == Phase::Ready)
@@ -242,7 +242,7 @@ impl OvnBackend {
             return self.nb.transact(DB, ops).await;
         };
         if !a.leadership.is_leader() {
-            return Err(ApiError::unavailable("ovn: not leader; skipping write"));
+            return Err(ApiError::unavailable("not leader; skipping write"));
         }
         let mut rx = a.leadership.subscribe();
         let lost = async move {
@@ -254,7 +254,7 @@ impl OvnBackend {
         };
         tokio::select! {
             r = self.nb.transact(DB, ops) => r,
-            _ = lost => Err(ApiError::unavailable("ovn: lost leadership; write abandoned")),
+            _ = lost => Err(ApiError::unavailable("lost leadership; write abandoned")),
         }
     }
 
@@ -278,11 +278,11 @@ impl OvnBackend {
                 out[1]["uuid"][1]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| ApiError::unavailable(format!("ovn: {table} insert: no uuid")))
+                    .ok_or_else(|| ApiError::unavailable(format!("{table} insert: no uuid")))
             }
             [one] => {
                 let u = ovsdb::row_uuid(one)
-                    .ok_or_else(|| ApiError::unavailable(format!("ovn: {table} row: no uuid")))?;
+                    .ok_or_else(|| ApiError::unavailable(format!("{table} row: no uuid")))?;
                 if !ovsdb::row_matches(one, &row) {
                     self.run(vec![ovsdb::update(table, vec![eq("_uuid", uuid(&u))], row)])
                         .await?;
@@ -290,7 +290,7 @@ impl OvnBackend {
                 Ok(u)
             }
             many => Err(ApiError::conflict(format!(
-                "ovn: {} {table} rows match {}",
+                "{} {table} rows match {}",
                 many.len(),
                 Value::Array(cond)
             ))),
@@ -369,7 +369,7 @@ impl OvnBackend {
             }
             [one] => {
                 let u = ovsdb::row_uuid(one)
-                    .ok_or_else(|| ApiError::unavailable("ovn: Port_Group row: no uuid"))?;
+                    .ok_or_else(|| ApiError::unavailable("Port_Group row: no uuid"))?;
                 let mut row = serde_json::Map::new();
                 if let Some(want) = acls {
                     if !same_acls(&have_acls, want) {
@@ -399,7 +399,7 @@ impl OvnBackend {
                 Ok(())
             }
             many => Err(ApiError::conflict(format!(
-                "ovn: {} Port_Group rows named {name}",
+                "{} Port_Group rows named {name}",
                 many.len()
             ))),
         }
@@ -516,7 +516,7 @@ impl OvnBackend {
         let mac = port.spec.mac.trim();
         if mac.is_empty() {
             return Err(ApiError::unavailable(format!(
-                "ovn: router port {} has no mac yet",
+                "router port {} has no mac yet",
                 port.meta.id
             )));
         }
@@ -760,7 +760,7 @@ fn port_network(port: &Port, subnet: &Subnet) -> ApiResult<String> {
         .or(subnet.spec.gateway)
         .ok_or_else(|| {
             ApiError::unavailable(format!(
-                "ovn: router port {} has no address on subnet {}",
+                "router port {} has no address on subnet {}",
                 port.meta.id, subnet.meta.id
             ))
         })?;
@@ -1419,7 +1419,7 @@ impl NetBackend for OvnBackend {
         if let Some((net, port)) = &view.gateway {
             let subnet = view.gateway_subnet.as_ref().ok_or_else(|| {
                 ApiError::unavailable(format!(
-                    "ovn: router {id} gateway port has no subnet on network {}",
+                    "router {id} gateway port has no subnet on network {}",
                     net.meta.id
                 ))
             })?;
@@ -1617,7 +1617,9 @@ impl NetBackend for OvnBackend {
     /// * Disassociate (`target: None`): remove the NAT row matching
     ///   `external_ids:pistack:id`.
     /// * No router joining the port's subnet to the floating IP's network
-    ///   is an `unavailable` error, retried by the reconciler.
+    ///   is an `unavailable` error, retried by the reconciler. The message
+    ///   names the port and both networks and says what fixes it: attach
+    ///   the port's subnet to a router with that external network.
     /// * The address itself is reserved in the external subnet by fabric's
     ///   IPAM; OVN needs nothing for an unassociated FIP.
     async fn associate_fip(&self, view: &FipView) -> ApiResult<()> {
@@ -1626,13 +1628,25 @@ impl NetBackend for OvnBackend {
         let Some((port, fixed)) = &view.target else {
             return self.delete_fip(id).await;
         };
-        let address = fip.spec.address.ok_or_else(|| {
-            ApiError::unavailable(format!("ovn: floating ip {id} has no address yet"))
-        })?;
+        let address = fip
+            .spec
+            .address
+            .ok_or_else(|| ApiError::unavailable(format!("floating ip {id} has no address yet")))?;
         let router = view.router.as_ref().ok_or_else(|| {
+            let (port_net, fip_net) = match self.attached.get() {
+                Some(a) => {
+                    let col = a.store.collection::<Network>();
+                    let named = |id: &Id| match col.try_get(id) {
+                        Ok(Some(n)) => format!("{} [{id}]", n.meta.name),
+                        _ => id.to_string(),
+                    };
+                    (named(&port.spec.network), named(&fip.spec.network))
+                }
+                None => (port.spec.network.to_string(), fip.spec.network.to_string()),
+            };
             ApiError::unavailable(format!(
-                "ovn: no router joins port {} to network {}",
-                port.meta.id, fip.spec.network
+                "no router connects the network {port_net} of port {} to the floating ip's external network {fip_net}. Attach the port's subnet to a router with {fip_net} as its external network",
+                port.meta.id
             ))
         })?;
         let mut ext = self.tags(id, fip.meta.project.as_ref());
@@ -2441,7 +2455,11 @@ mod tests {
             ..at("10.0.0.5")
         };
         let err = b.associate_fip(&lost).await.unwrap_err();
-        assert!(err.message.contains("no router joins"));
+        assert!(
+            err.message.contains("no router connects the network")
+                && err.message.contains("Attach the port's subnet to a router"),
+            "{err}"
+        );
     }
     fn sg(rules: Vec<Rule>) -> SecurityGroup {
         SecurityGroup {
