@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The `compute` API: `/machines`, `/hosts`, `/sizes`.
+//! The `compute` API: `/machines`, `/hosts`, `/sizes`, `/keypairs`.
 //!
 //! Handlers write `spec` and `meta` only. Anything that must happen on a
 //! host (start, stop, reboot, delete) is recorded as desired state and the
@@ -17,9 +17,10 @@
 //! is treated as cloud admin in dev mode and rejected otherwise.
 
 use crate::driver::DriverRegistry;
+use crate::keypair;
 use crate::types::{
-    new_machine, new_size, Host, Machine, MachineSpec, Size, DELETE_ANNOTATION,
-    SYSTEM_LABEL_PREFIX, ZONE_LABEL,
+    new_keypair, new_machine, new_size, Host, Keypair, Machine, MachineSpec, Size,
+    DELETE_ANNOTATION, SYSTEM_LABEL_PREFIX, ZONE_LABEL,
 };
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Request, State},
@@ -78,6 +79,8 @@ pub fn router(state: AppState) -> Router {
             "/sizes/{id}",
             get(get_size).put(update_size).delete(delete_size),
         )
+        .route("/keypairs", get(list_keypairs).post(create_keypair))
+        .route("/keypairs/{id}", get(get_keypair).delete(delete_keypair))
         .with_state(state)
 }
 
@@ -270,7 +273,7 @@ fn created<T: Serialize>(v: T) -> Response {
 async fn index() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "module": "forge",
-        "resources": ["machines", "hosts", "sizes"],
+        "resources": ["machines", "hosts", "sizes", "keypairs"],
     }))
 }
 
@@ -304,6 +307,9 @@ fn sizes(s: &AppState) -> Collection<Size> {
 }
 fn hosts(s: &AppState) -> Collection<Host> {
     s.store.collection::<Host>()
+}
+fn keypairs(s: &AppState) -> Collection<Keypair> {
+    s.store.collection::<Keypair>()
 }
 
 fn load_machine(s: &AppState, scope: &Scope, id: &str) -> ApiResult<Machine> {
@@ -376,6 +382,17 @@ async fn create_machine(
     check_zone(&body.spec)?;
     let size = resolve_size(&s, &body.spec.size)?;
     let mut spec = body.spec;
+    // The pair is resolved to its key for the host, but the name stays on the
+    // machine: it is what `pi machine show` prints and what update refuses to
+    // change. The host is given keys, never the name.
+    if let Some(name) = &spec.keypair {
+        if !name.trim().is_empty() {
+            let key = keypair_public_key(&s, &scope, name)?;
+            if !spec.ssh_keys.iter().any(|k| k == &key) {
+                spec.ssh_keys.push(key);
+            }
+        }
+    }
     // Store the canonical size name so renames of the request form do not
     // change what the scheduler looks up.
     spec.size = size.meta.name.clone();
@@ -423,6 +440,23 @@ async fn update_machine(
         m.meta.labels = l;
     }
     if let Some(mut spec) = body.spec {
+        // A key pair is a create-time name; an update carries the keys a
+        // machine has, so asking to change the pair is refused rather than
+        // quietly ignored. The name is compared to the stored name and to its
+        // id, since `pi apply` sends back whatever a read returned and an
+        // id is a legal way to name the pair.
+        if let Some(want) = spec.keypair.as_deref() {
+            let held = m.spec.keypair.as_deref();
+            // An id is a legal way to name the pair, so name and id both
+            // count as the same pair.
+            let same = held.is_some_and(|h| keypair_same(&s, &scope, want, h));
+            if !same {
+                return Err(ApiError::unprocessable(
+                    "spec.keypair is set when the machine is created and cannot change after it",
+                ));
+            }
+        }
+        spec.keypair = m.spec.keypair.clone();
         if m.status.phase != Phase::Pending
             && (spec.kind != m.spec.kind || spec.image != m.spec.image || spec.size != m.spec.size)
         {
@@ -902,6 +936,116 @@ async fn delete_size(
     }
     sizes(&s).delete(&sz.meta.id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- keypairs ----------------------------------------------------------------
+
+/// What a create takes. With `public_key` the key is imported; without one
+/// an `ed25519` pair is made and its private half returned once.
+#[derive(Debug, Deserialize)]
+pub struct CreateKeypair {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
+}
+
+/// The create response: the stored resource, and for a generated pair the
+/// private key, which is never stored.
+#[derive(Debug, Serialize)]
+pub struct KeypairCreated {
+    #[serde(flatten)]
+    pub keypair: Keypair,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+}
+
+fn load_keypair(s: &AppState, scope: &Scope, id: &str) -> ApiResult<Keypair> {
+    let k = keypairs(s).resolve(scope.filter(), id)?;
+    if !scope.can_see(k.meta.project.as_ref()) {
+        return Err(ApiError::not_found(format!("keypair '{id}' not found")));
+    }
+    Ok(k)
+}
+
+async fn list_keypairs(
+    State(s): State<AppState>,
+    scope: Scope,
+    List(q): List,
+) -> ApiResult<Json<Page<Keypair>>> {
+    Ok(Json(paginate(keypairs(&s).list(scope.filter())?, &q)))
+}
+
+async fn get_keypair(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Keypair>> {
+    Ok(Json(load_keypair(&s, &scope, &id)?))
+}
+
+async fn create_keypair(
+    State(s): State<AppState>,
+    scope: Scope,
+    Body(body): Body<CreateKeypair>,
+) -> ApiResult<Response> {
+    let project = scope
+        .project
+        .clone()
+        .ok_or_else(|| ApiError::forbidden("a project is required to hold a key pair"))?;
+    validate_name(&body.name)?;
+    let (key, private_key) = match &body.public_key {
+        Some(line) => (keypair::parse(line)?, None),
+        None => {
+            let made = keypair::generate_ed25519(&body.name);
+            (made.public, Some(made.private_openssh))
+        }
+    };
+    let mut kp = new_keypair(body.name, Some(project), key);
+    kp.meta.description = body.description;
+    kp.meta.labels = body.labels;
+    let kp = keypairs(&s).create(kp)?;
+    Ok(created(KeypairCreated {
+        keypair: kp,
+        private_key,
+    }))
+}
+
+/// Forget the pair. A machine made with it keeps the public key it was given
+/// at create, so nothing about a running machine changes.
+async fn delete_keypair(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let kp = load_keypair(&s, &scope, &id)?;
+    keypairs(&s).delete(&kp.meta.id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The public key of a pair named in the request, in the caller's project.
+/// A machine holds the key itself from here on; the name is not kept.
+/// Whether two spellings name the same key pair of this project. Equal
+/// strings are enough; otherwise both must resolve, to one resource.
+fn keypair_same(s: &AppState, scope: &Scope, a: &str, b: &str) -> bool {
+    a == b
+        || match (load_keypair(s, scope, a), load_keypair(s, scope, b)) {
+            (Ok(x), Ok(y)) => x.meta.id == y.meta.id,
+            _ => false,
+        }
+}
+
+fn keypair_public_key(s: &AppState, scope: &Scope, name_or_id: &str) -> ApiResult<String> {
+    let kp = load_keypair(s, scope, name_or_id).map_err(|_| {
+        ApiError::unprocessable(format!(
+            "keypair '{name_or_id}' not found in this project; create it with \
+             `pi keypair create {name_or_id}`"
+        ))
+    })?;
+    Ok(kp.spec.public_key.clone())
 }
 
 #[cfg(test)]

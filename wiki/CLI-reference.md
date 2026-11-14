@@ -294,6 +294,7 @@ pi machine stats <NAME>
 | `machine create` | `--volume <VOLUME>` | Volume (repeatable) |
 | `machine create` | `--kind <KIND>` | [default: vm] [possible values: vm, container, metal] |
 | `machine create` | `--ssh-key <KEY>` | SSH public key (repeatable); `@file` reads a file |
+| `machine create` | `--keypair <KEYPAIR>` | Key pair (name or id) whose public key the machine also gets |
 | `machine create` | `--user-data <USER_DATA>` | cloud-init user data; `@file` reads a file |
 | `machine create` | `--host-selector <K=V>` | Host selector `key=value` (repeatable) |
 | `machine create` | `--zone <ZONE>` | Availability zone: only hosts labelled `zone=<ZONE>` |
@@ -327,6 +328,28 @@ pi pod exec <POD> <COMMAND>...
 | `pod exec` | `<COMMAND>...` | Command and arguments. Flags after `--` belong to the command |
 | `pod exec` | `-c, --container <CONTAINER>` | Container name. Required when the pod has more than one |
 | `pod exec` | `--timeout <TIMEOUT>` | Seconds to wait. The server rejects values outside 1..=3600 [default: 30] |
+
+## pi keypair
+
+SSH key pairs.
+
+```text
+pi keypair list
+pi keypair show <NAME>
+pi keypair create [--public-key-file <FILE>] <NAME>
+pi keypair delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `keypair create` | `--description <DESCRIPTION>` |  |
+| `keypair create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `keypair create` | `--public-key-file <FILE>` | Import this public key file instead of making a key |
+| `keypair create` | `--out <FILE>` | Write a generated private key here, mode 0600, never overwritten |
+
+A create with `--public-key-file` imports the key in it. A create without it makes an ed25519 pair: the server keeps the public half and returns the private half once, and the CLI writes it to `--out` or sends it to a pipe. It is never printed on a terminal. The private half is not stored anywhere, so a pair made this way is lost if you do not keep the file. The name is settled before the server is asked: an existing file, or a directory that cannot be written, stops the command with nothing created. If the file still fails to be written after the pair is made, the pair is deleted again.
+
+`--keypair` on `machine create` gives the machine that pair's public key, beside any `--ssh-key`. The machine keeps the name, which `pi machine show` prints as `spec.keypair`, and it cannot be changed afterwards. The pair can be deleted afterwards; the machine keeps the key it was given.
 
 ## pi size
 
