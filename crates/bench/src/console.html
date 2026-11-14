@@ -97,6 +97,10 @@
     outline-offset: 1px;
   }
   a { color: var(--accent); }
+  /* The launch wizard's lesson, made general: a plain display rule on a
+     class beats the hidden attribute, so the attribute is given the last
+     word for every element. */
+  [hidden] { display: none !important; }
   /* display is only set when the section is shown. A plain display rule
      beats the hidden attribute, which left the login card on top of the
      console after sign-in. */
@@ -362,6 +366,9 @@
   .feed .what b { font-weight: 600; }
   .feed .code { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
   .feed li.bad .code, .feed li.bad .what { color: var(--bad); }
+  td.warn { color: var(--wait); white-space: nowrap; }
+  .checkrow { display: flex; align-items: center; gap: 0.5rem; margin: 0.4rem 0; color: var(--text); font-size: 0.9rem; }
+  .checkrow input { width: auto; accent-color: var(--accent); flex: none; }
   #view > h3:first-of-type { margin-top: 0; }
 
   @media (max-width: 860px) {
@@ -508,12 +515,15 @@ const VIEWS = {
   hosts: {
     title: "Hosts",
     path: "/compute/hosts",
+    note: "Open a host for its use, the machines on it and what an admin can do to it: disable, drain, evacuate.",
     cols: [
       ["Name", i => i.name],
       ["Phase", i => i.status && i.status.phase],
-      ["Node", i => i.spec && i.spec.node_name],
-      ["vCPU free", i => i.status && i.status.free && (i.status.free.vcpus + " / " + (i.spec.capacity ? i.spec.capacity.vcpus : ""))],
-      ["Drivers", i => ((i.spec && i.spec.drivers) || []).join(", ")],
+      ["Zone", i => (i.labels && i.labels.zone) || ""],
+      ["vCPU used", i => vcpuUse(i).join(" / ")],
+      ["Memory GiB used", i => gibUse(i).join(" / ")],
+      ["Machines", i => hostMachines.get(String(i.id)) || 0],
+      ["Certificate", i => dateOf(i.status && i.status.cert_expires)],
     ],
   },
   topology: { title: "Topology" },
@@ -830,6 +840,7 @@ let lastErr = "";
 let readOnly = false;
 let renderGen = 0;
 let openMachine = null;
+let openHost = null;
 let machineFips = [];
 // One-time key secret. Shown in the DOM, then dropped. Not stored.
 let keyOnce = null;
@@ -857,7 +868,11 @@ async function api(method, path, body, auth) {
     try { data = JSON.parse(text); } catch (e) { data = { error: { message: text.slice(0, 200) } }; }
   }
   if (res.status === 401 && auth !== false) { showLogin(); throw new Error("session ended"); }
-  if (!res.ok) throw new Error((data && data.error && data.error.message) || res.statusText);
+  if (!res.ok) {
+    const err = new Error((data && data.error && data.error.message) || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
   // A change went through: the create form has done its job.
   if (method !== "GET") formOpen[current] = false;
   return data;
@@ -867,6 +882,7 @@ function showLogin() {
   clearToken();
   keyOnce = null;
   openMachine = null;
+  openHost = null;
   document.getElementById("shell").hidden = true;
   document.getElementById("login").hidden = false;
 }
@@ -936,6 +952,19 @@ function protoText(p) {
 }
 function itemsOf(page) {
   return (page && page.items) || [];
+}
+// The host a machine sits on, as `status.host` holds it.
+function machineHost(m) {
+  return String((m.status && m.status.host) || "");
+}
+// Placed machines per host id.
+function placeCount(machines) {
+  const out = new Map();
+  for (const m of machines) {
+    const h = machineHost(m);
+    if (h) out.set(h, (out.get(h) || 0) + 1);
+  }
+  return out;
 }
 function num(obj, key) {
   if (!obj || obj[key] == null || obj[key] === "") return "";
@@ -1010,7 +1039,8 @@ document.getElementById("login-form").addEventListener("submit", async (ev) => {
     document.getElementById("pass").value = "";
     setWho(data.caller || {}, "admin");
     showApp();
-    go(hashView(), true);
+    const at = hashView();
+    go(at.view, true, at.id);
     loadCounts();
   } catch (e) {
     err.textContent = e.message === "invalid credentials"
@@ -1058,6 +1088,9 @@ async function loadProjects() {
     return;
   }
   // Signed in without a project: go to the one used last, else the first.
+  // Only on the way in. This runs in the background of every page, and a
+  // switch taken up here later would clear the page open on screen and
+  // redraw its list under the hand.
   if (!here && !autoPicked) {
     autoPicked = true;
     const last = lastProject();
@@ -1065,6 +1098,7 @@ async function loadProjects() {
     await switchProject(pick.name);
     return;
   }
+  if (!here) return;
   const tenants = [...new Set(mine.map(tenantOf))].sort();
   const tenant = here ? tenantOf(here) : "";
   tenantBox.replaceChildren();
@@ -1107,7 +1141,9 @@ async function switchProject(want) {
     const data = await api("POST", "/identity/tokens/self/switch", { project: want });
     setToken(data.token);
     try { localStorage.setItem("pistack.project", want); } catch (e) { /* private window */ }
-    openMachine = null;
+    // A different project is a different cloud, so the page open on the
+    // old one goes with it.
+    if (current === "machines" || current === "hosts") { openMachine = null; openHost = null; }
     keyOnce = null;
     sampleCache = { at: 0, rows: [] };
     for (const k of Object.keys(formOpen)) formOpen[k] = false;
@@ -1133,10 +1169,15 @@ tenantBox.addEventListener("change", () => {
 function navButton(view) {
   return document.querySelector('nav button[data-view="' + view + '"]');
 }
-function go(view, fromHash) {
+function go(view, fromHash, id) {
   if (!VIEWS[view]) view = "overview";
   current = view;
-  openMachine = null;
+  // The host page keeps its own address, so reload and Back land back on
+  // the host. A machine is opened from the list, which stays mounted under
+  // it, so its address is left alone: Back returns to the list.
+  const openable = id && view === "hosts" ? id : null;
+  openHost = view === "hosts" ? openable : null;
+  openMachine = view === "machines" ? (id || null) : null;
   for (const n of document.querySelectorAll("nav button[data-view]")) n.removeAttribute("aria-current");
   const b = navButton(view);
   let group = "";
@@ -1150,14 +1191,27 @@ function go(view, fromHash) {
   document.title = VIEWS[view].title + " · PiStack";
   document.getElementById("filter").value = "";
   document.getElementById("shell").classList.remove("nav-open");
-  if (!fromHash && location.hash !== "#/" + view) history.pushState(null, "", "#/" + view);
+  // The machine page keeps the list's address: a reload or a Back from
+  // there is meant to land back on the list. The host page keeps its own
+  // address, so reloading it returns to the host.
+  const want = "#/" + view + (id && view === "hosts" ? "/" + encodeURIComponent(id) : "");
+  if (location.hash !== want) history.pushState(null, "", want);
   render();
 }
+// Where the address points: the view, and the one row the hash names.
 function hashView() {
-  const v = location.hash.replace(/^#\/?/, "");
-  return VIEWS[v] ? v : "overview";
+  const parts = location.hash.replace(/^#\/?/, "").split("/");
+  const view = VIEWS[parts[0]] ? parts[0] : "overview";
+  let id = null;
+  try { id = parts[1] ? decodeURIComponent(parts[1]) : null; } catch (e) { id = parts[1] || null; }
+  if (id && view !== "hosts" && view !== "machines") id = null;
+  return { view, id };
 }
-window.addEventListener("popstate", () => { if (token()) go(hashView(), true); });
+window.addEventListener("popstate", () => {
+  if (!token()) return;
+  const at = hashView();
+  go(at.view, true, at.id);
+});
 
 function storedGroups() {
   try { return JSON.parse(localStorage.getItem("pistack.nav") || "{}") || {}; } catch (e) { return {}; }
@@ -1272,7 +1326,7 @@ liveBox.addEventListener("change", () => {
 setInterval(() => {
   if (!liveBox.checked || document.hidden || !token()) return;
   if (document.getElementById("shell").hidden) return;
-  if (openMachine || formOpen[current]) return;
+  if (openMachine || openHost || formOpen[current]) return;
   const view = document.getElementById("view");
   if (view.contains(document.activeElement) || view.querySelector(".once")) return;
   render(true);
@@ -2351,6 +2405,15 @@ function ago(ts) {
   if (s < 172800) return Math.round(s / 3600) + "h ago";
   return Math.round(s / 86400) + "d ago";
 }
+// A date kept short: month and day when the clock is that close, else to
+// the day.
+function dateOf(ts) {
+  const t = Date.parse(ts);
+  if (!t) return "";
+  const d = new Date(t);
+  if (Math.abs(Date.now() - t) < 86400000) return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString();
+}
 function fmtBytes(n) {
   n = Number(n) || 0;
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -3030,6 +3093,508 @@ async function renderMachine(id, gen) {
   }, 10000);
 }
 
+// ---- hosts ----------------------------------------------------------------
+
+// Machines on each host, read when the host list is drawn.
+let hostMachines = new Map();
+// The drain and evacuate answers, by host id: an action redraws the page,
+// and the report is the one thing that survives it.
+const reportHold = new Map();
+// Label rows being filled in, so a redraw neither drops what was typed nor
+// closes the editor under the hand typing it.
+// The label editor's state, outside the nodes: which host the draft
+// belongs to, the rows as typed, and whether the editor is open. Saving or
+// cancelling closes it; leaving for another host drops it.
+const labelDraft = {
+  host: "", rows: [], open: false,
+  reset(id, rows) { this.host = id; this.rows = rows; this.open = false; },
+  close() { this.host = ""; this.rows = []; this.open = false; },
+};
+// A label PiStack wrote itself: shown, never sent back.
+const SYS_LABEL = "pistack.io/";
+const DAY = 86400000;
+
+function hostCap(h) { return (h && h.spec && h.spec.capacity) || {}; }
+function hostFree(h) { return (h && h.status && h.status.free) || {}; }
+// Used of total. What the scheduler has left room for is the difference.
+function vcpuUse(h) {
+  const t = hostCap(h).vcpus || 0;
+  return [t - (hostFree(h).vcpus || 0), t];
+}
+function gibUse(h) {
+  const t = hostCap(h).memory_mib || 0;
+  return [gib(t - (hostFree(h).memory_mib || 0)), gib(t)];
+}
+function diskUse(h) {
+  const t = hostCap(h).disk_gib || 0;
+  return [t - (hostFree(h).disk_gib || 0), t];
+}
+function certSoon(h) {
+  const t = Date.parse((h && h.status && h.status.cert_expires) || "");
+  return !!t && t - Date.now() < 14 * DAY;
+}
+
+// The host list, dressed: meters, the disabled pill, a certificate in two
+// weeks' time, and rows that open the host page.
+function hostRows(table, hosts) {
+  [...table.querySelectorAll("tbody tr")].forEach((tr, idx) => {
+    const h = hosts[idx];
+    if (!h) return;
+    if (h.spec && h.spec.disabled) {
+      const p = pill("disabled");
+      p.title = h.spec.disabled_reason || "disabled by an admin";
+      tr.children[1].append(document.createTextNode(" "), p);
+    }
+    const cpu = vcpuUse(h);
+    const mem = gibUse(h);
+    cellText(tr, 3, cpu.join(" / "));
+    tr.children[3].prepend(meter(cpu[0], cpu[1]), document.createTextNode(" "));
+    cellText(tr, 4, mem.join(" / "));
+    tr.children[4].prepend(meter(mem[0], mem[1]), document.createTextNode(" "));
+    const cert = tr.children[6];
+    if (cert.textContent && certSoon(h)) {
+      cert.classList.add("warn");
+      cert.title = "The agent certificate on this host expires within two weeks";
+    }
+    const open = () => go("hosts", false, h.id);
+    nameLink(tr, 0, h.name, open);
+    tr.style.cursor = "pointer";
+    // The row opens the host. A button of its own stops the click here: the
+    // name cell has no nesting of its own to give the click back to.
+    tr.addEventListener("click", open);
+    tr.querySelectorAll("button").forEach((b) => b.addEventListener("click", (ev) => ev.stopPropagation()));
+  });
+}
+
+async function renderHost(id, gen) {
+  const root = document.getElementById("view");
+  root.replaceChildren();
+  const back = el("button", "← Hosts", "crumb"); back.type = "button";
+  back.addEventListener("click", () => go("hosts"));
+  root.append(back);
+  let host;
+  try {
+    host = await api("GET", "/compute/hosts/" + encodeURIComponent(id));
+  } catch (e) {
+    if (gen !== renderGen) return;
+    if (e.status === 403 || /admin/.test(e.message)) {
+      root.append(el("p", "Hosts are visible to administrators only.", "sub"));
+      return;
+    }
+    setErr(e.message);
+    return;
+  }
+  if (gen !== renderGen) return;
+  const quiet = (p) => p.catch(() => null);
+  const [machinePage, samples] = await Promise.all([
+    quiet(api("GET", "/compute/machines")),
+    quiet(usageSamples()),
+  ]);
+  if (gen !== renderGen) return;
+  const here = (machinePage ? itemsOf(machinePage) : []).filter(m => machineHost(m) === String(host.id));
+  const spec = host.spec || {};
+  const st = host.status || {};
+  const hid = encodeURIComponent(host.id);
+  const phase = String(st.phase || "").toLowerCase();
+
+  // ---- header ----
+  const head = el("div", null, "mhead");
+  const who = el("div", null, "who");
+  const title = el("h2", host.name);
+  title.append(pill(st.phase));
+  if (spec.disabled) {
+    const p = pill("disabled");
+    p.title = spec.disabled_reason || "disabled by an admin";
+    title.append(p);
+  }
+  const meta = el("p", null, "meta");
+  const bits = [spec.node_name, (host.labels && host.labels.zone) || "no zone",
+    "last seen " + (st.last_seen ? ago(st.last_seen) : "never"),
+    "created " + ago(host.created_at)].filter(Boolean);
+  bits.forEach((b, i) => { if (i) meta.append(" · "); meta.append(i === 0 ? el("b", b) : b); });
+  who.append(title, meta);
+  if (st.message && ["error", "failed"].includes(phase)) who.append(el("p", shortIds(st.message), "meta"));
+  const acts = el("div", null, "acts");
+  const again = el("button", "Refresh"); again.type = "button";
+  again.title = "Read the host, its labels and its machines again";
+  again.addEventListener("click", () => render());
+  acts.append(again);
+  head.append(who, acts);
+  root.append(head);
+
+  // ---- what an admin can do ----
+  const held = reportHold.get(String(host.id)) || null;
+  const drawReport = () => {
+    if (!held) return;
+    const box = el("div", null, "report");
+    box.append(el("h3", held.title));
+    if (held.rows === null) {
+      box.append(el("p", held.empty || "", "sub"));
+    } else {
+      const panel = el("div", null, "panel");
+      panel.append(simpleTable([
+        ["Machine", r => r.name],
+        ["Result", r => r.why],
+      ], held.rows));
+      box.append(panel);
+      if (!held.rows.length) box.append(el("p", held.empty, "sub"));
+    }
+    root.append(box);
+    if (box.scrollIntoView) box.scrollIntoView({ block: "nearest" });
+  };
+  if (!readOnly) {
+    // The answer is held, then the page is read again: an action ends with
+    // the host as the server now has it, and the report still under it.
+    const report = (title, rows, empty) => {
+      reportHold.set(String(host.id), { title, rows, empty });
+      return render();
+    };
+    const toggle = el("button", spec.disabled ? "Enable" : "Disable", spec.disabled ? "primary" : "");
+    toggle.type = "button";
+    toggle.addEventListener("click", async () => {
+      setErr("");
+      toggle.disabled = true;
+      try {
+        if (spec.disabled) {
+          await api("POST", "/compute/hosts/" + hid + "/enable");
+        } else {
+          const why = prompt("Why is " + host.name + " being disabled? Nothing new is placed on it. Empty for no reason.");
+          if (why === null) { toggle.disabled = false; return; }
+          await api("POST", "/compute/hosts/" + hid + "/disable", { reason: why });
+        }
+      } catch (e) { setErr(e.message); toggle.disabled = false; return; }
+      await render();
+    });
+    const drain = el("button", "Drain"); drain.type = "button";
+    drain.addEventListener("click", async () => {
+      if (!confirm("Drain " + host.name + "? The host is disabled and what can be live-migrated is moved off it. Nothing is stopped.")) return;
+      setErr("");
+      drain.disabled = true;
+      await report("Draining " + host.name, null, "The cloud is answering.");
+      let rep = null;
+      try { rep = await api("POST", "/compute/hosts/" + hid + "/drain", {}); }
+      catch (e) { reportHold.delete(String(host.id)); setErr(e.message); drain.disabled = false; return; }
+      await report("Drain of " + host.name, (rep.migrating || []).map(m => ({
+        name: m.name, why: "live-migrating to " + (m.to_name || shortId(m.to)),
+      })).concat((rep.not_moved || []).map(l => ({ name: l.name, why: "left: " + shortIds(l.reason) }))),
+        "Nothing was placed on this host.");
+    });
+    // Only a host that has stopped reporting, or one an operator disabled
+    // and says is dead. Anything else risks a second copy of a running
+    // machine, and the server says so; the button does not pretend otherwise.
+    const evacuate = el("button", "Evacuate", "danger"); evacuate.type = "button";
+    evacuate.disabled = !spec.disabled && phase === "ready";
+    evacuate.title = evacuate.disabled
+      ? "Evacuate a host that has stopped reporting, or one you disabled and know is dead"
+      : "Hand the machines of a host that is gone back to the scheduler";
+    evacuate.addEventListener("click", () => {
+      const box = el("div", null, "report");
+      box.append(el("h3", "Evacuate " + host.name));
+      box.append(el("p", "The machines are handed back to the scheduler and start again elsewhere. A root disk is a file on this host: it does not come with them. Volumes on shared storage are plugged back in.", "sub"));
+      const dead = el("input"); dead.type = "checkbox";
+      const rebuild = el("input"); rebuild.type = "checkbox";
+      const tick = (input, id, label, why) => {
+        input.id = id;
+        input.title = why;
+        const row = el("label", null, "checkrow");
+        row.append(input, el("span", label));
+        return row;
+      };
+      box.append(
+        tick(dead, "ev-dead", "This host is dead",
+          "Needed when the host is disabled but still reporting to the cloud"),
+        tick(rebuild, "ev-rebuild", "Start each machine again from its image, losing its root disk",
+          "A machine that cannot be started this way is reported and left where it is"),
+      );
+      const run = el("button", "Evacuate", "danger"); run.type = "button";
+      const cancel = el("button", "Cancel"); cancel.type = "button";
+      const tools = el("p", null, "tools");
+      tools.append(run, cancel);
+      box.append(tools);
+      // Without the rebuild the server evacuates nothing: every machine is
+      // skipped, its root disk left behind. So the rebuild box is what
+      // unlocks. "This host is dead" is a confirmation the server may ask
+      // for, never a way in on its own.
+      run.disabled = true;
+      rebuild.addEventListener("change", () => { run.disabled = !rebuild.checked; });
+      dead.addEventListener("change", () => { run.disabled = !rebuild.checked; });
+      run.addEventListener("click", async () => {
+        setErr("");
+        run.disabled = true;
+        await report("Evacuating " + host.name, null, "The cloud is answering.");
+        let rep = null;
+        try {
+          rep = await api("POST", "/compute/hosts/" + hid + "/evacuate",
+            { confirm_dead: dead.checked, rebuild_from_image: rebuild.checked });
+        } catch (e) { reportHold.delete(String(host.id)); setErr(e.message); run.disabled = false; return; }
+        await report("Evacuate of " + host.name, (rep.evacuated || []).map(v => ({
+          name: v.name,
+          why: "starts again from " + v.rebuilt_from + ((v.volumes || []).length ? " and keeps " + v.volumes.join(", ") : ""),
+        })).concat((rep.skipped || []).map(l => ({ name: l.name, why: "skipped: " + shortIds(l.reason) }))),
+          "No machine was recorded on this host.");
+      });
+      cancel.addEventListener("click", () => box.remove());
+      root.append(box);
+    });
+    acts.append(toggle, drain, evacuate);
+  }
+  drawReport();
+
+  // ---- usage ----
+  const node = spec.node_name || "";
+  const mine = (l) => l.host === node && !l.machine;
+  const rows = samples || [];
+  const hist = {
+    load: sumSeries(seriesOf(rows, "pistack_host_load1", mine)),
+    memUsed: sumSeries(seriesOf(rows, "pistack_host_memory_used_bytes", mine)),
+    memTotal: sumSeries(seriesOf(rows, "pistack_host_memory_total_bytes", mine)),
+    diskFree: sumSeries(seriesOf(rows, "pistack_host_data_disk_free_bytes", mine)),
+    diskTotal: sumSeries(seriesOf(rows, "pistack_host_data_disk_total_bytes", mine)),
+    machines: sumSeries(seriesOf(rows, "pistack_host_machines", mine)),
+  };
+  // The ring keeps one point per sample; the page adds points at the same
+  // fifteen second step, so the line is drawn on one grid either way.
+  for (const k of Object.keys(hist)) hist[k] = hist[k].map(p => ({ t: Math.round(p.t / 15000) * 15000, v: p.v }));
+  const cards = {
+    load: chartCard("Load"),
+    mem: chartCard("Memory"),
+    disk: chartCard("Disk free"),
+    placed: chartCard("Machines"),
+  };
+  const charts = el("div", null, "charts");
+  charts.append(cards.load.node, cards.mem.node, cards.disk.node, cards.placed.node);
+  root.append(charts);
+  const noData = samples === null ? "Usage could not be read" : "No usage reported for this host yet";
+  const drawCharts = () => {
+    const l = lastOf(hist.load);
+    cards.load.draw(l === null ? null : fmtNum(l), l === null ? "" : "over one minute", [hist.load], { empty: noData });
+    const used = lastOf(hist.memUsed), total = lastOf(hist.memTotal);
+    cards.mem.draw(used === null ? null : fmtBytes(used), total ? "of " + fmtBytes(total) : "", [hist.memUsed],
+      { ceiling: total || 0, empty: noData, note: total ? Math.round((used || 0) * 100 / total) + "% in use" : "" });
+    const free = lastOf(hist.diskFree), diskAll = lastOf(hist.diskTotal);
+    cards.disk.draw(free === null ? null : fmtBytes(free), diskAll ? "of " + fmtBytes(diskAll) : "", [hist.diskFree],
+      { ceiling: diskAll || 0, empty: noData, note: diskAll ? Math.round((diskAll - (free || 0)) * 100 / diskAll) + "% full" : "" });
+    const n = lastOf(hist.machines);
+    cards.placed.draw(n === null ? null : String(Math.round(n)), n === null ? "" : "as last reported", [hist.machines], { empty: noData });
+  };
+  drawCharts();
+
+  // ---- capacity ----
+  root.append(el("h3", "Capacity"));
+  const cap = el("div", null, "kv");
+  const capLine = (label, use, unit) => {
+    const p = el("p");
+    p.append(el("span", label, "k"));
+    const v = el("span", null, "v");
+    v.append(meter(use[0], use[1]), " " + use[0] + " of " + use[1] + (unit ? " " + unit : "") + " used");
+    p.append(v);
+    return p;
+  };
+  cap.append(
+    capLine("vCPU", vcpuUse(host), ""),
+    capLine("Memory", gibUse(host), "GiB"),
+    capLine("Disk", diskUse(host), "GiB"),
+  );
+  root.append(cap);
+  root.append(el("p", "Capacity less what the scheduler has placed here. The agent's own free figures are what the charts show.", "sub"));
+
+  // ---- details ----
+  root.append(el("h3", "Details"));
+  const kv = el("div", null, "kv");
+  kv.append(
+    kvLine("Node", spec.node_name),
+    kvLine("Zone", (host.labels && host.labels.zone) || "none"),
+    kvLine("Drivers", (spec.drivers || []).join(", ") || "none"),
+    kvLine("Underlay", spec.underlay_ip),
+    kvLine("Last seen", st.last_seen ? new Date(st.last_seen).toLocaleString() : ""),
+    kvLine("Disabled", yesNo(spec.disabled)),
+    kvLine("Reason given", spec.disabled_reason),
+    kvLine("Certificate expires", (st.cert_expires ? new Date(st.cert_expires).toLocaleString() : "") + (certSoon(host) ? " · within two weeks" : "")),
+    kvLine("ID", host.id, true),
+  );
+  if (st.message) kv.append(kvLine("Message", shortIds(st.message)));
+  root.append(kv);
+
+  // ---- labels ----
+  const labelHead = el("h3", "Labels");
+  if (!readOnly) {
+    // The head carries the redraw: the page has no other hand control, and
+    // every action on it redraws through the same door.
+    labelHead.append(" ");
+    const redraw = el("button", "Refresh"); redraw.type = "button";
+    redraw.className = "linkish";
+    redraw.title = "Read the host, its labels and its machines again";
+    redraw.addEventListener("click", () => render());
+    labelHead.append(redraw);
+  }
+  root.append(labelHead);
+  const labelBox = el("div", null, "detail");
+  labelBox.style.width = "100%";
+  root.append(labelBox);
+  drawLabels(labelBox, host);
+
+  // ---- machines here ----
+  root.append(el("h3", "Machines on this host (" + here.length + ")"));
+  const panel = el("div", null, "panel");
+  const table = simpleTable([
+    ["Name", m => m.name],
+    ["Phase", m => m.status && m.status.phase],
+    ["Power", m => m.status && m.status.power],
+    ["Size", m => m.spec && m.spec.size],
+    ["Address", m => ((m.status && m.status.addresses) || []).join(", ")],
+  ], here);
+  [...table.querySelectorAll("tbody tr")].forEach((tr, idx) => {
+    const m = here[idx];
+    if (!m) return;
+    const open = () => go("machines", false, m.id);
+    nameLink(tr, 0, m.name, open);
+    tr.style.cursor = "pointer";
+    tr.addEventListener("click", open);
+    tr.querySelectorAll("button").forEach((b) => b.addEventListener("click", (ev) => ev.stopPropagation()));
+  });
+  panel.append(table);
+  root.append(panel);
+
+  // ---- keeping it current ----
+  // The machine page's feed for a host: the host's own latest points, read
+  // every ten seconds and drawn without rebuilding the page.
+  const push = (list, t, v) => {
+    if (v === null || (list.length && list[list.length - 1].t >= t)) return;
+    list.push({ t, v });
+    if (list.length > 120) list.shift();
+  };
+  timer = setInterval(async () => {
+    if (document.hidden) return;
+    let rep = null;
+    try { rep = await api("GET", "/compute/hosts/" + hid + "/stats"); } catch (e) { return; }
+    if (gen !== renderGen) return;
+    const series = (rep && rep.series) || [];
+    const last = Math.max(...series.map(s => Date.parse(s.timestamp) || 0), 0);
+    const bucket = Math.round(last / 15000) * 15000;
+    const pick = (name, field) => {
+      const hits = series.filter(s => s.metric === name && s[field] !== undefined && s[field] !== null);
+      if (!hits.length) return null;
+      return hits.reduce((n, s) => n + Number(s[field]), 0);
+    };
+    push(hist.load, bucket, pick("pistack_host_load1", "value"));
+    push(hist.memUsed, bucket, pick("pistack_host_memory_used_bytes", "value"));
+    push(hist.memTotal, bucket, pick("pistack_host_memory_total_bytes", "value"));
+    push(hist.diskFree, bucket, pick("pistack_host_data_disk_free_bytes", "value"));
+    push(hist.diskTotal, bucket, pick("pistack_host_data_disk_total_bytes", "value"));
+    push(hist.machines, bucket, pick("pistack_host_machines", "value"));
+    drawCharts();
+  }, 10000);
+}
+
+// Labels an operator owns, in rows sent back as one set. Labels PiStack
+// wrote are shown and left out of the set; the server keeps those.
+function drawLabels(box, host) {
+  const all = host.labels || {};
+  const sys = Object.keys(all).filter(k => k.startsWith(SYS_LABEL)).sort();
+  const owned = Object.keys(all).filter(k => !k.startsWith(SYS_LABEL)).sort();
+  // A draft belongs to one host and lives until it is saved or cancelled.
+  // The edit state and the typed rows live here, not in the nodes, so the
+  // page redrawing itself under the hand keeps both.
+  if (labelDraft.host !== String(host.id)) labelDraft.reset(host.id, owned.map(k => ({ key: k, value: all[k] })));
+  const draft = labelDraft;
+  box.replaceChildren();
+  const chips = (title, keys, why) => {
+    if (!keys.length) return null;
+    const list = el("div", null, "strip");
+    list.append(el("span", title, "name"));
+    for (const k of keys) {
+      const tag = el("span", k + "=" + all[k], "srv");
+      tag.title = why;
+      list.append(tag);
+    }
+    return list;
+  };
+  // Read-only first, so the page shows what the host carries before an
+  // editor is asked for. The host's own labels above PiStack's.
+  const shown = el("div");
+  shown.append(chips("Labels", owned, "An operator's label. Edit labels to change the set.")
+    || el("p", "No labels of yours on this host. The zone label is what puts a host in an availability zone the launch wizard offers.", "sub"));
+  const bySys = chips("Set by PiStack", sys, "PiStack sets this label. It is shown here and not sent back.");
+  if (bySys) shown.append(bySys);
+  const editBtn = el("button", "Edit labels"); editBtn.type = "button";
+  const lbox = el("div", null, "panel");
+  const foot = el("p", null, "tools");
+  const draw = () => {
+    const open = draft.open;
+    shown.hidden = open;
+    editBtn.hidden = open || readOnly;
+    lbox.hidden = !open;
+    foot.hidden = !open;
+    if (!open) return;
+    // Built for this spell of editing; a redraw starts from the draft.
+    lbox.replaceChildren();
+    foot.replaceChildren();
+    const table = el("table");
+    const head = el("tr");
+    head.append(el("th", "Key"), el("th", "Value"), el("th", ""));
+    const thead = el("thead");
+    thead.append(head);
+    table.append(thead, el("tbody"));
+    lbox.append(table);
+    for (const r of draft.rows) {
+      const tr = el("tr");
+      const key = el("input"); key.value = r.key; key.placeholder = "env";
+      const val = el("input"); val.value = r.value; val.placeholder = "prod";
+      key.setAttribute("aria-label", "Label key");
+      val.setAttribute("aria-label", "Label value");
+      key.addEventListener("input", () => { r.key = key.value; });
+      val.addEventListener("input", () => { r.value = val.value; });
+      const td1 = el("td"); td1.append(key);
+      const td2 = el("td"); td2.append(val);
+      const td3 = el("td");
+      const x = el("button", "Remove", "danger"); x.type = "button";
+      x.title = "Take this label off the host when the set is saved";
+      x.setAttribute("aria-label", "Remove label " + (r.key || "new"));
+      x.addEventListener("click", () => { draft.rows.splice(draft.rows.indexOf(r), 1); draw(); });
+      td3.append(x);
+      tr.append(td1, td2, td3);
+      table.querySelector("tbody").append(tr);
+    }
+    if (!draft.rows.length) {
+      const tr = el("tr");
+      const td = el("td", "Nothing here yet. Add the first label.", "empty");
+      td.colSpan = 3;
+      tr.append(td);
+      table.querySelector("tbody").append(tr);
+    }
+    const add = el("button", "Add label"); add.type = "button";
+    const save = el("button", "Save labels", "primary"); save.type = "button";
+    const cancel = el("button", "Cancel"); cancel.type = "button";
+    add.addEventListener("click", () => { draft.rows.push({ key: "", value: "" }); draw(); });
+    cancel.addEventListener("click", () => {
+      draft.open = false;
+      draft.rows = owned.map(k => ({ key: k, value: all[k] }));
+      draw();
+    });
+    save.addEventListener("click", async () => {
+      const out = {};
+      for (const r of draft.rows) out[String(r.key || "").trim()] = String(r.value || "").trim();
+      setErr("");
+      save.disabled = true;
+      try { await api("PUT", "/compute/hosts/" + encodeURIComponent(host.id) + "/labels", { labels: out }); }
+      catch (e) { setErr(e.message); save.disabled = false; return; }
+      draft.close();
+      await render();
+    });
+    foot.append(add, save, cancel);
+  };
+  editBtn.addEventListener("click", () => {
+    // This closure holds the nodes of the page on screen, so it opens in
+    // place. The draft lives outside it, so the next redraw finds the
+    // editor open too.
+    draft.open = true;
+    draw();
+    const first = box.querySelector("input");
+    if (first) first.focus();
+  });
+  box.append(shown, editBtn, lbox, foot);
+  draw();
+}
 // What was done, newest first, from the audit log.
 function activityFeed(records, empty) {
   if (!records.length) return el("p", empty || "Nothing recorded yet.");
@@ -3323,14 +3888,23 @@ async function render(soft) {
     await renderMachine(openMachine, gen);
     return;
   }
-  const root = soft ? el("div") : live;
-  if (!soft) live.replaceChildren();
+  if (current === "hosts" && openHost) {
+    setErr("");
+    await renderHost(openHost, gen);
+    return;
+  }
+  // A detail page stays on screen while its list is read again underneath:
+  // `soft` swaps the nodes in, an open detail page keeps them out. The list
+  // is built either way, so its nav count stays true without flashing the
+  // page the user is on.
+  const detail = !!(openMachine || openHost);
+  const root = (soft || detail) ? el("div") : live;
+  if (!soft && !detail) live.replaceChildren();
   setErr("");
   await renderInto(root, view, gen);
   if (gen !== renderGen) return;
-  if (soft) {
-    if (lastErr) return;
-    live.replaceChildren(...root.childNodes);
+  if (root !== live && !(detail && lastErr)) {
+    if (!detail) live.replaceChildren(...root.childNodes);
   }
   applyFilter();
 }
@@ -3339,6 +3913,21 @@ async function render(soft) {
 // Pages whose rows are not deleted from here: a host leaves by being
 // drained and removed, and these pages draw their own rows.
 const NO_DELETE = new Set(["hosts", "dns", "balancers", "overview", "topology"]);
+
+// The plain text of a row's cell, after a helper has taken it over.
+function cellText(tr, idx, text) {
+  const cell = tr.children[idx];
+  if (cell) cell.textContent = text;
+}
+// A name that opens a detail page, in place of the row's plain text.
+function nameLink(tr, idx, text, open) {
+  const cell = tr.children[idx];
+  if (!cell) return;
+  cell.replaceChildren();
+  const btn = el("button", text || "—", "linkish"); btn.type = "button";
+  btn.addEventListener("click", open);
+  cell.append(btn);
+}
 
 // The subnets a router joins, each with a way to take it off, and a box to
 // add another. The whole list is sent each time.
@@ -3579,14 +4168,29 @@ async function renderInto(root, view, gen) {
   if (form) root.append(form);
   if (view.multi === "dns") { await renderDns(root, gen); return; }
   if (view.multi === "balancers") { await renderBalancers(root, gen); return; }
-  let page;
+  let page = null;
+  let denied = false;
   try { page = await api("GET", view.path); }
   catch (e) {
     if (gen !== renderGen) return;
-    setErr(e.message);
+    // Hosts are for cloud admins. A member gets one plain sentence rather
+    // than the refusal the API sent.
+    if (current === "hosts") denied = true;
+    else setErr(e.message);
+  }
+  if (denied) {
+    root.replaceChildren();
+    root.append(el("p", "Hosts are visible to administrators only.", "sub"));
     return;
   }
   if (gen !== renderGen) return;
+  if (current === "hosts") {
+    // Placed machines give the count per host. A list that cannot be read
+    // leaves the column at zero rather than failing the page.
+    try { hostMachines = placeCount(itemsOf(await api("GET", "/compute/machines"))); }
+    catch (e) { hostMachines = new Map(); }
+    if (gen !== renderGen) return;
+  }
   if (current === "machines") {
     try {
       const fp = await api("GET", "/network/floating-ips");
@@ -3614,6 +4218,7 @@ async function renderInto(root, view, gen) {
     table.querySelector("tr").append(el("th", "Subnets"));
     body.querySelectorAll("tr").forEach((tr, idx) => tr.append(routerSubnetCell(items[idx], routerSubnets)));
   }
+  if (current === "hosts") hostRows(table, items);
   const canDelete = !readOnly && !view.actions && !NO_DELETE.has(current);
   const rowAction = !!(view.actions || view.apply || canDelete);
   if (rowAction || view.rules) {
@@ -3757,7 +4362,8 @@ if (token()) {
   api("GET", "/identity/tokens/self").then((who) => {
     setWho(who || {}, "signed in");
     showApp();
-    go(hashView(), true);
+    const at = hashView();
+    go(at.view, true, at.id);
     loadCounts();
   }).catch(() => showLogin());
 }

@@ -158,6 +158,10 @@ mod tests {
         assert!(text.contains("/gauge/samples"));
         assert!(text.contains("renderTopology"));
         assert!(text.contains("/interfaces"));
+        // The host page and the answer a caller without the admin role gets
+        // instead of the API's refusal.
+        assert!(text.contains("/compute/hosts/"));
+        assert!(text.contains("Hosts are visible to administrators only."));
         assert!(!text.contains("10.66.66."));
         assert!(!text.contains("pistack0"));
         assert!(!text.to_ascii_lowercase().contains("ovn"));
