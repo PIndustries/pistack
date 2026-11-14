@@ -727,6 +727,33 @@ fn is_peer_call(path: &str, as_server: bool) -> bool {
     path.starts_with("/cluster/")
 }
 
+/// Over every route, on every server: a client that sends the headers a
+/// server puts on a request it carries gets them taken off before anything
+/// reads them. The peer key is the whole seal of a carried request, and a
+/// caller without this cluster's key is no server of it.
+///
+/// The check runs above every other layer, from a store given to it
+/// directly. A server answers a write inside the role and audit layers, so
+/// nothing there has to know these headers exist. Its store has a peer key
+/// from its first signing key, and one still downloading its first
+/// snapshot is not a leader and answers no write.
+pub async fn strip_carrier_headers(
+    State(store): State<Store>,
+    mut req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if CARRIED_HEADERS
+        .iter()
+        .any(|name| req.headers().contains_key(name))
+        && !is_by_member(&store, req.headers())
+    {
+        for name in CARRIED_HEADERS {
+            req.headers_mut().remove(name);
+        }
+    }
+    next.run(req).await
+}
+
 /// Under `PISTACK_CLUSTER_TLS=required`, refuse a call from another server
 /// that arrives on the plain listener. The caller has already sent its key
 /// in the clear by then; refusing it makes a server that still does so
@@ -758,6 +785,15 @@ pub async fn refuse_plain_peers(
 /// above all, sends this header with the value `leader`. A server that
 /// does not lead then carries the request to the leader itself.
 pub const FORWARD_HEADER: &str = "x-pistack-forward";
+/// A request carried for a client leaves this server with the carrier's
+/// peer key and node id, and the client's address. Only that proves to the
+/// leader where the request really came from, so a header of this name
+/// from an ordinary client is stripped at the edge.
+const CARRIED_HEADERS: [axum::http::HeaderName; 3] = [
+    axum::http::HeaderName::from_static(keep::peer::PEER_HEADER),
+    axum::http::HeaderName::from_static(NODE_HEADER),
+    axum::http::HeaderName::from_static(keep::peer::CLIENT_ADDR_HEADER),
+];
 /// On the answer to a write: the log entry that write was held at.
 pub const COMMIT_HEADER: &str = "x-pistack-commit";
 /// The largest body a follower holds to pass on. Past it the client is
@@ -777,6 +813,9 @@ pub fn wants_forward(headers: &axum::http::HeaderMap) -> bool {
 /// token goes with it and the leader checks it as it would any other. The
 /// header that asked for this does not, so a server that turns out not to
 /// lead answers with the usual refusal and nothing goes round in a circle.
+/// The caller's address goes in the peer header the leader already
+/// authenticates, so the leader's audit record names the client and not
+/// this server.
 ///
 /// After a write, this server waits a moment for its own store to reach
 /// that write, so what the client reads here next already has it.
@@ -789,6 +828,11 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
         .ok()
         .and_then(|members| members.into_iter().find(|member| member.api == api))
         .and_then(|member| member.agent_api);
+    let client_ip = req
+        .extensions()
+        .get::<keep::PeerIdentity>()
+        .and_then(|peer| peer.addr)
+        .map(|addr| addr.ip());
     let (parts, body) = req.into_parts();
     let Ok(body) = axum::body::to_bytes(body, FORWARD_LIMIT).await else {
         return ApiError::bad_request(
@@ -825,7 +869,11 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
                         out = out.header(name, value.clone());
                     }
                 }
-                out
+                let out = with_join(as_node(out, &handle.node_id));
+                match client_ip {
+                    Some(ip) => out.header(keep::peer::CLIENT_ADDR_HEADER, ip.to_string()),
+                    None => out,
+                }
             },
         )
         .await;
@@ -868,9 +916,31 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
     out
 }
 
+/// The client behind a request another server carried, and the node that
+/// carried it. The peer key is the whole proof: a caller that is not a
+/// member of this cluster has these headers taken off at the edge before
+/// anything reads them, and here the key is checked again. A write is
+/// audited wherever it is answered, and a follower cannot record an
+/// audited read, so every request that reaches a record passes here first.
+pub fn carried_client(headers: &HeaderMap, store: &Store) -> Option<(IpAddr, String)> {
+    if !is_by_member(store, headers) {
+        return None;
+    }
+    let client = headers
+        .get(keep::peer::CLIENT_ADDR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())?;
+    let by = headers
+        .get(NODE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+        .map(str::to_owned)?;
+    Some((client, by))
+}
+
 pub async fn reject_follower_writes(
     State(handle): State<std::sync::Arc<ClusterHandle>>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let method = req.method().clone();
@@ -886,6 +956,18 @@ pub async fn reject_follower_writes(
         .extensions()
         .get::<keep::PeerIdentity>()
         .is_some_and(|peer| peer.tls);
+    // A client that sent a carrier's headers had them taken off at the
+    // edge, unless its peer key proved it a member of this cluster.
+    // Wherever this request is answered, its record names the client that
+    // a member carried it for. An ordinary read is not recorded, and a
+    // follower cannot record an audited read; only the leader's answer to
+    // one needs the extension.
+    if !read || gate::audit::audited_read(&path) {
+        if let Some((client, by)) = carried_client(req.headers(), &handle.store) {
+            req.extensions_mut()
+                .insert(gate::audit::Carried { client, by });
+        }
+    }
     // The peer routes answer for themselves. Removing a member is an
     // operator's write and is held to the leader like any other.
     let peer = path.starts_with("/cluster") && !path.starts_with("/cluster/members");
@@ -2336,6 +2418,18 @@ fn enforce_peer(store: &Store, headers: &HeaderMap) -> Result<(), ApiError> {
 /// Header a server puts its node id in on every call to another server.
 pub const NODE_HEADER: &str = "x-pistack-node";
 
+/// Whether the caller showed the cluster's peer key: the one proof that a
+/// request between servers was carried by another server of this cluster.
+/// A join token is not proof: a server still joining has no key yet, and
+/// nothing it asks to be believed about a client's address is worth more
+/// than what an ordinary client could send.
+pub fn is_by_member(store: &Store, headers: &HeaderMap) -> bool {
+    match headers.get(PEER_HEADER) {
+        Some(offered) => keep::peer::is_member(store, offered.as_bytes()),
+        None => false,
+    }
+}
+
 /// Meta key: ids of removed servers, until they join again.
 const REMOVED_KEY: &str = "cluster_removed";
 
@@ -3112,8 +3206,15 @@ mod tests {
             ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // The gateway's TLS listener serves this same app, which reads the
+        // peer address from extensions, so the test's must supply it.
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .unwrap();
         });
         let base = format!("http://{addr}");
         *guard(&handle.leader_api) = base.clone();
@@ -4829,7 +4930,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .ok();
         });
         (format!("http://{addr}"), calls)
     }
@@ -5089,6 +5195,174 @@ mod tests {
         assert_eq!(nowhere.status(), 503);
         sim2.kill();
         sim3.kill();
+    }
+
+    /// A request carried to the leader is recorded there with the client's
+    /// address, not the carrier's: the follower passes it in a header only
+    /// its peer key seals, and the leader takes it only from a member.
+    #[tokio::test]
+    async fn a_carried_write_is_recorded_with_the_clients_address() {
+        // A leader and a follower behind a store that can say who is a
+        // member: `sim` has the record of a cloud, the other two none.
+        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_store = open_store(leader_dir.path());
+        gate::Keys::load_or_create(&leader_store).unwrap();
+        let key = peer_key(&leader_store).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let members = vec![Member::voter("sim", &api)];
+        seed_voter(&leader_store, "sim", &members, 5);
+        leader_store.set_log_term(5);
+        leader_store.set_record_log(true);
+        // The leader answers on the entry it held before the request ran,
+        // as every server does; the wait for a majority is not what this
+        // tests.
+        let ready = Established {
+            role: Role::Voter,
+            leader: true,
+            leader_api: api.clone(),
+            term: 5,
+            members,
+        };
+        let handle = Arc::new(handle_from(
+            "sim".into(),
+            api.clone(),
+            "c1".into(),
+            leader_store.clone(),
+            leader_dir.path().join("state.redb"),
+            &ready,
+            None,
+            Leadership::new(true),
+        ));
+        let audits = |store: &Store| {
+            gate::audit::list(store, &gate::audit::AuditQuery::default())
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|r| r.spec)
+                .collect::<Vec<_>>()
+        };
+        let app = router(handle.clone())
+            .route(
+                "/identity/projects",
+                axum::routing::post(|| async { StatusCode::CREATED }),
+            )
+            .route(
+                "/secrets/secrets/db/payload",
+                axum::routing::get(|| async { "ok" }),
+            )
+            // What the gateway's own layer does for the leader, around a
+            // store: the record of what was answered here.
+            .layer(middleware::from_fn_with_state(
+                leader_store.clone(),
+                gate::audit::layer,
+            ))
+            .layer(middleware::from_fn_with_state(
+                leader_store.clone(),
+                strip_carrier_headers,
+            ))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                reject_follower_writes,
+            ));
+        let serve_stop = CancellationToken::new();
+        let stop = serve_stop.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .with_graceful_shutdown(async move { stop.cancelled().await })
+            .await
+            .ok();
+        });
+
+        let client = reqwest::Client::new();
+        let post = |path: &str, with: &[(&str, &str)]| {
+            let mut request = client.post(format!("{api}{path}"));
+            for (name, value) in with {
+                request = request.header(*name, *value);
+            }
+            async move {
+                request
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A follower carrying a client's write, as `forward_to_leader`
+        // sends it: the client's address beside the peer key and node id.
+        let carried = post(
+            "/identity/projects",
+            &[
+                (PEER_HEADER, &key),
+                (NODE_HEADER, "sim2"),
+                (keep::peer::CLIENT_ADDR_HEADER, "203.0.113.7"),
+            ],
+        )
+        .await;
+        assert_eq!(carried.status(), 201);
+        // A client sending the headers plainly: taken off, and the record
+        // says nothing about a carrier or a client behind the connection.
+        let forged = post(
+            "/identity/projects",
+            &[
+                (PEER_HEADER, "a guess"),
+                (NODE_HEADER, "sim9"),
+                (keep::peer::CLIENT_ADDR_HEADER, "203.0.113.99"),
+            ],
+        )
+        .await;
+        assert_eq!(forged.status(), 201);
+        // A member may send an address that is not one, and it is ignored.
+        let broken = post(
+            "/identity/projects",
+            &[
+                (PEER_HEADER, &key),
+                (NODE_HEADER, "sim2"),
+                (keep::peer::CLIENT_ADDR_HEADER, "not an address"),
+            ],
+        )
+        .await;
+        assert_eq!(broken.status(), 201);
+
+        // A reader that passes the leader's own checks gets the client it
+        // names, because a leader answers its own audited reads inside
+        // this layer.
+        let read = client
+            .get(format!("{api}/secrets/secrets/db/payload"))
+            .header(PEER_HEADER, &key)
+            .header(NODE_HEADER, "sim2")
+            .header(keep::peer::CLIENT_ADDR_HEADER, "203.0.113.5")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read.status(), 200);
+
+        let log = audits(&leader_store);
+        let seen: Vec<(&str, &str, &str)> = log
+            .iter()
+            .map(|r| {
+                (
+                    r.client.as_deref().unwrap_or("-"),
+                    r.carried_by.as_deref().unwrap_or("-"),
+                    r.action.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("203.0.113.7", "sim2", "create"),
+                ("-", "-", "create"),
+                ("-", "-", "create"),
+                ("203.0.113.5", "sim2", "read_payload"),
+            ]
+        );
+        serve_stop.cancel();
     }
 
     #[tokio::test]
@@ -5447,7 +5721,14 @@ mod tests {
             ));
         let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", admin.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(admin, app).await.ok() });
+        tokio::spawn(async move {
+            axum::serve(
+                admin,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .ok();
+        });
         let call = |method: reqwest::Method, path: &str, who: Option<&str>| {
             let mut request = rpc_client().request(method, format!("{base}{path}"));
             if let Some(who) = who {

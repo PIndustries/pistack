@@ -339,7 +339,8 @@ Each record holds:
 | `principal`, `principal_id` | Who made the request. For a failed password login, the name that was tried and no id. |
 | `api_key` | The API key behind the token, when the token came from a key. |
 | `project` | The project the caller's token is scoped to. |
-| `client` | The address the connection came from, as the server saw it. Behind a proxy or load balancer this is the proxy; forwarding headers are not read. |
+| `client` | The address the connection came from, as the server saw it. Behind a proxy or load balancer this is the proxy; forwarding headers are not read. Of a request another server of the cluster carried, it is the client's address, the one the carrier saw. |
+| `carried_by` | The node id of the server that carried the request here, when another server of the cluster brought it. See [Running a cluster](Running-a-cluster). |
 | `method`, `path` | The request line, without the query string. |
 | `action` | What it did: `create`, `update`, `delete`, `login`, `enroll`, the name of an action route such as `drain`, `evacuate`, `start` or `revoke`, or a verb and the part it touched, such as `update_quotas`, `update_labels` or `read_payload`. |
 | `kind`, `resource` | The collection in the path (`machines`, `bindings`, `hosts`) and the resource as the request named it, by id or by name. For a create, the id of what was made. |
