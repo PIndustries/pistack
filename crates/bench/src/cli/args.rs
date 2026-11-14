@@ -363,7 +363,7 @@ pub struct MetaArgs {
 }
 
 macro_rules! crud {
-    ($name:ident, $create:ty $(, $(#[$m:meta])* $var:ident($args:ty))* $(,)?) => {
+    ($name:ident, $create:ty $(, $(#[$m:meta])* $var:ident ($($args:ty)?))* $(,)?) => {
         #[derive(Subcommand, Debug)]
         #[allow(clippy::large_enum_variant)]
         pub enum $name {
@@ -378,12 +378,18 @@ macro_rules! crud {
             /// Delete by name or id.
             #[command(alias = "rm")]
             Delete(DeleteArgs),
-            $( $(#[$m])* $var($args), )*
+            $($(#[$m])* $var $(($args))?, )*
         }
     };
 }
 
 // ---- identity ----------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct ProjectSwitchArgs {
+    /// Project name or id to move to.
+    pub project: String,
+}
 
 #[derive(Args, Debug)]
 pub struct ProjectCreate {
@@ -399,7 +405,14 @@ pub struct ProjectCreate {
     #[arg(long)]
     pub disabled: bool,
 }
-crud!(ProjectCmd, ProjectCreate);
+crud!(
+    ProjectCmd,
+    ProjectCreate,
+    /// List the projects this token can work in
+    Mine(),
+    /// Move to another project: trade the token for one scoped to it
+    Switch(ProjectSwitchArgs),
+);
 
 #[derive(Subcommand, Debug)]
 pub enum QuotaCmd {

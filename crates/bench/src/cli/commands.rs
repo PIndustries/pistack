@@ -990,7 +990,7 @@ fn merge(dst: &mut Value, src: Value) {
 
 // ---- identity nouns -------------------------------------------------------------------
 
-async fn project(ctx: &Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
+async fn project(ctx: &mut Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
     let k = kind("project");
     match cmd {
         ProjectCmd::List(a) => do_list(ctx, io, k, a).await,
@@ -1005,6 +1005,89 @@ async fn project(ctx: &Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
             });
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, false).await.map(|_| ())
+        }
+        ProjectCmd::Mine => {
+            let c = ctx.client()?;
+            let items = c.get_value("/identity/tokens/self/projects").await?;
+            let empty = Vec::new();
+            let items = items.as_array().unwrap_or(&empty);
+            match ctx.fmt.output {
+                Output::Json | Output::Yaml => {
+                    print_value(io.stdout, ctx.fmt, &Value::Array(items.to_vec()))?;
+                }
+                Output::Name => {
+                    for it in items {
+                        writeln!(io.stdout, "{}", str_at(it, "/name"))?;
+                    }
+                }
+                _ => {
+                    let rows: Vec<Vec<String>> = items
+                        .iter()
+                        .map(|it| {
+                            let roles = it
+                                .pointer("/roles")
+                                .and_then(Value::as_array)
+                                .map(|a| output::join(a))
+                                .unwrap_or_default();
+                            let current = it["current"] == json!(true);
+                            vec![
+                                if current { "*".into() } else { String::new() },
+                                str_at(it, "/name"),
+                                roles,
+                                str_at(it, "/parent_name"),
+                            ]
+                        })
+                        .collect();
+                    write!(
+                        io.stdout,
+                        "{}",
+                        output::table(&["", "name", "roles", "parent"], &rows, ctx.fmt.no_headers)
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        ProjectCmd::Switch(a) => {
+            let c = ctx.client()?;
+            let resp = c
+                .post(
+                    "/identity/tokens/self/switch",
+                    &json!({"project": a.project}),
+                )
+                .await?;
+            let token = str_at(&resp, "/token");
+            if token.is_empty() {
+                return Err(CliError::Transport("server returned no token".into()));
+            }
+            let project = str_at(&resp, "/caller/project");
+            let expires = str_at(&resp, "/expires_at");
+            let mut profile = match ctx.config.get(&ctx.profile_name).cloned() {
+                Some(p) => p,
+                None => Profile {
+                    url: ctx.url.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+            };
+            let scoped = (!project.is_empty()).then_some(project.clone());
+            profile.token = Some(token.clone());
+            profile.project = scoped.clone();
+            profile.expires_at = Some(expires);
+            ctx.config.set(&ctx.profile_name, profile);
+            ctx.config.save(&ctx.config_path)?;
+            ctx.token = Some(token);
+            ctx.project = scoped;
+            match ctx.fmt.output {
+                Output::Json | Output::Yaml => print_one(io.stdout, ctx.fmt, &resp)?,
+                _ => {
+                    let where_now = if project.is_empty() {
+                        "system scope"
+                    } else {
+                        &project
+                    };
+                    writeln!(io.stdout, "now in project {where_now}")?;
+                }
+            }
+            Ok(())
         }
     }
 }
