@@ -362,9 +362,9 @@ pi audit list --action login --principal alice
 pi audit list --kind hosts --resource rack1 -o json
 ```
 
-`pi audit list` prints the newest hundred records. `--since` and `--until` take an RFC 3339 time or an age such as `30m`, `2h` or `7d`. `--outcome` is `success` (a status below 400), `failure`, or one status code. When there are more records than `--limit`, `pi` prints the `--after` value that continues the list. `-o wide` adds the project, the API key, the method, the path and the record id.
+`pi audit list` prints the newest hundred records. `--since` and `--until` take an RFC 3339 time or an age such as `30m`, `2h` or `7d`. `--outcome` is `success` (a status below 400), `failure`, or one status code. `--carried-by <NODE>` keeps the records a server of the cluster carried to the leader, by its node id. When there are more records than `--limit`, `pi` prints the `--after` value that continues the list. `-o wide` adds the project, the API key, the server that carried the request, the method, the path and the record id.
 
-The API is `GET /identity/audit` with the query parameters `since`, `until`, `principal`, `project`, `action`, `kind`, `resource`, `outcome`, `order` (`asc`, the default, or `desc`), `limit` (100 by default, at most 1000) and `after`. It answers like every other list: `items`, `total`, and `next` when there is another page.
+The API is `GET /identity/audit` with the query parameters `since`, `until`, `principal`, `project`, `action`, `kind`, `resource`, `outcome`, `carried_by`, `order` (`asc`, the default, or `desc`), `limit` (100 by default, at most 1000) and `after`. It answers like every other list: `items`, `total`, and `next` when there is another page.
 
 A secret read is answered by the leader only. A follower cannot write the record, so it refuses the read with `409` and the leader's address, as it does for a write; `pi` follows that.
 

@@ -378,6 +378,9 @@ pub struct AuditQuery {
     /// `success` (below 400), `failure` (400 and up) or one status code.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// Node id of the server that carried the request here.
+    #[serde(default)]
+    pub carried_by: Option<String>,
     /// `asc`, oldest first (the default), or `desc`.
     #[serde(default)]
     pub order: Option<String>,
@@ -439,6 +442,7 @@ pub fn list(store: &Store, q: &AuditQuery) -> Result<Page<AuditEvent>, String> {
             && wanted(&q.action, &s.action)
             && wanted(&q.kind, &s.kind)
             && wanted(&q.resource, &s.resource)
+            && wanted(&q.carried_by, s.carried_by.as_deref().unwrap_or_default())
             && outcome.is_none_or(|o| match o {
                 Outcome::Success => s.status < 400,
                 Outcome::Failure => s.status >= 400,
@@ -637,6 +641,35 @@ mod tests {
         assert_eq!(items[0].spec.carried_by.as_deref(), Some("n2"));
         assert_eq!(items[1].spec.client.as_deref(), Some("10.0.0.9"));
         assert_eq!(items[1].spec.carried_by, None);
+    }
+
+    #[test]
+    fn records_can_be_filtered_by_the_carrier() {
+        let store = Store::in_memory().unwrap();
+        for by in [Some("n1"), Some("n2"), None] {
+            record(
+                &store,
+                Entry {
+                    carried_by: by.map(str::to_owned),
+                    ..entry("POST", "/compute/machines", 201)
+                },
+            );
+        }
+        let q = |by: Option<&str>| AuditQuery {
+            carried_by: by.map(str::to_owned),
+            ..AuditQuery::default()
+        };
+        let carried = |by: Option<&str>| {
+            list(&store, &q(by))
+                .unwrap()
+                .items
+                .iter()
+                .map(|r| r.spec.carried_by.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(carried(Some("n1")), [Some("n1".to_owned())]);
+        assert_eq!(carried(Some("n3")), []);
+        assert_eq!(carried(None).len(), 3);
     }
 
     #[test]

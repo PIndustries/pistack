@@ -782,6 +782,9 @@ pub struct AuditListArgs {
     /// `success`, `failure`, or one status code such as 403.
     #[arg(long)]
     pub outcome: Option<String>,
+    /// Node id of the server that carried the request to the leader.
+    #[arg(long = "carried-by", value_name = "NODE")]
+    pub carried_by: Option<String>,
     /// Most records to print.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
