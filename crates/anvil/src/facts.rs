@@ -100,6 +100,57 @@ fn stat_u64(n: impl Into<i128>) -> u64 {
     n.into() as u64
 }
 
+/// Whether a directory is on a filesystem other hosts mount too. The
+/// directory is shared when it is such a mount or sits under one. Only NFS
+/// and SMB count as network filesystems, so anything else, a local disk
+/// included and a directory that is not there, is read as local.
+pub fn on_shared_filesystem(path: &Path) -> bool {
+    mounts_shared(
+        std::fs::read_to_string("/proc/mounts")
+            .unwrap_or_default()
+            .as_bytes(),
+        path,
+    )
+}
+
+/// The part of [`on_shared_filesystem`] that reads nothing: `mounts` is
+/// `/proc/mounts` bytes, `path` is the directory being asked about.
+///
+/// A filesystem this kernel mounts under another name is read as local.
+fn mounts_shared(mounts: &[u8], path: &Path) -> bool {
+    let wanted = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let wanted = wanted.to_string_lossy();
+    let wanted = wanted.trim_end_matches('/');
+    let wanted = if wanted.is_empty() { "/" } else { wanted };
+    let unescape = |src: &str| src.replace("\\040", " ").replace("\\011", "\t");
+    for line in String::from_utf8_lossy(mounts).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_device), Some(dir), Some(fstype)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !matches!(unescape(fstype).as_str(), "nfs" | "nfs4" | "cifs" | "smb3") {
+            continue;
+        }
+        let dir = unescape(dir);
+        let dir = dir.trim_end_matches('/');
+        let dir = if dir.is_empty() { "/" } else { dir };
+        if dir == "/" || dir == wanted || starts_with(wanted, dir) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `path` sits below `dir`, on `/` boundaries. A directory is not
+/// below itself: `/srv` is under the mount at `/mnt/srv`, not the one at
+/// `/srv1`.
+fn starts_with(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+}
+
 /// Which drivers this host can offer.
 pub fn capabilities() -> Vec<String> {
     let mut caps = Vec::new();
@@ -167,5 +218,47 @@ mod tests {
         let f = gather_at(Path::new("/nonexistent-data-dir"));
         assert!(f.resources.vcpus >= 1);
         assert!(!f.node_name.is_empty());
+    }
+
+    const MOUNTS: &[u8] =
+        b"sysfs /sys sysfs rw 0 0\n/dev/sda1 / ext4 rw 0 0\n/dev/sdb1 /srv ext4 rw 0 0\n\
+          server:/exports /mnt/nfs4 nfs4 rw 0 0\n//server/share /mnt/cifs cifs rw 0 0\n\
+          //server/esc /mnt/my\\040dir cifs rw 0 0\nserver:/srv /srv/nested nfs rw 0 0\n\
+          server:/y /srv/sub/deeper nfs rw 0 0\n";
+
+    fn shared(dir: &str) -> bool {
+        mounts_shared(MOUNTS, Path::new(dir))
+    }
+
+    #[test]
+    fn a_local_directory_is_not_shared() {
+        assert!(!shared("/"));
+        assert!(!shared("/var/lib/libvirt/images/pistack"));
+        assert!(!shared("/srv"));
+        assert!(!shared("/srv1"), "a mount at /srv1 does not cover /srv");
+        assert!(!shared("relative/dir"));
+        assert!(!shared("/definitely/not/here"));
+        assert!(
+            !shared("/mnt"),
+            "a parent of the mount holds no disk of its own"
+        );
+    }
+
+    #[test]
+    fn a_directory_on_a_network_filesystem_is_shared() {
+        assert!(shared("/mnt/nfs4/pistack"));
+        assert!(shared("/mnt/cifs/pistack"));
+        assert!(shared("/mnt/cifs"), "the mount itself holds the disks");
+        assert!(shared("/mnt/my dir/pistack"), "an escaped space parses");
+        assert!(shared("/srv/nested/deep"), "a nested mount counts");
+        assert!(shared("/srv/sub/deeper/x"));
+        assert!(!shared("/srv/sub"), "a mount further down is not above us");
+    }
+
+    #[test]
+    fn the_root_of_a_network_filesystem_holds_anything_below_it() {
+        let mounts = b"server:/ /mnt/all nfs rw 0 0\n";
+        assert!(mounts_shared(mounts, Path::new("/mnt/all/pistack")));
+        assert!(!mounts_shared(b"", Path::new("/mnt/all/pistack")));
     }
 }

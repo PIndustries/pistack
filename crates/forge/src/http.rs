@@ -989,7 +989,12 @@ mod tests {
             disk_gib: 20,
             gpus: 0,
         };
-        let labels = BTreeMap::new();
+        // Both hosts keep machine disks on storage the other can see.
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            crate::types::DISK_LABEL.to_owned(),
+            crate::types::DISK_SHARED.to_owned(),
+        );
         let src = store
             .collection::<Host>()
             .create(new_host(

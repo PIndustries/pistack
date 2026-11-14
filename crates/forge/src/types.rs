@@ -91,6 +91,24 @@ pub const ZONE_LABEL: &str = "zone";
 /// cannot set them, and replacing a host's labels keeps them.
 pub const SYSTEM_LABEL_PREFIX: &str = "pistack.io/";
 
+/// Host label saying where the agent keeps machine root disks: `local`
+/// when the directory is on this host's own filesystem, `shared` when it is
+/// on a filesystem the other hosts mount too. The agent reports it and it
+/// defaults to `local`, because that is what a host that never said is.
+pub const DISK_LABEL: &str = "pistack.io/disk";
+
+/// The [`DISK_LABEL`] value for a host whose machine disks are elsewhere.
+pub const DISK_SHARED: &str = "shared";
+
+/// Whether this host's machine root disks are on storage every host can see.
+/// A host that did not report the label is treated as local.
+pub fn machine_disks_are_shared(host: &Host) -> bool {
+    host.meta
+        .labels
+        .get(DISK_LABEL)
+        .is_some_and(|v| v == DISK_SHARED)
+}
+
 // ---- Host ------------------------------------------------------------------
 
 /// What a host *is*: reported by the agent at hello time and on change.

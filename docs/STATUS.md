@@ -40,6 +40,7 @@ Done
 - Per-host resource accounting; a host that misses heartbeats is marked down
 - Volume hot-plug on libvirt
 - Host labels set by an admin; the `zone` label is the availability zone a machine can ask for
+- Host label `pistack.io/disk`, written by the agent: `shared` when its machine disk directory is on an NFS or SMB mount. Anything else is `local`
 - Disable and enable a host
 - Runtimes: libvirt/KVM, cloud-hypervisor, youki containers, bare metal power, mock
 - Pods, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, Ingress, Autoscaler (loom)
@@ -50,7 +51,7 @@ Partial
 - Console log: written on the host, no API to read it for a VM
 - Affinity: soft hints by machine name; no server groups, no hard rule
 - Host aggregates: labels and a host selector only; no aggregate resource
-- Drain: live-migrates running virtual machines on libvirt hosts; everything else is reported and left
+- Drain: live-migrates running virtual machines on libvirt hosts whose machine disks are shared; everything else is reported and left
 - Evacuate off a dead host: machines start elsewhere from their image without the root disk; RBD volumes follow, local ones do not; no fencing
 - Compute quota: no GPU limit; a pod's machine is counted but a pod is not refused
 - NIC hot-plug: the agent can do it, nothing on the server asks it to

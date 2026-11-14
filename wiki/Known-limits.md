@@ -54,8 +54,9 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **The agent is Linux only.** Elsewhere it reports no memory and nothing is placed on it.
 - **Cloud Hypervisor and bare metal are not selectable.** The runtimes are in the source, and the agent never picks them. A machine of kind `metal` is only placed on a mock host.
 - **Hosts cannot be removed.** A host that is gone for good stays in the list.
-- **Drain only moves running virtual machines on libvirt hosts.** Containers, pods, bare metal and stopped machines are reported and left where they are.
+- **Drain only moves running virtual machines on libvirt hosts whose machine disks are shared.** Containers, pods, bare metal, stopped machines and machines whose disks are on the host itself are reported and left where they are.
 - **Live migration does not copy disks.** It only works when the destination host already sees the machine's disk at the same path. A failed migration leaves the machine in phase `error` on the old host, still running.
+- **A machine whose disks are local to its host is not drained or migrated.** The agent says whether its machine disk directory is on an NFS or SMB mount, and the answer is `local` unless it says otherwise. A machine on such a host is listed by `pi host drain` with that reason, and a migrate call for it is refused. Mount the disk directory where every host can see it and the host reports `shared` at its next hello. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 - **Evacuating a host loses root disks.** A root disk is a file on its host. An evacuated machine starts from its image, and `pi host evacuate` moves nothing without `--rebuild-from-image`.
 - **Evacuation does not fence.** PiStack cannot power off a host. If an evacuated host is still running its machines, they run twice until its agent reports again, and both copies write to any shared volume.
 - **A machine with a local or LVM volume is not evacuated.** The volume was on the dead host.

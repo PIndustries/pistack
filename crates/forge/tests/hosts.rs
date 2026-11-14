@@ -91,6 +91,7 @@ impl Harness {
     ) -> (Host, Arc<MockDriver>) {
         let mut labels = BTreeMap::new();
         labels.insert("pistack.io/agent".to_owned(), "true".to_owned());
+        labels.insert("pistack.io/disk".to_owned(), "shared".to_owned());
         let mut host = new_host(
             name,
             name,
@@ -611,6 +612,76 @@ async fn drain_migrates_what_it_can_and_reports_the_rest() {
     assert_eq!(named.host.spec.disabled_reason, "kernel update");
 }
 
+/// A volume on the host's own storage holds its machine here too: it cannot
+/// be opened from the next host. A machine with only shared volumes moves.
+#[tokio::test]
+async fn drain_leaves_a_machine_with_a_local_volume() {
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(30),
+        ..QueueConfig::default()
+    });
+    let h = harness_on(Some(queue.clone())).await;
+    let vm_host = ["kvm", "libvirt", "youki"];
+    let (src, _) = h.add_host_with("src", &vm_host, Some("10.1.0.1"));
+    h.add_host_with("dst", &vm_host, Some("10.1.0.2"));
+    h.volume_type("standard", "local");
+    h.volume_type("ceph", "rbd");
+    // The host's root disks are shared here, so only the volume can hold it.
+    h.share_disks(&src.meta.id);
+
+    // Placed before `dst` is open, so both machines start on `src`.
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/dst/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let stuck = h.machine("stuck", vm(json!({}))).await;
+    let free = h.machine("free", vm(json!({}))).await;
+    h.attach("scratch", "standard", &stuck.meta.id);
+    h.attach("blocks", "ceph", &free.meta.id);
+    for m in [&stuck, &free] {
+        assert_eq!(h.ready_on(&m.meta.id).await, src.meta.id);
+    }
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/dst/enable", None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, report) =
+        call::<DrainReport>(&h.app, &admin(), "POST", "/hosts/src/drain", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(report.migrating.len(), 1, "{report:?}");
+    assert_eq!(report.migrating[0].id, free.meta.id);
+    let left = names(&report.not_moved);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].0, "stuck");
+    assert!(left[0].1.contains("volume scratch"), "{left:?}");
+    let src_now = h.store.collection::<Host>().get(&src.meta.id).unwrap();
+    let (moving, left) =
+        forge::maintain::drain(&h.store, Some(&queue), Default::default(), &src_now).unwrap();
+    assert_eq!(moving.len(), 1, "{:?}", names(&left));
+    assert_eq!(moving[0].id, free.meta.id);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].name, "stuck");
+    assert!(left[0].reason.contains("volume scratch"), "{left:?}");
+
+    // A migrate call for the machine that cannot move is refused with the
+    // words the drain report used, and it is not marked as moving.
+    let (st, body) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        &format!("/machines/{}/migrate", stuck.meta.id),
+        Some(json!({"host": "dst"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{st}");
+    assert!(
+        String::from_utf8_lossy(&body).contains("volume scratch"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let stuck_now = h.store.collection::<Machine>().get(&stuck.meta.id).unwrap();
+    assert_eq!(stuck_now.status.phase, Phase::Ready);
+    assert_eq!(stuck_now.status.host.as_ref(), Some(&src.meta.id));
+    assert!(!stuck_now.status.message.starts_with("migrating "));
+}
+
 #[tokio::test]
 async fn drain_without_live_migration_moves_nothing_and_says_so() {
     // Dev mode shape: mock hosts and no agent transport.
@@ -672,6 +743,19 @@ impl Harness {
                     backend: backend.into(),
                 },
             ))
+            .unwrap();
+    }
+
+    /// Say `host` keeps machine disks on storage every other host can see.
+    fn share_disks(&self, host: &Id) {
+        self.store
+            .collection::<Host>()
+            .modify(host, |h| {
+                h.meta
+                    .labels
+                    .insert("pistack.io/disk".to_owned(), "shared".to_owned());
+                Ok(())
+            })
             .unwrap();
     }
 
