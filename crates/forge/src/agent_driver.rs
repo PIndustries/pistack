@@ -539,6 +539,8 @@ pub struct Registrar {
     store: Store,
     drivers: Arc<DriverRegistry>,
     queue: CommandQueue,
+    /// Where a heartbeat's samples go.
+    gauge: gauge::Client,
     /// Machines with a delete of a stale copy in flight, so a host that
     /// heartbeats before it answers is not asked twice.
     deleting_stale: Arc<parking_lot::Mutex<BTreeSet<Id>>>,
@@ -546,10 +548,22 @@ pub struct Registrar {
 
 impl Registrar {
     pub fn new(store: Store, drivers: Arc<DriverRegistry>, queue: CommandQueue) -> Self {
+        let gauge = gauge::Client::new(store.clone(), Arc::new(gauge::SampleRing::memory()));
+        Self::with_gauge(store, drivers, queue, gauge)
+    }
+
+    /// A registrar that records what hosts report into `gauge`'s window.
+    pub fn with_gauge(
+        store: Store,
+        drivers: Arc<DriverRegistry>,
+        queue: CommandQueue,
+        gauge: gauge::Client,
+    ) -> Self {
         Self {
             store,
             drivers,
             queue,
+            gauge,
             deleting_stale: Default::default(),
         }
     }
@@ -723,12 +737,7 @@ impl Registrar {
         // `status.free` stays with the reconciler, which recomputes it from
         // placements every pass; the agent's figure is informational.
         // Capacity is the host total from hello, not `resources_free`.
-        crate::stats::record_heartbeat(
-            &gauge::Gauge.client(self.store.clone()),
-            &self.store,
-            &host,
-            hb,
-        );
+        crate::stats::record_heartbeat(&self.gauge, &self.store, &host, hb);
         tracing::trace!(node = %hb.node_name, free = ?hb.resources_free, "forge: heartbeat");
         for r in &hb.machines {
             if let Err(e) = self.apply_report(&host, r) {
@@ -987,7 +996,9 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let drivers = Arc::new(DriverRegistry::new());
         let queue = CommandQueue::default();
-        let reg = Registrar::new(store.clone(), drivers.clone(), queue.clone());
+        let gauge = gauge::Client::new(store.clone(), Arc::new(gauge::SampleRing::memory()));
+        let reg =
+            Registrar::with_gauge(store.clone(), drivers.clone(), queue.clone(), gauge.clone());
 
         let host = reg.on_hello(&hello("h1")).unwrap();
         assert_eq!(host.spec.node_name, "h1");
@@ -1034,7 +1045,7 @@ mod tests {
         assert_eq!(m.status.power, PowerState::Off);
         let h = store.collection::<Host>().get(&host.meta.id).unwrap();
         assert!(h.status.last_seen.unwrap() >= host.status.last_seen.unwrap());
-        let text = gauge::Gauge.client(store.clone()).metrics_text();
+        let text = gauge.metrics_text();
         assert!(
             text.lines().any(|l| {
                 l.contains("pistack_host_memory_mib")
@@ -1063,7 +1074,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(store.collection::<Host>().list(None).unwrap().len(), 1);
-        let text = gauge::Gauge.client(store).metrics_text();
+        let text = gauge.metrics_text();
         assert!(
             !text.lines().any(|l| l.contains("host=\"ghost\"")),
             "{text}"

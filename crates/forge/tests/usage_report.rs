@@ -36,6 +36,7 @@ async fn a_machines_usage_reaches_the_api_the_exposition_and_an_alarm() {
     let deadline = Instant::now() + Duration::from_secs(60);
 
     let store = Store::in_memory().unwrap();
+    let samples = Arc::new(gauge::SampleRing::memory());
     let shutdown = CancellationToken::new();
     let ctx = ModuleContext {
         store: Arc::new(store.clone()),
@@ -51,7 +52,9 @@ async fn a_machines_usage_reaches_the_api_the_exposition_and_an_alarm() {
         heartbeat_interval: Duration::from_secs(1),
         ovn: None,
     });
-    let forge = Forge::with_queue(Arc::new(DriverRegistry::new()), queue.clone()).dev_admin(true);
+    let forge = Forge::with_queue(Arc::new(DriverRegistry::new()), queue.clone())
+        .dev_admin(true)
+        .samples(samples.clone());
     let app = Router::new()
         .nest("/compute", forge.router(ctx.clone()))
         .nest("/rpc", pistack_rpc::router(queue.clone()));
@@ -67,7 +70,7 @@ async fn a_machines_usage_reaches_the_api_the_exposition_and_an_alarm() {
     });
 
     // An alarm on the machine's memory, by its name, before it exists.
-    let gauge = gauge::Gauge.client(store.clone());
+    let gauge = gauge::Client::new(store.clone(), samples.clone());
     let alarm = gauge
         .create_alarm(
             Meta::new(kind::ALARM, "usage-web-memory", None),

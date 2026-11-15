@@ -68,6 +68,8 @@ pub struct Forge {
     /// Treat unauthenticated requests as cloud admin.
     dev_admin: bool,
     strategy: Strategy,
+    /// Where what hosts report goes, and where the stats routes read it.
+    samples: Arc<gauge::SampleRing>,
 }
 
 impl Default for Forge {
@@ -79,6 +81,7 @@ impl Default for Forge {
             local_host: true,
             dev_admin: true,
             strategy: Strategy::Spread,
+            samples: gauge::samples(),
         }
     }
 }
@@ -93,6 +96,7 @@ impl Forge {
             local_host: false,
             dev_admin: false,
             strategy: Strategy::Spread,
+            samples: gauge::samples(),
         }
     }
 
@@ -119,6 +123,12 @@ impl Forge {
     }
     pub fn strategy(mut self, s: Strategy) -> Self {
         self.strategy = s;
+        self
+    }
+    /// Record host reports in, and answer stats from, `samples`. A test
+    /// gives its own window so it reads only what its hosts reported.
+    pub fn samples(mut self, samples: Arc<gauge::SampleRing>) -> Self {
+        self.samples = samples;
         self
     }
     /// The registry the reconciler consults. Register per-host drivers here.
@@ -219,6 +229,7 @@ impl Module for Forge {
             dev_admin: self.dev_admin,
             queue: self.queue.clone(),
             strategy: self.strategy,
+            samples: self.samples.clone(),
         })
     }
 
@@ -235,6 +246,7 @@ impl Module for Forge {
         let strategy = self.strategy;
         let queue = self.queue.clone();
         let local_host = self.local_host;
+        let samples = self.samples.clone();
         let node_name = ctx.node_name.clone();
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
@@ -245,6 +257,7 @@ impl Module for Forge {
                     let drivers = drivers.clone();
                     let queue = queue.clone();
                     let node_name = node_name.clone();
+                    let samples = samples.clone();
                     async move {
                         match Forge::seed_sizes(&store) {
                             Ok(n) if n > 0 => {
@@ -265,7 +278,12 @@ impl Module for Forge {
                             }
                         }
                         let registrar = queue.as_ref().map(|q| {
-                            let r = Registrar::new(store.clone(), drivers.clone(), q.clone());
+                            let r = Registrar::with_gauge(
+                                store.clone(),
+                                drivers.clone(),
+                                q.clone(),
+                                gauge::Client::new(store.clone(), samples.clone()),
+                            );
                             tokio::spawn(r.run(active.clone()))
                         });
                         if registrar.is_some() {
