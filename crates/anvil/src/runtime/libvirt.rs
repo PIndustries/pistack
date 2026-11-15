@@ -1476,6 +1476,78 @@ pub fn images_dir() -> PathBuf {
     LibvirtRuntime::dir()
 }
 
+/// The file names this runtime's machine disks are written under: the
+/// working disk, and the in-place names a rebuild passes it through. Only a
+/// file named here is this runtime's disk; every other file in a machine
+/// directory — the seed, the domain definition, the console log, the
+/// cloud-init files — holds no image and is not a disk to be asked about.
+pub(crate) fn runtime_disk_names() -> &'static [&'static str] {
+    &["disk.qcow2", "disk.qcow2.new", "disk.qcow2.old"]
+}
+
+/// The file `disk` was built on, when it is a qcow2 disk built on one.
+/// `None` for a disk that stands alone. An error is returned for a disk this
+/// host could not ask about — a tool that is missing, one that failed, output
+/// that says nothing — which is not the same answer as a disk with nothing
+/// behind it, and must not be read as one.
+///
+/// The probe is `-U`: a running guest holds a write lock on its own disk, and
+/// a plain `info` fails on exactly the disks whose backing files matter.
+pub async fn backing_file(disk: &Path) -> ApiResult<PathBuf> {
+    let out = run(
+        &qemu_img_bin(),
+        ["info", "-U", "--output=json", &disk.to_string_lossy()],
+    )
+    .await?;
+    backing_of_json(disk, &out)
+}
+
+/// What `backing_of_json` answers for a disk with nothing behind it. A caller
+/// deciding what a sweep may delete reads this phrase to tell a flat disk —
+/// built on no cache image, a whole answer — from a disk it could not read.
+pub(crate) const FLAT_DISK: &str = "the disk has nothing behind it";
+
+/// The base named by one `qemu-img info --output=json`, resolved against `disk`
+/// the way the tool resolves a relative name. Nothing behind a disk is an error
+/// naming the disk, never an absent one: a caller walking a chain reads it as
+/// the end of that chain, and a caller deciding what may be deleted reads it as
+/// a fault it could not settle. A flat disk is told apart from an unreadable
+/// one by [`FLAT_DISK`] alone, so the flat answer names that constant.
+fn backing_of_json(disk: &Path, out: &str) -> ApiResult<PathBuf> {
+    let unreadable = |why: &str| {
+        ApiError::internal(format!(
+            "could not read the image behind {}: {why}",
+            disk.display()
+        ))
+    };
+    let json: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|err| unreadable(&format!("the answer was not json: {err}")))?;
+    let Some(base) = json.get("backing-filename").and_then(|v| v.as_str()) else {
+        // A disk that stands alone answers with a format and no backing file; a
+        // disk that was not read at all answers with neither.
+        let flat = json
+            .get("format")
+            .and_then(|v| v.as_str())
+            .is_some_and(|format| !format.is_empty());
+        return Err(unreadable(if flat {
+            FLAT_DISK
+        } else {
+            "the answer named no backing file"
+        }));
+    };
+    let base = Path::new(base);
+    if base.as_os_str().is_empty() {
+        return Err(unreadable("the answer named an empty backing file"));
+    }
+    Ok(if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        disk.parent()
+            .ok_or_else(|| unreadable("the disk has no directory to look in"))?
+            .join(base)
+    })
+}
+
 fn domain_xml(
     domain: &str,
     memory_mib: u64,
@@ -3717,5 +3789,139 @@ exit 0
         let xml = std::fs::read_to_string(vm.join("domain.xml")).unwrap();
         assert!(xml.contains("<vcpu>1</vcpu>"), "{xml}");
         assert!(xml.contains("<memory unit='MiB'>1024</memory>"), "{xml}");
+    }
+
+    /// A `qemu-img` that only answers an `info` asked with `-U`, the way a host
+    /// answers for the disk of a running machine: a guest holds a write lock on
+    /// its own disk and a plain `info` refuses to open it. It names a backing
+    /// file per disk, in `bases`, and fails a disk listed in `locked`.
+    fn write_locking_qemu_img(bin: &Path, bases: &Path, locked: &Path, log: &Path) {
+        let body = format!(
+            r#"#!/bin/sh
+BASES='{bases}'
+LOCKED='{locked}'
+echo "$*" >> '{log}'
+share=0
+disk=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -b|-F) prev=$a; continue ;;
+  esac
+  prev=$a
+  case "$a" in
+    -U) share=1; continue ;;
+    -*) continue ;;
+  esac
+  case "$a" in
+    *.qcow2|*.img|*.raw) disk=$a ;;
+  esac
+done
+key=$(basename "$disk")
+if [ "$1" != info ]; then
+  echo "fake qemu-img: not asked for info: $*" >&2
+  exit 2
+fi
+if [ "$share" != 1 ]; then
+  echo "Could not open '$disk': Failed to get shared \"write\" lock.  Is another process using the image?" >&2
+  exit 1
+fi
+if [ -f "$LOCKED/$key" ]; then
+  echo "Could not open '$disk': Failed to get \"write\" lock.  Is another process using the image?" >&2
+  exit 1
+fi
+base=$(cat "$BASES/$key" 2>/dev/null)
+case "$base" in
+  '') printf '{{"format": "qcow2", "virtual-size": 1073741824}}\n' ;;
+  /*) printf '{{"format": "qcow2", "virtual-size": 1073741824, "backing-filename": "%s"}}\n' "$base" ;;
+  *) printf '{{"format": "qcow2", "virtual-size": 1073741824, "backing-filename": "%s", "full-backing-filename": "%s"}}\n' "$base" "$(dirname "$disk")/$base" ;;
+esac
+"#,
+            bases = bases.display(),
+            locked = locked.display(),
+            log = log.display(),
+        );
+        write_exec(bin, &body);
+    }
+
+    /// A disk is only worth what it names when it can be read, and a running
+    /// guest does not let it be read without `-U`.
+    #[tokio::test]
+    async fn the_image_behind_a_running_machines_disk_needs_the_share_flag() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let bases = root.path().join("bases");
+        let locked = root.path().join("locked");
+        std::fs::create_dir_all(&bases).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        let qemu = root.path().join("qemu-img");
+        let log = root.path().join("calls");
+        write_locking_qemu_img(&qemu, &bases, &locked, &log);
+        std::env::set_var("PISTACK_QEMU_IMG", &qemu);
+
+        let disk = root.path().join("disk.qcow2");
+        std::fs::write(&disk, b"overlay").unwrap();
+        std::fs::write(bases.join("disk.qcow2"), "/cache/base.qcow2").unwrap();
+
+        let base = backing_file(&disk).await.unwrap();
+        assert_eq!(base, Path::new("/cache/base.qcow2"));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("-U"),
+            "the probe did not ask to share a running guest's lock:\n{calls}"
+        );
+
+        // The base a chain ends at answers with a format and nothing behind it:
+        // the chain stops there and nothing is missing.
+        let alone = root.path().join("alone.qcow2");
+        std::fs::write(&alone, b"flat").unwrap();
+        let e = backing_file(&alone).await.unwrap_err();
+        assert!(e.message.contains("nothing behind"), "{}", e.message);
+
+        // An answer that does not even describe a disk is not a read either.
+        let e = backing_of_json(&alone, "not json at all").unwrap_err();
+        assert!(e.message.contains("not json"), "{}", e.message);
+        let e = backing_of_json(&alone, r#"{"virtual-size": 10}"#).unwrap_err();
+        assert!(e.message.contains("no backing file"), "{}", e.message);
+
+        // A disk that cannot be opened at all — not even shared — is not read
+        // as a disk with nothing behind it.
+        std::fs::write(locked.join("disk.qcow2"), b"").unwrap();
+        let e = backing_file(&disk).await.unwrap_err();
+        assert!(e.message.contains("write"), "{}", e.message);
+
+        // A relative name is resolved against the disk's own directory, the way
+        // the tool resolves it.
+        std::fs::remove_file(locked.join("disk.qcow2")).unwrap();
+        std::fs::write(bases.join("disk.qcow2"), "near.qcow2").unwrap();
+        let base = backing_file(&disk).await.unwrap();
+        assert_eq!(base, disk.parent().unwrap().join("near.qcow2"));
+    }
+
+    /// A tool that is not there is a disk that could not be read.
+    #[tokio::test]
+    async fn a_missing_tool_is_reported_and_not_read_as_a_flat_disk() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("PISTACK_QEMU_IMG", root.path().join("no-such-qemu-img"));
+        let disk = root.path().join("disk.qcow2");
+        std::fs::write(&disk, b"overlay").unwrap();
+
+        let e = backing_file(&disk).await.unwrap_err();
+        assert!(e.message.contains("not installed"), "{}", e.message);
+    }
+
+    /// An answer that is not an answer is reported too.
+    #[test]
+    fn an_unreadable_answer_names_the_disk_it_was_read_for() {
+        let disk = Path::new("/var/lib/libvirt/images/pistack/machines/m1/disk.qcow2");
+        let base = backing_of_json(
+            disk,
+            r#"{"format": "qcow2", "backing-filename": "/cache/b.qcow2"}"#,
+        )
+        .unwrap();
+        assert_eq!(base, Path::new("/cache/b.qcow2"));
     }
 }

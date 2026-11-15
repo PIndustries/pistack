@@ -27,6 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::images::ImageCache;
+/// The keep time and sweep interval of this host, named here so a caller of the
+/// agent can reach them without going into the image cache.
+pub use crate::images::SweepSettings;
 use chrono::Utc;
 use pistack_rpc::proto::{
     AgentHello, Command, CommandKind, CommandResult, DiskTarget, ExecRequest, Heartbeat, LogText,
@@ -411,6 +414,11 @@ async fn run_agent_on(
     underlay: Option<String>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    // The cache is swept whether or not this host has ever reached its control
+    // plane, so the settings are read, and a bad one refused, before the agent
+    // loops at all.
+    let sweep =
+        crate::images::sweep_settings().map_err(|msg| anyhow::anyhow!("anvil agent: {msg}"))?;
     let ovn_watch = Arc::new(AtomicBool::new(
         facts.capabilities.iter().any(|c| c == "ovs"),
     ));
@@ -419,7 +427,8 @@ async fn run_agent_on(
         runtimes,
         facts,
         probes: Arc::new(ProbeBook::new()),
-        images: ImageCache::new(&data_dir()),
+        images: Arc::new(ImageCache::new(&data_dir())),
+        sweep,
         ovn,
         ovn_watch,
         meta,
@@ -427,13 +436,22 @@ async fn run_agent_on(
         done: Arc::new(Completed::open(data_dir().join(crate::done::FILE))),
         unsent: Mutex::new(Vec::new()),
     };
+    // Swept beside the sessions, not inside one: a host whose control plane is
+    // down still has a cache to empty, and a machine stopped long ago is no
+    // less unused for the link being out.
+    let sweep = tokio::spawn(crate::images::run(
+        agent.images.clone(),
+        agent.sweep.keep_days,
+        agent.sweep.every,
+        shutdown.clone(),
+    ));
     let mut backoff = BACKOFF_MIN;
     loop {
         if shutdown.is_cancelled() {
-            return Ok(());
+            break;
         }
         match agent.session(&shutdown).await {
-            SessionEnd::Shutdown => return Ok(()),
+            SessionEnd::Shutdown => break,
             SessionEnd::Rehello => {
                 // The server forgot us (restart): say hello again at once.
                 backoff = BACKOFF_MIN;
@@ -441,13 +459,15 @@ async fn run_agent_on(
             SessionEnd::Error(e) => {
                 tracing::warn!(error = %e, retry_in = ?backoff, "anvil agent: control plane unreachable");
                 tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(backoff) => {}
                 }
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
     }
+    let _ = sweep.await;
+    Ok(())
 }
 
 enum SessionEnd {
@@ -461,7 +481,9 @@ struct Agent {
     runtimes: Runtimes,
     facts: HostFacts,
     probes: Arc<ProbeBook>,
-    images: ImageCache,
+    images: Arc<ImageCache>,
+    /// The keep time and interval the cache is swept on, read at startup.
+    sweep: SweepSettings,
     ovn: Arc<OvnHost>,
     /// Report OVN in heartbeats. Turned on by a hello answer that carries
     /// OVN settings, and from the start on a host that has Open vSwitch.
@@ -2059,7 +2081,14 @@ still here
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
-            images: ImageCache::new(std::path::Path::new("/nonexistent")),
+            images: Arc::new(ImageCache::pinned(
+                std::path::Path::new("/nonexistent"),
+                Arc::new(crate::images::NoPins),
+            )),
+            sweep: crate::images::SweepSettings {
+                keep_days: 7,
+                every: Duration::from_secs(60),
+            },
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(MetaNets::system()),
@@ -2235,7 +2264,14 @@ still here
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
-            images: ImageCache::new(std::path::Path::new("/nonexistent")),
+            images: Arc::new(ImageCache::pinned(
+                std::path::Path::new("/nonexistent"),
+                Arc::new(crate::images::NoPins),
+            )),
+            sweep: crate::images::SweepSettings {
+                keep_days: 7,
+                every: Duration::from_secs(60),
+            },
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(MetaNets::system()),
@@ -2845,7 +2881,14 @@ still here
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
-            images: ImageCache::new(dir.path()),
+            images: Arc::new(ImageCache::pinned(
+                dir.path(),
+                Arc::new(crate::images::NoPins),
+            )),
+            sweep: crate::images::SweepSettings {
+                keep_days: 7,
+                every: Duration::from_secs(60),
+            },
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(MetaNets::system()),
@@ -3098,7 +3141,14 @@ still here
             runtimes: Runtimes::all(rt),
             facts: facts::gather(),
             probes: Arc::new(ProbeBook::new()),
-            images: ImageCache::new(std::path::Path::new("/nonexistent")),
+            images: Arc::new(ImageCache::pinned(
+                std::path::Path::new("/nonexistent"),
+                Arc::new(crate::images::NoPins),
+            )),
+            sweep: crate::images::SweepSettings {
+                keep_days: 7,
+                every: Duration::from_secs(60),
+            },
             ovn: Arc::new(OvnHost::system()),
             ovn_watch: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(MetaNets::system()),

@@ -46,11 +46,18 @@ fn state_dir() -> PathBuf {
     }
 }
 
-fn images_dir() -> PathBuf {
+pub(crate) fn images_dir() -> PathBuf {
     match std::env::var_os("PISTACK_METAL_IMAGES") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => PathBuf::from(DEFAULT_IMAGES_DIR),
     }
+}
+
+/// The file names this runtime's machine disks are written under. Metal boots
+/// a machine from a file named by its image, so the image's own extensions
+/// are the disk names: a machine file named otherwise holds no image.
+pub(crate) fn runtime_disk_names() -> &'static [&'static str] {
+    &[".iso", ".img", ".qcow2"]
 }
 
 fn has_parent_dir(path: &Path) -> bool {

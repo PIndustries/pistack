@@ -19,3 +19,11 @@ pub(crate) fn state_dir() -> PathBuf {
     }
     PathBuf::from(DEFAULT_STATE)
 }
+
+/// The container runtime writes no machine disk: an image is unpacked into a
+/// `rootfs` directory and an attached volume names a host device or a folder,
+/// never a disk file of its own. Nothing in its state directory is a disk a
+/// cache image could be layered on.
+pub(crate) fn runtime_disk_names() -> &'static [&'static str] {
+    &[]
+}

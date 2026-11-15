@@ -225,6 +225,13 @@ Setting any `PISTACK_KEEP_VAULT_*` variable without `PISTACK_KEEP_BACKEND=vault`
 | `PISTACK_IP_BIN` | `ip` | `ip` binary for pod networking. |
 | `PISTACK_OVS_VSCTL_BIN` | `ovs-vsctl` | `ovs-vsctl` binary for plugging pods into OVN. |
 
+### Images
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_IMAGE_KEEP_DAYS` | `7` | Days an image nothing on the host uses is kept in the cache before a sweep deletes it. `0` is valid and means an unused image is kept for nothing beyond the sweep that finds it unused. A value that is not a whole number of days stops the agent at startup with an error. |
+| `PISTACK_IMAGE_SWEEP_SECONDS` | `21600` | How often the agent sweeps the image cache, from the moment the agent starts. `0` or a value that is not a number of seconds stops the agent at startup with an error. A sweep never deletes an image a machine uses, a machine disk is built on, one a machine's record names while its disk is still being provisioned, or one a download is filling in, and never deletes a file on the sweep that first finds it. A sweep that cannot read whether an image is in use — a machine disk it cannot open, a machine directory it cannot list, `qemu-img` missing — deletes nothing at all, warns once about what it could not read, and asks again next sweep. |
+
 ### Volumes
 
 | Variable | Default | Meaning |

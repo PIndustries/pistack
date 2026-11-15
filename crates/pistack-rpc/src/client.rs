@@ -398,12 +398,27 @@ impl AgentClient {
     /// caller streams it with [`reqwest::Response::chunk`]. A follower's
     /// leader hint is followed like any other call.
     pub async fn open_image(&self, id: &str) -> Result<Response, RpcError> {
+        self.open_image_range(id, None).await
+    }
+
+    /// Open the bytes of catalog image `id` with `range` as the `Range`
+    /// header. A server that knows ranges answers `206` with the part asked
+    /// for; one that does not answers `200` with the whole file. The caller
+    /// tells the two apart by the status.
+    pub async fn open_image_range(
+        &self,
+        id: &str,
+        range: Option<String>,
+    ) -> Result<Response, RpcError> {
         let mut hops = 0;
         loop {
             let base = self.base_url();
             // No request timeout: an image can take minutes. The caller
             // gives up when the body stalls.
-            let request = self.http().get(format!("{base}/images/{id}/data"));
+            let mut request = self.http().get(format!("{base}/images/{id}/data"));
+            if let Some(range) = &range {
+                request = request.header(reqwest::header::RANGE, range);
+            }
             let resp = match self.prepare(request).send().await {
                 Ok(resp) => resp,
                 Err(e) => {
