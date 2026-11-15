@@ -114,6 +114,14 @@ pub async fn ensure_share_root() -> ApiResult<PathBuf> {
 /// Realize `share` together with the shares already stored. `share` itself
 /// is not written; the caller stores it. Other shares are updated when
 /// their status changes.
+///
+/// A share not stored yet is worked on from the revision it will be filed at,
+/// which is the one [`pistack_store::Collection::create`] sets. Left at the zero
+/// its record is built with, the status handed back says "nothing of this has
+/// been observed", and the answer to a create is a share forever waiting on
+/// itself: `pi share show` still says `pending` a minute later, because the
+/// reconciler's own "is there work here" test is a status that has not caught up
+/// with the record — and a pass that fails backs off before it looks again.
 pub async fn prepare(store: &Store, share: &mut Share) -> ApiResult<()> {
     reject_bad_cidr(share)?;
     let _guard = export_lock().lock().await;
@@ -122,6 +130,7 @@ pub async fn prepare(store: &Store, share: &mut Share) -> ApiResult<()> {
     if let Some(pos) = all.iter().position(|s| s.meta.id == id) {
         all[pos] = share.clone();
     } else {
+        share.status.observed_revision = share.meta.revision;
         all.push(share.clone());
     }
     let _publish = drive(&mut all, Utc::now(), Some(&id), false).await;

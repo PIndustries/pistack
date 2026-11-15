@@ -42,6 +42,9 @@ base64.workspace = true
 [dev-dependencies]
 beacon.workspace = true
 relay.workspace = true
+shelf.workspace = true
+slab.workspace = true
+tokio-util.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 silo.workspace = true

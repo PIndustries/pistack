@@ -1069,6 +1069,69 @@ impl<K: Kind> Collection<K> {
         self.get_by_name(project, name_or_id)
     }
 
+    /// Resolve `name-or-id` for a caller who may reach the whole cloud.
+    ///
+    /// An id — whole, or the short tail a table prints — is the row's own
+    /// address and is answered whole. A name is looked up in `project` and then
+    /// in the cloud scope: a row created through a token holding no project is
+    /// filed under the bare name, and the caller listing it usually holds one.
+    /// A caller of no project therefore resolves the same row its own list
+    /// printed, rather than being handed a name it cannot use. What the caller
+    /// may then touch is the caller's own rule; this is only where the row is
+    /// found.
+    ///
+    /// The name order is deliberately not reversed. A name is unique inside a
+    /// project and separately unique in the cloud scope, so the two can hold
+    /// different rows of the same name; the caller's own project wins, exactly
+    /// as it does for [`Self::resolve`].
+    pub fn resolve_scoped(&self, project: Option<&Id>, name_or_id: &str) -> Result<K> {
+        if let Some(id) = self.addressed(name_or_id)? {
+            return self.get(&id);
+        }
+        match self.find_by_name(project, name_or_id)? {
+            Some(k) => Ok(k),
+            None if project.is_some() => self.get_by_name(None, name_or_id),
+            None => Err(StoreError::NotFound(format!(
+                "{} '{name_or_id}' not found",
+                K::KIND
+            ))),
+        }
+    }
+
+    /// The id of the row this collection holds that `text` is the address of, if
+    /// any: a whole id of this kind, or the short form a table prints.
+    ///
+    /// A whole id is answered straight from the row key — the resources table is
+    /// keyed `{kind}/{id}`, so a lookup by a valid id cannot be beaten by a name
+    /// that looks the same way. This matters more than it looks: names may
+    /// contain hyphens and hex, so a long hyphenated name is indistinguishable
+    /// from an id to a parser that only reads text, and a service that generates
+    /// a resource name out of another resource's full id — a restored volume is
+    /// named after the backup it came from — then produces rows whose names are
+    /// id-shaped. Resolving those names before the row's own address lets a
+    /// project own the name and quietly answer a different row than the caller
+    /// pointed at, or answer `not found` for a row it can see in its own list.
+    ///
+    /// A whole id that names no row is not an answer: it falls through to the
+    /// name lookup, because an id that was deleted is a name nobody has taken.
+    fn addressed(&self, text: &str) -> Result<Option<Id>> {
+        if let Some(id) = Id::parse(leak(K::KIND), text) {
+            if self.try_get(&id)?.is_some() {
+                return Ok(Some(id));
+            }
+        }
+        displayed_id(self, K::KIND, text)
+    }
+
+    /// [`Self::get_by_name`] as `None` rather than an error.
+    fn find_by_name(&self, project: Option<&Id>, name: &str) -> Result<Option<K>> {
+        match self.get_by_name(project, name) {
+            Ok(k) => Ok(Some(k)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// All resources of this kind, optionally one project's.
     pub fn list(&self, project: Option<&Id>) -> Result<Vec<K>> {
         let prefix = format!("{}/", K::KIND);
@@ -1249,6 +1312,76 @@ impl<K: Kind> Collection<K> {
 fn leak(s: &str) -> &'static str {
     // KIND constants are already 'static; this only runs for them.
     Box::leak(s.to_owned().into_boxed_str())
+}
+
+/// How many hex digits of an id a display keeps, and the shortest run that
+/// is read back as an id rather than a name.
+const SHORT_ID_HEX: usize = 8;
+const SHORT_ID_MIN: usize = 4;
+
+/// The id as a table column prints it: the kind prefix and the last
+/// [`SHORT_ID_HEX`] hex digits of the uuid.
+pub fn short_id(id: &Id) -> String {
+    let hex = id.uuid.simple().to_string();
+    format!("{}-{}", id.kind, &hex[hex.len() - SHORT_ID_HEX..])
+}
+
+/// Read back what [`short_id`] wrote as the id of `prefix`, or a full id,
+/// against the rows of `col`.
+///
+/// The short form is what a table shows, so it is what an operator copies
+/// back. The tail is not unique on its own — see [`find_by_short_id`] — and
+/// a run shorter than [`SHORT_ID_MIN`] is taken for what it most likely is:
+/// a name, so this answers `None` and the caller looks the name up.
+pub fn displayed_id<K: Kind>(col: &Collection<K>, prefix: &str, text: &str) -> Result<Option<Id>> {
+    if let Some(id) = Id::parse(leak(prefix), text) {
+        return Ok(Some(id));
+    }
+    // The prefix is what the tool that printed the id calls the kind, which is
+    // not always the kind itself: a table's ID column prints a backup as
+    // `bak-1a2b3c4d` while the row's kind is `backup`. An id read back has to
+    // be tried under the name it was written with as well as under the kind,
+    // or every short id from that table is a word the service cannot find.
+    for kind in [K::KIND, prefix] {
+        if let Some(tail) = short_tail_of(kind, text) {
+            return find_by_short_id(col, &tail);
+        }
+    }
+    Ok(None)
+}
+
+/// The tail [`short_id`] keeps, when `text` is that form of an id of
+/// `prefix`. `None` when `text` is neither a full id of `prefix` nor
+/// `prefix-<tail>`.
+pub fn short_tail_of(prefix: &str, text: &str) -> Option<String> {
+    if Id::parse(leak(prefix), text).is_some() {
+        return None;
+    }
+    text.strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('-'))
+        .filter(|t| t.len() >= SHORT_ID_MIN && t.len() < 32)
+        .filter(|t| t.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|t| t.to_ascii_lowercase())
+}
+
+/// The row of `col` whose id ends in `tail`. A v7 uuid leads with a
+/// millisecond clock, so a tail is unique while rows are made apart; a tail
+/// two rows do share is refused rather than guessed.
+pub fn find_by_short_id<K: Kind>(col: &Collection<K>, tail: &str) -> Result<Option<Id>> {
+    let hits: Vec<Id> = col
+        .list(None)?
+        .into_iter()
+        .map(|item| item.meta().id.clone())
+        .filter(|id| id.uuid.simple().to_string().ends_with(tail))
+        .collect();
+    match hits.len() {
+        0 => Ok(None),
+        1 => Ok(hits.into_iter().next()),
+        _ => Err(StoreError::Conflict(format!(
+            "short id '{tail}' is ambiguous: {} rows end in it",
+            hits.len()
+        ))),
+    }
 }
 
 /// What [`check_file`] read from a store file.

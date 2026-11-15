@@ -336,6 +336,19 @@ impl Client {
         Ok(self.call(Method::GET, path, None).await?.1)
     }
 
+    /// `GET` that answers `None` on `not found` instead of an error: for a
+    /// caller that is looking something up of its own accord and wants to keep
+    /// its own words for a row that is not there. Any other failure, including
+    /// a `forbidden` whose message names an object the caller never asked
+    /// about, is returned as it came.
+    pub async fn get_or_none(&self, path: &str) -> CliResult<Option<Value>> {
+        match self.call(Method::GET, path, None).await {
+            Ok((_, v)) => Ok(Some(v)),
+            Err(CliError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn post(&self, path: &str, body: &Value) -> CliResult<Value> {
         Ok(self.call(Method::POST, path, Some(body)).await?.1)
     }
