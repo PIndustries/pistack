@@ -362,6 +362,8 @@ async fn reads_at_leader(
         return next.run(req).await;
     }
     if crate::cluster::wants_forward(req.headers()) {
+        let mut req = req;
+        req.headers_mut().remove(crate::cluster::FORWARD_HEADER);
         return crate::cluster::forward_to_leader(&handle, req).await;
     }
     let leader = handle
