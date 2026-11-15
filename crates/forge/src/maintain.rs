@@ -316,7 +316,7 @@ pub fn drain(
     Ok((moving, left))
 }
 
-fn phase_word(phase: Phase) -> String {
+pub(crate) fn phase_word(phase: Phase) -> String {
     format!("{phase:?}").to_lowercase()
 }
 

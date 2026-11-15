@@ -745,6 +745,22 @@ impl Agent {
                 self.probes.forget(&r.id);
                 Ok(serde_json::Value::Null)
             }
+            CommandKind::RebuildMachine => {
+                let mut req: MachineRequest = payload(c.payload)?;
+                tracing::info!(machine = %req.id, name = %req.name, "anvil: rebuild");
+                if req.nics.iter().any(on_ovn) {
+                    self.ovn.require_ready().await?;
+                    self.meta.refresh(&self.client).await;
+                }
+                self.localize_image(&mut req).await?;
+                let rt = self.runtimes.rebuild(&req).await?;
+                self.probes.install(
+                    &req.id,
+                    probe::probes_in_user_data(req.user_data.as_deref()),
+                    Utc::now(),
+                );
+                serde_json::to_value(rt).map_err(|e| ApiError::internal(e.to_string()))
+            }
             CommandKind::AttachVolume => {
                 let req: VolumeAttach = payload(c.payload)?;
                 tracing::info!(machine = %req.machine, volume = %req.volume, "anvil: attach volume");

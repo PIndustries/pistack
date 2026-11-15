@@ -83,6 +83,11 @@ pub const NODE_PIN_ANNOTATION: &str = "loom.pistack.io/node";
 /// to plug shared volumes back in.
 pub const EVACUATED_FROM_ANNOTATION: &str = "pistack.io/evacuated-from";
 
+/// A root disk rebuild the reconciler owes the machine, written by
+/// `POST /machines/{id}/rebuild`. The value is the image the new disk is a
+/// copy of. While it is set, `Updating` means rebuild, not migration.
+pub const REBUILD_ANNOTATION: &str = "pistack.io/rebuild";
+
 /// Host label that names the availability zone. `MachineSpec::zone` is a
 /// hard selector on it.
 pub const ZONE_LABEL: &str = "zone";
@@ -510,4 +515,13 @@ fn underlay_ip_ok(ip: Ipv4Addr) -> bool {
 /// Whether a delete has been requested (see `DELETE_ANNOTATION`).
 pub fn delete_requested(m: &Machine) -> bool {
     m.meta.annotations.contains_key(DELETE_ANNOTATION) || m.status.phase == Phase::Deleting
+}
+
+/// Whether a root disk rebuild is owed to this machine (see
+/// `REBUILD_ANNOTATION`).
+pub fn rebuild_requested(m: &Machine) -> bool {
+    m.meta
+        .annotations
+        .get(REBUILD_ANNOTATION)
+        .is_some_and(|v| !v.is_empty())
 }

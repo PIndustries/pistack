@@ -94,6 +94,32 @@ impl MachineRuntime for MockRuntime {
         Ok(())
     }
 
+    /// The record is replaced with a fresh one, as a rebuilt disk is. The
+    /// machine keeps its identity on the host, and so its address.
+    async fn rebuild(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
+        {
+            let mut st = self.lock()?;
+            let Some(old) = st.machines.get(&req.id) else {
+                return Err(ApiError::not_found(format!(
+                    "mock runtime: machine {} not here",
+                    req.id
+                )));
+            };
+            let rt = RunningMachine {
+                id: req.id.clone(),
+                addresses: old.addresses.clone(),
+                power: PowerState::On,
+                message: String::new(),
+            };
+            st.machines.insert(req.id.clone(), rt);
+            st.probes.insert(
+                req.id.clone(),
+                crate::probe::probes_in_user_data(req.user_data.as_deref()),
+            );
+        }
+        self.start(req).await
+    }
+
     async fn container_probes(&self, id: &Id) -> Vec<crate::probe::ContainerProbes> {
         self.lock()
             .map(|st| st.probes.get(id).cloned().unwrap_or_default())

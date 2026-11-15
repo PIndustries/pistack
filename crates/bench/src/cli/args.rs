@@ -649,9 +649,29 @@ crud!(
     Stop(PowerArgs),
     /// Reboot.
     Reboot(PowerArgs),
+    /// Replace the machine's root disk with a fresh copy of an image and
+    /// start it again. Its id, name, host, network and keys are kept; what
+    /// was on the root disk is gone.
+    Rebuild(MachineRebuildArgs),
     /// What the machine is using now: CPU, memory, disk and network.
     Stats(NameArg),
 );
+
+#[derive(Args, Debug)]
+pub struct MachineRebuildArgs {
+    /// Name or id.
+    pub name: String,
+    /// Image the new root disk is a copy of (name or id). Default: the
+    /// image the machine has.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Wait until the machine is ready again (or failed).
+    #[arg(long)]
+    pub wait: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct PodCreate {

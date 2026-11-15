@@ -113,21 +113,19 @@ impl RpcDriver {
         }
     }
 
-    /// Send one command and wait for the host's answer. With `machine`
-    /// the command is keyed by that machine: the reconciler issues it again
-    /// after a leader change, it keeps its id, and the host runs it once.
+    /// Send one command and wait for the host's answer. With `key` the
+    /// command is keyed: the reconciler issues it again after a leader
+    /// change, it keeps its id, and the host runs it once.
     async fn call<T: serde::Serialize>(
         &self,
-        machine: Option<&Id>,
+        key: Option<&str>,
         kind: CommandKind,
         payload: &T,
     ) -> ApiResult<serde_json::Value> {
         let payload =
             serde_json::to_value(payload).map_err(|e| ApiError::internal(e.to_string()))?;
-        let ticket = match machine {
-            Some(id) => self
-                .queue
-                .enqueue_keyed(&self.node, &machine_key(id), kind, payload)?,
+        let ticket = match key {
+            Some(key) => self.queue.enqueue_keyed(&self.node, key, kind, payload)?,
             None => self.queue.enqueue(&self.node, kind, payload)?,
         };
         // Timeouts, queue-full and node-removed all map to `unavailable`
@@ -188,7 +186,11 @@ impl HostDriver for RpcDriver {
             )));
         }
         let v = self
-            .call(Some(&m.meta.id), CommandKind::StartMachine, &req)
+            .call(
+                Some(&machine_key(&m.meta.id)),
+                CommandKind::StartMachine,
+                &req,
+            )
             .await?;
         let rt: RunningMachine = serde_json::from_value(v).map_err(|e| {
             ApiError::internal(format!(
@@ -201,7 +203,7 @@ impl HostDriver for RpcDriver {
 
     async fn stop(&self, id: &Id) -> ApiResult<()> {
         self.call(
-            Some(id),
+            Some(&machine_key(id)),
             CommandKind::StopMachine,
             &MachineRef { id: id.clone() },
         )
@@ -211,12 +213,33 @@ impl HostDriver for RpcDriver {
 
     async fn delete(&self, id: &Id) -> ApiResult<()> {
         self.call(
-            Some(id),
+            Some(&machine_key(id)),
             CommandKind::DeleteMachine,
             &MachineRef { id: id.clone() },
         )
         .await
         .map(|_| ())
+    }
+
+    /// The old disk is gone once the host answers, so this is asked once:
+    /// the reconciler ends the request in `Error` on a failure instead of
+    /// sending it again.
+    async fn rebuild(&self, m: &Machine) -> ApiResult<MachineRuntime> {
+        let req = self.request_for(m);
+        let v = self
+            .call(
+                Some(&rebuild_key(&m.meta.id)),
+                CommandKind::RebuildMachine,
+                &req,
+            )
+            .await?;
+        let rt: RunningMachine = serde_json::from_value(v).map_err(|e| {
+            ApiError::internal(format!(
+                "host {} returned a bad rebuild result: {e}",
+                self.node
+            ))
+        })?;
+        Ok(runtime_from_wire(rt))
     }
 
     /// Always `Ok(empty)`: there is no list command on the wire. The agent
@@ -234,8 +257,15 @@ pub fn machine_key(id: &Id) -> String {
     format!("machine/{id}")
 }
 
+/// The queue key of a machine's rebuild. A rebuild is not a start that may
+/// be re-sent: its answer is keyed apart so a memoised start never stands
+/// in for it, and a memoised rebuild never stands in for a later start.
+fn rebuild_key(id: &Id) -> String {
+    format!("{}/rebuild", machine_key(id))
+}
+
 /// Catalog row, read as JSON so forge does not depend on mold.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct CatalogImage {
     id: String,
     name: String,
@@ -243,18 +273,23 @@ struct CatalogImage {
     #[serde(default)]
     project: Option<String>,
     #[serde(default)]
+    created_at: String,
+    #[serde(default)]
     spec: CatalogSpec,
     #[serde(default)]
     status: CatalogStatus,
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(Clone, serde::Deserialize, Default)]
 struct CatalogSpec {
     #[serde(default)]
     format: String,
     /// `private` (the default), `project` or `public`.
     #[serde(default)]
     visibility: String,
+    /// Smallest disk the image is known to need.
+    #[serde(default)]
+    min_disk_gib: u64,
 }
 
 /// An image member row: `project` may use `image`.
@@ -269,7 +304,7 @@ struct CatalogMemberSpec {
     project: String,
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(Clone, serde::Deserialize, Default)]
 struct CatalogStatus {
     #[serde(default)]
     phase: String,
@@ -281,6 +316,9 @@ struct CatalogStatus {
     sha256: Option<String>,
     #[serde(default)]
     size_bytes: Option<u64>,
+    /// Size of the disk the image expands to.
+    #[serde(default)]
+    virtual_size_bytes: Option<u64>,
 }
 
 impl CatalogImage {
@@ -339,6 +377,99 @@ impl CatalogImage {
             format: self.spec.format.clone(),
         })
     }
+
+    /// The smallest disk this image needs: what the catalog recorded, and
+    /// at least the disk the image expands to.
+    fn min_disk_gib(&self) -> u64 {
+        let expanded = self
+            .status
+            .virtual_size_bytes
+            .map(|b| b.div_ceil(1 << 30))
+            .unwrap_or(0);
+        self.spec.min_disk_gib.max(expanded)
+    }
+}
+
+/// The catalog image called `name_or_id` (name or id). The name is looked up
+/// as `mold::Client::resolve` looks it up: the project's own image first,
+/// then a cloud-wide one, then a public one of that name, newest first.
+fn catalog_named(store: &Store, project: Option<&Id>, name_or_id: &str) -> Option<CatalogImage> {
+    if let Some(id) = pistack_types::Id::parse(pistack_types::kind::IMAGE, name_or_id) {
+        let key = format!("img/{id}");
+        let (_, bytes) = store
+            .raw_scan("resources", &key)
+            .ok()?
+            .into_iter()
+            .find(|(k, _)| k == &key)?;
+        return serde_json::from_slice(&bytes).ok();
+    }
+    let rows: Vec<CatalogImage> = store
+        .raw_scan("resources", "img/")
+        .ok()?
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice(&bytes).ok())
+        .filter(|i: &CatalogImage| i.name == name_or_id)
+        .collect();
+    let own = project.map(Id::to_string);
+    rows.iter()
+        .find(|i| i.project == own)
+        .or_else(|| rows.iter().find(|i| i.project.is_none()))
+        .or_else(|| {
+            rows.iter()
+                .filter(|i| i.spec.visibility == "public")
+                .max_by_key(|i| i.created_at.as_str())
+        })
+        .cloned()
+}
+
+/// Why `image` cannot be a machine's boot image, or `None` when it can: a
+/// path the host resolves itself, or a catalog image that is ready, visible
+/// to `project` and carries a file or a digest. Unlike a start, which sends
+/// an unknown name to the host and fails there, a rebuild answers now.
+pub(crate) fn boot_image_problem(
+    store: &Store,
+    project: Option<&Id>,
+    image: &str,
+) -> Option<String> {
+    if image.trim().is_empty() {
+        return Some("the machine names no image".to_owned());
+    }
+    if Path::new(image).is_absolute() {
+        return None;
+    }
+    match catalog_named(store, project, image) {
+        None => Some(format!("image '{image}' not found")),
+        Some(img) if img.status.phase != "ready" => Some(format!(
+            "image '{image}' is {phased}, not ready",
+            phased = img.status.phase
+        )),
+        Some(img) if !img.usable_by(store, project) => {
+            Some(format!("image '{image}' is not visible to this project"))
+        }
+        Some(img) if img.local_file().is_none() && img.source().is_none() => Some(format!(
+            "image '{image}' has no file and no digest the host can use"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Why `image` cannot become the root disk of a machine of `disk_gib`, or
+/// `None` when it fits or the store knows nothing to size it by. A disk of
+/// 0 takes the default of 10 GiB, as the host's provision does.
+pub(crate) fn boot_image_size_problem(
+    store: &Store,
+    project: Option<&Id>,
+    image: &str,
+    disk_gib: u64,
+) -> Option<String> {
+    if Path::new(image).is_absolute() {
+        return None;
+    }
+    let img = catalog_named(store, project, image)?;
+    let want = img.min_disk_gib();
+    let disk = if disk_gib == 0 { 10 } else { disk_gib };
+    (want > disk)
+        .then(|| format!("image '{image}' needs a {want} GiB disk; the size gives {disk} GiB"))
 }
 
 /// The image string for the wire, and where an agent can fetch it.
