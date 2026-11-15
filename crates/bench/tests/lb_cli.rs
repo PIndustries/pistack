@@ -417,7 +417,7 @@ async fn pool_list_create_show_delete() {
             "--protocol",
             "http",
             "--algorithm",
-            "least-conn",
+            "least_conn",
             "--health-check",
             "--monitor",
             "http",
@@ -500,6 +500,46 @@ async fn pool_list_create_show_delete() {
     let v: Value = serde_json::from_str(&r.out).unwrap();
     assert_eq!(v["spec"]["protocol"], "tcp");
     assert_eq!(v["spec"]["health_monitor"]["kind"], "http");
+
+    // The help names the three it takes, so a reader sees the wire names.
+    let r = pi(&s, &["lb", "pool", "create", "--help"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let help = format!("{}{}", r.out, r.err);
+    assert!(
+        help.contains("round_robin, least_conn or source_ip"),
+        "{help}"
+    );
+
+    // --algorithm takes the wire names and nothing else, refused locally
+    // with the same words the API uses.
+    for bad in ["least-conn", "weighted_rr"] {
+        let r = pi(
+            &s,
+            &[
+                "lb",
+                "pool",
+                "create",
+                "--balancer",
+                "web-lb",
+                "--algorithm",
+                bad,
+                "bad-pool",
+            ],
+        )
+        .await;
+        assert_ne!(r.code, 0, "{bad}: {r:?}");
+        assert!(
+            r.err
+                .contains(&format!("algorithm '{bad}' is not a balancing algorithm")),
+            "{bad}: {}",
+            r.err
+        );
+        assert!(r.err.contains("round_robin"), "{bad}: {}", r.err);
+        assert!(r.err.contains("least_conn"), "{bad}: {}", r.err);
+        assert!(r.err.contains("source_ip"), "{bad}: {}", r.err);
+    }
+    let r = pi(&s, &["lb", "pool", "show", "bad-pool"]).await;
+    assert_ne!(r.code, 0);
 
     let r = pi(
         &s,

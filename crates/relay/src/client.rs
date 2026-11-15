@@ -442,19 +442,13 @@ impl Client {
         Ok(m)
     }
 
-    /// Members of a pool that should take traffic right now.
+    /// Members of a pool that should take traffic right now. Everything the
+    /// data planes dial starts here, so no algorithm can reach a member that
+    /// is administratively down, `Offline`, `Draining` or weighted zero.
     pub fn active_members(&self, pool: &Pool) -> ApiResult<Vec<Member>> {
-        Ok(self
-            .members_of(&pool.meta.id)?
+        Ok(crate::picker::eligible(&self.members_of(&pool.meta.id)?)
             .into_iter()
-            .filter(|m| {
-                m.spec.admin_up
-                    && m.spec.weight > 0
-                    && matches!(
-                        m.status.operating_status,
-                        OperatingStatus::Online | OperatingStatus::NoMonitor
-                    )
-            })
+            .cloned()
             .collect())
     }
 

@@ -465,12 +465,39 @@ pub enum PoolProto {
     Https,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum PoolAlgorithm {
     #[default]
     RoundRobin,
     LeastConn,
     SourceIp,
+}
+
+impl PoolAlgorithm {
+    /// The names a pool spec carries, and the only ones `--algorithm`
+    /// accepts, so the CLI refuses what the relay would refuse.
+    pub const NAMES: [&'static str; 3] = ["round_robin", "least_conn", "source_ip"];
+
+    /// Refused before the request goes out, in the relay's own words.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "round_robin" => Ok(Self::RoundRobin),
+            "least_conn" => Ok(Self::LeastConn),
+            "source_ip" => Ok(Self::SourceIp),
+            other => Err(format!(
+                "algorithm '{other}' is not a balancing algorithm; use one of {}",
+                Self::NAMES.join(", ")
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::LeastConn => "least_conn",
+            Self::SourceIp => "source_ip",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -492,8 +519,9 @@ pub struct PoolCreate {
     pub meta: MetaArgs,
     #[arg(long, value_enum, default_value_t = PoolProto::Tcp)]
     pub protocol: PoolProto,
-    #[arg(long, value_enum, default_value_t = PoolAlgorithm::RoundRobin)]
-    pub algorithm: PoolAlgorithm,
+    /// Spreading algorithm: round_robin, least_conn or source_ip.
+    #[arg(long, default_value = "round_robin", value_name = "ALGORITHM")]
+    pub algorithm: String,
     /// Add a health monitor with these probe settings.
     #[arg(long)]
     pub health_check: bool,
@@ -782,6 +810,8 @@ async fn pool(ctx: &Ctx, cmd: PoolCmd, io: &mut Io<'_>) -> CliResult<()> {
 }
 
 async fn pool_create(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: PoolCreate) -> CliResult<()> {
+    let algorithm = PoolAlgorithm::parse(&a.algorithm)
+        .map_err(|reason| CliError::usage(format!("--algorithm: {reason}")))?;
     let c = ctx.client()?;
     let protocol = match a.protocol {
         PoolProto::Tcp => "tcp",
@@ -812,11 +842,7 @@ async fn pool_create(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: PoolCreate) -> 
     let spec = json!({
         "balancer": commands::resolve(&c, kind_balancer(), &a.balancer).await?,
         "protocol": protocol,
-        "algorithm": match a.algorithm {
-            PoolAlgorithm::RoundRobin => "round_robin",
-            PoolAlgorithm::LeastConn => "least_conn",
-            PoolAlgorithm::SourceIp => "source_ip",
-        },
+        "algorithm": algorithm.name(),
         "health_monitor": health_monitor,
         "admin_up": !a.down,
     });

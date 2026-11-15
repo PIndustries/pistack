@@ -9,31 +9,87 @@
 //! port. Unspecified, public, multicast, broadcast, link-local, and
 //! 100.64/10 addresses are refused.
 //! `provider_ref` is the bound socket, `127.0.0.1:PORT` when the bind
-//! address is loopback. The TCP accept loop dials the members in turn, one
-//! per connection, and copies both directions. An empty TCP member list, or a member that does
-//! not accept, is accepted and closed. UDP copies datagrams to an up member
-//! and is not ready when that list is empty. A later `ensure_listener`
-//! replaces the member list without rebinding. `delete_listener` and
-//! `delete_balancer` stop the task and drop the socket.
+//! address is loopback. The TCP accept loop picks a member under the
+//! pool's algorithm and copies both directions. An empty TCP member list,
+//! or a member that does not accept, is accepted and closed. UDP copies
+//! datagrams to an up member and is not ready when that list is empty. A
+//! later `ensure_listener` replaces the member list without rebinding.
+//! `delete_listener` and `delete_balancer` stop the task and drop the
+//! socket.
 
 use super::{LbProvider, ListenerView, Realized};
-use crate::types::{Balancer, ListenerProtocol, Provider};
+use crate::picker::{Backend, Picker};
+use crate::types::{Algorithm, Balancer, ListenerProtocol, Member, Provider};
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+/// What the forwarder dials: the members that may take traffic, with their
+/// weights, plus the connections open on each so `least_conn` can see them.
+#[derive(Clone)]
+struct Dial {
+    backends: Arc<parking_lot::Mutex<Vec<Backend>>>,
+    picker: Picker,
+    conns: Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>,
+}
+
+impl Dial {
+    fn new(algo: Algorithm) -> Self {
+        Self {
+            backends: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            picker: Picker::new(algo),
+            conns: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Replace the member list. A member re-added at the same address
+    /// starts counting again.
+    fn set_members(&self, members: &[Member]) {
+        *self.backends.lock() = members.iter().map(Backend::of).collect();
+    }
+
+    /// The backends to choose between, each with its live connection count.
+    fn snapshot(&self) -> Vec<Backend> {
+        let conns = self.conns.lock();
+        self.backends
+            .lock()
+            .iter()
+            .map(|b| Backend {
+                conns: conns.get(&b.addr).copied().unwrap_or(0),
+                ..*b
+            })
+            .collect()
+    }
+
+    fn open(&self, addr: SocketAddr) {
+        *self.conns.lock().entry(addr).or_insert(0) += 1;
+    }
+
+    fn close(&self, addr: SocketAddr) {
+        let mut conns = self.conns.lock();
+        if let Some(n) = conns.get_mut(&addr) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                conns.remove(&addr);
+            }
+        }
+    }
+}
+
+/// One balancer's socket and the task that serves it.
 struct Slot {
     bound: SocketAddr,
     /// Held until the accept task starts, then `None`.
     listener: Option<TcpListener>,
     task: Option<JoinHandle<()>>,
     cancel: tokio_util::sync::CancellationToken,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    /// Who the accept loop dials and what it owes them. Replaced by
+    /// `ensure_listener`, read by every connection it accepts.
+    dial: Arc<parking_lot::Mutex<Arc<Dial>>>,
     udp: Option<crate::udp::UdpForward>,
 }
 
@@ -106,30 +162,35 @@ fn realized(bound: SocketAddr) -> Realized {
     }
 }
 
-fn member_addrs(view: &ListenerView) -> Vec<SocketAddr> {
-    view.pool
-        .as_ref()
-        .map(|(_, members)| members.iter().map(|m| m.addr()).collect())
-        .unwrap_or_default()
+/// The listener's pool and members as the forwarder dials them. Members
+/// not fit to take traffic are already out of the view.
+fn dial_for(view: &ListenerView) -> Arc<Dial> {
+    let empty: &[Member] = &[];
+    let (algo, members) = match &view.pool {
+        Some((pool, members)) if pool.spec.admin_up => (pool.spec.algorithm, members.as_slice()),
+        // No pool, or one administratively down: nothing to dial.
+        _ => (Algorithm::default(), empty),
+    };
+    let dial = Arc::new(Dial::new(algo));
+    dial.set_members(members);
+    dial
 }
 
 async fn accept_loop(
     listener: TcpListener,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+    dial: Arc<parking_lot::Mutex<Arc<Dial>>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let cursor = Arc::new(AtomicUsize::new(0));
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => {
-                        let members = members.clone();
-                        let cursor = cursor.clone();
+                    Ok((stream, peer)) => {
+                        let dial = dial.lock().clone();
                         tokio::spawn(async move {
-                            forward_one(stream, members, cursor).await;
+                            forward_one(stream, dial, peer.ip()).await;
                         });
                     }
                     Err(e) => {
@@ -142,33 +203,24 @@ async fn accept_loop(
     }
 }
 
-fn pick(members: &[SocketAddr], cursor: &AtomicUsize) -> Option<SocketAddr> {
-    if members.is_empty() {
-        return None;
-    }
-    let n = cursor.fetch_add(1, Ordering::Relaxed);
-    Some(members[n % members.len()])
-}
-
-async fn forward_one(
-    mut inbound: TcpStream,
-    members: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
-    cursor: Arc<AtomicUsize>,
-) {
+async fn forward_one(mut inbound: TcpStream, dial: Arc<Dial>, client: IpAddr) {
     let _ = inbound.set_nodelay(true);
-    let dest = pick(&members.lock(), &cursor);
-    let Some(dest) = dest else {
+    let Some(dest) = dial.picker.pick(&dial.snapshot(), Some(client)) else {
         return;
     };
-    let mut outbound = match TcpStream::connect(dest).await {
+    dial.open(dest);
+    let outbound = TcpStream::connect(dest).await;
+    let mut outbound = match outbound {
         Ok(stream) => stream,
         Err(e) => {
+            dial.close(dest);
             tracing::debug!(%dest, error = %e, "forward member is not up");
             return;
         }
     };
     let _ = outbound.set_nodelay(true);
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    dial.close(dest);
 }
 
 #[async_trait]
@@ -210,7 +262,9 @@ impl LbProvider for ForwardProvider {
                 listener,
                 task: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
-                members: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                dial: Arc::new(parking_lot::Mutex::new(Arc::new(Dial::new(
+                    Algorithm::default(),
+                )))),
                 udp: None,
             },
         );
@@ -226,7 +280,7 @@ impl LbProvider for ForwardProvider {
         if matches!(view.listener.spec.protocol, ListenerProtocol::Udp) {
             return self.ensure_udp(view).await;
         }
-        let addrs = member_addrs(view);
+        let dial = dial_for(view);
         let id = view.balancer.meta.id.clone();
         let unbound = {
             let slots = self.slots.lock();
@@ -247,7 +301,7 @@ impl LbProvider for ForwardProvider {
         let slot = slots
             .get_mut(&id)
             .ok_or_else(|| ApiError::bad_request("forward balancer is not bound"))?;
-        *slot.members.lock() = addrs;
+        *slot.dial.lock() = dial;
         if slot.task.is_none() && slot.listener.is_none() {
             slot.listener = fresh;
         }
@@ -256,10 +310,10 @@ impl LbProvider for ForwardProvider {
                 .listener
                 .take()
                 .ok_or_else(|| ApiError::internal("forward socket is missing"))?;
-            let members = slot.members.clone();
+            let dial = slot.dial.clone();
             let cancel = slot.cancel.clone();
             slot.task = Some(tokio::spawn(async move {
-                accept_loop(listener, members, cancel).await;
+                accept_loop(listener, dial, cancel).await;
             }));
         }
         Ok(slot.bound.to_string())
@@ -343,20 +397,37 @@ mod tests {
     }
 
     fn view_with(lb: &Balancer, members: Vec<SocketAddr>) -> ListenerView {
+        let weights = vec![1u16; members.len()];
+        let up = vec![OperatingStatus::NoMonitor; members.len()];
+        weighted_view(lb, members, weights, up, Algorithm::default())
+    }
+
+    fn weighted_view(
+        lb: &Balancer,
+        members: Vec<SocketAddr>,
+        weights: Vec<u16>,
+        up: Vec<OperatingStatus>,
+        algorithm: Algorithm,
+    ) -> ListenerView {
         let pool_meta = Meta::new(kinds::POOL, "pool", None);
         let member_rows = members
             .into_iter()
-            .map(|addr| Member {
+            .zip(weights)
+            .zip(up)
+            .map(|((addr, weight), status)| Member {
                 meta: Meta::new(kinds::MEMBER, "m", None),
                 spec: MemberSpec {
                     pool: pool_meta.id.clone(),
                     address: addr.ip(),
                     port: addr.port(),
-                    weight: 1,
+                    weight,
                     backup: false,
                     admin_up: true,
                 },
-                status: MemberStatus::default(),
+                status: MemberStatus {
+                    operating_status: status,
+                    ..MemberStatus::default()
+                },
             })
             .collect();
         let pool = Pool {
@@ -364,7 +435,7 @@ mod tests {
             spec: PoolSpec {
                 balancer: lb.meta.id.clone(),
                 protocol: PoolProtocol::Tcp,
-                algorithm: Algorithm::default(),
+                algorithm,
                 session_persistence: None,
                 health_monitor: None,
                 admin_up: true,
@@ -553,6 +624,172 @@ mod tests {
         }
         assert_eq!(seen, [b"one!", b"two!", b"one!", b"two!"]);
         p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    /// Two members answering with their own name, plus the ports they listen on.
+    /// Members that answer with their own name, so a connection says who
+    /// dialed it.
+    async fn speakers(bodies: &[&'static [u8]]) -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        for body in bodies {
+            let member = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(member.local_addr().unwrap());
+            let body = *body;
+            tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = member.accept().await.unwrap();
+                    let mut buf = [0u8; 4];
+                    sock.read_exact(&mut buf).await.unwrap();
+                    sock.write_all(body).await.unwrap();
+                }
+            });
+        }
+        addrs
+    }
+
+    /// Open `n` connections through the VIP in turn, each closed before the
+    /// next, and return what the member answered with.
+    async fn dial_n(vip: &str, n: usize) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            let mut client = TcpStream::connect(vip).await.unwrap();
+            let _ = client.set_nodelay(true);
+            client.write_all(b"ping").await.unwrap();
+            let mut buf = vec![0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+                .await
+                .expect("timed out waiting for the member")
+                .unwrap();
+            seen.push(buf);
+            drop(client);
+        }
+        seen
+    }
+
+    fn tally(bodies: &[Vec<u8>]) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for body in bodies {
+            let name = String::from_utf8_lossy(body).to_string();
+            match out.iter_mut().find(|(k, _)| *k == name) {
+                Some((_, n)) => *n += 1,
+                None => out.push((name, 1)),
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn round_robin_honours_weight() {
+        let addrs = speakers(&[b"one!", b"two!"]).await;
+        let p = ForwardProvider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        let view = weighted_view(
+            &lb,
+            addrs,
+            vec![3, 1],
+            vec![OperatingStatus::NoMonitor; 2],
+            Algorithm::RoundRobin,
+        );
+        p.ensure_listener(&view).await.unwrap();
+        let seen = dial_n(&realized.provider_ref, 8).await;
+        assert_eq!(
+            tally(&seen),
+            vec![("one!".into(), 6), ("two!".into(), 2)],
+            "weight 3 against weight 1 takes three in four: {seen:?}"
+        );
+        p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn least_conn_picks_the_member_with_the_fewest_open() {
+        let addrs = speakers(&[b"one!", b"two!"]).await;
+        let p = ForwardProvider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        let view = weighted_view(
+            &lb,
+            addrs.clone(),
+            vec![1, 1],
+            vec![OperatingStatus::NoMonitor; 2],
+            Algorithm::LeastConn,
+        );
+        p.ensure_listener(&view).await.unwrap();
+        // One connection held open on the first member: the next must be
+        // dialed to the second.
+        let mut hold = TcpStream::connect(&realized.provider_ref).await.unwrap();
+        hold.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), hold.read(&mut buf))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(
+            buf, *b"one!",
+            "the held connection sits on the first member"
+        );
+        assert_eq!(
+            dial_n(&realized.provider_ref, 1).await[0],
+            b"two!",
+            "the member already holding one is not picked again"
+        );
+        drop(hold);
+        p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_ip_keeps_one_client_on_one_member() {
+        let addrs = speakers(&[b"one!", b"two!", b"thr!"]).await;
+        let p = ForwardProvider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        let view = weighted_view(
+            &lb,
+            addrs,
+            vec![1, 1, 1],
+            vec![OperatingStatus::NoMonitor; 3],
+            Algorithm::SourceIp,
+        );
+        p.ensure_listener(&view).await.unwrap();
+        // Every connection here arrives from 127.0.0.1, so all of them must
+        // land on the one member that address hashes to. Against three
+        // members, plain round robin would answer `one!` twice in six.
+        let seen = dial_n(&realized.provider_ref, 6).await;
+        assert_eq!(
+            tally(&seen).len(),
+            1,
+            "one client address moved between members: {seen:?}"
+        );
+        p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_member_is_never_dialed() {
+        let addrs = speakers(&[b"one!", b"two!"]).await;
+        for algo in [
+            Algorithm::RoundRobin,
+            Algorithm::LeastConn,
+            Algorithm::SourceIp,
+        ] {
+            let p = ForwardProvider::new();
+            let lb = balancer(None);
+            let realized = p.ensure_balancer(&lb).await.unwrap();
+            // The second member answers, but is Offline, so the reconciler
+            // never hands it to the forwarder at all.
+            let view = weighted_view(
+                &lb,
+                vec![addrs[0]],
+                vec![1],
+                vec![OperatingStatus::NoMonitor],
+                algo,
+            );
+            p.ensure_listener(&view).await.unwrap();
+            for body in dial_n(&realized.provider_ref, 4).await {
+                assert_eq!(body, b"one!", "{algo}: the offline member took traffic");
+            }
+            p.delete_balancer(&lb.meta.id).await.unwrap();
+        }
     }
 
     #[tokio::test]

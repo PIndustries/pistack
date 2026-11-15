@@ -259,6 +259,16 @@ Unset, it follows the fabric: `forward` when the fabric is `hostnat`, `overlay` 
 
 The forwarder runs on the leader, so balancer traffic passes through the leader. Listeners bind loopback unless the balancer's address is a loopback or private address. There is no OVN load balancer.
 
+A pool spreads new connections by its `algorithm`, on TCP and HTTP alike.
+
+| Value | Meaning |
+| --- | --- |
+| `round_robin` | Each member is visited in proportion to its weight, so weight 2 takes twice the share. The default. |
+| `least_conn` | The member with the fewest open connections. A tie goes to the heavier member, then to the earlier one. |
+| `source_ip` | One client address stays on one member while the member set is unchanged. |
+
+Anything else is refused when the pool is created or updated. A member that is down, draining or weighted zero is never picked under any algorithm. `session_persistence` is stored and ignored; `source_ip` is the algorithm, not persistence.
+
 `pi lb` covers balancers, and the listeners, pools and members under them; see the [CLI reference](CLI-reference.md#pi-lb). Services and ingresses in `loom` create balancers for you.
 
 ## DNS
