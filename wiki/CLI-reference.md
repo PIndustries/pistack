@@ -119,6 +119,53 @@ pi quota set <PROJECT> <RES=N>...
 | `quota set` | `<PROJECT>` | Project (name or id) |
 | `quota set` | `<RES=N>...` | Limit `resource=N`; `resource=unlimited` removes it (repeatable) |
 
+## pi alarm
+
+Threshold alarms on metrics (gauge). See [Metrics and alarms](Metrics-and-alarms).
+
+```text
+pi alarm list
+pi alarm show <NAME>
+pi alarm create --metric <SERIES> --comparison <COMPARISON> --threshold <VALUE> <NAME>
+pi alarm update <NAME>
+pi alarm delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `alarm create` | `--description <DESCRIPTION>` |  |
+| `alarm create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `alarm create` | `--metric <SERIES>` | Series to watch: a name, or a name and labels such as `pistack_host_load1{host="h1"}`. With labels the alarm watches every series that has them; with none, every series of that name |
+| `alarm create` | `--comparison <COMPARISON>` | Which side of the threshold fires [possible values: gt, lt, eq] |
+| `alarm create` | `--threshold <VALUE>` |  |
+| `alarm create` | `--for-seconds <SECONDS>` | How long the value must keep crossing before it fires, in seconds. The wait is measured on the stamps of the samples themselves [default: 0] |
+| `alarm show` | `--samples` | Also print the points the deciding series has now |
+| `alarm update` | `--description <DESCRIPTION>` |  |
+| `alarm update` | `--label <K=V>` | Set a label `key=value` (repeatable) |
+| `alarm update` | `--metric <SERIES>` | Series to watch |
+| `alarm update` | `--comparison <COMPARISON>` | [possible values: gt, lt, eq] |
+| `alarm update` | `--threshold <VALUE>` |  |
+| `alarm update` | `--for-seconds <SECONDS>` | How long the value must keep crossing before it fires, in seconds |
+
+`show` prints the record with its `status`: the phase, the latest value the phase was decided from, and the series that decided it. With `--samples` the points held for that series follow; for `-o json|yaml` they ride inside the record under `samples`. `update` changes what you name and keeps the rest; a new spec is decided again at once from the window, so a new threshold shows without waiting for the next sample, and its hold begins from the stamps there.
+
+## pi metric
+
+The series one server holds points for (gauge). There is no history: what a server holds is the last minutes of each series, kept in memory. See [Metrics and alarms](Metrics-and-alarms).
+
+```text
+pi metric list
+pi metric show <SERIES>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `metric list` | `--name <NAME>` | Keep series with this metric name |
+| `metric show` | `<SERIES>` | The series, as `pi metric list` prints it: `queue.depth`, or `pistack_host_load1{host="h1"}` |
+| `metric show` | `--last <N>` | Keep the last N points |
+
+`list` prints one row per series with its newest point, and `show` the points a server holds for one series, oldest first. The window is the server answering the request: behind a load balancer, one row can come from one server and the next from another.
+
 ## pi audit
 
 The audit log (admin).
@@ -1116,7 +1163,7 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | Certificate authorities | `/secrets/cas` |
 | Access keys | `/secrets/access-keys` |
 | Join tokens | `/secrets/join-tokens` |
-| Alarms and posted samples | `/gauge` |
+| Posted samples | `/gauge/samples` |
 
 ```sh
 pi api GET /balancers/balancers

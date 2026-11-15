@@ -5,6 +5,7 @@
 //! writes to the handles in `io`, so tests drive it end to end without a
 //! process.
 
+pub mod alarm;
 pub mod args;
 pub mod backup;
 pub mod bucket;

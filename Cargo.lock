@@ -363,6 +363,7 @@ dependencies = [
  "comfy-table",
  "dirs",
  "futures",
+ "gauge",
  "pistack-store",
  "pistack-types",
  "relay",

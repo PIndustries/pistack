@@ -157,6 +157,106 @@ fn admin_caller() -> Caller {
 }
 
 #[tokio::test]
+async fn an_update_keeps_what_it_does_not_name() {
+    let h = harness();
+    let (st, raw) = h
+        .call(
+            "POST",
+            "/samples",
+            Some(json!({"metric": "queue.update-keeps", "value": 2.0})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{raw}");
+    let (st, raw) = h
+        .call(
+            "POST",
+            "/alarms",
+            Some(json!({
+                "name": "queue-update",
+                "labels": {"team": "core"},
+                "spec": {
+                    "name": "queue-update",
+                    "metric": "queue.update-keeps",
+                    "comparison": "gt",
+                    "threshold": 10.0,
+                    "for_seconds": 0
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{raw}");
+
+    let (st, raw) = h
+        .call(
+            "PUT",
+            "/alarms/queue-update",
+            Some(json!({"spec": {"threshold": 1.0}})),
+        )
+        .await;
+    let alarm = json_body(st, &raw);
+    assert_eq!(st, StatusCode::OK, "{alarm}");
+    assert_eq!(alarm["spec"]["threshold"], 1.0);
+    assert_eq!(alarm["spec"]["metric"], "queue.update-keeps");
+    assert_eq!(alarm["spec"]["comparison"], "gt");
+    assert_eq!(alarm["labels"]["team"], "core");
+    // What the samples are measured against changed, so the alarm is decided
+    // again at once from the window the way it would be at a creation: the
+    // sample there crosses the new threshold.
+    assert_eq!(alarm["status"]["phase"], "Firing");
+    assert_eq!(alarm["status"]["last_value"], 2.0);
+
+    let (st, raw) = h
+        .call(
+            "PUT",
+            "/alarms/queue-update",
+            Some(json!({
+                "description": "watching the depth",
+                "labels": {"team": "oncall"},
+                "spec": {
+                    "name": "queue-update",
+                    "metric": "queue.update-gone",
+                    "comparison": "lt",
+                    "threshold": 10.0,
+                    "for_seconds": 30
+                }
+            })),
+        )
+        .await;
+    let alarm = json_body(st, &raw);
+    assert_eq!(st, StatusCode::OK, "{alarm}");
+    assert_eq!(alarm["description"], "watching the depth");
+    assert_eq!(alarm["labels"]["team"], "oncall");
+    assert_eq!(alarm["spec"]["metric"], "queue.update-gone");
+    assert_eq!(alarm["spec"]["comparison"], "lt");
+    assert_eq!(alarm["spec"]["for_seconds"], 30);
+    // Nothing fresh is watched, so there is no phase to keep.
+    assert_eq!(alarm["status"]["phase"], "Pending");
+    assert!(alarm["status"]["last_value"].is_null(), "{alarm}");
+    let revision = alarm["revision"].as_u64().unwrap();
+
+    let (st, raw) = h
+        .call(
+            "PUT",
+            "/alarms/queue-nothing",
+            Some(json!({"spec": {"threshold": 1.0}})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{raw}");
+
+    // A spec that cannot be a spec is refused, and the record stays.
+    let (st, raw) = h
+        .call(
+            "PUT",
+            "/alarms/queue-update",
+            Some(json!({"spec": {"metric": "   "}})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{raw}");
+    let (_, raw) = h.call("GET", "/alarms/queue-update", None).await;
+    assert_eq!(json_body(StatusCode::OK, &raw)["revision"], revision);
+}
+
+#[tokio::test]
 async fn missing_caller_is_unauthorized() {
     let h = harness();
     let res = h
