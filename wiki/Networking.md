@@ -212,7 +212,7 @@ Unset, it follows the fabric: `forward` when the fabric is `hostnat`, `overlay` 
 
 The forwarder runs on the leader, so balancer traffic passes through the leader. Listeners bind loopback unless the balancer's address is a loopback or private address. There is no OVN load balancer.
 
-`pi` has no balancer commands yet. The API is under `/balancers`; use `pi api`. Services and ingresses in `loom` create balancers for you.
+`pi lb` covers balancers, and the listeners, pools and members under them; see the [CLI reference](CLI-reference.md#pi-lb). Services and ingresses in `loom` create balancers for you.
 
 ## DNS
 

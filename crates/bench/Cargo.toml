@@ -38,5 +38,6 @@ reqwest = { workspace = true, features = ["stream"] }
 futures.workspace = true
 
 [dev-dependencies]
+relay.workspace = true
 tempfile.workspace = true
 tower.workspace = true

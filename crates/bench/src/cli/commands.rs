@@ -81,12 +81,13 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Daemonset { cmd } => daemonset(ctx, cmd, io).await,
         Cmd::Autoscaler { cmd } => autoscaler(ctx, cmd, io).await,
         Cmd::Stack { cmd } => stack(ctx, cmd, io).await,
+        Cmd::Lb { cmd } => super::lb::dispatch(ctx, cmd, io).await,
     }
 }
 
 // ---- small helpers ------------------------------------------------------------
 
-fn kind(noun: &str) -> &'static KindDef {
+pub(crate) fn kind(noun: &str) -> &'static KindDef {
     // Every noun this file names is in the table; a miss is a programming error.
     kinds::by_noun(noun).unwrap_or(&kinds::KINDS[0])
 }
@@ -147,7 +148,7 @@ fn compact(v: Value) -> Value {
 }
 
 /// Name or id -> id, via `GET /<path>/{name}` when needed.
-async fn resolve(c: &Client, k: &KindDef, name_or_id: &str) -> CliResult<String> {
+pub(crate) async fn resolve(c: &Client, k: &KindDef, name_or_id: &str) -> CliResult<String> {
     if k.is_id(name_or_id) {
         return Ok(name_or_id.to_owned());
     }
@@ -161,7 +162,7 @@ async fn resolve(c: &Client, k: &KindDef, name_or_id: &str) -> CliResult<String>
     Ok(str_at(&v, "/id"))
 }
 
-async fn resolve_opt(c: &Client, k: &KindDef, v: &Option<String>) -> CliResult<Value> {
+pub(crate) async fn resolve_opt(c: &Client, k: &KindDef, v: &Option<String>) -> CliResult<Value> {
     match v {
         Some(s) => Ok(Value::String(resolve(c, k, s).await?)),
         None => Ok(Value::Null),
@@ -177,7 +178,12 @@ async fn resolve_all(c: &Client, k: &KindDef, names: &[String]) -> CliResult<Val
 }
 
 /// Create body in the shape the module expects.
-fn create_body(k: &KindDef, name: &str, meta: &MetaArgs, spec: Value) -> CliResult<Value> {
+pub(crate) fn create_body(
+    k: &KindDef,
+    name: &str,
+    meta: &MetaArgs,
+    spec: Value,
+) -> CliResult<Value> {
     let labels = parse_kv(&meta.labels, "--label")?;
     let mut body = Map::new();
     body.insert("name".into(), json!(name));
@@ -197,7 +203,7 @@ fn create_body(k: &KindDef, name: &str, meta: &MetaArgs, spec: Value) -> CliResu
     Ok(Value::Object(body))
 }
 
-fn confirm(io: &mut Io<'_>, verb: &str, what: &str) -> CliResult<bool> {
+pub(crate) fn confirm(io: &mut Io<'_>, verb: &str, what: &str) -> CliResult<bool> {
     if !io.tty {
         return Err(CliError::usage(format!(
             "refusing to {verb} {what} without --yes (no terminal to confirm on)"
@@ -210,7 +216,13 @@ fn confirm(io: &mut Io<'_>, verb: &str, what: &str) -> CliResult<bool> {
 }
 
 /// Say what happened in table mode; dump the resource otherwise.
-fn report(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, v: &Value, verb: &str) -> CliResult<()> {
+pub(crate) fn report(
+    ctx: &Ctx,
+    io: &mut Io<'_>,
+    k: &KindDef,
+    v: &Value,
+    verb: &str,
+) -> CliResult<()> {
     match ctx.fmt.output {
         Output::Table | Output::Wide => {
             let id = str_at(v, "/id");
@@ -272,21 +284,21 @@ async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>
     Ok(items)
 }
 
-async fn do_list(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: ListArgs) -> CliResult<()> {
+pub(crate) async fn do_list(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: ListArgs) -> CliResult<()> {
     let c = ctx.client()?;
     let items = list_all(&c, k, &a).await?;
     print_list(io.stdout, ctx.fmt, k, &items)?;
     Ok(())
 }
 
-async fn do_show(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: NameArg) -> CliResult<()> {
+pub(crate) async fn do_show(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: NameArg) -> CliResult<()> {
     let c = ctx.client()?;
     let v = c.get_value(&k.item_path(&a.name)).await?;
     print_one(io.stdout, ctx.fmt, &v)?;
     Ok(())
 }
 
-async fn do_create(
+pub(crate) async fn do_create(
     ctx: &Ctx,
     io: &mut Io<'_>,
     k: &KindDef,
@@ -302,7 +314,12 @@ async fn do_create(
     Ok(v)
 }
 
-async fn do_delete(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: DeleteArgs) -> CliResult<()> {
+pub(crate) async fn do_delete(
+    ctx: &Ctx,
+    io: &mut Io<'_>,
+    k: &KindDef,
+    a: DeleteArgs,
+) -> CliResult<()> {
     let c = ctx.client()?;
     let path = k.item_path(&a.name);
     if !a.yes && !confirm(io, "delete", &format!("{} \"{}\"", k.noun, a.name))? {

@@ -257,6 +257,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: StackCmd,
     },
+    /// Load balancers, and their listeners, pools and members (relay).
+    Lb {
+        #[command(subcommand)]
+        cmd: super::lb::LbCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
