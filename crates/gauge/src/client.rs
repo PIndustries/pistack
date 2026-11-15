@@ -7,8 +7,8 @@ use crate::catalog::{self, MetricKind, RESERVED_PREFIX};
 use crate::series::{sanitize_name, Series};
 use crate::store::SampleRing;
 use crate::types::{
-    crosses, decide_on, hold_coverable, phase_for, Alarm, AlarmPhase, AlarmSpec, AlarmStatus,
-    Comparison, Sample, ALARM_REFRESH, MAX_HOLD, STALE_AFTER,
+    crosses, decide_on, hold_coverable, phase_for, Alarm, AlarmPhase, AlarmSpec, AlarmSpecUpdate,
+    AlarmStatus, Comparison, Sample, ALARM_REFRESH, MAX_HOLD, STALE_AFTER,
 };
 use chrono::{DateTime, Utc};
 use pistack_store::{Collection, Store};
@@ -273,6 +273,74 @@ impl Client {
             .map_err(ApiError::from)
     }
 
+    /// Change what an alarm watches, or its description and labels. What the
+    /// update names is changed; the rest stays. A new spec goes through the
+    /// same validation as a replacement, and is decided again at once from the
+    /// window the way a creation would be: what the samples are measured
+    /// against is new, so nothing of the old alarm's run carries over.
+    pub fn update_alarm_fields(
+        &self,
+        project: Option<&Id>,
+        name_or_id: &str,
+        description: Option<String>,
+        labels: Option<BTreeMap<String, String>>,
+        spec: Option<AlarmSpecUpdate>,
+    ) -> ApiResult<Alarm> {
+        let current = self.get_alarm(project, name_or_id)?;
+        let mut next = current.clone();
+        if let Some(d) = &description {
+            next.meta.description = d.clone();
+        }
+        if let Some(l) = &labels {
+            next.meta.labels = l.clone();
+        }
+        let watched = match spec {
+            Some(update) => {
+                let candidate = update.apply(current.spec.clone());
+                let changed = candidate != current.spec;
+                next.spec = candidate;
+                changed
+            }
+            None => false,
+        };
+        if !watched {
+            return self.update_alarm(next, None);
+        }
+        validate_alarm(&next.spec)?;
+        if !hold_coverable(next.spec.for_seconds) {
+            return Err(ApiError::unprocessable(format!(
+                "for_seconds must be at most {}, the longest hold the sample window can \
+                 decide",
+                MAX_HOLD.num_seconds()
+            )));
+        }
+        // Decided as at a creation: an alarm with a hold from the stamps held,
+        // one without from a series still reporting. What no series says is
+        // left Pending, and what none says at all has nothing to show.
+        let mut status = AlarmStatus::default();
+        let held = next.spec.for_seconds > 0;
+        if let Some(chosen) = self
+            .select(
+                &next.spec,
+                next.meta.project.as_ref(),
+                &self.admin_project(),
+            )
+            .iter()
+            .rev()
+            .find(|c| held || c.fresh)
+        {
+            status.last_value = Some(chosen.value());
+            status.series = Some(chosen.series.clone());
+            status.phase = if held {
+                decide_on(&next.spec, &chosen.points)
+            } else {
+                phase_for(next.spec.comparison, chosen.value(), next.spec.threshold)
+            };
+        }
+        next.status = status;
+        self.update_alarm(next, None)
+    }
+
     pub fn delete_alarm(&self, id: &Id) -> ApiResult<Alarm> {
         self.alarms().delete(id).map_err(ApiError::from)
     }
@@ -444,7 +512,7 @@ fn validate_name(name: &str) -> ApiResult<()> {
 
 fn validate_alarm(spec: &AlarmSpec) -> ApiResult<()> {
     validate_name(&spec.name)?;
-    if spec.metric.is_empty() || spec.metric.len() > 256 {
+    if spec.metric.trim().is_empty() || spec.metric.len() > 256 {
         return Err(ApiError::bad_request("metric must be 1-256 characters"));
     }
     if !spec.threshold.is_finite() {

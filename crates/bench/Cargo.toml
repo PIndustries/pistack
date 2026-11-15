@@ -16,6 +16,7 @@ path = "src/bin/pi.rs"
 [dependencies]
 pistack-types.workspace = true
 pistack-store.workspace = true
+gauge.path = "../gauge"
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 axum.workspace = true

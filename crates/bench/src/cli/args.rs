@@ -297,6 +297,16 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: crate::cli::dns::DnsCmd,
     },
+    /// Threshold alarms on metrics (gauge).
+    Alarm {
+        #[command(subcommand)]
+        cmd: super::alarm::AlarmCmd,
+    },
+    /// Metric series a server holds points for (gauge).
+    Metric {
+        #[command(subcommand)]
+        cmd: super::alarm::MetricCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

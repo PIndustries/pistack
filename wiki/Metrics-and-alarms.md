@@ -163,11 +163,15 @@ pi api POST /gauge/samples -d '{"metric":"queue.depth","value":12}'
 pi api GET '/gauge/samples?metric=queue.depth'
 ```
 
+From the CLI, `pi metric list` and `pi metric show <SERIES>` read the same window: one row per series with its newest point, and the points held for one series. See [CLI reference](CLI-reference#pi-metric).
+
 A posted sample lives in the same window and appears in `/metrics` as a gauge, with characters that are not legal in a metric name turned into `_`. Names that start with `pistack_` cannot be posted. `GET /gauge/samples` returns the whole window to a cloud admin. Anyone else gets what was posted, plus the `pistack_` series of their own project.
 
 ## Alarms
 
 An alarm compares a metric with a threshold. It is `Firing` while the value crosses, `Ok` while it does not, and `Pending` until there is a sample.
+
+`pi alarm list`, `show`, `create`, `update` and `delete` do all of this from the CLI, including `pi alarm show <NAME> --samples`, which prints the points the deciding series has now. See [CLI reference](CLI-reference#pi-alarm).
 
 ```sh
 pi api POST /gauge/alarms -d '{
@@ -182,6 +186,8 @@ pi api POST /gauge/alarms -d '{
 }'
 pi api GET /gauge/alarms/web-busy
 ```
+
+A `PUT /gauge/alarms/{id}` takes `{description, labels, spec}` and changes only what it names; a new spec is decided again at once from the window, and its hold begins from the stamps there.
 
 `metric` is a name with or without labels. With labels, the alarm watches every series that has those labels; with none, every series of that name. It fires while any of them crosses, and `status.series` names the one that decided. `comparison` is `gt`, `lt` or `eq`.
 

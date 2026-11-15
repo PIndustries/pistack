@@ -8,7 +8,8 @@
 //! and cannot be posted. `GET /samples?metric=` lists the window: all of it
 //! for a cloud admin, and for anyone else what was posted plus PiStack's
 //! series for their own project.
-//! `GET|POST /alarms`, `GET|DELETE /alarms/{id}`.
+//! `GET|POST /alarms`, `GET|PUT|DELETE /alarms/{id}`. A `PUT` takes
+//! `{description, labels, spec}` and keeps what it does not name.
 //! `GET /metrics` is the Prometheus text for a cloud admin. A scraper uses
 //! `/metrics` at the root of the API, which also takes a scrape token.
 //!
@@ -18,7 +19,7 @@
 use crate::catalog::RESERVED_PREFIX;
 use crate::client::Client;
 use crate::series::Series;
-use crate::types::{Alarm, AlarmSpec, Sample};
+use crate::types::{Alarm, AlarmSpec, AlarmSpecUpdate, Sample};
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, StatusCode},
@@ -38,7 +39,10 @@ pub fn router(client: Client) -> axum::Router {
     axum::Router::new()
         .route("/samples", get(list_samples).post(record_sample))
         .route("/alarms", get(list_alarms).post(create_alarm))
-        .route("/alarms/{id}", get(get_alarm).delete(delete_alarm))
+        .route(
+            "/alarms/{id}",
+            get(get_alarm).delete(delete_alarm).put(update_alarm),
+        )
         .route("/metrics", get(metrics))
         .layer(middleware::from_fn(require_caller))
         .with_state(client)
@@ -64,6 +68,16 @@ struct Create<S> {
     #[serde(default)]
     project: Option<Id>,
     spec: S,
+}
+
+#[derive(Deserialize, Default)]
+struct UpdateAlarm {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    spec: Option<AlarmSpecUpdate>,
 }
 
 #[derive(Deserialize, Default)]
@@ -230,6 +244,25 @@ async fn get_alarm(
         &caller,
         client.get_alarm(project.as_ref(), &id)?,
     )?))
+}
+
+async fn update_alarm(
+    State(client): State<Client>,
+    Extension(caller): Extension<Caller>,
+    Query(sq): Query<ScopeQuery>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateAlarm>,
+) -> ApiResult<Json<Alarm>> {
+    let project = scope(&caller, &sq)?;
+    visible(&caller, client.get_alarm(project.as_ref(), &id)?)?;
+    let updated = client.update_alarm_fields(
+        project.as_ref(),
+        &id,
+        body.description,
+        body.labels,
+        body.spec,
+    )?;
+    Ok(Json(updated))
 }
 
 async fn delete_alarm(

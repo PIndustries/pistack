@@ -90,6 +90,8 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Secret { cmd } => crate::cli::secret::secret(ctx, cmd, io).await,
         Cmd::Cert { cmd } => crate::cli::secret::cert(ctx, cmd, io).await,
         Cmd::Dns { cmd } => dns(ctx, cmd, io).await,
+        Cmd::Alarm { cmd } => super::alarm::alarm(ctx, kind("alarm"), cmd, io).await,
+        Cmd::Metric { cmd } => super::alarm::metric(ctx, cmd, io).await,
     }
 }
 
@@ -101,7 +103,7 @@ pub(crate) fn kind(noun: &str) -> &'static KindDef {
 }
 
 /// `k=v` pairs into a JSON object of strings.
-fn parse_kv(pairs: &[String], what: &str) -> CliResult<Map<String, Value>> {
+pub(crate) fn parse_kv(pairs: &[String], what: &str) -> CliResult<Map<String, Value>> {
     let mut m = Map::new();
     for p in pairs {
         let (k, v) = p

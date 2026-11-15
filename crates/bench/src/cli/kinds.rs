@@ -952,13 +952,23 @@ pub static KINDS: &[KindDef] = &[
 pub fn by_noun(noun: &str) -> Option<&'static KindDef> {
     let n = noun.trim().to_lowercase().replace(['_', ' '], "-");
     let compact = n.replace('-', "");
-    KINDS.iter().find(|k| {
+    every().find(|k| {
         k.noun == n
             || k.noun.replace('-', "") == compact
             || k.aliases
                 .iter()
                 .any(|a| *a == n || a.replace('-', "") == compact)
     })
+}
+
+/// Nouns whose table lives with the command that uses it. Searched first, so
+/// a name given there wins over one in `KINDS`.
+fn extra() -> impl Iterator<Item = &'static KindDef> {
+    super::alarm::KINDS.iter().copied()
+}
+
+fn every() -> impl Iterator<Item = &'static KindDef> {
+    extra().chain(KINDS.iter())
 }
 
 #[cfg(test)]
