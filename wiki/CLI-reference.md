@@ -805,6 +805,68 @@ pi autoscaler delete <NAME>
 | `autoscaler create` | `--min <MIN_REPLICAS>` | Minimum replicas [default: 1] |
 | `autoscaler create` | `--max <MAX_REPLICAS>` | Maximum replicas |
 
+## pi lb
+
+Load balancers, and the listeners, pools and members under them. A balancer owns one address (a VIP) on a network; listeners bind a protocol and port on it and point at a pool; a pool holds backends, one `address:port` each.
+
+```text
+pi lb list
+pi lb show <NAME>
+pi lb create --network <NETWORK> <NAME>
+pi lb delete <NAME>
+pi lb listener list
+pi lb listener show <NAME>
+pi lb listener create --balancer <BALANCER> --port <PORT> <NAME>
+pi lb listener delete <NAME>
+pi lb pool list
+pi lb pool show <NAME>
+pi lb pool create --balancer <BALANCER> <NAME>
+pi lb pool delete <NAME>
+pi lb member list
+pi lb member add --pool <POOL> --port <PORT> <ADDRESS>
+pi lb member remove --pool <POOL> <MEMBER>
+```
+
+Deleting a balancer deletes its listeners, pools and members with it. A pool a listener points at cannot be deleted until the listener is changed or gone.
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `lb create` | `--description <DESCRIPTION>` |  |
+| `lb create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `lb create` | `--network <NETWORK>` | Network (name or id) the VIP lives on |
+| `lb create` | `--vip <VIP>` | Explicit VIP address (default: allocated) |
+| `lb create` | `--vip-port <VIP_PORT>` | Bind this exact port on the VIP instead of an ephemeral one |
+| `lb create` | `--provider <PROVIDER>` | Data plane [default: forward] [possible values: forward, relay] |
+| `lb create` | `--down` | Bring it up administratively off |
+| `lb listener list` | `--balancer <BALANCER>` | Filter to one balancer (name or id) |
+| `lb listener create` | `--balancer <BALANCER>` | Balancer (name or id) the listener binds on |
+| `lb listener create` | `--protocol <PROTOCOL>` | [default: tcp] [possible values: tcp, udp, http, https, terminated] |
+| `lb listener create` | `--port <PORT>` |  |
+| `lb listener create` | `--pool <POOL>` | Default pool (name or id) |
+| `lb listener create` | `--cert <CERT>` | Certificate id for `--protocol terminated` |
+| `lb listener create` | `--connection-limit <CONNECTION_LIMIT>` | Max concurrent connections; 0 means unlimited [default: 0] |
+| `lb listener create` | `--down` | Bring it up administratively off |
+| `lb pool list` | `--balancer <BALANCER>` | Filter to one balancer (name or id) |
+| `lb pool create` | `--balancer <BALANCER>` | Balancer (name or id) the pool belongs to |
+| `lb pool create` | `--protocol <PROTOCOL>` | [default: tcp] [possible values: tcp, udp, http, https] |
+| `lb pool create` | `--algorithm <ALGORITHM>` | [default: round-robin] [possible values: round-robin, least-conn, source-ip] |
+| `lb pool create` | `--health-check` | Add a health monitor with these probe settings |
+| `lb pool create` | `--monitor <MONITOR>` | What the monitor speaks. Default: the pool protocol; a udp pool is probed with a bare connect [default: tcp] [possible values: tcp, http, https] |
+| `lb pool create` | `--interval <INTERVAL>` | Seconds between probes [default: 5] |
+| `lb pool create` | `--timeout <TIMEOUT>` | Seconds before a probe fails [default: 3] |
+| `lb pool create` | `--rise <RISE>` | Consecutive successes before a member is online [default: 2] |
+| `lb pool create` | `--fall <FALL>` | Consecutive failures before a member is offline [default: 3] |
+| `lb pool create` | `--down` | Bring it up administratively off |
+| `lb member list` | `--pool <POOL>` | Filter to one pool (name or id) |
+| `lb member list` | `--only <ONLY>` | Members whose name or address contains this |
+| `lb member add` | `--pool <POOL>` | Pool (name or id) to add the backend to |
+| `lb member add` | `--port <PORT>` | Backend port |
+| `lb member add` | `--weight <WEIGHT>` | Share of traffic; 0-256 [default: 1] |
+| `lb member add` | `--backup` | Take no new traffic while others are up |
+| `lb member add` | `--down` | Add it administratively off |
+| `lb member remove` | `--pool <POOL>` | Pool (name or id) |
+| `lb member remove` | `<MEMBER>` | Member name, id, `ADDRESS:PORT`, or address alone when the pool holds one member on it. A member's name is made from its pool, address and port; see `pi lb member list` |
+
 ## pi stack
 
 Stacks (blueprint).
@@ -834,7 +896,6 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | What | Path |
 | --- | --- |
 | DNS zones and records | `/dns` |
-| Load balancers | `/balancers` |
 | Secrets, certificates, certificate authorities | `/secrets` |
 | Buckets | `/silo/buckets` |
 | Shares | `/shelf` |

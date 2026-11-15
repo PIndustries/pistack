@@ -10,6 +10,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod kinds;
+pub mod lb;
 pub mod output;
 
 use anyhow::Result;

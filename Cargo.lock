@@ -361,6 +361,7 @@ dependencies = [
  "futures",
  "pistack-store",
  "pistack-types",
+ "relay",
  "reqwest",
  "rpassword",
  "serde",
