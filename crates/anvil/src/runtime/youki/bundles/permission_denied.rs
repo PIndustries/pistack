@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 P. Industries LLC and PiStack contributors
+
+pub(in crate::runtime::youki) fn permission_denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+}
