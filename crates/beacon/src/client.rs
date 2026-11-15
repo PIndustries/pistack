@@ -72,15 +72,27 @@ impl Client {
         Ok(best)
     }
 
-    /// Zone by apex name (any project).
+    /// Zone by apex name (any project). A zone served as primary is preferred
+    /// when the apex is held both ways, so callers that mean "the zone we
+    /// serve" — lookups, export, an auto record — never land on a secondary
+    /// copy of the same name.
     pub fn zone_by_apex(&self, apex: &str) -> ApiResult<Option<Zone>> {
+        Ok(self.zones_by_apex(apex)?.into_iter().next())
+    }
+
+    /// Every zone held for `apex`, primary first. A notify pass needs the
+    /// secondary entries too: they are the list of whom to tell.
+    pub fn zones_by_apex(&self, apex: &str) -> ApiResult<Vec<Zone>> {
         let apex = normalize_name(apex)?;
-        Ok(self
+        let mut found: Vec<Zone> = self
             .zones()
             .list(None)
             .map_err(store_err)?
             .into_iter()
-            .find(|z| z.spec.name == apex))
+            .filter(|z| z.spec.name == apex)
+            .collect();
+        found.sort_by_key(|z| !matches!(z.spec.kind, ZoneKind::Primary));
+        Ok(found)
     }
 
     // ---- zones ------------------------------------------------------------
@@ -88,7 +100,15 @@ impl Client {
     pub fn create_zone(&self, mut meta: Meta, mut spec: ZoneSpec) -> ApiResult<Zone> {
         meta.id = Id::new(kind::ZONE);
         validate_zone(&mut spec)?;
-        if let Some(other) = self.zone_by_apex(&spec.name)? {
+        // One primary per apex, and at most one secondary: a node holds a zone
+        // one way or the other. A secondary next to a primary of the same name
+        // is the shape of a node that serves a zone and keeps a pulled copy of
+        // someone else's — which is exactly what NOTIFY has to be able to see.
+        let held = self.zones_by_apex(&spec.name)?;
+        if let Some(other) = held
+            .iter()
+            .find(|z| std::mem::discriminant(&z.spec.kind) == std::mem::discriminant(&spec.kind))
+        {
             return Err(ApiError::conflict(format!(
                 "zone {} already exists as {}",
                 spec.name, other.meta.id
@@ -274,6 +294,11 @@ impl Client {
 
     /// Recompute the zone's content digest; bump the serial when it moved.
     /// Idempotent, so it is safe to run on every event and on a timer.
+    ///
+    /// Serial movement is what a NOTIFY and an AXFR both compare against, and
+    /// what a secondary's pull is told to fetch, so a zone whose stored serial
+    /// does not yet describe its stored content is not up to date: the first
+    /// pass after any write bumps.
     pub fn reconcile_zone(&self, id: &Id) -> ApiResult<Option<Zone>> {
         let zone = match self.zones().try_get(id).map_err(store_err)? {
             Some(z) => z,
@@ -299,7 +324,14 @@ impl Client {
         }
         let sets = self.recordsets_in_zone(id)?;
         let digest = content_digest(&zone, &sets);
-        if zone.status.digest == digest && zone.status.phase == Phase::Ready {
+        // "Ready" means the stored serial describes the stored content. A
+        // second write inside the reconciler's coalescing window still has to
+        // move the serial, or the peer a NOTIFY names would be told a serial
+        // that does not include it.
+        if zone.status.digest == digest
+            && zone.status.phase == Phase::Ready
+            && zone.status.serial > 0
+        {
             return Ok(Some(zone));
         }
         let next_serial = zone.status.serial.wrapping_add(1).max(1);

@@ -13,6 +13,7 @@
 //! Without one, the request is rejected.
 
 use crate::client::Client;
+use crate::notify::Notifier;
 use crate::types::*;
 use axum::{
     extract::{Extension, Path, Query, Request, State},
@@ -29,7 +30,16 @@ use std::collections::BTreeMap;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-pub fn router(client: Client) -> axum::Router {
+/// What a handler needs: the write path, and — when this node runs the notify
+/// loop — the way to ask it for one.
+#[derive(Clone)]
+pub struct ApiState {
+    pub client: Client,
+    pub notifier: Option<Notifier>,
+}
+
+pub fn router(client: Client, notifier: Option<Notifier>) -> axum::Router {
+    let state = ApiState { client, notifier };
     axum::Router::new()
         .route("/", get(info))
         .route("/zones", get(list_zones).post(create_zone))
@@ -46,7 +56,25 @@ pub fn router(client: Client) -> axum::Router {
                 .delete(delete_recordset),
         )
         .layer(middleware::from_fn(require_caller))
-        .with_state(client)
+        .with_state(state)
+}
+
+/// The apex of the zone a record set lives in. `""` when it cannot be found:
+/// the write itself already reported anything worth reporting.
+async fn apex_of(st: &ApiState, zone: &Id) -> String {
+    st.client
+        .zones()
+        .get(zone)
+        .map(|z| z.spec.name)
+        .unwrap_or_default()
+}
+
+/// Ask for a NOTIFY, if this node runs the notify loop. The write is already
+/// in the store; the response to the caller does not wait for any of it.
+fn asked(st: &ApiState, apex: &str) {
+    if let Some(n) = &st.notifier {
+        n.notify_zone(apex);
+    }
 }
 
 /// The gateway attaches a `Caller`. A request without one is refused.
@@ -229,23 +257,25 @@ fn created<T: Serialize>(t: T) -> Response {
 // ---- zones ------------------------------------------------------------------
 
 async fn list_zones(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Page<Zone>>> {
     let project = scope(&caller, &sq)?;
-    Ok(Json(page(c.zones().list(project.as_ref())?, &q)))
+    Ok(Json(page(st.client.zones().list(project.as_ref())?, &q)))
 }
 
 async fn create_zone(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Json(body): Json<Create<ZoneSpec>>,
 ) -> ApiResult<Response> {
     let project = create_project(&caller, &body.project)?;
     let meta = new_meta(kind::ZONE, &body, project)?;
-    Ok(created(c.create_zone(meta, body.spec)?))
+    let z = st.client.create_zone(meta, body.spec)?;
+    asked(&st, &z.spec.name);
+    Ok(created(z))
 }
 
 /// Zones resolve by resource name, id, or apex (`example.cloud.`).
@@ -258,7 +288,7 @@ fn resolve_zone(c: &Client, project: Option<&Id>, id: &str) -> ApiResult<Zone> {
 }
 
 async fn get_zone(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
@@ -266,12 +296,12 @@ async fn get_zone(
     let project = scope(&caller, &sq)?;
     Ok(Json(visible(
         &caller,
-        resolve_zone(&c, project.as_ref(), &id)?,
+        resolve_zone(&st.client, project.as_ref(), &id)?,
     )?))
 }
 
 async fn update_zone(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
@@ -279,68 +309,74 @@ async fn update_zone(
     Json(body): Json<Update<ZoneSpec>>,
 ) -> ApiResult<Json<Zone>> {
     let project = scope(&caller, &sq)?;
-    let cur = visible(&caller, resolve_zone(&c, project.as_ref(), &id)?)?;
+    let cur = visible(&caller, resolve_zone(&st.client, project.as_ref(), &id)?)?;
     let rev = if_match(&headers)?;
-    Ok(Json(c.update_zone(&cur.meta.id, rev, |z| {
+    let z = st.client.update_zone(&cur.meta.id, rev, |z| {
         apply_meta(&mut z.meta, &body);
         z.spec = body.spec.clone();
         Ok(())
-    })?))
+    })?;
+    asked(&st, &z.spec.name);
+    Ok(Json(z))
 }
 
 async fn delete_zone(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let project = scope(&caller, &sq)?;
-    let cur = visible(&caller, resolve_zone(&c, project.as_ref(), &id)?)?;
-    c.delete_zone(&cur.meta.id)?;
+    let cur = visible(&caller, resolve_zone(&st.client, project.as_ref(), &id)?)?;
+    st.client.delete_zone(&cur.meta.id)?;
+    asked(&st, &cur.spec.name);
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn export_zone_text(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let project = scope(&caller, &sq)?;
-    let cur = visible(&caller, resolve_zone(&c, project.as_ref(), &id)?)?;
-    let text = c.export(&cur.meta.id)?;
+    let cur = visible(&caller, resolve_zone(&st.client, project.as_ref(), &id)?)?;
+    let text = st.client.export(&cur.meta.id)?;
     Ok(([(header::CONTENT_TYPE, "text/dns; charset=utf-8")], text).into_response())
 }
 
 // ---- record sets ------------------------------------------------------------
 
 async fn list_recordsets(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Page<RecordSet>>> {
     let project = scope(&caller, &sq)?;
-    let mut items = c.recordsets().list(project.as_ref())?;
+    let mut items = st.client.recordsets().list(project.as_ref())?;
     if let Some(z) = &sq.zone {
-        let zone = resolve_zone(&c, project.as_ref(), z)?;
+        let zone = resolve_zone(&st.client, project.as_ref(), z)?;
         items.retain(|r| r.spec.zone == zone.meta.id);
     }
     Ok(Json(page(items, &q)))
 }
 
 async fn create_recordset(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Json(body): Json<Create<RecordSetSpec>>,
 ) -> ApiResult<Response> {
     let project = create_project(&caller, &body.project)?;
     let meta = new_meta(kind::RECORD, &body, project)?;
-    Ok(created(c.create_recordset(meta, body.spec)?))
+    let apex = apex_of(&st, &body.spec.zone).await;
+    let r = st.client.create_recordset(meta, body.spec)?;
+    asked(&st, &apex);
+    Ok(created(r))
 }
 
 async fn get_recordset(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
@@ -348,12 +384,12 @@ async fn get_recordset(
     let project = scope(&caller, &sq)?;
     Ok(Json(visible(
         &caller,
-        c.recordsets().resolve(project.as_ref(), &id)?,
+        st.client.recordsets().resolve(project.as_ref(), &id)?,
     )?))
 }
 
 async fn update_recordset(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
@@ -361,23 +397,32 @@ async fn update_recordset(
     Json(body): Json<Update<RecordSetSpec>>,
 ) -> ApiResult<Json<RecordSet>> {
     let project = scope(&caller, &sq)?;
-    let cur = visible(&caller, c.recordsets().resolve(project.as_ref(), &id)?)?;
+    let cur = visible(
+        &caller,
+        st.client.recordsets().resolve(project.as_ref(), &id)?,
+    )?;
     let rev = if_match(&headers)?;
-    Ok(Json(c.update_recordset(&cur.meta.id, rev, |r| {
+    let r = st.client.update_recordset(&cur.meta.id, rev, |r| {
         apply_meta(&mut r.meta, &body);
         r.spec = body.spec.clone();
         Ok(())
-    })?))
+    })?;
+    asked(&st, &apex_of(&st, &r.spec.zone).await);
+    Ok(Json(r))
 }
 
 async fn delete_recordset(
-    State(c): State<Client>,
+    State(st): State<ApiState>,
     Extension(caller): Extension<Caller>,
     Query(sq): Query<ScopeQuery>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let project = scope(&caller, &sq)?;
-    let cur = visible(&caller, c.recordsets().resolve(project.as_ref(), &id)?)?;
-    c.delete_recordset(&cur.meta.id)?;
+    let cur = visible(
+        &caller,
+        st.client.recordsets().resolve(project.as_ref(), &id)?,
+    )?;
+    st.client.delete_recordset(&cur.meta.id)?;
+    asked(&st, &apex_of(&st, &cur.spec.zone).await);
     Ok(StatusCode::NO_CONTENT)
 }

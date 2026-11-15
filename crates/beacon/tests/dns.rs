@@ -29,7 +29,12 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let store = Store::in_memory().unwrap();
+    harness_with(Store::in_memory().unwrap()).await
+}
+
+/// A beacon on a store of the caller's choosing, so a test can restart one
+/// over data it already holds.
+async fn harness_with(store: Store) -> Harness {
     let module = Beacon::with_listen("127.0.0.1:0".parse().unwrap());
     let ctx = ModuleContext {
         store: Arc::new(store.clone()),
@@ -84,6 +89,12 @@ impl Harness {
             .query(Name::from_str(name).unwrap(), DNSClass::IN, rt)
             .await
             .unwrap()
+    }
+
+    /// The zone's current serial, `0` when the store has none yet.
+    async fn zone_serial(&self, zone: &str) -> u32 {
+        let (_, z) = self.call("GET", &format!("/zones/{zone}"), None).await;
+        z["status"]["serial"].as_u64().unwrap_or(0) as u32
     }
 
     /// Poll until the zone's serial satisfies `pred`.
@@ -459,6 +470,455 @@ async fn secondary_axfr_from_local_primary() {
 
     ctx2.shutdown.cancel();
     primary.ctx.shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// A NOTIFY as a primary sends it: the same wire format beacon's notifier uses,
+/// over a socket of the test's own, so the refusal path can be seen from the
+/// outside rather than inferred from a status field.
+///
+/// `from` is a host to speak as; the port the packet leaves from is the OS's, as
+/// it is for a real notifier, since a peer's own port is not ours to bind.
+/// Beacon matches the address a zone lists on host alone, so that host is all
+/// acceptance sees. `serial` is what the sender claims; acceptance does not
+/// consult it.
+async fn notify_as(from: SocketAddr, to: SocketAddr, apex: &str, serial: u32) -> ResponseCode {
+    let bytes = beacon::notify::notify_message(apex, serial).unwrap();
+    let from = SocketAddr::new(from.ip(), 0);
+    let sock = tokio::net::UdpSocket::bind(from).await.unwrap();
+    sock.connect(to).await.unwrap();
+    sock.send(&bytes).await.unwrap();
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf))
+        .await
+        .expect("no answer to a NOTIFY")
+        .unwrap();
+    hickory_server::proto::op::Message::from_vec(&buf[..n])
+        .unwrap()
+        .metadata
+        .response_code
+}
+
+/// The primary's change reaches the secondary inside a second. The refresh
+/// timer runs at thirty, so a change that lands this fast arrived on the
+/// NOTIFY.
+#[tokio::test]
+async fn a_serial_change_reaches_the_secondary_by_notify() {
+    let primary = harness().await;
+    let secondary = harness().await;
+    let (st, zone) = primary
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "n1",
+                "spec": { "name": "n.cloud.", "email": "ops@n.cloud",
+                          "nameservers": ["ns1.n.cloud."] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{zone}");
+    let zone_id = zone["id"].as_str().unwrap().to_owned();
+    let (st, _) = primary
+        .call(
+            "POST",
+            "/recordsets",
+            Some(json!({
+                "name": "web-a",
+                "spec": { "zone": zone_id, "name": "web", "type": "A",
+                          "records": ["10.20.30.40"] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let serial = primary.wait_serial(&zone_id, |s| s >= 1).await;
+
+    // The secondary lists the primary and, being a secondary, starts empty.
+    let (st, _) = secondary
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "n1",
+                "spec": { "name": "n.cloud.", "email": "ops@n.cloud",
+                          "nameservers": ["ns1.n.cloud."],
+                          "kind": { "type": "secondary",
+                                    "primaries": [primary.dns.to_string()] } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(
+        secondary
+            .query("web.n.cloud.", Rt::A)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::Refused,
+        "nothing of the primary's should be served yet"
+    );
+
+    // What a primary does when its serial moves: NOTIFY each address that lists
+    // it as a primary.
+    //
+    // The refresh timer runs at thirty seconds, so a zone that fills this fast
+    // filled because of the NOTIFY.
+    let started = tokio::time::Instant::now();
+    let peer = secondary.dns.to_string();
+    beacon::notify::notify_peers(&[peer], "n.cloud.", serial)
+        .await
+        .expect("the NOTIFY did not reach the secondary");
+
+    loop {
+        let resp = secondary.query("web.n.cloud.", Rt::A).await;
+        if resp.metadata.response_code == ResponseCode::NoError {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the zone took {:?} to fill — the refresh timer is 30s, so this is \
+             not a NOTIFY",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let serial_now = secondary.zone_serial("n1").await;
+    assert!(
+        serial_now >= serial,
+        "the secondary pulled a stale copy: {serial_now} < {serial}"
+    );
+
+    secondary.ctx.shutdown.cancel();
+    primary.ctx.shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// A NOTIFY is believed by host. One from a host no secondary zone lists is
+/// refused and pulls nothing; the primary's own host is answered, and the pull
+/// it asks for happens.
+#[tokio::test]
+async fn a_notify_is_accepted_only_from_the_listed_primary() {
+    let source = harness().await;
+    let (st, zone) = source
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "s1",
+                "spec": { "name": "q.cloud.", "email": "ops@q.cloud",
+                          "nameservers": ["ns1.q.cloud."] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{zone}");
+    let zone_id = zone["id"].as_str().unwrap().to_owned();
+    let (st, _) = source
+        .call(
+            "POST",
+            "/recordsets",
+            Some(json!({
+                "name": "web-a",
+                "spec": { "zone": zone_id, "name": "web", "type": "A",
+                          "records": ["10.31.31.31"] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let serial = source.wait_serial(&zone_id, |s| s >= 1).await;
+
+    // The node that will be notified. It is given the zone with a primary
+    // nothing answers at, so the periodic transfer fails and cannot fill the
+    // zone behind the test's back. The primary's real address goes in later,
+    // just before its NOTIFY, and the periodic pass runs at thirty seconds — so
+    // anything that fills this zone in the meantime arrived on the NOTIFY.
+    let node = harness().await;
+    let (st, _) = node
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "s1",
+                "spec": { "name": "q.cloud.", "email": "ops@q.cloud",
+                          "nameservers": ["ns1.q.cloud."],
+                          "kind": { "type": "secondary",
+                                    "primaries": ["192.0.2.1"] } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // A second beacon on loopback, holding nothing of this zone. A secondary
+    // matches a NOTIFY against the primaries of its own zones, so a sender
+    // trusted nowhere must be refused — and refused, not pulled.
+    let neighbour = harness().await;
+    let (st, _) = neighbour
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "s1-foreign",
+                "spec": { "name": "q.cloud.", "email": "ops@q.cloud",
+                          "nameservers": ["ns1.q.cloud."],
+                          "kind": { "type": "primary" } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(
+        notify_as(neighbour.dns, node.dns, "q.cloud.", serial + 500).await,
+        ResponseCode::Refused,
+        "a sender listed by no secondary zone was accepted"
+    );
+    // A NOTIFY for a zone this node does not hold is refused too, even from the
+    // primary it does trust.
+    assert_eq!(
+        notify_as(source.dns, node.dns, "elsewhere.cloud.", 1).await,
+        ResponseCode::Refused,
+        "a notify for a zone nobody holds was accepted"
+    );
+
+    // The refusal is not cosmetic: the zone is untouched, still waiting on the
+    // transfer a NOTIFY would have started. (The notify for the zone nobody
+    // holds cannot move anything by construction.)
+    let (_, z) = node.call("GET", "/zones/s1", None).await;
+    assert_eq!(
+        z["status"]["phase"].as_str(),
+        Some("pending"),
+        "a refused notify moved the zone: {z}"
+    );
+    assert_eq!(
+        node.query("web.q.cloud.", Rt::A)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::Refused,
+        "a refused notify pulled the zone"
+    );
+
+    // Now the primary's address, as an operator would set it. Nothing pulls
+    // yet: the refresh pass that would is still a long way off.
+    let (st, upd) = node
+        .call(
+            "PUT",
+            "/zones/s1",
+            Some(json!({
+                "spec": { "name": "q.cloud.", "email": "ops@q.cloud",
+                          "nameservers": ["ns1.q.cloud."],
+                          "kind": { "type": "secondary",
+                                    "primaries": [source.dns.to_string()] } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{upd}");
+    let (_, z) = node.call("GET", "/zones/s1", None).await;
+    assert_eq!(
+        z["status"]["phase"].as_str(),
+        Some("pending"),
+        "the zone transferred before anything asked it to: {z}"
+    );
+
+    // And the primary, whose address the zone now lists, asks for the pull.
+    assert_eq!(
+        notify_as(source.dns, node.dns, "q.cloud.", serial).await,
+        ResponseCode::NoError,
+        "a listed primary was refused"
+    );
+    let started = tokio::time::Instant::now();
+    loop {
+        let resp = node.query("web.q.cloud.", Rt::A).await;
+        let ip = resp.answers.iter().find_map(|r| match &r.data {
+            RData::A(a) => Some(a.0.to_string()),
+            _ => None,
+        });
+        if ip.as_deref() == Some("10.31.31.31") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an accepted notify did not pull the zone"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    neighbour.ctx.shutdown.cancel();
+    node.ctx.shutdown.cancel();
+    source.ctx.shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// What an `also_notify` listener saw, and when each send arrived.
+#[derive(Clone)]
+struct Seen {
+    hits: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
+}
+
+/// A stand-in for an outside secondary: a plain UDP listener that answers a
+/// NOTIFY and records every send. With `silent` it drops the first send and
+/// answers from the second on, which is how a lost answer looks to the sender.
+async fn listener(silent: bool) -> (SocketAddr, Seen) {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let seen = Seen {
+        hits: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let hits = seen.hits.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        let mut got = 0usize;
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let Ok(msg) = hickory_server::proto::op::Message::from_vec(&buf[..n]) else {
+                continue;
+            };
+            if msg.metadata.op_code != hickory_server::proto::op::OpCode::Notify {
+                continue;
+            }
+            hits.lock().push(std::time::Instant::now());
+            got += 1;
+            // A silent listener ignores the first send; the answer it eventually
+            // sends is only an ack, never the point.
+            if silent && got == 1 {
+                continue;
+            }
+            let mut answer = msg.clone();
+            answer.metadata.message_type = hickory_server::proto::op::MessageType::Response;
+            answer.metadata.response_code = hickory_server::proto::op::ResponseCode::NoError;
+            let _ = sock.send_to(&answer.to_vec().unwrap(), from).await;
+        }
+    });
+    (addr, seen)
+}
+
+/// A primary's change reaches a server listed only in `also_notify` — an outside
+/// DNS that holds nothing in the store — inside a second, and a send whose
+/// answer is lost is tried again. The zone names the listener and nothing else,
+/// so nothing but `also_notify` can put a packet there.
+#[tokio::test]
+async fn an_also_notify_listener_is_reached_and_retried() {
+    // A listener that ignores the first send and answers the second: the lost
+    // answer the primary has to retry through.
+    let (peer, seen) = listener(true).await;
+
+    let h = harness().await;
+    let peer_str = peer.to_string();
+
+    // A secondary refuses the field before it can be stored anywhere.
+    let (st, _) = h
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "sec",
+                "spec": { "name": "an.cloud.", "email": "ops@an.cloud",
+                          "nameservers": ["ns1.an.cloud."],
+                          "also_notify": [peer_str.clone()],
+                          "kind": { "type": "secondary",
+                                    "primaries": ["192.0.2.9"] } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a secondary took also_notify");
+
+    // Too many addresses, and an address that is not one, are refused too.
+    let many: Vec<String> = (0..17).map(|i| format!("198.51.100.{}", i % 251)).collect();
+    let (st, _) = h
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "many",
+                "spec": { "name": "many.cloud.", "email": "ops@many.cloud",
+                          "nameservers": ["ns1.many.cloud."],
+                          "also_notify": many }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "seventeen addresses were taken"
+    );
+    let (st, _) = h
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "junk",
+                "spec": { "name": "junk.cloud.", "email": "ops@junk.cloud",
+                          "nameservers": ["ns1.junk.cloud."],
+                          "also_notify": ["not-an-address"] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a non-address was taken");
+
+    // The primary, naming the listener and no in-cloud secondary.
+    let (st, zone) = h
+        .call(
+            "POST",
+            "/zones",
+            Some(json!({
+                "name": "an",
+                "spec": { "name": "an.cloud.", "email": "ops@an.cloud",
+                          "nameservers": ["ns1.an.cloud."],
+                          "also_notify": [peer_str.clone()] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{zone}");
+    let zone_id = zone["id"].as_str().unwrap().to_owned();
+    let (_st, _) = h
+        .call(
+            "POST",
+            "/recordsets",
+            Some(json!({
+                "name": "web-a",
+                "spec": { "zone": zone_id, "name": "web", "type": "A",
+                          "records": ["10.40.40.40"] }
+            })),
+        )
+        .await;
+    h.wait_serial(&zone_id, |s| s >= 1).await;
+
+    // A change is on its way: fire exactly what a leader fires when the serial
+    // moves — the real notify path over the zone's stored peers.
+    let started = std::time::Instant::now();
+    let client = h.module.client(&h.ctx);
+    beacon::notify::notify_one(&client, "an.cloud.").await;
+
+    // The listener saw it, and quickly: the refresh timer is thirty seconds, so
+    // a send this soon is the NOTIFY, not a poll.
+    loop {
+        if !seen.hits.lock().is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the also_notify listener was never asked"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let first = *seen.hits.lock().first().unwrap();
+    assert!(
+        first.duration_since(started) < Duration::from_secs(1),
+        "the listener was reached {:?} after the change",
+        first.duration_since(started)
+    );
+    // The first answer was lost, so the same NOTIFY is tried again.
+    loop {
+        if seen.hits.lock().len() >= 2 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the lost answer was not retried"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    h.ctx.shutdown.cancel();
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 

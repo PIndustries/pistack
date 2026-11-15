@@ -87,8 +87,28 @@ pub(crate) async fn pull_from_primaries(
     primaries: &[String],
     apex: &str,
 ) -> anyhow::Result<(u32, ZoneData, String)> {
+    pull_ordered(primaries, primaries, apex).await
+}
+
+/// Pull from `first` before `rest` — the notify path names the sender, and
+/// that is the primary whose data is known to be new. Addresses in `first`
+/// are not tried twice.
+pub(crate) async fn pull_from_listed_first(
+    first: &[String],
+    rest: &[String],
+    apex: &str,
+) -> anyhow::Result<(u32, ZoneData, String)> {
+    pull_ordered(first, rest, apex).await
+}
+
+async fn pull_ordered(
+    first: &[String],
+    rest: &[String],
+    apex: &str,
+) -> anyhow::Result<(u32, ZoneData, String)> {
     let mut last_err = anyhow::anyhow!("no primaries configured");
-    for raw in primaries {
+    let mut tried: Vec<SocketAddr> = Vec::new();
+    for raw in first.iter().chain(rest) {
         let addr = match parse_primary(raw) {
             Ok(a) => a,
             Err(e) => {
@@ -96,6 +116,10 @@ pub(crate) async fn pull_from_primaries(
                 continue;
             }
         };
+        if tried.contains(&addr) {
+            continue;
+        }
+        tried.push(addr);
         match pull_axfr(addr, apex).await {
             Ok((serial, data)) => return Ok((serial, data, raw.clone())),
             Err(e) => {

@@ -56,6 +56,9 @@ pub const AUTO_LABEL: &str = "pistack.io/auto";
 /// Label beacon puts on record sets it manages itself; users should not
 /// edit those by hand, the next pass would overwrite them.
 pub const MANAGED_LABEL: &str = "pistack.io/managed-by";
+/// How many `also_notify` addresses one primary zone may name. A zone that
+/// needs more is a anycast set, not a zone with secondaries.
+pub const MAX_ALSO_NOTIFY: usize = 16;
 
 // ---- Zone -------------------------------------------------------------------
 
@@ -90,6 +93,11 @@ pub struct ZoneSpec {
     /// MNAME. Defaults to `ns1.<zone>` when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nameservers: Vec<String>,
+    /// Addresses (`ip` or `ip:port`) of servers outside this cloud that are
+    /// secondaries of a primary zone, and are therefore told when its serial
+    /// moves. A secondary zone does not take this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_notify: Vec<String>,
 }
 
 pub fn default_ttl() -> u32 {
@@ -108,6 +116,7 @@ impl Default for ZoneSpec {
             ttl: default_ttl(),
             email: default_email(),
             nameservers: Vec::new(),
+            also_notify: Vec::new(),
         }
     }
 }
@@ -329,23 +338,76 @@ pub fn validate_zone(spec: &mut ZoneSpec) -> ApiResult<()> {
         }
     }
     spec.nameservers = ns;
+    let mut also = Vec::with_capacity(spec.also_notify.len());
+    for a in &spec.also_notify {
+        let a = notify_addr(a)
+            .map_err(|e| ApiError::bad_request(format!("also_notify {}", e.message)))?;
+        if !also.contains(&a) {
+            also.push(a);
+        }
+    }
+    if also.len() > MAX_ALSO_NOTIFY {
+        return Err(ApiError::bad_request(format!(
+            "a zone names at most {MAX_ALSO_NOTIFY} also_notify addresses"
+        )));
+    }
+    spec.also_notify = also;
     if let ZoneKind::Secondary { primaries } = &spec.kind {
+        if !spec.also_notify.is_empty() {
+            return Err(ApiError::bad_request(
+                "only a primary zone takes also_notify",
+            ));
+        }
         if primaries.is_empty() {
             return Err(ApiError::bad_request(
                 "a secondary zone needs at least one primary",
             ));
         }
         for p in primaries {
-            let host = p.rsplit_once(':').map(|(h, _)| h).unwrap_or(p);
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            if host.parse::<std::net::IpAddr>().is_err() {
-                return Err(ApiError::bad_request(format!(
-                    "primary {p} is not an ip address"
-                )));
-            }
+            notify_addr(p)?;
         }
     }
     Ok(())
+}
+
+/// Check one address written `ip` or `ip:port`, and return it in the form
+/// [`crate::notify::parse_addr`] reads: trimmed, a v6 host bracketed only when a
+/// port follows. A bare address names the standard port, so a v6 address with
+/// several colons and no bracket is the address itself, never a malformed
+/// `ip:port` pair. An address whose octets or port do not parse is refused here,
+/// where the caller can answer, rather than deep in a notify pass.
+fn notify_addr(raw: &str) -> ApiResult<String> {
+    let a = raw.trim();
+    let bad = |why: &str| ApiError::bad_request(format!("{raw} {why}"));
+    // Split into host and port on the last colon. A bracketed host always ends
+    // before its port; otherwise only a single colon separates the two, so a
+    // v6 address written bare — several colons, no bracket — is all host.
+    let bracketed = a.starts_with('[');
+    let split = match a.rfind(':') {
+        Some(i) if bracketed => Some(i),
+        Some(i) if a.matches(':').count() == 1 => Some(i),
+        Some(_) => None,
+        None => None,
+    };
+    let (host, port) = match split {
+        Some(i) => {
+            let (h, p) = (&a[..i], &a[i + 1..]);
+            if p.parse::<u16>().is_err() {
+                return Err(bad("has a port that is not a number"));
+            }
+            (h, Some(p))
+        }
+        None => (a, None),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.parse::<std::net::IpAddr>().is_err() {
+        return Err(bad("is not an ip address"));
+    }
+    Ok(match port {
+        Some(p) if host.contains(':') => format!("[{host}]:{p}"),
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_owned(),
+    })
 }
 
 /// Normalise and check a record set against its zone. Owner is made
@@ -595,6 +657,80 @@ mod tests {
             ..ZoneSpec::default()
         };
         validate_zone(&mut sec).unwrap();
+    }
+
+    #[test]
+    fn also_notify_addresses_are_validated() {
+        let mut s = ZoneSpec {
+            name: "x.".into(),
+            also_notify: vec![
+                " 198.51.100.7 ".into(),
+                "203.0.113.9:5353".into(),
+                "[2001:db8::1]:5353".into(),
+                "2001:db8::2".into(),
+                "198.51.100.7".into(),
+            ],
+            ..ZoneSpec::default()
+        };
+        validate_zone(&mut s).unwrap();
+        assert_eq!(
+            s.also_notify,
+            vec![
+                "198.51.100.7",
+                "203.0.113.9:5353",
+                "[2001:db8::1]:5353",
+                "2001:db8::2"
+            ],
+            "a repeat of a name address is dropped"
+        );
+
+        // The bare form is a v6 address, not a malformed `ip:port`.
+        let mut s = ZoneSpec {
+            name: "x.".into(),
+            also_notify: vec!["2001:db8::1".into()],
+            ..ZoneSpec::default()
+        };
+        validate_zone(&mut s).unwrap();
+
+        for bad in ["ns1.example.net", "198.51.100.7:ssh", "198.51.100.999", ""] {
+            let mut s = ZoneSpec {
+                name: "x.".into(),
+                also_notify: vec![bad.into()],
+                ..ZoneSpec::default()
+            };
+            assert!(validate_zone(&mut s).is_err(), "{bad} was accepted");
+        }
+
+        let many: Vec<String> = (0..=MAX_ALSO_NOTIFY)
+            .map(|i| format!("198.51.100.{}", i % 256))
+            .collect();
+        let mut s = ZoneSpec {
+            name: "x.".into(),
+            also_notify: many.iter().take(MAX_ALSO_NOTIFY).cloned().collect(),
+            ..ZoneSpec::default()
+        };
+        validate_zone(&mut s).unwrap();
+        let mut s = ZoneSpec {
+            name: "x.".into(),
+            also_notify: many.clone(),
+            ..ZoneSpec::default()
+        };
+        assert!(
+            validate_zone(&mut s).is_err(),
+            "{} addresses were accepted",
+            many.len()
+        );
+
+        // Only a primary tells anyone about a change.
+        let mut s = ZoneSpec {
+            name: "x.".into(),
+            kind: ZoneKind::Secondary {
+                primaries: vec!["10.0.0.1".into()],
+            },
+            also_notify: vec!["198.51.100.7".into()],
+            ..ZoneSpec::default()
+        };
+        assert!(validate_zone(&mut s).is_err());
     }
 
     #[test]
