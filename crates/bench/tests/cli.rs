@@ -36,6 +36,12 @@ struct Mock {
     identity_posts: Arc<Mutex<Vec<String>>>,
     /// Bodies of the project switches asked for.
     switches: Arc<Mutex<Vec<Value>>>,
+    /// Reads answered with a 404 before the row appears: a server whose copy
+    /// has not caught up with the one that took the write. Counts are per
+    /// path, so the caller's word and the id are hidden apart.
+    hiding: Arc<Mutex<BTreeMap<String, u32>>>,
+    /// Paths every read of this server has seen.
+    reads: Arc<Mutex<Vec<String>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -44,6 +50,28 @@ fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
         Json(json!({"error": {"code": code, "message": msg, "details": {}}})),
     )
         .into_response()
+}
+
+/// Spend one of the misses owed to `path`, if any are left.
+fn hiding(m: &Mock, path: &str) -> bool {
+    let mut hiding = m.hiding.lock().unwrap();
+    let Some(n) = hiding.get_mut(path) else {
+        return false;
+    };
+    if *n == 0 {
+        return false;
+    }
+    *n -= 1;
+    true
+}
+
+/// The 404 of a server that does not have the row.
+fn gone(what: &str) -> axum::response::Response {
+    err(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        &format!("mach '{what}' not found"),
+    )
 }
 
 fn authed(h: &HeaderMap) -> bool {
@@ -181,13 +209,14 @@ async fn show(
     if !authed(&h) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
     }
+    let path = format!("/compute/machines/{id}");
+    m.reads.lock().unwrap().push(path.clone());
+    if hiding(&m, &path) {
+        return gone(&id);
+    }
     let mut machines = m.machines.lock().unwrap();
     let Some(mut v) = find(&machines, &id) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("mach '{id}' not found"),
-        );
+        return gone(&id);
     };
     *m.polls.lock().unwrap() += 1;
     let name = v["name"].as_str().unwrap_or("").to_owned();
@@ -205,6 +234,27 @@ async fn show(
     Json(v).into_response()
 }
 
+/// The action endpoints for the power verbs: the machine as it is, with the
+/// power the action asks for.
+async fn power_action(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path((id, action)): Path<(String, String)>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let mut machines = m.machines.lock().unwrap();
+    let Some(mut v) = find(&machines, &id) else {
+        return err(StatusCode::NOT_FOUND, "not_found", "no such machine");
+    };
+    let want = if action == "stop" { "off" } else { "on" };
+    v["status"]["power"] = json!(want);
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    machines.insert(name, v.clone());
+    Json(v).into_response()
+}
+
 async fn delete(
     State(m): State<Mock>,
     h: HeaderMap,
@@ -215,22 +265,11 @@ async fn delete(
     }
     let mut machines = m.machines.lock().unwrap();
     let Some(v) = find(&machines, &id) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("mach '{id}' not found"),
-        );
+        return gone(&id);
     };
-    machines.remove(v["name"].as_str().unwrap_or(""));
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    machines.remove(&name);
     (StatusCode::ACCEPTED, Json(v)).into_response()
-}
-
-async fn start(State(m): State<Mock>, Path(id): Path<String>) -> axum::response::Response {
-    let machines = m.machines.lock().unwrap();
-    match find(&machines, &id) {
-        Some(v) => Json(v).into_response(),
-        None => err(StatusCode::NOT_FOUND, "not_found", "no such machine"),
-    }
 }
 
 fn find_pod(pods: &BTreeMap<String, Value>, id: &str) -> Option<Value> {
@@ -621,6 +660,11 @@ async fn automatic_floating_ips_are_set_on_create_and_changed_later() {
 
 async fn serve() -> (String, Mock) {
     let mock = Mock::default();
+    let url = serve_with(mock.clone()).await;
+    (url, mock)
+}
+
+async fn serve_with(mock: Mock) -> String {
     let app = Router::new()
         .route("/", get(discovery))
         .route("/identity/tokens", post(login))
@@ -647,7 +691,7 @@ async fn serve() -> (String, Mock) {
         )
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
-        .route("/compute/machines/{id}/start", post(start))
+        .route("/compute/machines/{id}/{action}", post(power_action))
         .route("/loom/pods/{id}", get(show_pod))
         .route("/loom/pods/{id}/exec", post(exec_pod))
         .route(
@@ -658,7 +702,7 @@ async fn serve() -> (String, Mock) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), mock)
+    format!("http://{addr}")
 }
 
 #[derive(Debug)]
@@ -988,16 +1032,30 @@ async fn cluster_status_lists_the_servers_and_marks_the_leader() {
     assert_eq!(v["members"].as_array().unwrap().len(), 4);
 }
 
-/// A server that refuses every write the way a follower does, naming
-/// `leader`, and counts what it was sent.
-async fn follower(leader: String) -> (String, Arc<Mutex<u32>>) {
-    let refused = Arc::new(Mutex::new(0));
-    let count = refused.clone();
-    let app = Router::new().fallback(move || {
+/// A server that answers reads from its own copy, which does not have `row`,
+/// and refuses every write the way a follower does, naming `leader`. Counts
+/// what it was sent.
+async fn follower(leader: String, row: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let count = seen.clone();
+    let missing = row.to_owned();
+    let app = Router::new().fallback(move |r: axum::extract::Request| {
         let leader = leader.clone();
         let count = count.clone();
+        let missing = missing.clone();
         async move {
-            *count.lock().unwrap() += 1;
+            let path = r.uri().path().to_owned();
+            count.lock().unwrap().push(path.clone());
+            if r.method() == axum::http::Method::GET {
+                if path == format!("/compute/machines/{missing}") {
+                    return gone(&missing);
+                }
+                return err(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("mach '{missing}' not found"),
+                );
+            }
             (
                 StatusCode::CONFLICT,
                 Json(
@@ -1005,18 +1063,20 @@ async fn follower(leader: String) -> (String, Arc<Mutex<u32>>) {
                     "details": {"leader": leader}}}),
                 ),
             )
+                .into_response()
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), refused)
+    (format!("http://{addr}"), seen)
 }
 
 #[tokio::test]
 async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     let (leader, mock) = serve().await;
-    let (url, refused) = follower(leader.clone()).await;
+    let (url, seen) = follower(leader.clone(), "").await;
+    let refused = Arc::clone(&seen);
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
     let create = [
@@ -1028,7 +1088,7 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
     assert_eq!(r.code, 0, "{r:?}");
     assert!(mock.machines.lock().unwrap().contains_key("web"));
-    assert_eq!(*refused.lock().unwrap(), 1);
+    assert_eq!(*refused.lock().unwrap(), ["/compute/machines".to_owned()]);
     assert_eq!(
         r.err,
         format!("{url} is not the leader; sending the request to {leader}\n")
@@ -1044,7 +1104,7 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     // Two followers that name each other: one retry, then the refusal.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let other = format!("http://{}", listener.local_addr().unwrap());
-    let (lost, lost_refused) = follower(other.clone()).await;
+    let (lost, lost_seen) = follower(other.clone(), "").await;
     let back = lost.clone();
     let app = Router::new().fallback(move || {
         let back = back.clone();
@@ -1062,7 +1122,7 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     let on = ["--url", lost.as_str(), "--token", TOKEN];
     let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
     assert_eq!(r.code, 1, "{r:?}");
-    assert_eq!(*lost_refused.lock().unwrap(), 1);
+    assert_eq!(*lost_seen.lock().unwrap(), ["/compute/machines".to_owned()]);
     assert!(r.err.contains("error: not the leader"), "{}", r.err);
     assert!(
         r.err.contains(&format!("\"leader\":\"{lost}\"")),
@@ -1071,11 +1131,12 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     );
 
     // A leader on another scheme is not followed: the token stays put.
-    let (url, refused) = follower("https://127.0.0.1:1".into()).await;
+    let (url, seen) = follower("https://127.0.0.1:1".into(), "").await;
+    let refused = Arc::clone(&seen);
     let on = ["--url", url.as_str(), "--token", TOKEN];
     let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
     assert_eq!(r.code, 1, "{r:?}");
-    assert_eq!(*refused.lock().unwrap(), 1);
+    assert_eq!(*refused.lock().unwrap(), ["/compute/machines".to_owned()]);
     assert!(r.err.starts_with("error: not the leader"), "{}", r.err);
     assert!(r.err.contains("https://127.0.0.1:1"), "{}", r.err);
 }
@@ -1545,5 +1606,200 @@ async fn a_token_lists_its_projects_and_moves_between_them() {
         3,
         "{:?}",
         mock.switches.lock().unwrap()
+    );
+}
+
+// ---- waiting on a server whose copy lags -----------------------------------------
+
+/// Log in against `url` and return the config path.
+async fn signed_in(url: &str, dir: &std::path::Path) -> std::path::PathBuf {
+    let cfg = dir.join("config.toml");
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    cfg
+}
+
+const WEB_ID: &str = "mach-0199a5e0-aaaa-7000-8000-000000000001";
+
+#[tokio::test]
+async fn create_wait_retries_a_row_the_reads_do_not_have_yet() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+
+    // The first two reads answer as if the machine was never made.
+    mock.hiding
+        .lock()
+        .unwrap()
+        .insert(format!("/compute/machines/{WEB_ID}"), 2);
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a", "--wait",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert!(
+        lines[0].starts_with("machine \"web\" created (mach-00000001)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(lines[1], "machine \"web\": creating");
+    assert_eq!(lines[2], "machine \"web\": ready");
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        mock.reads.lock().unwrap().len(),
+        4,
+        "{:?}",
+        mock.reads.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_wait_that_never_finds_the_row_reports_the_404() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+    mock.hiding
+        .lock()
+        .unwrap()
+        .insert(format!("/compute/machines/{WEB_ID}"), u32::MAX);
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a", "--wait",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(
+        r.err.contains(&format!("mach '{WEB_ID}' not found")),
+        "{}",
+        r.err
+    );
+    // The grace is bounded: a few reads, not a wait that never ends.
+    let reads = mock.reads.lock().unwrap().len();
+    assert!(
+        // About one read a second over the grace, and no more.
+        (10..20).contains(&reads),
+        "the grace should cost about ten reads, got {reads}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_wait_reads_from_the_leader_the_write_reached() {
+    let (leader, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    // The follower took the write for the leader, and its own copy does not
+    // have the row yet.
+    let (url, seen) = follower(leader.clone(), WEB_ID).await;
+    let admin = ["--url", url.as_str(), "--token", TOKEN];
+    let r = pi(
+        &dir.path().join("config.toml"),
+        "",
+        &[
+            &admin[..],
+            &[
+                "machine", "create", "web", "--size", "s.1x1", "--image", "a", "--wait",
+            ],
+        ]
+        .concat(),
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("machine \"web\": ready"), "{}", r.out);
+    // The follower saw the write and nothing else: the retry and every read
+    // of the wait went to the leader it named.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["/compute/machines".to_owned()],
+        "the follower was asked again"
+    );
+    let reads = mock.reads.lock().unwrap().clone();
+    assert_eq!(
+        reads,
+        [
+            format!("/compute/machines/{WEB_ID}"),
+            format!("/compute/machines/{WEB_ID}"),
+        ],
+        "the wait must read from the leader the write reached"
+    );
+}
+
+#[tokio::test]
+async fn delete_wait_believes_the_server_it_asked() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // The first read after the delete is answered as if the row was never
+    // here. The wait asks by the name the user gave, so this is the machine
+    // gone and the server that says so is the one that is believed.
+    mock.hiding
+        .lock()
+        .unwrap()
+        .insert("/compute/machines/web".into(), 1);
+    let r = pi(&cfg, "", &["machine", "delete", "web", "--yes", "--wait"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        r.out,
+        "machine \"web\" deletion requested\nmachine \"web\": gone\n"
+    );
+    assert_eq!(
+        *mock.reads.lock().unwrap(),
+        ["/compute/machines/web".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn power_wait_reads_the_row_the_action_handed_back() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // The action answers with the machine's id, and the wait reads that row.
+    // One read answers the machine as the action left it, and that is the
+    // power asked for, so there is no second one.
+    let r = pi(&cfg, "", &["machine", "stop", "web", "--wait"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("power off"), "{}", r.out);
+    // The row the action handed back is what the reads asked for.
+    let reads = mock.reads.lock().unwrap().clone();
+    assert!(
+        reads
+            .iter()
+            .all(|p| p == &format!("/compute/machines/{WEB_ID}")),
+        "{reads:?}"
+    );
+    assert_eq!(
+        mock.machines.lock().unwrap()["web"]["status"]["power"],
+        "off"
     );
 }

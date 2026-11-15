@@ -120,6 +120,9 @@ pub struct Client {
     base: String,
     token: Option<String>,
     notices: Notices,
+    /// Carries every read and write to whichever server answered last, so a
+    /// wait after a write keeps reading where the write happened.
+    home: Arc<Mutex<Option<String>>>,
 }
 
 /// The leader a "not the leader" answer names, if a request sent to `base`
@@ -164,6 +167,7 @@ impl Client {
             base: url.trim_end_matches('/').to_owned(),
             token,
             notices: Notices::default(),
+            home: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -185,7 +189,7 @@ impl Client {
     }
 
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
-        self.request_url(method, self.url(path))
+        self.request_url(method, self.address(path))
     }
 
     fn request_url(&self, method: Method, url: String) -> reqwest::RequestBuilder {
@@ -196,9 +200,42 @@ impl Client {
         r
     }
 
+    /// The server `path` goes to: the leader this client was sent to, else
+    /// the one it was configured with.
+    fn address(&self, path: &str) -> String {
+        let home = self
+            .home
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.base.clone());
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return path.to_owned();
+        }
+        format!("{home}/{}", path.trim_start_matches('/'))
+    }
+
+    /// Where the next request goes.
+    #[cfg(test)]
+    fn settled(&self) -> String {
+        self.address("/")
+    }
+
+    /// Remember `leader` as the server to send the rest of this client's
+    /// requests to. Only a leader named by a refusal, whose scheme matches
+    /// the address given: a token is not handed to an address nobody chose.
+    /// Nothing is remembered across commands or processes.
+    fn settle(&self, leader: &str) {
+        let mut held = self.home.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_deref() != Some(leader) {
+            *held = Some(leader.to_owned());
+        }
+    }
+
     /// Where to send `path` again after `err`, when a follower refused it
-    /// and named the leader. Says so on stderr. The caller retries once: a
-    /// second refusal is returned as it is.
+    /// and named the leader. Says so on stderr, and the rest of this
+    /// client's requests go there too. The caller retries once: a second
+    /// refusal is returned as it is.
     fn leader_url(&self, path: &str, err: &CliError) -> Option<String> {
         if path.starts_with("http://") || path.starts_with("https://") {
             return None;
@@ -212,6 +249,7 @@ impl Client {
         if !notices.contains(&notice) {
             notices.push(notice);
         }
+        self.settle(&leader);
         Some(format!("{leader}/{}", path.trim_start_matches('/')))
     }
 
@@ -237,6 +275,8 @@ impl Client {
     }
 
     /// One JSON request, sent again at the leader when a follower refuses it.
+    /// The leader a follower names takes the rest of this client's requests,
+    /// so a wait after a write reads where the write happened.
     async fn call_following(
         &self,
         method: Method,
@@ -245,7 +285,7 @@ impl Client {
         if_match: Option<&str>,
     ) -> CliResult<(StatusCode, Value)> {
         let first = self
-            .send_json(method.clone(), self.url(path), body, if_match)
+            .send_json(method.clone(), self.address(path), body, if_match)
             .await;
         let Err(err) = &first else {
             return first;
@@ -318,7 +358,7 @@ impl Client {
     /// refusal is followed to the leader like [`Client::call`], reading the
     /// file again from the start.
     pub async fn put_file(&self, path: &str, file: &Path) -> CliResult<Value> {
-        let first = self.put_file_to(self.url(path), file).await;
+        let first = self.put_file_to(self.address(path), file).await;
         let Err(err) = &first else {
             return first;
         };
@@ -455,6 +495,56 @@ mod tests {
             details,
         };
         assert_eq!(named_leader(base, &other), None);
+    }
+
+    #[test]
+    fn a_client_keeps_the_leader_it_was_told_about() {
+        let c = Client::new("http://10.0.0.12:8443", None, false).unwrap();
+        assert_eq!(c.settled(), "http://10.0.0.12:8443/");
+        c.settle("http://10.0.0.13:8443");
+        assert_eq!(c.settled(), "http://10.0.0.13:8443/");
+        // A path that is already an address is sent where it says.
+        assert_eq!(c.address("http://x/y"), "http://x/y");
+    }
+
+    #[tokio::test]
+    async fn the_server_that_refused_a_write_takes_what_comes_next() {
+        use axum::Json;
+        use serde_json::json;
+        async fn refuse(leader: String) -> (String, Arc<Mutex<u32>>) {
+            let hits = Arc::new(Mutex::new(0));
+            let count = hits.clone();
+            let app = axum::Router::new().fallback(move || {
+                let leader = leader.clone();
+                let count = count.clone();
+                async move {
+                    *count.lock().unwrap() += 1;
+                    (
+                        StatusCode::CONFLICT,
+                        Json(
+                            json!({"error": {"code": "conflict", "message": "not the leader",
+                            "details": {"leader": leader}}}),
+                        ),
+                    )
+                }
+            });
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            (format!("http://{addr}"), hits)
+        }
+        let (leader, leader_hits) = refuse(String::new()).await;
+        let (url, refused) = refuse(leader.clone()).await;
+        let c = Client::new(&url, Some("t".into()), false).unwrap();
+        let out = c.post("/compute/machines", &json!({"name": "web"})).await;
+        assert!(out.is_err(), "the leader's own refusal comes back");
+        assert_eq!(*refused.lock().unwrap(), 1);
+        assert_eq!(*leader_hits.lock().unwrap(), 1);
+        // The reads that follow go to the leader the write reached.
+        assert_eq!(c.settled(), format!("{leader}/"));
+        let _ = c.get_value("/compute/machines/mach-1").await;
+        assert_eq!(*leader_hits.lock().unwrap(), 2);
+        assert_eq!(*refused.lock().unwrap(), 1);
     }
 
     #[test]
