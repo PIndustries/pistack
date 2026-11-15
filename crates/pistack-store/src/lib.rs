@@ -961,6 +961,60 @@ impl Store {
             None => format!("{kind_}/-/{name}"),
         }
     }
+
+    fn name_entry(kind_: &str, meta: &Meta) -> Op {
+        Op::Put {
+            table: "names".into(),
+            key: Self::name_key(kind_, meta.project.as_ref(), &meta.name),
+            value: meta.id.to_string().into_bytes(),
+        }
+    }
+
+    /// Move one row to another project and take its name index entry with it.
+    /// The resource row and both index keys land in one batch, so a name is
+    /// never in two projects or in none — a name lookup reads the index and a
+    /// list reads the row, and one of them would otherwise still answer for
+    /// the project that gave the row away. A name already taken in the project
+    /// asked for refuses the move and leaves the row where it was.
+    pub fn reproject<K: Kind>(&self, id: &Id, project: Option<&Id>) -> Result<K> {
+        let _g = self.write_lock.write();
+        let col = self.collection::<K>();
+        let cur = col.get(id)?;
+        if cur.meta().project.as_ref() == project {
+            return Ok(cur);
+        }
+        let wanted = Store::name_key(K::KIND, project, &cur.meta().name);
+        if self.backend.get("names", &wanted)?.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "{} named '{}' already exists",
+                K::KIND,
+                cur.meta().name
+            )));
+        }
+        let old = cur.meta().clone();
+        let moved_meta = {
+            let mut m = old.clone();
+            m.project = project.cloned();
+            m.touch();
+            m
+        };
+        let mut item = cur;
+        *item.meta_mut() = moved_meta.clone();
+        self.backend.batch(vec![
+            Op::Delete {
+                table: "names".into(),
+                key: Store::name_key(K::KIND, old.project.as_ref(), &old.name),
+            },
+            Op::Put {
+                table: "resources".into(),
+                key: Store::res_key(K::KIND, &moved_meta.id),
+                value: serde_json::to_vec(&item)?,
+            },
+            Store::name_entry(K::KIND, &moved_meta),
+        ])?;
+        col.emit(&moved_meta, EventAction::Updated);
+        Ok(item)
+    }
 }
 
 /// Typed view over one resource kind.
@@ -1093,8 +1147,14 @@ impl<K: Kind> Collection<K> {
             }
         }
         let mut ops = Vec::new();
-        // Rename support: move the name index entry.
-        if current.meta().name != item.meta().name {
+        // The name index is keyed by project as well as name, so a write that
+        // changes either has to move the entry and drop the old key: a rename,
+        // and a move to another project, which keeps the name and changes the
+        // project. Left in place, the row answers to its former name or its
+        // former project forever.
+        let renamed = current.meta().name != item.meta().name
+            || current.meta().project != item.meta().project;
+        if renamed {
             let old = Store::name_key(
                 K::KIND,
                 current.meta().project.as_ref(),
@@ -1705,6 +1765,44 @@ mod tests {
             col.get_by_name(Some(&proj), "a"),
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn a_row_moved_to_another_project_answers_to_its_name_there() {
+        let store = Store::in_memory().unwrap();
+        let col = store.collection::<Widget>();
+        let from = Id::new(kind::PROJECT);
+        let to = Id::new(kind::PROJECT);
+        let w = col.create(widget("a", Some(from.clone()))).unwrap();
+
+        let moved = store.reproject::<Widget>(&w.meta.id, Some(&to)).unwrap();
+        assert_eq!(moved.meta.project.as_ref(), Some(&to));
+        assert_eq!(moved.meta.name, "a");
+        assert_eq!(moved.meta.revision, w.meta.revision + 1);
+        assert_eq!(col.get_by_name(Some(&to), "a").unwrap().meta.id, w.meta.id);
+        assert!(matches!(
+            col.get_by_name(Some(&from), "a"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(col.list(Some(&from)).unwrap().is_empty());
+        assert_eq!(col.list(Some(&to)).unwrap().len(), 1);
+        // The name sits under one project, not both.
+        assert_eq!(store.raw_scan("names", "widget/").unwrap().len(), 1);
+
+        // A move that comes back, and a move nowhere at all, both hold.
+        let back = store.reproject::<Widget>(&w.meta.id, Some(&from)).unwrap();
+        assert_eq!(back.meta.project.as_ref(), Some(&from));
+        let same = store.reproject::<Widget>(&w.meta.id, Some(&from)).unwrap();
+        assert_eq!(same.meta.revision, back.meta.revision);
+
+        // A name already taken in the project asked for refuses the move,
+        // and the row stays where it was.
+        col.create(widget("a", Some(to.clone()))).unwrap();
+        assert!(matches!(
+            store.reproject::<Widget>(&w.meta.id, Some(&to)),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(col.get(&w.meta.id).unwrap().meta.project, Some(from));
     }
 
     #[test]

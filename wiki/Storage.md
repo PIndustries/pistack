@@ -67,6 +67,37 @@ Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check
 
 Volumes can grow and cannot shrink. The `--encrypted` flag is stored on the volume and has no effect.
 
+### Moving a volume to another project
+
+A volume belongs to the project that created it. Handing one over is a transfer: the owner offers the volume and gets a transfer id and a secret, and someone in another project accepts with both. The volume and every snapshot taken from it arrive together, or nothing does.
+
+There are no `pi` commands for it; the API is under `/volume`.
+
+```sh
+# in the giving project
+pi api POST /volume/volumes/data/transfer
+# -> { "transfer": { "id": "xfer-..." }, "secret": "vxt_..." }
+
+# in the receiving project
+pi api POST /volume/transfers/xfer-.../accept -d '{"secret":"vxt_..."}'
+
+# until it is accepted, the giver can take the offer back
+pi api DELETE /volume/transfers/xfer-...
+```
+
+The secret is returned once, with the offer, and is not stored: the record keeps only its hash. Nothing on any later read gives it back, so an offer cannot be repeated from the transfer record and `pi api GET /volume/transfers/xfer-...` is safe to script. A wrong secret, an id that was never issued and an offer that is closed all answer the same `not found`, so guessing at ids tells an attacker nothing.
+
+Seeing a transfer follows the same line. The giving project reads its own offers; the receiving project reads one only after it has taken it, because until then nothing identifies it as the receiver except the secret. Whoever is handed the id and secret is whoever was meant to accept it.
+
+Rules that hold it together:
+
+- The volume must be sitting idle. An attached volume, one with an attach under way, or one with a backup still writing cannot be offered. A finished backup is no obstacle.
+- While an offer is open the volume is held: it cannot be attached or deleted, so the volume that is accepted is the one that was offered. Cancel the transfer first.
+- One open offer per volume. Cancelling and offering again issues a new secret; the old one then opens nothing.
+- The receiving project is checked for the volume and its snapshots against its own limits before anything moves, and the giving project is released when it does. A project with room for the volume but not for its snapshots takes neither.
+- An offer lasts 24 hours and then closes itself. Nothing moves when it does; the volume stays where it was.
+- What arrives behaves like a volume created in the receiving project: it is listed there, and answers to its name and its id there. It stops answering to its name in the project that gave it. A name already used there for another volume refuses the accept, and the volume stays where it was.
+
 ## Images
 
 ```sh

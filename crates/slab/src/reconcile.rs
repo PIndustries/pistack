@@ -57,6 +57,9 @@ pub async fn run(
                                 pistack_types::tally::reconcile_failed("slab");
                                 tracing::warn!(error = %e, "slab: evacuated attach reconcile failed");
                             }
+                            if let Err(e) = client.reap_expired_transfers() {
+                                tracing::warn!(error = %e, "slab: expired transfers were not closed");
+                            }
                             resume_attaches(&client);
                         }
                         ev = events.recv() => match ev {
