@@ -168,6 +168,11 @@ pub struct ClusterHandle {
     pub role: Mutex<Role>,
     pub leader: AtomicBool,
     pub leader_api: Mutex<String>,
+    /// A test's stand-in for the leader: one address, and the one path
+    /// carried for it. A request carried for any other path still goes to the
+    /// real leader. Nothing outside a test sets this.
+    #[cfg(test)]
+    pub(crate) stand_in: Mutex<Option<(String, String)>>,
     pub term: AtomicU64,
     pub announce: watch::Sender<Announce>,
     /// Shared with ModuleContext so controllers idle on followers.
@@ -619,6 +624,8 @@ pub fn handle_from(
         role: Mutex::new(established.role),
         leader: AtomicBool::new(established.leader),
         leader_api: Mutex::new(established.leader_api.clone()),
+        #[cfg(test)]
+        stand_in: Mutex::new(None),
         term: AtomicU64::new(established.term),
         announce: tx,
         leadership,
@@ -809,9 +816,14 @@ pub fn wants_forward(headers: &axum::http::HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("leader"))
 }
 
-/// The headers of the hop this request is leaving, so a request carried on
-/// does not arrive with them: the six an intermediary never passes, the
-/// `Connection` line itself, and every name that line asks to be dropped.
+/// The headers of the hop being left, so a request carried on does not
+/// arrive with them: the six an intermediary never passes, the `Connection`
+/// line itself, and every name that line asks to be dropped.
+///
+/// `upgrade` is not among them. It names a protocol on the connection the
+/// request came in on, so it travels with a request; the answer's copy
+/// names a protocol on the leader's own connection, which is not the one
+/// the client is on, so [`carried_headers`] drops it.
 fn hop_by_hop(headers: &axum::http::HeaderMap) -> Vec<axum::http::HeaderName> {
     const STOPPED: [&str; 7] = [
         "connection",
@@ -845,17 +857,23 @@ fn hop_by_hop(headers: &axum::http::HeaderMap) -> Vec<axum::http::HeaderName> {
 }
 
 /// Carry a request to the leader and hand its answer back. The caller's
-/// token goes with it and the leader checks it as it would any other. The
-/// header that asked for this does not, so a server that turns out not to
-/// lead answers with the usual refusal and nothing goes round in a circle.
-/// The caller's address goes in the peer header the leader already
-/// authenticates, so the leader's audit record names the client and not
-/// this server.
+/// token goes with it and the leader checks it as it would any other. Both
+/// callers take the header that asked for this off first, so the request
+/// that reaches the leader is one the leader owns and answers; a server
+/// that turns out not to lead answers with the usual refusal and nothing
+/// goes round in a circle. The caller's address goes in the peer header the
+/// leader already authenticates, so the leader's audit record names the
+/// client and not this server.
 ///
 /// After a write, this server waits a moment for its own store to reach
 /// that write, so what the client reads here next already has it.
 pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Request) -> Response {
-    let api = locked(&handle.leader_api);
+    let asked_for = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .to_owned();
+    let api = leader_route(handle, &asked_for);
     if api.is_empty() || api == handle.self_api {
         return ApiError::unavailable("no leader yet, retry soon").into_response();
     }
@@ -963,12 +981,47 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
     }
     let mut out = Response::new(axum::body::Body::from(bytes));
     *out.status_mut() = status;
-    for name in ["content-type", "etag", "location", COMMIT_HEADER] {
-        if let Some(value) = headers.get(name) {
-            if let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) {
-                out.headers_mut().insert(name, value.clone());
-            }
-        }
+    *out.headers_mut() = carried_headers(&headers);
+    out
+}
+
+/// What the client gets back from an answer this server carried.
+///
+/// Two things do not cross. The headers of the hop the answer is leaving,
+/// which say something about the leader's own connection and would be a lie
+/// about the client's — `upgrade` among them, since a protocol the leader
+/// switched its own connection to is not one the client's connection is on.
+/// And the length the leader counted with, because the body was held here and
+/// is framed again on the way out. Everything else goes as it was said, in
+/// order and with repeats kept repeated: a `Set-Cookie` line is a different
+/// cookie each time the name appears, and a `Vary` list assembled out of
+/// order is not the same list. The commit point the leader reports is among
+/// what crosses — the client is owed the point the write was actually held
+/// at, which is the leader's, not this follower's.
+fn carried_headers(from: &axum::http::HeaderMap) -> axum::http::HeaderMap {
+    // What the leader's hop says about its own connection says something
+    // false about the client's, so none of it crosses: the seven an
+    // intermediary never passes, `upgrade`, and every name the leader's own
+    // `Connection` line asks to drop.
+    let mut dropped = hop_by_hop(from);
+    dropped.push(axum::http::header::UPGRADE);
+    // Read the answer out once, in order and with repeats, before anything is
+    // filtered. The length is what `append` below refuses: a name already in
+    // the map stands beside the one being added rather than replacing it, so
+    // the filtered list is appended to an empty map once, not grown in place.
+    dropped.push(axum::http::header::CONTENT_LENGTH);
+    let kept: Vec<(axum::http::HeaderName, axum::http::HeaderValue)> = from
+        .keys()
+        .filter(|name| !dropped.contains(name))
+        .flat_map(|name| {
+            from.get_all(name)
+                .iter()
+                .map(move |value| (name.clone(), value.clone()))
+        })
+        .collect();
+    let mut out = axum::http::HeaderMap::new();
+    for (name, value) in kept {
+        out.append(name, value);
     }
     out
 }
@@ -1071,6 +1124,10 @@ pub async fn reject_follower_writes(
         };
     }
     if wants_forward(req.headers()) {
+        // The header that asked for this does not go on, so that a server
+        // that turns out not to lead answers with the usual refusal and
+        // nothing goes round in a circle.
+        req.headers_mut().remove(FORWARD_HEADER);
         return forward_to_leader(&handle, req).await;
     }
     let leader = locked(&handle.leader_api);
@@ -2647,6 +2704,22 @@ fn http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Where a follower looks for the leader. A test can name one path to carry
+/// somewhere else — the only way to see what a carried answer does with
+/// headers no route through a real leader puts on one.
+#[cfg(test)]
+fn leader_route(handle: &ClusterHandle, path: &str) -> String {
+    match guard(&handle.stand_in).as_ref() {
+        Some((api, at)) if path.starts_with(at.as_str()) => api.clone(),
+        _ => locked(&handle.leader_api),
+    }
+}
+
+#[cfg(not(test))]
+fn leader_route(handle: &ClusterHandle, _path: &str) -> String {
+    locked(&handle.leader_api)
 }
 
 /// The store this server keeps, for the peer key on outgoing calls. Set
@@ -5263,6 +5336,13 @@ mod tests {
     /// in the leader's answer.
     struct Signed {
         follower_api: String,
+        /// The leader's own listener. A client is never given it, which is
+        /// why anything seen there was carried to it.
+        leader_api: String,
+        /// The address of the listener below, as it reported answering.
+        /// Empty until one of its requests arrives, which is the proof that a
+        /// carried request reached it rather than being answered here.
+        answered: Arc<Mutex<String>>,
         store: Store,
         /// The bucket the client writes into.
         bucket: pistack_types::Id,
@@ -5393,11 +5473,14 @@ mod tests {
         // What the gateway has around every route: the peer key check, the
         // carrier's headers taken off a stranger, and the leader's own write
         // answer. On the follower too, so the carrier starts from what an
-        // ordinary request would have been given.
+        // ordinary request would have been given. `sim` is told it does not
+        // lead — a SigV4 write reaches a leader only through the carry
+        // layer — so an S3 read of its own has to be carried to it, and it
+        // answers once asked.
         let leader_app = router(leader_handle.clone())
             .nest(
                 "/silo",
-                silo::http::router_with(silo, Some(keep), region.clone()),
+                silo::http::router_with(silo, Some(keep.clone()), region.clone()),
             )
             .layer(middleware::from_fn_with_state(
                 leader_store.clone(),
@@ -5420,7 +5503,15 @@ mod tests {
         // The carrier signs with its own peer key, as a server does. Both
         // handles share the store, so the key is this server's own either way.
         set_peer_store(&follower_store);
+        // A read only the leader answers, in both directions: asked plainly,
+        // the follower says who leads; asked to carry, it goes and hands the
+        // leader's answer back whole.
         let follower_app = router(follower_handle.clone())
+            .fallback(|| async { ApiError::conflict("not the leader").into_response() })
+            .layer(middleware::from_fn_with_state(
+                follower_handle.clone(),
+                forward_when_asked,
+            ))
             .layer(middleware::from_fn_with_state(
                 follower_store.clone(),
                 strip_carrier_headers,
@@ -5442,8 +5533,47 @@ mod tests {
                 .ok();
             });
         }
+        // A listener on the leader's address answering with headers that no
+        // other route puts on an answer by itself: the waiting time of a
+        // sign-in refused too often, a cookie said twice, and a hop of the
+        // leader's own connection. The follower is pointed at it below, so
+        // whatever reaches the client is the carry's doing and nothing else's.
+        let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_api = format!("http://{}", echo_listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(String::new()));
+        let answered = echo_api.clone();
+        let wrote = seen.clone();
+        let echo = Router::new().fallback(move || {
+            let wrote = wrote.clone();
+            let answered = answered.clone();
+            async move {
+                *wrote.lock().unwrap() = answered.clone();
+                let value = |text: &str| axum::http::HeaderValue::from_str(text).unwrap();
+                let mut answer = axum::response::Response::new(Body::from("refused by the leader"));
+                *answer.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                let out = answer.headers_mut();
+                out.append("retry-after", value("30"));
+                out.append("etag", value("\"leader-etag\""));
+                out.append("content-range", value("bytes 0-1/7"));
+                out.append("set-cookie", value("a=1; Path=/"));
+                out.append("set-cookie", value("b=2; Path=/"));
+                out.append("www-authenticate", value("Bearer"));
+                out.append("x-amz-request-id", value("leader-request"));
+                out.append("x-pistack-said", value("leader"));
+                out.append("x-pistack-other", value("the-leader-answers-this-one"));
+                out.append("connection", value("close, x-leader-only"));
+                out.append("keep-alive", value("timeout=5"));
+                out.append("x-leader-only", value("should-not-cross"));
+                out.append("upgrade", value("h2c"));
+                answer
+            }
+        });
+        tokio::spawn(async move { axum::serve(echo_listener, echo).await.ok() });
+        *guard(&follower_handle.stand_in) = Some((echo_api, "/refused-at-the-leader".to_owned()));
         Signed {
             follower_api,
+            leader_api,
+            answered: seen,
             store,
             bucket,
             objects: leader_dir.path().join("silo"),
@@ -5456,7 +5586,12 @@ mod tests {
 
     /// A signed request, sent to `to`, with `host` the address the client
     /// signed for. Everything the signature covers is on the wire.
-    async fn signed_send(
+    /// A signed request the client signs for `host`, sent to `to`, with
+    /// `extra` headers the signature covers, and the answer kept whole: what
+    /// a signed request gets back is more than a status and a body once the
+    /// headers matter.
+    #[allow(clippy::too_many_arguments)]
+    async fn signed_call(
         w: &Signed,
         to: &str,
         method: &str,
@@ -5464,7 +5599,8 @@ mod tests {
         query: &str,
         body: &[u8],
         host: &str,
-    ) -> (u16, Vec<u8>) {
+        extra: &[(&str, &str)],
+    ) -> reqwest::Response {
         let payload = silo::sigv4::hex_sha256(body);
         let date = amz_now();
         let mut headers: Vec<(String, String)> = vec![
@@ -5474,6 +5610,9 @@ mod tests {
         ];
         if method == "PUT" || method == "POST" {
             headers.push(("content-length".into(), body.len().to_string()));
+        }
+        for (name, value) in extra {
+            headers.push(((*name).to_owned(), (*value).to_owned()));
         }
         headers.sort();
         let signed: Vec<String> = headers.iter().map(|(k, _)| k.clone()).collect();
@@ -5496,7 +5635,7 @@ mod tests {
         };
         let mut request = http_client()
             .request(method.parse().unwrap(), format!("{to}{uri}"))
-            .header("x-pistack-forward", "leader")
+            .header(FORWARD_HEADER, "leader")
             .header(
                 "authorization",
                 format!(
@@ -5509,7 +5648,20 @@ mod tests {
         for (k, v) in &headers {
             request = request.header(k.as_str(), v.as_str());
         }
-        let answer = request.body(body.to_vec()).send().await.unwrap();
+        request.body(body.to_vec()).send().await.unwrap()
+    }
+
+    /// As [`signed_call`], with only the status and the body read off.
+    async fn signed_send(
+        w: &Signed,
+        to: &str,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        host: &str,
+    ) -> (u16, Vec<u8>) {
+        let answer = signed_call(w, to, method, path, query, body, host, &[]).await;
         let status = answer.status().as_u16();
         let bytes = answer.bytes().await.unwrap().to_vec();
         (status, bytes)
@@ -5694,6 +5846,221 @@ mod tests {
         )
         .await;
         assert_eq!(status, 404, "{status}: {}", String::from_utf8_lossy(&body));
+    }
+
+    /// What the gateway does with a read only the leader can answer: a
+    /// client that asked to be carried is carried, and anything else goes to
+    /// the refusal this server owes it.
+    async fn forward_when_asked(
+        axum::extract::State(handle): axum::extract::State<Arc<ClusterHandle>>,
+        req: axum::extract::Request,
+        _next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        if wants_forward(req.headers()) {
+            let mut req = req;
+            req.headers_mut().remove(FORWARD_HEADER);
+            return forward_to_leader(&handle, req).await;
+        }
+        ApiError::conflict("not the leader")
+            .with_detail("leader", locked(&handle.leader_api))
+            .into_response()
+    }
+
+    /// A read of an object as the leader answers it, carried. Everything the
+    /// leader put on the answer — the ETag of the bytes it served, when they
+    /// changed, the length it counted with — crosses to the client. The
+    /// follower's own connection says nothing about the leader's, so the
+    /// headers of that hop are the one thing that must not cross.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_carried_answer_keeps_the_headers_the_leader_gave_it() {
+        let w = signed_cluster().await;
+        let objects = silo::Client::new(w.store.clone(), w.objects.clone());
+        let payload = b"the whole object";
+        objects
+            .put_object(&w.bucket, "whole.txt", payload, Some("text/plain".into()))
+            .await
+            .unwrap();
+        let direct = signed_call(
+            &w,
+            &w.leader_api,
+            "GET",
+            "/silo/widgets/whole.txt",
+            "",
+            b"",
+            "s3.example:8443",
+            &[],
+        )
+        .await;
+        let wanted = lines(&direct.headers().clone());
+        let body = String::from_utf8(direct.bytes().await.unwrap().to_vec()).unwrap();
+        let carried = signed_call(
+            &w,
+            &w.follower_api,
+            "GET",
+            "/silo/widgets/whole.txt",
+            "",
+            b"",
+            "s3.example:8443",
+            &[],
+        )
+        .await;
+        let headers = carried.headers().clone();
+        let got = lines(&headers);
+        let carried_body = String::from_utf8(carried.bytes().await.unwrap().to_vec()).unwrap();
+        assert_eq!(carried_body, body);
+        // Both servers frame the length themselves, and a server's own
+        // listener dates an answer when it writes it out.
+        let kept = |lines: &Vec<String>| -> Vec<String> {
+            lines
+                .iter()
+                .filter(|line| !line.starts_with("date:") && !line.starts_with("content-length:"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(kept(&got), kept(&wanted), "{got:?} vs {wanted:?}");
+        assert!(got.iter().any(|line| line.starts_with("etag:")), "{got:?}");
+        assert_eq!(
+            headers["content-length"],
+            body.len().to_string(),
+            "{headers:?}"
+        );
+    }
+
+    /// Every header on an answer, one line per appearance: a name sent
+    /// twice is two lines, in the order it was sent.
+    fn lines(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+        headers
+            .iter()
+            .map(|(name, value)| {
+                format!("{}: {}", name.as_str(), value.to_str().unwrap_or("<bytes>"))
+            })
+            .collect()
+    }
+
+    /// A ranged read of an object, signed for a name the leader does not
+    /// answer on and carried. The leader answers 206 and names the range it
+    /// served, along with the word that ranges work here at all; the
+    /// follower hands over those headers and the slice, and no longer says
+    /// what the whole object is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_carried_ranged_read_keeps_the_range_the_leader_answered() {
+        let w = signed_cluster().await;
+        let objects = silo::Client::new(w.store.clone(), w.objects.clone());
+        let payload = b"0123456789abcdef";
+        objects
+            .put_object(&w.bucket, "ranged.txt", payload, Some("text/plain".into()))
+            .await
+            .unwrap();
+        let answer = signed_call(
+            &w,
+            &w.follower_api,
+            "GET",
+            "/silo/widgets/ranged.txt",
+            "",
+            b"",
+            "s3.example:8443",
+            &[("range", "bytes=4-9")],
+        )
+        .await;
+        let status = answer.status();
+        let headers = answer.headers().clone();
+        let body = answer.bytes().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "{headers:?} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(headers["content-range"], "bytes 4-9/16");
+        assert_eq!(headers["accept-ranges"], "bytes");
+        assert_eq!(headers["content-type"], "text/plain");
+        assert_eq!(body, &payload[4..10]);
+        assert_eq!(headers["content-length"], "6");
+    }
+
+    /// An answer written by hand on the leader's own address, carried. A
+    /// sign-in refused for too many failures is answered this way — 429 with
+    /// a `Retry-After` — and a client refused through a follower needs the
+    /// same waiting time it would have been given at the leader. A name said
+    /// twice stays two lines in the order it was said, a name this follower
+    /// answers with itself stays the follower's, and what describes the
+    /// leader's own connection does not cross: the hop-by-hop names, and the
+    /// one its `Connection` line names beside them. A cookie is carried as a
+    /// header and nothing more; no server here keeps a jar that could answer
+    /// the next request out of the last one's memory.
+    #[tokio::test]
+    async fn a_carried_refusal_keeps_the_leader_s_waiting_time() {
+        let w = signed_cluster().await;
+        let carried = http_client()
+            .get(format!("{}/refused-at-the-leader", w.follower_api))
+            .header(FORWARD_HEADER, "leader")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(carried.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = carried.text().await.unwrap();
+        assert_eq!(body, "refused by the leader");
+        let stood_in = || !guard(&w.answered).is_empty();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stood_in() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the follower answered this one itself, not the stand-in");
+        let carried = http_client()
+            .get(format!("{}/refused-at-the-leader", w.follower_api))
+            .header(FORWARD_HEADER, "leader")
+            .send()
+            .await
+            .unwrap();
+        let got = lines(&carried.headers().clone());
+        let said = |name: &str| -> Vec<String> {
+            got.iter()
+                .filter(|line| line.starts_with(&format!("{name}:")))
+                .cloned()
+                .collect()
+        };
+        for wanted in [
+            "retry-after: 30",
+            "etag: \"leader-etag\"",
+            "content-range: bytes 0-1/7",
+            "www-authenticate: Bearer",
+            "x-amz-request-id: leader-request",
+        ] {
+            assert_eq!(said(wanted.split(':').next().unwrap()), [wanted], "{got:?}");
+        }
+        // Two cookies, two lines, in the order the leader wrote them.
+        assert_eq!(
+            said("set-cookie"),
+            ["set-cookie: a=1; Path=/", "set-cookie: b=2; Path=/"],
+            "{got:?}"
+        );
+        // A name the leader answers with under the prefix this server uses
+        // for its own answers crosses the same as any other: it is the
+        // leader's answer that the client asked for.
+        assert_eq!(
+            said("x-pistack-said"),
+            ["x-pistack-said: leader"],
+            "{got:?}"
+        );
+        assert_eq!(
+            said("x-pistack-other"),
+            ["x-pistack-other: the-leader-answers-this-one"],
+            "{got:?}"
+        );
+        // Everything of the leader's own hop stays there, the extra name its
+        // `Connection` line asked to drop among them. The length that arrives
+        // is the one written for the body handed over, counted again on this
+        // server's own connection rather than copied from the leader's.
+        for name in ["connection", "keep-alive", "x-leader-only", "upgrade"] {
+            assert!(said(name).is_empty(), "{got:?} still has {name}");
+        }
+        assert_eq!(
+            said("content-length"),
+            [format!("content-length: {}", "refused by the leader".len())],
+            "{got:?}"
+        );
     }
 
     /// A SigV4 request the client signs for a name the leader does not
