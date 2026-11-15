@@ -243,6 +243,10 @@ impl NetBackend for HostNat {
         _port: &Port,
         _groups: &[SecurityGroup],
     ) -> ApiResult<PortBinding> {
+        // Nothing to do for a port, and nothing to do for its allowed address
+        // pairs: this backend filters no traffic by address or mac, so there
+        // is no anti-spoofing rule to widen. What a guest may send is decided
+        // by the libvirt network it sits on.
         Ok(PortBinding {
             vif_type: "hostnat".into(),
             vif_details: Default::default(),

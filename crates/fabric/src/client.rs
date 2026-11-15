@@ -326,6 +326,7 @@ impl Client {
     /// default security group when the spec leaves them empty.
     pub fn create_port(&self, mut meta: Meta, mut spec: PortSpec) -> ApiResult<Port> {
         meta.id = Id::new(kind::PORT);
+        validate_pairs(&spec)?;
         let net = self.networks().get(&spec.network).map_err(store_err)?;
         check_same_project(&meta, &net.meta, "network")?;
 
@@ -426,6 +427,7 @@ impl Client {
         next.status = cur.status.clone();
         next.meta.id = cur.meta.id.clone();
         next.meta.project = cur.meta.project.clone();
+        validate_pairs(&next.spec)?;
         if next.spec.network != cur.spec.network || next.spec.subnet != cur.spec.subnet {
             return Err(ApiError::bad_request(
                 "port network and subnet are immutable",
@@ -663,6 +665,7 @@ impl Client {
                 device: Some(router.meta.id.clone()),
                 security_groups: Vec::new(),
                 port_security: false,
+                allowed_address_pairs: Vec::new(),
             };
             self.create_port_as_router(meta, spec)?;
         }
@@ -737,6 +740,7 @@ impl Client {
             device: Some(router.meta.id.clone()),
             security_groups: Vec::new(),
             port_security: false,
+            allowed_address_pairs: Vec::new(),
         };
         self.create_port_as_router(meta, spec)
     }
@@ -1285,6 +1289,21 @@ fn validate_routes(routes: &[StaticRoute]) -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+/// Allowed address pairs are the exceptions to a port's own filter, so they
+/// need a filter to be in. A whole-family prefix is refused too: it lets the
+/// machine claim any address there.
+fn validate_pairs(spec: &PortSpec) -> ApiResult<()> {
+    if spec.allowed_address_pairs.is_empty() {
+        return Ok(());
+    }
+    if !spec.port_security {
+        return Err(ApiError::bad_request(
+            "allowed_address_pairs needs port security on this port",
+        ));
+    }
+    ipam::validate_pairs(&spec.allowed_address_pairs)
 }
 
 fn overlaps(a: IpNet, b: IpNet) -> bool {
