@@ -141,6 +141,12 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: PodCmd,
     },
+    /// SSH key pairs.
+    #[command(alias = "keypairs", alias = "kp")]
+    Keypair {
+        #[command(subcommand)]
+        cmd: KeypairCmd,
+    },
     /// Sizes (flavors).
     Size {
         #[command(subcommand)]
@@ -593,6 +599,9 @@ pub struct MachineCreate {
     /// SSH public key (repeatable); `@file` reads a file.
     #[arg(long = "ssh-key", value_name = "KEY")]
     pub ssh_keys: Vec<String>,
+    /// Key pair (name or id) whose public key the machine also gets.
+    #[arg(long, value_name = "KEYPAIR")]
+    pub keypair: Option<String>,
     /// cloud-init user data; `@file` reads a file.
     #[arg(long)]
     pub user_data: Option<String>,
@@ -613,6 +622,23 @@ pub struct PowerArgs {
     #[arg(long)]
     pub wait: bool,
 }
+
+#[derive(Args, Debug)]
+pub struct KeypairCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Import this public key file instead of making a key.
+    #[arg(long = "public-key-file", value_name = "FILE")]
+    pub public_key_file: Option<String>,
+    /// Write a generated private key here, mode 0600, never overwritten.
+    /// Without it a key is printed, and only when the output is not a
+    /// terminal.
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<String>,
+}
+
+crud!(KeypairCmd, KeypairCreate);
 
 crud!(
     MachineCmd,

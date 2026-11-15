@@ -24,6 +24,7 @@ pub mod agent_driver;
 pub mod console;
 pub mod driver;
 pub mod http;
+pub mod keypair;
 pub mod maintain;
 mod metadata;
 mod nic;

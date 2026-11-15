@@ -280,6 +280,50 @@ pub fn default_sizes() -> Vec<Size> {
     ]
 }
 
+// ---- Keypair ---------------------------------------------------------------
+
+/// Id prefix / store table for key pairs.
+pub const KEYPAIR_KIND: &str = "keypair";
+
+/// An SSH public key a machine can be given. Only the public half is ever
+/// stored; a pair generated here hands its private half to the caller once.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KeypairSpec {
+    /// The key as one OpenSSH line, what a guest is given verbatim.
+    pub public_key: String,
+    /// Wire name: `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256`.
+    pub key_type: String,
+    /// `SHA256:...`, as `ssh-keygen -l` prints it.
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KeypairStatus {}
+
+resource_kind!(
+    /// A named SSH public key in a project.
+    Keypair,
+    KeypairSpec,
+    KeypairStatus,
+    KEYPAIR_KIND
+);
+
+pub fn new_keypair(
+    name: impl Into<String>,
+    project: Option<Id>,
+    key: crate::keypair::PublicKey,
+) -> Keypair {
+    Keypair(Resource {
+        meta: Meta::new(KEYPAIR_KIND, name, project),
+        spec: KeypairSpec {
+            public_key: key.line,
+            key_type: key.key_type,
+            fingerprint: key.fingerprint,
+        },
+        status: KeypairStatus {},
+    })
+}
+
 // ---- Machine ---------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -341,6 +385,12 @@ pub struct MachineSpec {
     pub user_data: Option<String>,
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+    /// Key pair name whose public key was added to `ssh_keys` at create.
+    /// Resolved in the caller's project and stored as given; read-only after
+    /// create. The machine carries the key itself, so deleting the pair
+    /// changes nothing about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keypair: Option<String>,
     /// Soft hint: prefer hosts that already run machines with these names.
     #[serde(default)]
     pub affinity: Vec<String>,

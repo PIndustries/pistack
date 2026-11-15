@@ -59,6 +59,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::JoinToken { cmd } => join_token(ctx, cmd, io).await,
         Cmd::Machine { cmd } => machine(ctx, cmd, io).await,
         Cmd::Size { cmd } => size(ctx, cmd, io).await,
+        Cmd::Keypair { cmd } => keypair(ctx, cmd, io).await,
         Cmd::Host { cmd } => host(ctx, cmd, io).await,
         Cmd::Cluster { cmd } => cluster(ctx, cmd, io).await,
         Cmd::Server { cmd } => server(ctx, cmd, io).await,
@@ -1646,6 +1647,188 @@ async fn join_token(ctx: &Ctx, cmd: JoinTokenCmd, io: &mut Io<'_>) -> CliResult<
 
 // ---- compute nouns -----------------------------------------------------------------------
 
+/// The resource without its private key, for output formats that dump it.
+fn strip_private(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut m = m.clone();
+            m.remove("private_key");
+            Value::Object(m)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Write a private key the server made, readable only by this user. An
+/// existing file is never replaced: a key that is already there belongs to
+/// something.
+fn write_private_key(path: &str, key: &str) -> CliResult<()> {
+    let path = std::path::Path::new(path);
+    if path.exists() {
+        return Err(CliError::usage(format!(
+            "refusing to overwrite {}: a private key there already",
+            path.display()
+        )));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| CliError::usage(format!("creating {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| CliError::usage(format!("setting mode on {}: {e}", path.display())))?;
+    }
+    use std::io::Write;
+    let mut file = file;
+    file.write_all(key.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Where a generated private key is going to land, settled before anything
+/// is asked of the server: a pair whose key cannot be written is a pair
+/// nobody can use.
+fn check_out(path: &str) -> CliResult<()> {
+    let p = std::path::Path::new(path);
+    if p.exists() {
+        return Err(CliError::usage(format!(
+            "refusing to overwrite {}: a private key there already",
+            p.display()
+        )));
+    }
+    let dir = if p.parent().map(|d| d.as_os_str().is_empty()).unwrap_or(true) {
+        std::path::Path::new(".")
+    } else {
+        p.parent().unwrap()
+    };
+    if !dir.is_dir() {
+        return Err(CliError::usage(format!(
+            "no such directory for {}: {}",
+            p.display(),
+            dir.display()
+        )));
+    }
+    // Write the key on top of an existing file. A read-only or busy directory
+    // is found out here, not after the server has made a key.
+    let probe = dir.join(format!(
+        ".{}.probe",
+        p.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(CliError::usage(format!(
+            "cannot write to {}: {e}",
+            dir.display()
+        ))),
+    }
+}
+
+async fn keypair(ctx: &Ctx, cmd: KeypairCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("keypair");
+    match cmd {
+        KeypairCmd::List(a) => do_list(ctx, io, k, a).await,
+        KeypairCmd::Show(a) => do_show(ctx, io, k, a).await,
+        KeypairCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        KeypairCmd::Create(a) => {
+            let mut body = Map::new();
+            body.insert("name".into(), json!(a.name));
+            if let Some(d) = &a.meta.description {
+                body.insert("description".into(), json!(d));
+            }
+            let labels = parse_kv(&a.meta.labels, "--label")?;
+            if !labels.is_empty() {
+                body.insert("labels".into(), Value::Object(labels));
+            }
+            if let Some(file) = &a.public_key_file {
+                if a.out.is_some() {
+                    return Err(CliError::usage(
+                        "--out writes a generated private key and is not used with --public-key-file",
+                    ));
+                }
+                let key = std::fs::read_to_string(file)
+                    .map_err(|e| CliError::usage(format!("reading {file}: {e}")))?;
+                body.insert("public_key".into(), json!(key.trim()));
+            } else if let Some(path) = &a.out {
+                // Nothing is asked of the server until the key has somewhere
+                // to go.
+                check_out(path)?;
+            }
+            let c = ctx.client()?;
+            let v = c.post(k.path, &Value::Object(body)).await?;
+            // A private key is written to a file or sent down a pipe, never
+            // shown on a terminal.
+            let private = str_at(&v, "/private_key");
+            if !private.is_empty() {
+                match &a.out {
+                    Some(path) => {
+                        // The pair exists now. If the file still cannot be
+                        // written, the pair goes back: a kept one would be a
+                        // key nobody holds.
+                        if let Err(e) = write_private_key(path, &private) {
+                            let id = str_at(&v, "/id");
+                            let name = str_at(&v, "/name");
+                            match c
+                                .delete(&k.item_path(if id.is_empty() { &name } else { &id }))
+                                .await
+                            {
+                                Ok(_) => {
+                                    return Err(CliError::usage(format!(
+                                    "{e}; keypair \"{name}\" was made and has been deleted again"
+                                )))
+                                }
+                                Err(de) => {
+                                    return Err(CliError::usage(format!(
+                                        "{e}; keypair \"{name}\" was made but could not be \
+                                         deleted ({de}) and its private key was not written"
+                                    )))
+                                }
+                            }
+                        }
+                        if matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+                            writeln!(io.stdout, "private key written to {path} (mode 0600)")?;
+                        }
+                    }
+                    None if io.tty => {
+                        return Err(CliError::usage(
+                            "a private key was made; write it with --out FILE rather than printing it",
+                        ));
+                    }
+                    None => {
+                        if matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+                            writeln!(io.stdout, "keypair \"{}\" created", str_at(&v, "/name"))?;
+                        }
+                        write!(io.stdout, "{private}")?;
+                        return Ok(());
+                    }
+                }
+            } else if a.out.is_some() {
+                // An older server imported what it was given and made nothing.
+                return Err(CliError::usage(
+                    "the server returned no private key, so there is nothing to write",
+                ));
+            }
+            match ctx.fmt.output {
+                Output::Table | Output::Wide => report(ctx, io, k, &v, "created")?,
+                Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/name"))?,
+                _ => print_one(io.stdout, ctx.fmt, &strip_private(&v))?,
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
     let k = kind("machine");
     match cmd {
@@ -1668,6 +1851,7 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "networks": a.networks,
                 "volumes": a.volumes,
                 "ssh_keys": keys,
+                "keypair": opt(a.keypair),
                 "user_data": user_data,
                 "host_selector": Value::Object(parse_kv(&a.host_selector, "--host-selector")?),
                 "zone": opt(a.zone),

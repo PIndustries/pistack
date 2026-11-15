@@ -379,6 +379,23 @@ pub static KINDS: &[KindDef] = &[
         wide: WIDE_GLOBAL,
     },
     KindDef {
+        noun: "keypair",
+        aliases: &["keypairs", "key-pair", "key-pairs", "kp"],
+        path: "/compute/keypairs",
+        id_prefix: "keypair",
+        update: UpdateStyle::None,
+        flat_create: true,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("TYPE", "/spec/key_type"),
+            col!("FINGERPRINT", "/spec/fingerprint"),
+            col!("DESCRIPTION", description),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
         noun: "host",
         aliases: &["hosts"],
         path: "/compute/hosts",
@@ -830,6 +847,9 @@ mod tests {
         assert_eq!(by_noun("DaemonSet").unwrap().noun, "daemonset");
         assert_eq!(by_noun("hpa").unwrap().noun, "autoscaler");
         assert_eq!(by_noun("stack").unwrap().path, "/blueprint/stacks");
+        assert_eq!(by_noun("keypair").unwrap().path, "/compute/keypairs");
+        assert_eq!(by_noun("KeyPair").unwrap().noun, "keypair");
+        assert_eq!(by_noun("kp").unwrap().noun, "keypair");
         assert_eq!(by_noun("access-key").unwrap().path, "/secrets/access-keys");
         assert_eq!(by_noun("akey").unwrap().noun, "access-key");
         assert_eq!(by_noun("join-token").unwrap().path, "/secrets/join-tokens");
