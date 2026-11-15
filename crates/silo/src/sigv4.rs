@@ -901,6 +901,7 @@ fn sigv4_error(err: ApiError) -> Response {
         | "InvalidArgument"
         | "IncompleteBody"
         | "BadDigest"
+        | "InvalidDigest"
         | "XAmzContentSHA256Mismatch"
         | "XAmzContentChecksumMismatch" => StatusCode::BAD_REQUEST,
         "InvalidAccessKeyId"

@@ -8,6 +8,7 @@
 //! GET                       /{bucket}?list-type=2&prefix=&delimiter=&continuation-token=&start-after=&max-keys=
 //! GET                       /{bucket}?uploads&prefix=&delimiter=&key-marker=&upload-id-marker=&max-uploads=
 //!                                     ListMultipartUploads
+//! POST                      /{bucket}?delete (XML body)   DeleteObjects
 //!
 //! Multipart (query on the object path):
 //! POST   ?uploads                         CreateMultipartUpload
@@ -46,6 +47,21 @@
 //! destination keys reject XML-unsafe characters (C0 controls, U+007F,
 //! U+FFFE, U+FFFF) after bucket visibility; GET/HEAD/DELETE leave existing
 //! keys readable.
+//!
+//! **GetObject** answers a `Range` header of `bytes=a-b`, `bytes=a-` or
+//! `bytes=-n` with 206, `Content-Range`, and the requested bytes — seeked to
+//! and length-limited on disk, never buffered whole. A first byte at or past
+//! the end is `InvalidRange` with 416 and `Content-Range: bytes */size`. A
+//! multi-range or unreadable header, and `first > last`, are ignored and the
+//! whole object is served with 200, as is a range naming all of it. GET and
+//! HEAD both answer `Accept-Ranges: bytes`.
+//!
+//! **DeleteObjects** (`POST /{bucket}?delete`, XML body) takes up to 1000
+//! keys and honours the declared body hash the way CompleteMultipartUpload
+//! does. A key that is not there counts as deleted; `Quiet`, on the request or
+//! on one object, drops that `<Deleted>` entry. Anything else that fails
+//! becomes one `<Error>` naming the key, and the answer is still 200: a batch
+//! does not fail as a whole over one key.
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
@@ -516,6 +532,7 @@ pub async fn get_object(
     ext: Option<Extension<Caller>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<ObjectQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Some(upload_id) = q.upload_id.as_deref() {
         return match list_parts_inner(c, ext, bucket, key, upload_id).await {
@@ -523,7 +540,7 @@ pub async fn get_object(
             Err(err) => s3_error(err),
         };
     }
-    match get_object_inner(c, ext, bucket, key, true).await {
+    match get_object_inner(c, ext, bucket, key, headers, true).await {
         Ok(resp) => resp,
         Err(err) => s3_error(err),
     }
@@ -533,8 +550,9 @@ pub async fn head_object(
     State(c): State<Client>,
     ext: Option<Extension<Caller>>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    match get_object_inner(c, ext, bucket, key, false).await {
+    match get_object_inner(c, ext, bucket, key, headers, false).await {
         Ok(resp) => resp,
         Err(err) => s3_error(err),
     }
@@ -545,23 +563,63 @@ async fn get_object_inner(
     ext: Option<Extension<Caller>>,
     bucket: String,
     key: String,
+    headers: HeaderMap,
     with_body: bool,
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
-    if with_body {
-        let (obj, file) = c.open_object(&bucket.meta.id, &key).await?;
-        let mut resp =
-            Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
-        apply_object_headers(resp.headers_mut(), &obj)?;
-        Ok(resp)
-    } else {
+    if !with_body {
         let obj = c.head_object(&bucket.meta.id, &key)?;
         let mut resp = StatusCode::OK.into_response();
         apply_object_headers(resp.headers_mut(), &obj)?;
         *resp.body_mut() = Body::empty();
-        Ok(resp)
+        return Ok(resp);
     }
+    let (obj, mut file) = c.open_object(&bucket.meta.id, &key).await?;
+    let Some(range) = header_str(&headers, "range").and_then(copy::parse_get_range) else {
+        let mut resp =
+            Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
+        apply_object_headers(resp.headers_mut(), &obj)?;
+        return Ok(resp);
+    };
+    let size = obj.status.size_bytes;
+    let Some((start, end)) = copy::satisfiable(range, size) else {
+        // A refused range still says how big the object is.
+        let mut resp = s3_error(multipart::s3_err(
+            "InvalidRange",
+            "The requested range is not satisfiable",
+        ));
+        *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes */{size}")) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+        return Ok(resp);
+    };
+    // A range that names the whole object — an empty one included — is
+    // answered as a plain 200 without a Content-Range, as S3 answers it.
+    if start == 0 && end + 1 >= size {
+        let mut resp =
+            Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
+        apply_object_headers(resp.headers_mut(), &obj)?;
+        return Ok(resp);
+    }
+    let len = end - start + 1;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(multipart::io_err)?;
+    }
+    let mut resp =
+        Body::from_stream(ReaderStream::with_capacity(file.take(len), 256 * 1024)).into_response();
+    apply_object_headers(resp.headers_mut(), &obj)?;
+    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    if let Ok(v) = HeaderValue::from_str(&len.to_string()) {
+        resp.headers_mut().insert(header::CONTENT_LENGTH, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")) {
+        resp.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
+    Ok(resp)
 }
 
 pub async fn delete_object(
@@ -864,6 +922,146 @@ async fn list_uploads_inner(
         .into_response())
 }
 
+pub async fn delete_objects(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(bucket): Path<String>,
+    req: Request,
+) -> Response {
+    match delete_objects_inner(c, ext, bucket, req).await {
+        Ok(resp) => resp,
+        Err(err) => s3_error(err),
+    }
+}
+
+async fn delete_objects_inner(
+    c: Client,
+    ext: Option<Extension<Caller>>,
+    bucket_name: String,
+    req: Request,
+) -> ApiResult<Response> {
+    let who = caller(ext)?;
+    let bucket = load_bucket(&c, &who, &bucket_name)?;
+    // A Content-MD5 that cannot be read is refused before a byte is touched.
+    // S3 answers InvalidDigest for a header that is not base64 of 16 bytes
+    // and BadDigest for one that is well formed but not the body's hash.
+    let declared_md5 = req
+        .headers()
+        .get_all("content-md5")
+        .iter()
+        .map(|v| v.to_str().map(str::to_owned).unwrap_or_default())
+        .next();
+    // The declared body hash is honoured exactly as CompleteMultipartUpload
+    // honours it: the SigV4 middleware recorded what the client said the body
+    // was, and the request is refused when these are not those bytes.
+    let expected = req.extensions().get::<ExpectedPayloadSha256>().cloned();
+    let body = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("reading delete body: {e}")))?;
+    sigv4::verify_body_sha256(expected.as_ref(), &body)?;
+    if let Some(declared) = declared_md5 {
+        check_content_md5(&declared, &body)?;
+    }
+    let raw = std::str::from_utf8(&body)
+        .map_err(|_| multipart::s3_err("MalformedXML", "body is not UTF-8"))?;
+    let parsed = multipart::parse_delete_xml(raw)?;
+    if parsed.objects.len() > S3_MAX_KEYS {
+        return Err(multipart::s3_err(
+            "MalformedXML",
+            format!("DeleteObjects takes at most {S3_MAX_KEYS} keys"),
+        ));
+    }
+
+    let mut deleted: Vec<String> = Vec::new();
+    let mut failed: Vec<FailedKey> = Vec::new();
+    for object in &parsed.objects {
+        let refused = match c.delete_object(&bucket.meta.id, &object.key).await {
+            Ok(_) => false,
+            // A key that is not there is already as deleted as the caller
+            // wants it, so it is not a failure.
+            Err(err) if key_not_there(&err) => false,
+            Err(err) => {
+                failed.push(FailedKey {
+                    key: object.key.clone(),
+                    code: s3_code_of(&err).unwrap_or("InternalError").to_owned(),
+                    message: err.message,
+                });
+                true
+            }
+        };
+        let quiet = object.quiet.unwrap_or(parsed.quiet);
+        if !refused && !quiet {
+            deleted.push(object.key.clone());
+        }
+    }
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        delete_objects_xml(&deleted, &failed),
+    )
+        .into_response())
+}
+
+struct FailedKey {
+    key: String,
+    code: String,
+    message: String,
+}
+
+/// The body must be the bytes the declared Content-MD5 was taken of. A header
+/// that is not 16 bytes of base64 is InvalidDigest; a right-shaped hash of the
+/// wrong bytes is BadDigest. Both refuse the whole request.
+fn check_content_md5(declared: &str, body: &[u8]) -> ApiResult<()> {
+    let declared = declared.trim();
+    let digest = base64::engine::general_purpose::STANDARD
+        .decode(declared)
+        .ok()
+        .filter(|d| d.len() == 16);
+    let Some(digest) = digest else {
+        return Err(multipart::s3_err(
+            "InvalidDigest",
+            "The Content-MD5 you specified was an invalid.",
+        ));
+    };
+    use md5::Digest;
+    if md5::Md5::digest(body).as_slice() != digest {
+        return Err(multipart::s3_err(
+            "BadDigest",
+            "The Content-MD5 you specified did not match what we received.",
+        ));
+    }
+    Ok(())
+}
+
+/// The key is not there, so there is nothing to delete. A bucket that is not
+/// there is a different thing: the caller's whole request is wrong.
+fn key_not_there(err: &ApiError) -> bool {
+    s3_code_of(err) == Some("NoSuchKey")
+        || (s3_code_of(err).is_none()
+            && err.status() == StatusCode::NOT_FOUND
+            && !err.message.contains("bucket"))
+}
+
+fn delete_objects_xml(deleted: &[String], failed: &[FailedKey]) -> String {
+    let mut body = String::new();
+    body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    body.push_str("<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for key in deleted {
+        body.push_str("<Deleted>");
+        body.push_str(&format!("<Key>{}</Key>", xml_escape(key)));
+        body.push_str("</Deleted>");
+    }
+    for e in failed {
+        body.push_str("<Error>");
+        body.push_str(&format!("<Key>{}</Key>", xml_escape(&e.key)));
+        body.push_str(&format!("<Code>{}</Code>", xml_escape(&e.code)));
+        body.push_str(&format!("<Message>{}</Message>", xml_escape(&e.message)));
+        body.push_str("</Error>");
+    }
+    body.push_str("</DeleteResult>");
+    body
+}
+
 struct ListUploadsPage<'a> {
     bucket: &'a str,
     prefix: &'a str,
@@ -993,6 +1191,7 @@ fn apply_object_headers(headers: &mut HeaderMap, obj: &Object) -> ApiResult<()> 
     if let Ok(v) = HeaderValue::from_str(&last_mod.to_string()) {
         headers.insert(header::LAST_MODIFIED, v);
     }
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     Ok(())
 }
 
@@ -1220,12 +1419,20 @@ fn s3_error(err: ApiError) -> Response {
     } else {
         default_code
     };
-    let xml = format!(
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/xml")],
+        error_xml(code, &err.message),
+    )
+        .into_response()
+}
+
+fn error_xml(code: &str, message: &str) -> String {
+    format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{}</Code><Message>{}</Message></Error>",
         code,
-        xml_escape(&err.message)
-    );
-    (status, [(header::CONTENT_TYPE, "application/xml")], xml).into_response()
+        xml_escape(message)
+    )
 }
 
 #[cfg(test)]

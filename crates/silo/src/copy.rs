@@ -2,8 +2,8 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Helpers for S3 UploadPartCopy / CopyObject (`x-amz-copy-source`, range,
-//! conditionals). Range parsing is for UploadPartCopy only; CopyObject
-//! rejects `x-amz-copy-source-range`.
+//! conditionals), and for the `Range` header of GetObject. CopyObject rejects
+//! `x-amz-copy-source-range`; GetObject reads only its own `Range`.
 
 use crate::multipart::s3_err;
 use crate::types::Object;
@@ -105,6 +105,81 @@ pub fn parse_copy_source_range(raw: &str, object_size: u64) -> ApiResult<(u64, u
         ));
     }
     Ok((first, last - first + 1))
+}
+
+/// What a `Range` header asked for. `None` means the header is not a single
+/// satisfiable byte range and the whole object is served, which is what S3
+/// does with a multi-range or malformed header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetRange {
+    /// `bytes=a-b` or `bytes=a-`: from `first` to `last`, both included.
+    From { first: u64, last: u64 },
+    /// `bytes=-n`: the last `n` bytes.
+    Suffix { length: u64 },
+}
+
+/// Parse a `Range` header for GetObject. Unlike
+/// [`parse_copy_source_range`], a header this cannot read is not an error:
+/// it answers `None` and the caller serves the whole object.
+///
+/// `bytes=a-b`, `bytes=a-` and `bytes=-n` are understood, with `n` of zero
+/// or more. `a > b` is malformed, not unsatisfiable — S3 answers 200 with
+/// the whole object for it.
+pub fn parse_get_range(raw: &str) -> Option<GetRange> {
+    let rest = raw.trim().strip_prefix("bytes=")?;
+    if rest.contains(',') || !rest.contains('-') {
+        return None;
+    }
+    let (first_s, last_s) = rest.split_once('-')?;
+    let first_s = first_s.trim();
+    let last_s = last_s.trim();
+    if first_s.is_empty() {
+        if last_s.is_empty() {
+            return None;
+        }
+        return Some(GetRange::Suffix {
+            length: last_s.parse::<u64>().ok()?,
+        });
+    }
+    let first: u64 = first_s.parse().ok()?;
+    if last_s.is_empty() {
+        return Some(GetRange::From {
+            first,
+            last: u64::MAX,
+        });
+    }
+    let last: u64 = last_s.parse().ok()?;
+    if first > last {
+        return None;
+    }
+    Some(GetRange::From { first, last })
+}
+
+/// The range clipped to an object of `size` bytes, as `(first, last)` with
+/// both included, or `None` when the object cannot answer it and S3 answers
+/// 416: a first byte at or past the end of a non-empty object, or a suffix of
+/// zero bytes.
+///
+/// On an empty object nothing is unsatisfiable — every range asks for bytes
+/// that are simply not there, and the answer is the empty object.
+pub fn satisfiable(range: GetRange, size: u64) -> Option<(u64, u64)> {
+    if size == 0 {
+        return Some((0, 0));
+    }
+    match range {
+        GetRange::From { first, last } => {
+            if first >= size {
+                return None;
+            }
+            Some((first, last.min(size - 1)))
+        }
+        GetRange::Suffix { length } => {
+            if length == 0 {
+                return None;
+            }
+            Some((size.saturating_sub(length), size - 1))
+        }
+    }
 }
 
 /// Evaluate UploadPartCopy conditional headers against the source object.
@@ -216,5 +291,111 @@ mod tests {
         assert!(parse_copy_source_range("bytes=0-99", 50).is_err());
         assert!(parse_copy_source_range("bytes=10-5", 50).is_err());
         assert!(parse_copy_source_range("0-9", 50).is_err());
+    }
+
+    #[test]
+    fn get_range_reads_the_three_forms() {
+        assert_eq!(
+            parse_get_range("bytes=0-9"),
+            Some(GetRange::From { first: 0, last: 9 })
+        );
+        assert_eq!(
+            parse_get_range("bytes=40-"),
+            Some(GetRange::From {
+                first: 40,
+                last: u64::MAX
+            })
+        );
+        assert_eq!(
+            parse_get_range("bytes=-20"),
+            Some(GetRange::Suffix { length: 20 })
+        );
+        assert_eq!(
+            parse_get_range("  bytes=1-2 "),
+            Some(GetRange::From { first: 1, last: 2 })
+        );
+    }
+
+    #[test]
+    fn get_range_ignores_what_it_cannot_read() {
+        for raw in [
+            "bytes=0-10,20-30",
+            "bytes=",
+            "bytes=-",
+            "bytes=abc-def",
+            "bytes=10-5",
+            "items=0-9",
+            "bytes=0-9,10",
+            "0-9",
+        ] {
+            assert_eq!(parse_get_range(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn get_range_clips_to_the_object() {
+        assert_eq!(
+            satisfiable(GetRange::From { first: 0, last: 9 }, 100),
+            Some((0, 9))
+        );
+        // Past the end of the object the last byte simply is the last byte.
+        assert_eq!(
+            satisfiable(
+                GetRange::From {
+                    first: 90,
+                    last: u64::MAX
+                },
+                100
+            ),
+            Some((90, 99))
+        );
+        assert_eq!(
+            satisfiable(
+                GetRange::From {
+                    first: 0,
+                    last: u64::MAX
+                },
+                100
+            ),
+            Some((0, 99))
+        );
+        assert_eq!(satisfiable(GetRange::Suffix { length: 5 }, 3), Some((0, 2)));
+        assert_eq!(satisfiable(GetRange::Suffix { length: 3 }, 3), Some((0, 2)));
+    }
+
+    #[test]
+    fn get_range_refuses_what_the_object_cannot_answer() {
+        assert_eq!(
+            satisfiable(
+                GetRange::From {
+                    first: 100,
+                    last: u64::MAX
+                },
+                100
+            ),
+            None
+        );
+        assert_eq!(satisfiable(GetRange::From { first: 5, last: 9 }, 3), None);
+        // A suffix of zero bytes asks for nothing at all.
+        assert_eq!(satisfiable(GetRange::Suffix { length: 0 }, 3), None);
+    }
+
+    #[test]
+    fn every_range_on_an_empty_object_is_the_empty_object() {
+        for range in [
+            GetRange::From { first: 0, last: 9 },
+            GetRange::From {
+                first: 0,
+                last: u64::MAX,
+            },
+            GetRange::From {
+                first: 4,
+                last: u64::MAX,
+            },
+            GetRange::Suffix { length: 0 },
+            GetRange::Suffix { length: 9 },
+        ] {
+            assert_eq!(satisfiable(range, 0), Some((0, 0)), "{range:?}");
+        }
     }
 }

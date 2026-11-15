@@ -99,9 +99,10 @@ Requests are authenticated with a bearer token, or with AWS Signature Version 4 
 
 ### What is implemented
 
-- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`
+- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects`
 - `CopyObject`
 - `ListObjectsV2`, with prefix and delimiter
+- Range reads on `GetObject`: `bytes=a-b`, `bytes=a-` and `bytes=-n`, answered with 206 and `Content-Range`. A range past the end is 416 `InvalidRange`; a multi-range or malformed header is ignored and the whole object is returned.
 - Multipart upload: create, upload part, upload part copy, complete, abort, list parts, list uploads
 - SigV4 in the header, presigned URLs (up to seven days), and chunked uploads
 
@@ -109,13 +110,11 @@ Requests are authenticated with a bearer token, or with AWS Signature Version 4 
 
 - Bucket operations through S3. `CreateBucket`, `DeleteBucket` and `ListBuckets` are not there. Create buckets through the native API: `pi api POST /silo/buckets -d '{"name":"backups"}'`.
 - `ListObjects` version 1.
-- Range requests on `GetObject`.
-- `DeleteObjects` (batch delete).
 - ACLs, bucket policies, lifecycle rules, tagging, CORS, server-side encryption.
 - Reading old versions. A bucket can keep earlier generations of an object, but there is no call to fetch one.
 - SigV4A.
 
-Limits: 5 GiB per single `PutObject`, parts of at least 5 MiB, 10,000 parts per upload, 1,000 keys per list page. Unfinished multipart uploads are removed after seven days. The object size limit, the multipart lifetime and the region can be changed in `[modules.silo]`; see the [Configuration reference](Configuration-reference).
+Limits: 5 GiB per single `PutObject`, parts of at least 5 MiB, 10,000 parts per upload, 1,000 keys per list page and per `DeleteObjects` request. Unfinished multipart uploads are removed after seven days. The object size limit, the multipart lifetime and the region can be changed in `[modules.silo]`; see the [Configuration reference](Configuration-reference).
 
 An S3 client has to be set to path-style addressing, given `http://<server>/silo` as its endpoint and `pistack` as its region, and must not try to create the bucket itself.
 
