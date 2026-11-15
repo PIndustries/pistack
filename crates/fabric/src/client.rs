@@ -64,6 +64,9 @@ impl Client {
     pub fn networks(&self) -> Collection<Network> {
         self.store.collection()
     }
+    pub fn vpcs(&self) -> Collection<Vpc> {
+        self.store.collection()
+    }
     pub fn subnets(&self) -> Collection<Subnet> {
         self.store.collection()
     }
@@ -160,6 +163,7 @@ impl Client {
     pub fn create_network(&self, mut meta: Meta, spec: NetworkSpec) -> ApiResult<Network> {
         meta.id = Id::new(kind::NETWORK);
         validate_network(&spec)?;
+        self.check_vpc_membership(&meta.project, &spec)?;
         if spec.auto_floating_ip {
             self.only_auto_fip_network(&meta.id)?;
         }
@@ -187,8 +191,16 @@ impl Client {
         next.meta.id = cur.meta.id.clone();
         next.meta.project = cur.meta.project.clone();
         validate_network(&next.spec)?;
+        if next.spec.vpc != cur.spec.vpc {
+            return Err(ApiError::bad_request(
+                "a network belongs to the vpc it was made in",
+            ));
+        }
         if next.spec.kind != cur.spec.kind {
             return Err(ApiError::bad_request("network kind is immutable"));
+        }
+        if next.spec.external && !cur.spec.external {
+            self.check_vpc_membership(&cur.meta.project, &next.spec)?;
         }
         if next.spec.auto_floating_ip && !cur.spec.auto_floating_ip {
             self.only_auto_fip_network(id)?;
@@ -261,10 +273,31 @@ impl Client {
             spec,
             status: SubnetStatus::default(),
         };
+        self.check_vpc_subnet(&sub)?;
+        let vpc = self.vpc_of_network(&net.meta.id);
+        if vpc.is_some() {
+            self.vpc_joinable(&net, &sub)?;
+        }
         let project = sub.meta.project.clone();
-        admitted(&self.store, project.as_ref(), usage::SUBNETS, || {
-            self.subnets().create(sub).map_err(store_err)
-        })
+        let made = admitted(&self.store, project.as_ref(), usage::SUBNETS, || {
+            self.subnets().create(sub.clone()).map_err(store_err)
+        });
+        match made {
+            Ok(s) => {
+                // The router interface is part of the subnet's own create.
+                // It is taken back if anything below it refuses.
+                if let Some(v) = vpc {
+                    if let Err(e) = self.vpc_attach(&v, &s) {
+                        let _ = self.subnets().delete(&s.meta.id);
+                        released(&self.store, project.as_ref(), usage::SUBNETS);
+                        return Err(e);
+                    }
+                    self.count_vpc_subnets(&v.meta.id);
+                }
+                Ok(s)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn update_subnet(
@@ -303,7 +336,16 @@ impl Client {
 
     pub fn delete_subnet(&self, id: &Id) -> ApiResult<Subnet> {
         let sub = self.subnets().get(id).map_err(store_err)?;
+        let net = self.networks().get(&sub.spec.network).map_err(store_err)?;
+        // The vpc's own interface leaves with the subnet; any other router on
+        // the subnet is somebody else's and the subnet cannot go under it.
+        let owned = self
+            .vpc_of_network(&net.meta.id)
+            .and_then(|v| self.vpc_router(&v.meta.id).ok().map(|r| r.meta.id));
         for p in self.ports_on_network(&sub.spec.network)? {
+            if p.spec.device.as_ref() == owned.as_ref() {
+                continue;
+            }
             if p.spec.subnet.as_ref() == Some(id)
                 || p.spec.fixed_ips.iter().any(|ip| sub.spec.cidr.contains(ip))
             {
@@ -315,8 +357,16 @@ impl Client {
                 return Err(ApiError::conflict(format!("subnet {id} still has {what}")));
             }
         }
+        if let Some(v) = self.vpc_of_network(&net.meta.id) {
+            // The interface port goes first: it holds an address in the
+            // subnet, and the subnet cannot go with anything on it.
+            self.vpc_detach(&v, id)?;
+        }
         let sub = self.subnets().delete(id).map_err(store_err)?;
         released(&self.store, sub.meta.project.as_ref(), usage::SUBNETS);
+        if let Some(v) = self.vpc_of_network(&net.meta.id) {
+            self.count_vpc_subnets(&v.meta.id);
+        }
         Ok(sub)
     }
 
@@ -324,14 +374,32 @@ impl Client {
 
     /// Create a port. Fills in subnet, fixed IPs, MAC and the project's
     /// default security group when the spec leaves them empty.
-    pub fn create_port(&self, mut meta: Meta, mut spec: PortSpec) -> ApiResult<Port> {
+    pub fn create_port(&self, meta: Meta, spec: PortSpec) -> ApiResult<Port> {
+        self.port_row(meta, spec, None)
+    }
+
+    /// `pending` is a subnet about to be created: fabric's own interface for
+    /// it is made first, so the caller can take the subnet back whole if the
+    /// interface cannot be made.
+    pub(crate) fn port_row(
+        &self,
+        mut meta: Meta,
+        mut spec: PortSpec,
+        pending: Option<&Subnet>,
+    ) -> ApiResult<Port> {
         meta.id = Id::new(kind::PORT);
         validate_pairs(&spec)?;
         let net = self.networks().get(&spec.network).map_err(store_err)?;
         check_same_project(&meta, &net.meta, "network")?;
 
-        // Subnet: explicit, or the network's first.
-        let subnets = self.subnets_of_network(&spec.network)?;
+        // Subnet: explicit, or the network's first. `pending_subnet` is the
+        // one a vpc interface is made for a moment before its own row exists.
+        let mut subnets = self.subnets_of_network(&spec.network)?;
+        if let Some(p) = &pending {
+            if !subnets.iter().any(|s| s.meta.id == p.meta.id) {
+                subnets.push((*p).clone());
+            }
+        }
         let subnet = match &spec.subnet {
             Some(sid) => Some(
                 subnets
@@ -476,7 +544,7 @@ impl Client {
         self.delete_port_unchecked(&port)
     }
 
-    fn delete_port_unchecked(&self, port: &Port) -> ApiResult<Port> {
+    pub(crate) fn delete_port_unchecked(&self, port: &Port) -> ApiResult<Port> {
         for f in self.floating_ips().list(None).map_err(store_err)? {
             if f.spec.port.as_ref() == Some(&port.meta.id) {
                 self.floating_ips()
@@ -535,6 +603,11 @@ impl Client {
     // ---- routers ----------------------------------------------------------
 
     pub fn create_router(&self, mut meta: Meta, spec: RouterSpec) -> ApiResult<Router> {
+        if spec.vpc.is_some() {
+            return Err(ApiError::bad_request(
+                "a vpc makes its own router; it is shown as owned and not made here",
+            ));
+        }
         meta.id = Id::new(kind::ROUTER);
         validate_routes(&spec.routes)?;
         let ext = match &spec.external_network {
@@ -550,13 +623,7 @@ impl Client {
         // Only the row is stored under the lock. The ports below are made
         // through create_port, which takes it for a counted port.
         let router = admitted(&self.store, project.as_ref(), usage::ROUTERS, || {
-            self.routers()
-                .create(Router {
-                    meta,
-                    spec,
-                    status: RouterStatus::default(),
-                })
-                .map_err(store_err)
+            self.router_row(meta, spec)
         })?;
         let plumb = (|| -> ApiResult<Router> {
             if let Some(net) = &ext {
@@ -578,6 +645,21 @@ impl Client {
         }
     }
 
+    /// Store one router row. The only place that does, so a router a VPC owns
+    /// can be made without the project's `routers` limit being spent on it.
+    pub(crate) fn router_row(&self, mut meta: Meta, spec: RouterSpec) -> ApiResult<Router> {
+        if meta.id.kind != kind::ROUTER || meta.id.uuid.is_nil() {
+            meta.id = Id::new(kind::ROUTER);
+        }
+        self.routers()
+            .create(Router {
+                meta,
+                spec,
+                status: RouterStatus::default(),
+            })
+            .map_err(store_err)
+    }
+
     /// Update routes and the external gateway. `interfaces` changes are
     /// ignored here; use `set_router_interfaces`.
     pub fn update_router(
@@ -587,6 +669,7 @@ impl Client {
         f: impl FnOnce(&mut Router) -> ApiResult<()>,
     ) -> ApiResult<Router> {
         let cur = self.routers().get(id).map_err(store_err)?;
+        owned_by_vpc(&cur)?;
         let mut next = cur.clone();
         f(&mut next)?;
         next.status = cur.status.clone();
@@ -619,6 +702,7 @@ impl Client {
         subnets: &[Id],
     ) -> ApiResult<Router> {
         let router = self.routers().get(id).map_err(store_err)?;
+        owned_by_vpc(&router)?;
         if let Some(exp) = expected {
             if exp != router.meta.revision {
                 return Err(ApiError::conflict(format!(
@@ -688,8 +772,23 @@ impl Client {
             .map_err(store_err)
     }
 
+    /// The vpc a router belongs to, when it belongs to one.
+    fn vpc_of_router(&self, r: &Router) -> String {
+        match &r.spec.vpc {
+            Some(v) => crate::vpc::owner_name(r).unwrap_or_else(|| v.to_string()),
+            None => String::new(),
+        }
+    }
+
     pub fn delete_router(&self, id: &Id) -> ApiResult<Router> {
         let router = self.routers().get(id).map_err(store_err)?;
+        if router.spec.vpc.is_some() {
+            return Err(ApiError::conflict(format!(
+                "router {} belongs to vpc {}; it goes when the vpc does",
+                router.meta.id,
+                self.vpc_of_router(&router)
+            )));
+        }
         for f in self.floating_ips().list(None).map_err(store_err)? {
             if f.status.router.as_ref() == Some(id) && f.spec.port.is_some() {
                 self.floating_ips()
@@ -709,7 +808,7 @@ impl Client {
         Ok(router)
     }
 
-    fn external_network(&self, id: &Id) -> ApiResult<Network> {
+    pub(crate) fn external_network(&self, id: &Id) -> ApiResult<Network> {
         let net = self.networks().get(id).map_err(store_err)?;
         if !net.spec.external {
             return Err(ApiError::bad_request(format!(
@@ -719,7 +818,7 @@ impl Client {
         Ok(net)
     }
 
-    fn create_gateway_port(&self, router: &Router, net: &Network) -> ApiResult<Port> {
+    pub(crate) fn create_gateway_port(&self, router: &Router, net: &Network) -> ApiResult<Port> {
         if self.subnets_of_network(&net.meta.id)?.is_empty() {
             return Err(ApiError::bad_request(format!(
                 "external network {} has no subnet",
@@ -1279,7 +1378,7 @@ fn validate_network(spec: &NetworkSpec) -> ApiResult<()> {
     Ok(())
 }
 
-fn validate_routes(routes: &[StaticRoute]) -> ApiResult<()> {
+pub(crate) fn validate_routes(routes: &[StaticRoute]) -> ApiResult<()> {
     for r in routes {
         if r.destination.addr().is_ipv4() != r.nexthop.is_ipv4() {
             return Err(ApiError::bad_request(format!(
@@ -1308,6 +1407,21 @@ fn validate_pairs(spec: &PortSpec) -> ApiResult<()> {
 
 fn overlaps(a: IpNet, b: IpNet) -> bool {
     a.contains(&b.addr()) || b.contains(&a.addr())
+}
+
+/// A router a VPC owns is changed on the VPC, not on the router.
+fn owned_by_vpc(r: &Router) -> ApiResult<()> {
+    match &r.spec.vpc {
+        // The name the router was given at birth, or its id when the vpc's own
+        // row is already gone.
+        Some(v) => Err(ApiError::conflict(format!(
+            "router {} belongs to vpc {}; change it there",
+            r.meta.id,
+            crate::vpc::owner_name(r).unwrap_or_else(|| v.to_string())
+        ))
+        .with_detail("vpc", v.to_string())),
+        None => Ok(()),
+    }
 }
 
 fn is_router_device(d: &Option<Id>) -> bool {

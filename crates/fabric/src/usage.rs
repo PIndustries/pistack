@@ -1,32 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Network quotas: `networks`, `subnets`, `routers`, `security_groups`,
-//! `ports` and `floating_ips` per project. No project, or no limit for the
-//! resource, means unlimited. A missing project row is the same: callers
-//! address ids that are not gate projects. A disabled project rejects a
-//! create.
+//! Network quotas: `networks`, `vpcs`, `subnets`, `routers`,
+//! `security_groups`, `ports` and `floating_ips` per project. No project, or
+//! no limit for the resource, means unlimited. A missing project row is the
+//! same: callers address ids that are not gate projects. A disabled project
+//! rejects a create.
 //!
 //! Usage is the number of rows the project has, counted at each admission
 //! under gate's admission lock and copied to the project for reading.
 //! What fabric makes on its own is not counted: the gateway and interface
-//! ports of a router, and the project's `default` security group. There is
-//! no separate DHCP port.
+//! ports of a router, the router a vpc owns, and the project's `default`
+//! security group. There is no separate DHCP port.
 
 use crate::client::DEFAULT_SG;
-use crate::types::{FloatingIp, Network, Port, Router, SecurityGroup, Subnet};
+use crate::types::{FloatingIp, Network, Port, Router, SecurityGroup, Subnet, Vpc};
 use gate::quota::{self, Demand};
 use pistack_store::Store;
 use pistack_types::error::ErrorCode;
 use pistack_types::{ApiResult, Id};
 
-pub use gate::quota::{FLOATING_IPS, NETWORKS, PORTS, ROUTERS, SECURITY_GROUPS, SUBNETS};
+pub use gate::quota::{FLOATING_IPS, NETWORKS, PORTS, ROUTERS, SECURITY_GROUPS, SUBNETS, VPCS};
 
 /// How many of `resource` the project has.
 pub fn count(store: &Store, project: &Id, resource: &str) -> ApiResult<u64> {
     let p = Some(project);
     let n = match resource {
         NETWORKS => store.collection::<Network>().count(p)?,
+        VPCS => store.collection::<Vpc>().count(p)?,
         SUBNETS => store.collection::<Subnet>().count(p)?,
         ROUTERS => store.collection::<Router>().count(p)?,
         FLOATING_IPS => store.collection::<FloatingIp>().count(p)?,
@@ -80,6 +81,21 @@ pub(crate) fn released(store: &Store, project: Option<&Id>, resource: &str) {
         Ok(n) => quota::mirror_usage(store, project, &[(resource, n)]),
         Err(e) => {
             tracing::warn!(%project, resource, error = %e, "fabric: usage was not recorded")
+        }
+    }
+}
+
+/// Copy the current count of `resource` to the project for reading. For a
+/// resource the module makes on its own, which is never admitted.
+pub(crate) fn mirror(store: &Store, project: Option<&Id>, resource: &str) {
+    let Some(project) = project else {
+        return;
+    };
+    let _admission = quota::admission();
+    match count(store, project, resource) {
+        Ok(n) => quota::mirror_usage(store, project, &[(resource, n)]),
+        Err(e) => {
+            tracing::warn!(%project, resource, error = %e, "fabric: usage was not counted")
         }
     }
 }
@@ -216,6 +232,7 @@ mod tests {
             Meta::new(kind::ROUTER, name, Some(project.clone())),
             RouterSpec {
                 external_network: None,
+                vpc: None,
                 interfaces: vec![],
                 routes: vec![],
             },
@@ -272,6 +289,7 @@ mod tests {
                 Meta::new(kind::ROUTER, "edge", Some(project.clone())),
                 RouterSpec {
                     external_network: Some(ext),
+                    vpc: None,
                     interfaces: vec![sub],
                     routes: vec![],
                 },
@@ -415,6 +433,7 @@ mod tests {
             .unwrap();
         let spec = RouterSpec {
             external_network: Some(bare.meta.id),
+            vpc: None,
             interfaces: vec![],
             routes: vec![],
         };

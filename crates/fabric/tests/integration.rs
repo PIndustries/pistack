@@ -155,6 +155,7 @@ async fn network_subnet_ports_router_fip_flow() {
             h.meta(kind::ROUTER, "edge"),
             RouterSpec {
                 external_network: Some(ext.meta.id.clone()),
+                vpc: None,
                 interfaces: vec![],
                 routes: vec![],
             },
