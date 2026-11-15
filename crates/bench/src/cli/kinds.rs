@@ -92,6 +92,14 @@ fn source_image(v: &Value, _: DateTime<Utc>) -> String {
     short_id(&str_at(v, "/spec/source/id"))
 }
 
+/// Serials are printed in hex, the way every other tool shows one.
+fn serial(v: &Value, _: DateTime<Utc>) -> String {
+    match v.pointer("/status/serial").and_then(Value::as_u64) {
+        Some(n) if n > 0 => format!("{n:x}"),
+        _ => String::new(),
+    }
+}
+
 /// `Attaching` until the host path is confirmed, then `Attached`.
 fn attach_state(v: &Value, _: DateTime<Utc>) -> String {
     let Some(items) = v.pointer("/status/conditions").and_then(Value::as_array) else {
@@ -855,6 +863,59 @@ pub static KINDS: &[KindDef] = &[
         wide: &[
             col!("CLIENTS", count "/spec/access"),
             col!("MESSAGE", "/status/message"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "secret",
+        aliases: &["secrets"],
+        path: "/secrets/secrets",
+        id_prefix: "sec",
+        update: UpdateStyle::Meta,
+        // keep takes the payload and the kind beside `name`.
+        flat_create: true,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("KIND", "/spec/kind"),
+            col!("VERSION", "/status/version"),
+            col!("ROTATED", "/status/last_rotated"),
+            col!("EXPIRES", "/spec/expires_at"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("CONTENT-TYPE", "/spec/content_type"),
+            col!("ROTATE-AFTER", "/spec/rotate_after_days"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "cert",
+        aliases: &["certs", "certificate", "certificates"],
+        path: "/secrets/certificates",
+        id_prefix: "cert",
+        update: UpdateStyle::None,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("SUBJECT", "/spec/common_name"),
+            col!("SANS", list "/spec/sans"),
+            col!("USAGE", "/spec/usage"),
+            col!("SERIAL", serial),
+            col!("REVOKED", "/status/revoked"),
+            col!("EXPIRES", "/status/not_after"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("TTL-DAYS", "/spec/ttl_days"),
+            col!("ISSUER", short "/status/issuer"),
+            col!("FINGERPRINT", "/status/fingerprint_sha256"),
+            col!("KEY-SECRET", short "/status/key_secret"),
             col!("FULL-ID", full_id),
             col!("PROJECT", project),
             col!("LABELS", labels),

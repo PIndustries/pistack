@@ -282,6 +282,16 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: super::share::ShareCmd,
     },
+    /// Secrets (keep). The payload is never an argument.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
+    /// Certificates issued by the cloud CA (keep).
+    Cert {
+        #[command(subcommand)]
+        cmd: CertCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1601,6 +1611,138 @@ pub struct ObjectDeleteArgs {
     /// Do not ask for confirmation.
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+// ---- secrets and certificates (keep) -------------------------------------------
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum SecretKindArg {
+    #[default]
+    Opaque,
+    Password,
+    SshKey,
+    Token,
+    Certificate,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum CertUsageArg {
+    #[default]
+    Server,
+    Client,
+    Both,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// The value: a file, or `-` for stdin. Default: stdin.
+    #[arg(long = "value-file", value_name = "PATH")]
+    pub value_file: Option<String>,
+    #[arg(long, value_enum, default_value_t = SecretKindArg::Opaque)]
+    pub kind: SecretKindArg,
+    /// MIME type of the value. Default depends on the kind.
+    #[arg(long)]
+    pub content_type: Option<String>,
+    /// When the value stops being valid, RFC 3339.
+    #[arg(long)]
+    pub expires_at: Option<String>,
+    /// Warn once the value is this many days old.
+    #[arg(long, value_name = "DAYS")]
+    pub rotate_after_days: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretGet {
+    /// Name or id.
+    pub name: String,
+    /// The version to print. Only the current payload is kept, so this
+    /// checks the version that comes back and fails if it is another one.
+    #[arg(long = "version", value_name = "N")]
+    pub version: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretPut {
+    /// Name or id.
+    pub name: String,
+    /// The new value: a file, or `-` for stdin. Default: stdin.
+    #[arg(long = "value-file", value_name = "PATH")]
+    pub value_file: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SecretCmd {
+    /// List. The payload is never listed.
+    #[command(alias = "ls")]
+    List(ListArgs),
+    /// Show one record by name or id. The payload is not in it.
+    Show(NameArg),
+    /// Create with a value from a file or stdin.
+    Create(SecretCreate),
+    /// Delete by name or id.
+    #[command(alias = "rm")]
+    Delete(DeleteArgs),
+    /// Print the value. The only command that does.
+    // `--version` here names the payload's version, so this command does not
+    // carry the version flag the rest of the tree gets.
+    #[command(disable_version_flag = true)]
+    Get(SecretGet),
+    /// Replace the value: the next version of the secret.
+    Put(SecretPut),
+}
+
+#[derive(Args, Debug)]
+pub struct CertIssue {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Subject of the certificate. Defaults to the name.
+    #[arg(long)]
+    pub common_name: Option<String>,
+    /// DNS name or address (repeatable). The subject is not added to it.
+    #[arg(long = "san", value_name = "NAME")]
+    pub sans: Vec<String>,
+    #[arg(long, value_enum, default_value_t = CertUsageArg::Server)]
+    pub usage: CertUsageArg,
+    /// Days until it expires. The issuing CA can cut this short.
+    #[arg(long, value_name = "DAYS")]
+    pub ttl_days: Option<u32>,
+    /// Certificate authority to sign with (id); default: the issuing CA.
+    /// Naming one needs admin.
+    #[arg(long)]
+    pub issuer: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct CertRevoke {
+    /// Name or id.
+    pub name: String,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum CertCmd {
+    /// List.
+    #[command(alias = "ls")]
+    List(ListArgs),
+    /// Show one, its PEM included.
+    Show(NameArg),
+    /// Issue one now from the cloud CA.
+    Issue(CertIssue),
+    /// Delete by name or id, with its key. A revoked certificate is kept.
+    #[command(alias = "rm")]
+    Delete(DeleteArgs),
+    /// Revoke it. The record stays so its serial stays in the CRL.
+    Revoke(CertRevoke),
+    /// Print the certificate, its private key and the chain (admin).
+    Key(NameArg),
 }
 
 #[cfg(test)]

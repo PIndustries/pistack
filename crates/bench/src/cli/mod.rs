@@ -14,6 +14,7 @@ pub mod config;
 pub mod kinds;
 pub mod lb;
 pub mod output;
+pub mod secret;
 pub mod share;
 
 use anyhow::Result;

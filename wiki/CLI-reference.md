@@ -984,6 +984,58 @@ pi share access deny --cidr <CIDR> <NAME>
 
 The API has no endpoint for one rule, so `allow` and `deny` read the share, edit its access list and send the whole spec back with `If-Match` set to the revision they read. If the share was written in between, the command reports a revision mismatch and changes nothing; run it again.
 
+## pi secret
+
+Secrets (keep). The value of a secret never appears on the command line: it comes from a file or from stdin, and only `secret get` prints it back.
+
+```text
+pi secret list
+pi secret show <NAME>
+pi secret create <NAME>
+pi secret delete <NAME>
+pi secret get <NAME>
+pi secret put <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `secret create` | `--description <DESCRIPTION>` |  |
+| `secret create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `secret create` | `--value-file <PATH>` | The value: a file, or `-` for stdin. Default: stdin |
+| `secret create` | `--kind <KIND>` | [default: opaque] [possible values: opaque, password, ssh-key, token, certificate] |
+| `secret create` | `--content-type <CONTENT_TYPE>` | MIME type of the value. Default depends on the kind |
+| `secret create` | `--expires-at <EXPIRES_AT>` | When the value stops being valid, RFC 3339 |
+| `secret create` | `--rotate-after-days <DAYS>` | Warn once the value is this many days old |
+| `secret get` | `--version <N>` | The version to print. Only the current payload is kept, so this checks the version that comes back and fails if it is another one |
+| `secret put` | `--value-file <PATH>` | The new value: a file, or `-` for stdin. Default: stdin |
+
+A trailing newline is trimmed off whatever is read: a pipe and an editor end a file with one, and it is not part of the secret. An empty value is refused. `list`, `show` and `apply` carry the record, never the payload; a manifest that names a secret which does not exist yet prints what to run instead of creating a record with nothing in it.
+
+## pi cert
+
+Certificates issued by the cloud CA (keep).
+
+```text
+pi cert list
+pi cert show <NAME>
+pi cert issue <NAME>
+pi cert delete <NAME>
+pi cert revoke <NAME>
+pi cert key <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `cert issue` | `--description <DESCRIPTION>` |  |
+| `cert issue` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `cert issue` | `--common-name <COMMON_NAME>` | Subject of the certificate. Defaults to the name |
+| `cert issue` | `--san <NAME>` | DNS name or address (repeatable). The subject is not added to it |
+| `cert issue` | `--usage <USAGE>` | [default: server] [possible values: server, client, both] |
+| `cert issue` | `--ttl-days <DAYS>` | Days until it expires. The issuing CA can cut this short |
+| `cert issue` | `--issuer <ISSUER>` | Certificate authority to sign with (id); default: the issuing CA. Naming one needs admin |
+
+`show` includes the certificate PEM; `key` prints the certificate, its private key and the chain, and needs admin. `revoke` is not a deletion — the record stays so its serial stays in the CRL. Certificate authorities have no noun of their own; `pi api GET /secrets/cas` lists them.
+
 ## Not in the CLI yet
 
 These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
@@ -991,7 +1043,9 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | What | Path |
 | --- | --- |
 | DNS zones and records | `/dns` |
-| Secrets, certificates, certificate authorities | `/secrets` |
+| Certificate authorities | `/secrets/cas` |
+| Access keys | `/secrets/access-keys` |
+| Join tokens | `/secrets/join-tokens` |
 | Alarms and posted samples | `/gauge` |
 
 ```sh

@@ -86,6 +86,8 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Bucket { cmd } => super::bucket::bucket(ctx, cmd, io).await,
         Cmd::Object { cmd } => super::bucket::object(ctx, cmd, io).await,
         Cmd::Share { cmd } => super::share::share(ctx, cmd, io).await,
+        Cmd::Secret { cmd } => crate::cli::secret::secret(ctx, cmd, io).await,
+        Cmd::Cert { cmd } => crate::cli::secret::cert(ctx, cmd, io).await,
     }
 }
 
@@ -133,12 +135,12 @@ fn at_file(s: &str) -> CliResult<String> {
     }
 }
 
-fn opt(v: Option<String>) -> Value {
+pub(crate) fn opt(v: Option<String>) -> Value {
     v.map(Value::String).unwrap_or(Value::Null)
 }
 
 /// Drop nulls so the server's `#[serde(default)]` applies.
-fn compact(v: Value) -> Value {
+pub(crate) fn compact(v: Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
             m.into_iter()
@@ -1012,6 +1014,11 @@ async fn apply(ctx: &Ctx, a: ApplyArgs, io: &mut Io<'_>) -> CliResult<()> {
                 Err(e) => return Err(e),
             }
         };
+        // A secret is its payload, so `keep` handles that noun in `secret.rs`.
+        if k.noun == "secret" {
+            super::secret::apply(ctx, io, k, &doc, existing).await?;
+            continue;
+        }
         match existing {
             None => {
                 let mut body = Map::new();
