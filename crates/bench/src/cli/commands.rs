@@ -197,13 +197,13 @@ fn create_body(k: &KindDef, name: &str, meta: &MetaArgs, spec: Value) -> CliResu
     Ok(Value::Object(body))
 }
 
-fn confirm(io: &mut Io<'_>, what: &str) -> CliResult<bool> {
+fn confirm(io: &mut Io<'_>, verb: &str, what: &str) -> CliResult<bool> {
     if !io.tty {
         return Err(CliError::usage(format!(
-            "refusing to delete {what} without --yes (no terminal to confirm on)"
+            "refusing to {verb} {what} without --yes (no terminal to confirm on)"
         )));
     }
-    write!(io.stderr, "delete {what}? [y/N] ")?;
+    write!(io.stderr, "{verb} {what}? [y/N] ")?;
     io.stderr.flush()?;
     let line = io.read_line()?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
@@ -305,7 +305,7 @@ async fn do_create(
 async fn do_delete(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: DeleteArgs) -> CliResult<()> {
     let c = ctx.client()?;
     let path = k.item_path(&a.name);
-    if !a.yes && !confirm(io, &format!("{} \"{}\"", k.noun, a.name))? {
+    if !a.yes && !confirm(io, "delete", &format!("{} \"{}\"", k.noun, a.name))? {
         writeln!(io.stderr, "aborted")?;
         return Ok(());
     }
@@ -1562,7 +1562,7 @@ async fn access_key(ctx: &Ctx, cmd: AccessKeyCmd, io: &mut Io<'_>) -> CliResult<
             // DELETE revokes; say so in the confirmation and result line.
             let c = ctx.client()?;
             let path = k.item_path(&a.name);
-            if !a.yes && !confirm(io, &format!("{} \"{}\"", k.noun, a.name))? {
+            if !a.yes && !confirm(io, "delete", &format!("{} \"{}\"", k.noun, a.name))? {
                 writeln!(io.stderr, "aborted")?;
                 return Ok(());
             }
@@ -1862,8 +1862,39 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
         MachineCmd::Start(a) => power(ctx, io, k, a, "start").await,
         MachineCmd::Stop(a) => power(ctx, io, k, a, "stop").await,
         MachineCmd::Reboot(a) => power(ctx, io, k, a, "reboot").await,
+        MachineCmd::Rebuild(a) => machine_rebuild(ctx, io, k, a).await,
         MachineCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
     }
+}
+
+async fn machine_rebuild(
+    ctx: &Ctx,
+    io: &mut Io<'_>,
+    k: &KindDef,
+    a: MachineRebuildArgs,
+) -> CliResult<()> {
+    if !a.yes
+        && !confirm(
+            io,
+            "rebuild",
+            &format!("machine \"{}\" (its root disk is lost)", a.name),
+        )?
+    {
+        writeln!(io.stderr, "aborted")?;
+        return Ok(());
+    }
+    let body = match &a.image {
+        Some(image) => json!({"image": image}),
+        None => json!({}),
+    };
+    let v = do_action(ctx, io, k, &a.name, "rebuild", Some(body)).await?;
+    if a.wait {
+        let c = ctx.client()?;
+        // The rebuild ends when the machine is ready (or failed) again;
+        // `updating` is only ever the middle of it.
+        wait_ready(&c, io, k, &Just::of(&v, &a.name)).await?;
+    }
+    Ok(())
 }
 
 /// `1536` -> `1.5 KiB`. Whole bytes below 1024.
@@ -2219,7 +2250,13 @@ async fn server(ctx: &Ctx, cmd: ServerCmd, io: &mut Io<'_>) -> CliResult<()> {
         .unwrap_or_default();
     let found = pick_server(&all, &a.server)?;
     let (id, api) = (str_at(found, "/id"), str_at(found, "/api"));
-    if !a.yes && !confirm(io, &format!("server {id} ({api}) from the cluster"))? {
+    if !a.yes
+        && !confirm(
+            io,
+            "remove from the cluster",
+            &format!("server {id} ({api})"),
+        )?
+    {
         writeln!(io.stderr, "aborted")?;
         return Ok(());
     }

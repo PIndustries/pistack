@@ -42,6 +42,8 @@ struct Mock {
     hiding: Arc<Mutex<BTreeMap<String, u32>>>,
     /// Paths every read of this server has seen.
     reads: Arc<Mutex<Vec<String>>>,
+    /// Bodies of machine rebuilds asked for.
+    rebuilds: Arc<Mutex<Vec<Value>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -270,6 +272,30 @@ async fn delete(
     let name = v["name"].as_str().unwrap_or("").to_owned();
     machines.remove(&name);
     (StatusCode::ACCEPTED, Json(v)).into_response()
+}
+
+async fn rebuild(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    m.rebuilds.lock().unwrap().push(match body {
+        Some(Json(b)) => b,
+        None => json!(null),
+    });
+    let machines = m.machines.lock().unwrap();
+    match find(&machines, &id) {
+        Some(v) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&v).unwrap()))
+            .unwrap(),
+        None => err(StatusCode::NOT_FOUND, "not_found", "no such machine"),
+    }
 }
 
 fn find_pod(pods: &BTreeMap<String, Value>, id: &str) -> Option<Value> {
@@ -691,6 +717,7 @@ async fn serve_with(mock: Mock) -> String {
         )
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
+        .route("/compute/machines/{id}/rebuild", post(rebuild))
         .route("/compute/machines/{id}/{action}", post(power_action))
         .route("/loom/pods/{id}", get(show_pod))
         .route("/loom/pods/{id}/exec", post(exec_pod))
@@ -889,6 +916,32 @@ async fn login_then_machines_end_to_end() {
         "{}",
         r.out
     );
+
+    // Rebuild without --yes and no tty refuses; with --yes the request goes,
+    // with the image only when one is named.
+    let r = pi(&cfg, "", &["machine", "rebuild", "web"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("--yes"), "{}", r.err);
+    assert!(mock.rebuilds.lock().unwrap().is_empty());
+    let r = pi(&cfg, "", &["machine", "rebuild", "web", "--yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        r.out.trim(),
+        "machine \"web\" rebuild requested (mach-00000001)"
+    );
+    let r = pi(
+        &cfg,
+        "",
+        &["machine", "rebuild", "web", "--image", "noble", "--yes"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    {
+        let got = mock.rebuilds.lock().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], json!({}), "no body without --image");
+        assert_eq!(got[1], json!({"image": "noble"}));
+    }
 
     // Delete without --yes and no tty refuses; with --yes it goes.
     let r = pi(&cfg, "", &["machine", "delete", "web"]).await;

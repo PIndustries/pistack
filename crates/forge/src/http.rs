@@ -20,7 +20,7 @@ use crate::driver::DriverRegistry;
 use crate::keypair;
 use crate::types::{
     new_keypair, new_machine, new_size, Host, Keypair, Machine, MachineSpec, Size,
-    DELETE_ANNOTATION, SYSTEM_LABEL_PREFIX, ZONE_LABEL,
+    DELETE_ANNOTATION, REBUILD_ANNOTATION, SYSTEM_LABEL_PREFIX, ZONE_LABEL,
 };
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Request, State},
@@ -62,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .route("/machines/{id}/start", post(start_machine))
         .route("/machines/{id}/stop", post(stop_machine))
         .route("/machines/{id}/reboot", post(reboot_machine))
+        .route("/machines/{id}/rebuild", post(rebuild_machine))
         .route("/machines/{id}/migrate", post(migrate_machine))
         .route("/machines/{id}/stats", get(machine_stats))
         .route("/machines/{id}/console", get(console))
@@ -565,6 +566,83 @@ async fn reboot_machine(
         sp.restarts += 1;
     })
     .await
+}
+
+/// Body of `POST /machines/{id}/rebuild`.
+#[derive(Debug, Deserialize, Default)]
+struct RebuildBody {
+    /// Image the new root disk is a copy of: name or id. Default: the
+    /// machine's current image.
+    #[serde(default)]
+    image: Option<String>,
+}
+
+/// Replace the machine's root disk with a fresh copy of an image and start
+/// it again. Everything the machine is stays: id, name, host, ports,
+/// addresses, volumes and keys. The call is accepted for a machine that is
+/// ready or stopped and returns as it enters the `updating` phase; see
+/// [`crate::reconcile::Reconciler::rebuild`] for what the host does.
+async fn rebuild_machine(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<RebuildBody>,
+) -> ApiResult<Json<Machine>> {
+    let m = load_machine(&s, &scope, &id)?;
+    if m.meta.annotations.contains_key(DELETE_ANNOTATION) {
+        return Err(ApiError::conflict("machine is being deleted"));
+    }
+    if m.status.phase != Phase::Ready && m.status.phase != Phase::Pending {
+        return Err(ApiError::conflict(format!(
+            "a {} machine cannot be rebuilt; stop it or wait for it to finish",
+            crate::maintain::phase_word(m.status.phase)
+        )));
+    }
+    let mut m = m;
+    if let Some(image) = body.image.map(|i| i.trim().to_owned()) {
+        if image.is_empty() {
+            return Err(ApiError::bad_request("image must not be empty"));
+        }
+        m.spec.image = image;
+    }
+    if let Some(why) =
+        crate::agent_driver::boot_image_problem(&s.store, m.meta.project.as_ref(), &m.spec.image)
+    {
+        return Err(ApiError::unprocessable(why));
+    }
+    let size = resolve_size(&s, &m.spec.size)?;
+    if let Some(why) = crate::agent_driver::boot_image_size_problem(
+        &s.store,
+        m.meta.project.as_ref(),
+        &m.spec.image,
+        size.spec.resources.disk_gib,
+    ) {
+        return Err(ApiError::unprocessable(why));
+    }
+    let image = m.spec.image.clone();
+    let phase = match m.status.phase {
+        // Nothing runs yet: the request rides along to the placement and
+        // the reconciler rebuilds the machine once it has a host.
+        Phase::Pending => Phase::Pending,
+        // Placed: the reconciler turns `Updating` into the rebuild.
+        _ => Phase::Updating,
+    };
+    let m = machines(&s).modify(&m.meta.id, |x| {
+        x.spec = m.spec.clone();
+        x.meta
+            .annotations
+            .insert(REBUILD_ANNOTATION.into(), image.clone());
+        if x.status.phase != phase {
+            x.status.phase = phase;
+        }
+        x.status.message = if phase == Phase::Pending {
+            format!("will rebuild from image {image}")
+        } else {
+            format!("rebuilding from image {image}")
+        };
+        Ok(())
+    })?;
+    Ok(Json(m))
 }
 
 #[derive(Debug, Deserialize)]

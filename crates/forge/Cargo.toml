@@ -35,4 +35,6 @@ ring.workspace = true
 tower.workspace = true
 http-body-util = "0.1"
 anvil.workspace = true
+mold.workspace = true
 reqwest.workspace = true
+tempfile.workspace = true

@@ -18,6 +18,7 @@ use crate::types::{Machine, PowerState};
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use pistack_types::{ApiError, ApiResult, Id};
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -34,7 +35,7 @@ pub struct MachineRuntime {
 }
 
 #[async_trait]
-pub trait HostDriver: Send + Sync + 'static {
+pub trait HostDriver: Any + Send + Sync + 'static {
     /// Create (if needed) and power on. Idempotent: starting a running
     /// machine returns its current runtime.
     async fn start(&self, m: &Machine) -> ApiResult<MachineRuntime>;
@@ -44,6 +45,18 @@ pub trait HostDriver: Send + Sync + 'static {
     async fn delete(&self, id: &Id) -> ApiResult<()>;
     /// Everything this host currently runs.
     async fn list(&self) -> ApiResult<Vec<MachineRuntime>>;
+
+    /// Replace `m`'s root disk with a fresh copy of its image and start it
+    /// again. First-boot setup is written again, so the guest runs it as it
+    /// did on a new machine. When this returns the old disk is gone, whether
+    /// the new one was written or not, so a failure is final and must end
+    /// the request rather than be retried. Default: this host cannot rebuild.
+    async fn rebuild(&self, m: &Machine) -> ApiResult<MachineRuntime> {
+        let _ = m;
+        Err(ApiError::not_implemented(
+            "this host cannot rebuild a root disk",
+        ))
+    }
 }
 
 // ---- MockDriver ------------------------------------------------------------
@@ -53,6 +66,9 @@ pub trait HostDriver: Send + Sync + 'static {
 #[derive(Default)]
 pub struct MockDriver {
     inner: Mutex<MockState>,
+    /// Set to make `rebuild` fail once, as a host whose disk cannot be
+    /// written does. Tests use it.
+    fail_rebuild: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -72,6 +88,12 @@ impl MockDriver {
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The next `rebuild` fails and clears this. Nothing else notices.
+    pub fn fail_next_rebuild(&self) {
+        self.fail_rebuild
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -116,6 +138,20 @@ impl HostDriver for MockDriver {
         Ok(())
     }
 
+    /// The record's power is reset and its address kept: a rebuild replaces
+    /// the disk, not the machine's place on the network.
+    async fn rebuild(&self, m: &Machine) -> ApiResult<MachineRuntime> {
+        if self
+            .fail_rebuild
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(ApiError::internal(
+                "mock driver: the disk could not be written",
+            ));
+        }
+        self.start(m).await
+    }
+
     async fn list(&self) -> ApiResult<Vec<MachineRuntime>> {
         Ok(self.inner.lock().machines.values().cloned().collect())
     }
@@ -130,6 +166,7 @@ pub enum DriverCommand {
     Stop(Id),
     Delete(Id),
     List,
+    Rebuild(Box<Machine>),
 }
 
 /// The answer to a `DriverCommand`.
@@ -203,6 +240,15 @@ impl HostDriver for ChannelDriver {
             other => Err(unexpected("list", &other)),
         }
     }
+    async fn rebuild(&self, m: &Machine) -> ApiResult<MachineRuntime> {
+        match self
+            .call(DriverCommand::Rebuild(Box::new(m.clone())))
+            .await?
+        {
+            DriverReply::Started(rt) => Ok(rt),
+            other => Err(unexpected("rebuild", &other)),
+        }
+    }
 }
 
 fn unexpected(op: &str, got: &DriverReply) -> ApiError {
@@ -218,6 +264,7 @@ pub async fn serve_driver(mut rx: mpsc::Receiver<DriverRequest>, backend: Arc<dy
             DriverCommand::Start(m) => backend.start(&m).await.map(DriverReply::Started),
             DriverCommand::Stop(id) => backend.stop(&id).await.map(|_| DriverReply::Done),
             DriverCommand::Delete(id) => backend.delete(&id).await.map(|_| DriverReply::Done),
+            DriverCommand::Rebuild(m) => backend.rebuild(&m).await.map(DriverReply::Started),
             DriverCommand::List => backend.list().await.map(DriverReply::Listed),
         };
         // The caller gave up; nothing to do.

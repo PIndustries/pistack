@@ -669,6 +669,10 @@ pub enum CommandKind {
     StartMachine,
     StopMachine,
     DeleteMachine,
+    /// Replace a machine's root disk with a fresh copy of the image in the
+    /// [`MachineRequest`] payload and start it again. The payload is the
+    /// same [`MachineRequest`] as a start.
+    RebuildMachine,
     AttachVolume,
     DetachVolume,
     PlugPort,
@@ -696,6 +700,7 @@ impl std::fmt::Display for CommandKind {
             CommandKind::StartMachine => "start_machine",
             CommandKind::StopMachine => "stop_machine",
             CommandKind::DeleteMachine => "delete_machine",
+            CommandKind::RebuildMachine => "rebuild_machine",
             CommandKind::AttachVolume => "attach_volume",
             CommandKind::DetachVolume => "detach_volume",
             CommandKind::PlugPort => "plug_port",

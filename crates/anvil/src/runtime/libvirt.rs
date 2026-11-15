@@ -46,6 +46,29 @@ impl LibvirtRuntime {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/lib/libvirt/images/pistack"))
     }
+
+    /// Start the defined domain and report its addresses. A port address is
+    /// what the guest is configured to use. Waiting for a DHCP lease would
+    /// report a different address, or none, when the seed turns DHCP off.
+    async fn power_on(req: &MachineRequest) -> ApiResult<RunningMachine> {
+        let domain = domain_name(&req.id)?;
+        virsh(["start", &domain]).await?;
+        let addresses = if req.nics.is_empty() {
+            wait_lease(&domain, LEASE_WAIT).await
+        } else {
+            req.nics
+                .iter()
+                .map(|n| n.address.clone())
+                .filter(|a| !a.is_empty())
+                .collect()
+        };
+        Ok(RunningMachine {
+            id: req.id.clone(),
+            addresses,
+            power: PowerState::On,
+            message: String::new(),
+        })
+    }
 }
 
 #[async_trait]
@@ -65,27 +88,9 @@ impl MachineRuntime for LibvirtRuntime {
             }
             Err(_) => {
                 provision(&dir, &domain, req).await?;
-                virsh(["start", &domain]).await?;
             }
         }
-        // A port address is what the guest is configured to use. Waiting for
-        // a DHCP lease would report a different address, or none, when the
-        // seed turns DHCP off.
-        let addresses = if req.nics.is_empty() {
-            wait_lease(&domain, LEASE_WAIT).await
-        } else {
-            req.nics
-                .iter()
-                .map(|n| n.address.clone())
-                .filter(|a| !a.is_empty())
-                .collect()
-        };
-        Ok(RunningMachine {
-            id: req.id.clone(),
-            addresses,
-            power: PowerState::On,
-            message: String::new(),
-        })
+        LibvirtRuntime::power_on(req).await
     }
 
     async fn stop(&self, id: &Id) -> ApiResult<()> {
@@ -120,6 +125,50 @@ impl MachineRuntime for LibvirtRuntime {
                 .map_err(|e| ApiError::internal(format!("removing {}: {e}", vm.display())))?;
         }
         Ok(())
+    }
+
+    async fn rebuild(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
+        let domain = domain_name(&req.id)?;
+        let state = dom_state(&domain)
+            .await
+            .map_err(|_| ApiError::not_found(format!("machine {} is not on this host", req.id)))?;
+        ensure_network().await?;
+        let was_on = state == "running" || state == "paused";
+        if was_on {
+            let _ = virsh(["destroy", &domain]).await;
+        }
+        // The definition stays: the domain must never be defined while one
+        // of the same name exists. Only the disk and the seed change, and
+        // the XML names both by path, so it cannot go stale.
+        let root = Self::dir();
+        let vm = root.join("machines").join(&domain);
+        let disk = vm.join("disk.qcow2");
+        // The old disk is moved aside, not deleted: if the new one cannot be
+        // written the machine is left as it was found.
+        let old = vm.join("disk.qcow2.old");
+        let _ = tokio::fs::remove_file(&old).await;
+        let moved = tokio::fs::rename(&disk, &old).await.is_ok();
+        rebuild_disk(&root, &vm, &domain, req)
+            .await
+            .inspect_err(|_| {
+                // Put the old disk back so the machine can be started as it was.
+                if moved {
+                    let _ = std::fs::rename(&old, &disk);
+                }
+            })?;
+        if moved {
+            let _ = tokio::fs::remove_file(&old).await;
+        }
+        if was_on {
+            LibvirtRuntime::power_on(req).await
+        } else {
+            Ok(RunningMachine {
+                id: req.id.clone(),
+                addresses: configured_addresses(req),
+                power: PowerState::Off,
+                message: String::new(),
+            })
+        }
     }
 
     async fn attach_volume(&self, req: &VolumeAttach) -> ApiResult<String> {
@@ -307,6 +356,53 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
     virsh(["define", &xml_path.to_string_lossy()])
         .await
         .map(|_| ())
+}
+
+/// Replace the root disk and the seed of a machine already defined, writing
+/// nothing else. `provision` does this for a machine that does not exist yet;
+/// a rebuild keeps the definition, so the domain is never defined twice.
+/// The seed is written with a fresh instance id, so cloud-init treats the
+/// next boot as a first boot and runs the setup again.
+async fn rebuild_disk(root: &Path, vm: &Path, domain: &str, req: &MachineRequest) -> ApiResult<()> {
+    let base = resolve_image(root, &req.image)?;
+    tokio::fs::create_dir_all(vm)
+        .await
+        .map_err(|e| ApiError::internal(format!("creating {}: {e}", vm.display())))?;
+    let disk = vm.join("disk.qcow2");
+    let gib = if req.resources.disk_gib == 0 {
+        10
+    } else {
+        req.resources.disk_gib
+    };
+    let format = image_format(&base).await?;
+    let size = format!("{gib}G");
+    run(
+        &qemu_img_bin(),
+        [
+            "create",
+            "-f",
+            "qcow2",
+            "-F",
+            &format,
+            "-b",
+            &base.to_string_lossy(),
+            &disk.to_string_lossy(),
+            &size,
+        ],
+    )
+    .await?;
+    write_seed(vm, &format!("{domain} rebuilt"), req).await?;
+    Ok(())
+}
+
+/// The addresses a machine is configured with, without waiting for leases:
+/// a stopped machine reports what the ports gave it.
+fn configured_addresses(req: &MachineRequest) -> Vec<String> {
+    req.nics
+        .iter()
+        .map(|n| n.address.clone())
+        .filter(|a| !a.is_empty())
+        .collect()
 }
 
 /// Build the NoCloud seed for `req` in `vm` and return its path. The user
@@ -2104,6 +2200,42 @@ mod tests {
         path
     }
 
+    /// The lock every runtime's tests share before touching a tool path:
+    /// `qemu-img` and `cloud-localds` are the same variables the
+    /// cloud-hypervisor tests swap, and env writes race with reads in a
+    /// parallel test binary.
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        crate::runtime::youki::youki_env_lock()
+    }
+
+    /// Tool paths a test points at its own fakes, restored on drop. Read
+    /// the same variable once, at call time, while the holder keeps
+    /// `VIRSH_LOCK` or `env_lock`.
+    fn tool_env_guard() -> EnvLock {
+        EnvLock::new(&["PISTACK_QEMU_IMG", "PISTACK_CLOUD_LOCALDS"])
+    }
+
+    /// A few environment keys, restored to what they were on drop. Only
+    /// safe while the holder keeps the lock every env test shares.
+    struct EnvLock(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvLock {
+        fn new(keys: &[&'static str]) -> Self {
+            EnvLock(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvLock {
+        fn drop(&mut self) {
+            for (k, v) in self.0.iter() {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     struct ClearEnv(&'static str);
     impl Drop for ClearEnv {
         fn drop(&mut self) {
@@ -2537,6 +2669,196 @@ exit 0
         let _ = std::fs::remove_file(root.join("detach"));
         unplug_port(&port_req("10.90.0.10", Some(4))).await.unwrap();
         assert!(!root.join("detach").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `virsh` that answers `domstate` from a file and records every call.
+    fn write_state_virsh(dir: &std::path::Path, state: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("virsh");
+        let out = dir.to_string_lossy().replace('\'', "'\\''");
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> '{out}/calls'
+cmd=""
+skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
+  if [ "$a" = "-c" ]; then
+    skip=1
+    continue
+  fi
+  cmd="$a"
+  break
+done
+case "$cmd" in
+  domstate)
+    cat '{out}/state'
+    ;;
+  destroy|start|undefine)
+    printf '%s\n' "$@" >> '{out}/state-calls'
+    ;;
+  net-info)
+    echo "Name      pistack0"
+    echo "Active    yes"
+    ;;
+  domifaddr)
+    ;;
+  *)
+    ;;
+esac
+exit 0
+"#
+        );
+        std::fs::write(dir.join("state"), format!("{state}\n")).unwrap();
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A `qemu-img` that answers `info` and records `create`.
+    fn write_qemu_img(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("qemu-img");
+        let out = dir.to_string_lossy().replace('\'', "'\\''");
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> '{out}/qemu-img-calls'
+case "$1" in
+  info) echo '{{"format": "qcow2", "virtual-size": 1073741824}}' ;;
+esac
+exit 0
+"#
+        );
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn rebuild_replaces_the_disk_and_never_defines_the_domain_twice() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "pistack-rebuild-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let virshd = root.join("virshd");
+        let bin = write_state_virsh(&virshd, "running");
+        let img = write_qemu_img(&root);
+        let images = root.join("images");
+        std::fs::create_dir_all(images.join("bases")).unwrap();
+        std::fs::write(images.join("bases/ubuntu-24.04.qcow2"), b"base").unwrap();
+        // The seed is the first argument cloud-localds is given.
+        let localds = root.join("cloud-localds");
+        std::fs::write(&localds, "#!/bin/sh\nprintf 'seed\\n' > \"$1\"\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&localds, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("PISTACK_VIRSH", &bin);
+        std::env::set_var("PISTACK_LIBVIRT_DIR", &images);
+        std::env::set_var("PISTACK_QEMU_IMG", &img);
+        std::env::set_var("PISTACK_CLOUD_LOCALDS", &localds);
+
+        let req = req("ubuntu");
+        let domain = domain_name(&req.id).unwrap();
+        let vm = images.join("machines").join(&domain);
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::write(vm.join("disk.qcow2"), b"old-disk").unwrap();
+
+        let rt = LibvirtRuntime;
+        let out = rt.rebuild(&req).await.unwrap();
+        assert_eq!(out.power, PowerState::On);
+
+        // The definition is never touched: no define, no undefine.
+        let calls = std::fs::read_to_string(virshd.join("calls")).unwrap();
+        assert!(
+            !calls.contains("define"),
+            "the domain must not be defined while it exists: {calls}"
+        );
+        assert!(!calls.contains("undefine"), "{calls}");
+        // The running guest is stopped, the new root is created off the
+        // base image, and the guest is started again.
+        let state_calls = std::fs::read_to_string(virshd.join("state-calls")).unwrap();
+        assert!(state_calls.contains("destroy"), "{state_calls}");
+        assert!(state_calls.contains("start"), "{state_calls}");
+        let qcalls = std::fs::read_to_string(root.join("qemu-img-calls")).unwrap();
+        assert!(qcalls.contains("create"), "{qcalls}");
+        assert!(qcalls.contains("bases/ubuntu-24.04.qcow2"), "{qcalls}");
+        // The machine's files sit in one directory, not a nested copy.
+        let nested = vm.join("machines");
+        assert!(!nested.exists(), "provision wrote a nested directory");
+        // The old disk is gone once the new one is in place, and the new
+        // one was created directly under the machine directory.
+        assert!(!vm.join("disk.qcow2.old").exists());
+        assert!(
+            qcalls
+                .lines()
+                .any(|l| l == vm.join("disk.qcow2").to_string_lossy().as_ref()),
+            "the new disk must sit in {vm:?}: {qcalls}"
+        );
+        // First-boot setup is written again for the new root.
+        assert!(vm.join("seed.iso").exists(), "no seed was written");
+        let meta = std::fs::read_to_string(vm.join("meta-data")).unwrap();
+        assert!(meta.contains("rebuilt"), "{meta}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebuild_puts_the_old_disk_back() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "pistack-rebuild-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let virshd = root.join("virshd");
+        let bin = write_state_virsh(&virshd, "shut off");
+        let img = write_qemu_img(&root);
+        let images = root.join("images");
+        // The base image is missing, so the new disk cannot be written.
+        std::fs::create_dir_all(images.join("bases")).unwrap();
+
+        std::env::set_var("PISTACK_VIRSH", &bin);
+        std::env::set_var("PISTACK_LIBVIRT_DIR", &images);
+        std::env::set_var("PISTACK_QEMU_IMG", &img);
+
+        let req = req("ubuntu");
+        let domain = domain_name(&req.id).unwrap();
+        let vm = images.join("machines").join(&domain);
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::write(vm.join("disk.qcow2"), b"old-disk").unwrap();
+
+        let rt = LibvirtRuntime;
+        let e = rt.rebuild(&req).await.unwrap_err();
+        assert!(e.message.contains("image"), "{}", e.message);
+        // The machine is as it was found: its disk is back, no start was
+        // asked for, and it was never defined.
+        assert_eq!(std::fs::read(vm.join("disk.qcow2")).unwrap(), b"old-disk");
+        assert!(!vm.join("disk.qcow2.old").exists());
+        assert!(!vm.join("disk.qcow2.new").exists());
+        let calls = std::fs::read_to_string(virshd.join("calls")).unwrap();
+        assert!(!calls.contains("define"), "{calls}");
+        assert!(
+            !virshd.join("state-calls").exists(),
+            "the guest was never on"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

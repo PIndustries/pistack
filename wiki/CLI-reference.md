@@ -281,6 +281,7 @@ pi machine delete <NAME>
 pi machine start <NAME>
 pi machine stop <NAME>
 pi machine reboot <NAME>
+pi machine rebuild <NAME>
 pi machine stats <NAME>
 ```
 
@@ -302,8 +303,13 @@ pi machine stats <NAME>
 | `machine start` | `--wait` |  |
 | `machine stop` | `--wait` |  |
 | `machine reboot` | `--wait` |  |
+| `machine rebuild` | `--image <IMAGE>` | Image the new root disk is a copy of (name or id). Default: the image the machine has |
+| `machine rebuild` | `-y, --yes` | Do not ask for confirmation |
+| `machine rebuild` | `--wait` | Wait until the machine is ready again (or failed) |
 
 `machine stats` prints the current value of each of the machine's usage series, and for a counter how fast it is rising. A machine that is off, or one whose runtime does not measure, has none. See [Metrics and alarms](Metrics-and-alarms).
+
+`machine rebuild` replaces the machine's root disk with a fresh copy of an image and starts it again. The machine keeps its id, name, host, ports, addresses, volumes, keys and size; what was on the root disk is gone, and first-boot setup runs again. It works on a machine that is ready or stopped, and the machine goes to `updating` and back to `ready` with the power state it had. It asks for confirmation unless `--yes`.
 
 ## pi pod
 
