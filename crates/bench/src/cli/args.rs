@@ -685,6 +685,15 @@ pub struct KeypairCreate {
 
 crud!(KeypairCmd, KeypairCreate);
 
+#[derive(Args, Debug)]
+pub struct MachineResizeArgs {
+    /// Machine name or id. Must be stopped.
+    pub name: String,
+    /// New size name or id.
+    #[arg(long)]
+    pub size: String,
+}
+
 crud!(
     MachineCmd,
     MachineCreate,
@@ -698,6 +707,8 @@ crud!(
     /// start it again. Its id, name, host, network and keys are kept; what
     /// was on the root disk is gone.
     Rebuild(MachineRebuildArgs),
+    /// Change the machine's size. Stop it first.
+    Resize(MachineResizeArgs),
     /// What the machine is using now: CPU, memory, disk and network.
     Stats(NameArg),
 );
