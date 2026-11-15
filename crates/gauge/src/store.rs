@@ -98,13 +98,22 @@ impl SampleRing {
                 continue;
             }
             let points = map.entry(sample.metric).or_default();
-            while points.len() >= WINDOW_POINTS {
+            // Kept oldest stamp first, so the last point is the newest however the samples
+            // for a series arrive: a report carrying a reading it took earlier is a point
+            // of the series and does not become the point alarms read. What leaves the
+            // window is still what a server that receives its samples in order reports
+            // first.
+            let at = points.partition_point(|p| p.at <= sample.timestamp);
+            points.insert(
+                at,
+                Point {
+                    at: sample.timestamp,
+                    value: sample.value,
+                },
+            );
+            while points.len() > WINDOW_POINTS {
                 points.pop_front();
             }
-            points.push_back(Point {
-                at: sample.timestamp,
-                value: sample.value,
-            });
         }
     }
 
@@ -127,12 +136,12 @@ impl SampleRing {
         self.lock().len()
     }
 
-    /// Every point held, oldest first. `metric` keeps one series, by its
-    /// exact key.
+    /// Every point held. `metric` keeps one series, by its exact key. Points
+    /// come out oldest first within a series; across series the order is by
+    /// key and not by time.
     pub fn list(&self, metric: Option<&str>) -> Vec<Sample> {
         let map = self.lock();
-        let mut out: Vec<Sample> = map
-            .iter()
+        map.iter()
             .filter(|(key, _)| metric.is_none_or(|m| key.as_str() == m))
             .flat_map(|(key, points)| {
                 points.iter().map(|p| Sample {
@@ -141,9 +150,7 @@ impl SampleRing {
                     timestamp: p.at,
                 })
             })
-            .collect();
-        out.sort_by_key(|s| s.timestamp);
-        out
+            .collect()
     }
 
     /// Latest sample of the series with exactly this key.
@@ -207,6 +214,23 @@ mod tests {
         assert_eq!(ring.latest("m").unwrap().value, (WINDOW_POINTS + 4) as f64);
         assert_eq!(ring.list(None).len(), WINDOW_POINTS + 1);
         assert_eq!(ring.series_count(), 2);
+    }
+
+    #[test]
+    fn a_late_sample_lands_where_its_stamp_belongs_and_alarms_read_the_newest() {
+        let ring = SampleRing::memory();
+        let now = Utc::now();
+        ring.push(sample("m", 1.0, now));
+        // A report carrying a reading it took two minutes ago.
+        ring.push(sample("m", 2.0, now - Duration::minutes(2)));
+        assert_eq!(ring.latest("m").unwrap().value, 1.0);
+        assert_eq!(
+            ring.list(Some("m"))
+                .iter()
+                .map(|s| s.value)
+                .collect::<Vec<_>>(),
+            vec![2.0, 1.0]
+        );
     }
 
     #[test]

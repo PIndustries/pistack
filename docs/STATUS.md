@@ -295,10 +295,10 @@ Done
 - Pod logs
 
 Partial
-- History: none; a server keeps the last 60 points per series in memory and Prometheus keeps the rest
+- History: none; a server keeps the last 240 points per series in memory and Prometheus keeps the rest
 - Host and machine series are on the leader only and start empty after a failover
 - Machine usage: libvirt only; nothing for containers, cloud-hypervisor or bare metal
-- Alarms: `for_seconds` is ignored; no CLI
+- Alarms: no CLI; a `for_seconds` hold is measured on the stamps of its series' samples and can ask for at most the hour the window reaches
 - Events exist in-process with no API
 
 Missing
