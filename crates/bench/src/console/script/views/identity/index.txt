@@ -3,6 +3,7 @@ QUOTAS.js
 quotaInfo.js
 quotaNames.js
 quotaLine.js
+quotaNone.js
 quotaEditor.js
 quotaBlock.js
 projectName.js

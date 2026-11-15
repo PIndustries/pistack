@@ -9,7 +9,10 @@ async function quotaBlock(project, cappedOnly) {
     return box;
   }
   let named = quotaNames(report);
-  if (cappedOnly) named = named.filter(r => report.quotas[r].limit != null);
+  if (cappedOnly) {
+    named = named.filter(r => report.quotas[r].limit != null);
+    if (!named.length) return quotaNone();
+  }
   // Each resource keeps its own copy, so the answer to a write can replace
   // one line without taking the others with it.
   const lines = {};

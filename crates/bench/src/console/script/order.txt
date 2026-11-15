@@ -153,6 +153,7 @@ views/identity/QUOTAS.js
 views/identity/quotaInfo.js
 views/identity/quotaNames.js
 views/identity/quotaLine.js
+views/identity/quotaNone.js
 views/identity/quotaEditor.js
 views/identity/quotaBlock.js
 views/identity/projectName.js
