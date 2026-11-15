@@ -76,7 +76,9 @@ fn volume(v: &Value, _: DateTime<Utc>) -> String {
     short_id(&str_at(v, "/spec/volume"))
 }
 fn bucket(v: &Value, _: DateTime<Utc>) -> String {
-    str_at(v, "/spec/target")
+    // The target is a bucket id, which is what every other id column shows:
+    // the short form, never the whole uuid.
+    short_id(&str_at(v, "/spec/target"))
 }
 fn size_gib(v: &Value, _: DateTime<Utc>) -> String {
     str_at(v, "/status/size_gib")
@@ -183,9 +185,15 @@ async fn show(ctx: &Ctx, io: &mut Io<'_>, a: NameArg) -> CliResult<()> {
 async fn create(ctx: &Ctx, io: &mut Io<'_>, a: BackupCreate) -> CliResult<()> {
     let c = ctx.client()?;
     let volume = resolve_volume(&c, &a.volume).await?;
+    // The bucket is resolved the way the volume is: the CLI sends the object
+    // store's own id, never the word the operator typed. A bucket made in a
+    // project is filed under `{kind}/{project}/{name}`, so a service that
+    // resolves the typed name only in the record's own scope and the cloud
+    // scope cannot find it, and every upload against such a backup fails.
+    let bucket = resolve_bucket(&c, &a.bucket).await?;
     let mut spec = Map::new();
     spec.insert("volume".into(), json!(volume));
-    spec.insert("target".into(), json!(a.bucket));
+    spec.insert("target".into(), json!(bucket));
     let body = create_body(&a.name, &a.meta, Value::Object(spec))?;
     let v = c.post(BACKUP.path, &body).await?;
     report(ctx, io, &v, "created")?;
@@ -241,6 +249,24 @@ async fn resolve_volume(c: &Client, name_or_id: &str) -> CliResult<String> {
             e
         }
     })?;
+    Ok(str_at(&v, "/id"))
+}
+
+/// The bucket's own id, so a backup's `spec.target` names a row and not a
+/// word. A name the caller cannot read is reported by this command, in these
+/// words, rather than by whichever route happened to answer: `GET /silo/buckets`
+/// answers `forbidden` with a bucket id in the message for a caller that named
+/// a name, which reads like a server bug and hides the operator's own typo.
+async fn resolve_bucket(c: &Client, name_or_id: &str) -> CliResult<String> {
+    let k = &super::bucket::BUCKET;
+    if k.is_id(name_or_id) {
+        return Ok(name_or_id.to_owned());
+    }
+    let missing = CliError::usage(format!("bucket '{name_or_id}' not found"));
+    let v = c
+        .get_or_none(&k.item_path(name_or_id))
+        .await?
+        .ok_or(missing)?;
     Ok(str_at(&v, "/id"))
 }
 

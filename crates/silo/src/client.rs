@@ -111,11 +111,25 @@ impl Client {
         })
     }
 
+    /// One bucket by full id, by the short id a table prints, then by name in
+    /// `project` and then the cloud scope.
+    ///
+    /// The id is tried first of all. A bucket name may contain hyphens and
+    /// hex — an object store allows what an S3 client will send — so a long
+    /// hyphenated name and an id are the same shape to a parser that only reads
+    /// text. A service that consults the name index first can therefore answer
+    /// a *different* row than the caller pointed at, or `not found` for a row
+    /// whose own address the caller holds; and a bucket whose name is id-shaped
+    /// is exactly what a tool makes one when it files bytes per resource. The
+    /// row's address is not a name and is not up for the name index to shadow.
     pub fn get_bucket(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Bucket> {
-        self.store
-            .collection::<Bucket>()
-            .resolve(project, name_or_id)
-            .map_err(Into::into)
+        let col = self.store.collection::<Bucket>();
+        if let Some(id) = pistack_store::displayed_id(&col, BucketSpec::KIND, name_or_id)? {
+            if let Ok(bucket) = col.get(&id) {
+                return Ok(bucket);
+            }
+        }
+        col.resolve(project, name_or_id).map_err(Into::into)
     }
 
     pub fn list_buckets(&self, project: Option<&Id>) -> ApiResult<Vec<Bucket>> {
@@ -336,6 +350,11 @@ impl Client {
         }
         let file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
+            // The record is there and the bytes are not. "not found" is what an
+            // S3 client is owed for a key it cannot open, and it is also the
+            // sentence a caller reads as "I never told you about that key" — so
+            // the log says which of the two this is, because the fix is nothing
+            // like the same.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ApiError::not_found(format!("object '{key}' not found")));
             }

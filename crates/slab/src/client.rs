@@ -601,8 +601,12 @@ impl Client {
         Ok(vol)
     }
 
+    /// One volume by name, full id or the short id a table prints. Goes through
+    /// [`Collection::resolve_scoped`] so an admin whose token carries no project
+    /// gets back the row its own list printed; whose reach is then decided by
+    /// `check_visible`, exactly as a list decides it.
     pub fn get_volume(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Volume> {
-        Ok(self.volumes().resolve(project, name_or_id)?)
+        Ok(self.volumes().resolve_scoped(project, name_or_id)?)
     }
 
     pub fn list_volumes(&self, project: Option<&Id>) -> ApiResult<Vec<Volume>> {
@@ -1122,7 +1126,7 @@ impl Client {
     }
 
     pub fn get_snapshot(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Snapshot> {
-        Ok(self.snapshots().resolve(project, name_or_id)?)
+        Ok(self.snapshots().resolve_scoped(project, name_or_id)?)
     }
 
     pub fn list_snapshots(&self, project: Option<&Id>) -> ApiResult<Vec<Snapshot>> {
@@ -1175,8 +1179,20 @@ impl Client {
         Ok(backup)
     }
 
+    /// The backup `name_or_id` names: resolved by whole id first of all, then by
+    /// name in `project` and then in the cloud scope.
+    ///
+    /// The id-first order is the point of this method. `Collection::resolve_scoped`
+    /// recognises a whole id and a short id — `bak-1a2b3c4d`, the form a table
+    /// prints and an operator copies back — and takes a long hyphenated string for
+    /// a name, because a name is allowed to look exactly like that. A restore's
+    /// default volume is named after the full id of the backup, so a caller who
+    /// copied a row's name out of a listing of restored volumes and then asked for
+    /// a backup by full id was answered with the *volume*'s namesake two scopes
+    /// away, or with `not found`. The row's own address is not a name and is
+    /// answered before the name index is consulted.
     pub fn get_backup(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Backup> {
-        Ok(self.backups().resolve(project, name_or_id)?)
+        Ok(self.backups().resolve_scoped(project, name_or_id)?)
     }
 
     pub fn list_backups(&self, project: Option<&Id>) -> ApiResult<Vec<Backup>> {
@@ -1666,6 +1682,10 @@ impl Client {
             v.status.phase = Phase::Creating;
             Ok(())
         })?;
+        // From here the bytes are the restored volume's. A write that fails
+        // half-way leaves them partially written, so the restore is over:
+        // `fail_volume` moves the record to `error` and the delete that follows
+        // takes the file with it. The object is read once, straight through.
         if let Err(e) = self
             .write_backup_bytes(&dest, &bucket.meta.id, &key, &expect_sha, need)
             .await
@@ -2610,6 +2630,18 @@ impl Client {
         Ok(None)
     }
 
+    /// The bucket a backup's bytes go to. `spec.target` names a row — the id
+    /// the CLI resolved before it created the record — so the bucket is read
+    /// the way every other name in this service is: whole id, then the short
+    /// id a table prints, then the name in the backup's project and then the
+    /// cloud scope.
+    ///
+    /// The name order matters. A bucket made inside a project is filed under
+    /// `{kind}/{project}/{name}`, and a backup inherits its volume's project,
+    /// so a project-scoped backup finds its own bucket first; a cloud-scope
+    /// token, which holds no project of its own, still finds a row filed under
+    /// the bare name. A target naming nothing is refused with the word the
+    /// record holds, because that is the word the operator typed.
     fn backup_bucket(&self, backup: &Backup) -> ApiResult<silo::Bucket> {
         let target = backup.spec.target.trim();
         if target.is_empty() {
@@ -2618,24 +2650,16 @@ impl Client {
             ));
         }
         let silo = self.silo();
-        if let Ok(bucket) = silo.get_bucket(backup.meta.project.as_ref(), target) {
-            return Ok(bucket);
-        }
-        if backup.meta.project.is_some() {
-            if let Ok(bucket) = silo.get_bucket(None, target) {
-                return Ok(bucket);
-            }
-        }
-        if let Some(bucket) = silo
-            .list_buckets(None)?
-            .into_iter()
-            .find(|bucket| bucket.meta.name == target || bucket.meta.id.to_string() == target)
-        {
-            return Ok(bucket);
-        }
-        Err(ApiError::not_found(format!(
-            "silo bucket '{target}' not found"
-        )))
+        let project = backup.meta.project.as_ref();
+        let found = match silo.get_bucket(project, target) {
+            Ok(bucket) => Some(bucket),
+            Err(e) if e.code == ErrorCode::NotFound => match silo.get_bucket(None, target) {
+                Ok(bucket) => Some(bucket),
+                Err(_) => find_short_bucket(&self.store, target)?,
+            },
+            Err(e) => return Err(e),
+        };
+        found.ok_or_else(|| ApiError::not_found(format!("silo bucket '{target}' not found")))
     }
 
     /// Record a failed upload. Ready is never set here. Unavailable is
@@ -2731,6 +2755,8 @@ struct UploadedBackup {
 /// Preferred part size is 64 MiB, raised to silo's minimum when that still
 /// fits in `max_object_bytes`. Otherwise the part size is the cap itself so
 /// a volume larger than the single-object limit can be split.
+const BACKUP_PART_BYTES: usize = 64 * 1024 * 1024;
+
 fn backup_part_size(min_part: usize, max_object: usize) -> ApiResult<usize> {
     if max_object == 0 {
         return Err(ApiError::unavailable("silo max_object_bytes is 0"));
@@ -2742,8 +2768,6 @@ fn backup_part_size(min_part: usize, max_object: usize) -> ApiResult<usize> {
         Ok(max_object)
     }
 }
-
-const BACKUP_PART_BYTES: usize = 64 * 1024 * 1024;
 
 async fn read_part(
     reader: &mut crate::backend::BackupStream,
@@ -2818,6 +2842,20 @@ fn secret_matches(secret: &str, offer: &Transfer) -> bool {
     };
     let given = transfer::hash_secret(secret);
     bool::from(given.as_bytes().ct_eq(stored.as_bytes()))
+}
+
+/// The bucket whose id ends in `tail`. A short id is what `pi` prints, so it is
+/// what an operator types back; it is not unique on its own, and a tail two
+/// buckets share is refused rather than guessed.
+fn find_short_bucket(store: &Store, tail: &str) -> ApiResult<Option<silo::Bucket>> {
+    let col = store.collection::<silo::Bucket>();
+    Ok(
+        match pistack_store::find_by_short_id(&col, tail)?.map(|id| col.get(&id)) {
+            None => None,
+            Some(Ok(bucket)) => Some(bucket),
+            Some(Err(_)) => None,
+        },
+    )
 }
 
 #[cfg(test)]
