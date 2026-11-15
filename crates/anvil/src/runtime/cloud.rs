@@ -449,11 +449,19 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     match std::env::var_os("PISTACK_CLOUD_STATE") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => PathBuf::from(DEFAULT_STATE),
     }
+}
+
+/// The file names this runtime's machine disks are written under: the raw
+/// disk and the part-file it is assembled in. cloud-hypervisor reads raw
+/// only, so no qcow2 is ever built here. A file named otherwise in a machine
+/// directory — a seed, a kernel, a log — is not a disk.
+pub(crate) fn runtime_disk_names() -> &'static [&'static str] {
+    &["disk.raw", "disk.raw.part"]
 }
 
 fn machine_dir(id: &Id) -> ApiResult<PathBuf> {

@@ -10,7 +10,7 @@
 
 pub mod cloud;
 pub mod libvirt;
-mod metal;
+pub(crate) mod metal;
 pub mod mock;
 pub(crate) mod ovsplug;
 mod podnet;
