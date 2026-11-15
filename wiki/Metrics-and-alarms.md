@@ -22,7 +22,7 @@ On the wire a machine with one disk and one interface is about 300 bytes of JSON
 
 ## What a server keeps
 
-- The last 60 points of each series, and nothing older than an hour.
+- The last 240 points of each series, and nothing older than an hour. Points are kept in stamp order, so a report arriving late with a reading it took earlier is a point of the series where its stamp puts it and not the point alarms read.
 - At most 50,000 series. A machine with one disk and one interface is about a dozen, so that is room for some four thousand machines. Past the limit, samples for new series are dropped and the server logs that once.
 - In memory only. Nothing is written to disk, and nothing is copied to the other servers.
 
@@ -189,4 +189,6 @@ An alarm that belongs to a project sees only the `pistack_` series of that proje
 
 Alarms are evaluated when a sample arrives, on the server that received it. The phase is written to the store when it changes; while it stays the same, `last_value` is refreshed at most once a minute. Only the leader can write to the store, so an alarm follows the series the leader has: hosts, machines, posted samples and the leader's own control-plane series. For a follower's control-plane series use Prometheus rules.
 
-What alarms do not do: `for_seconds` is stored and ignored, so an alarm fires on the first sample that crosses. Nothing is sent anywhere when one fires. An alarm on a series that stops reporting keeps its last phase. For paging, use Prometheus rules.
+`for_seconds` asks the alarm to hold off: the value has to cross at every sample for that long before the alarm fires, and the first sample that does not cross ends the run so the wait starts again. It is measured in seconds on the samples themselves — the stamp of the newest crossing sample minus the stamp of the first of the run — so a hold of sixty seconds is spanned by the fifth sample of a machine reporting every fifteen, and by the second of one reporting every minute, whatever moment either report reaches the server at. Leaving it out, or `0`, fires on the first sample that crosses. The longest hold an alarm may ask for is an hour, which is as far back as the window of samples reaches; an alarm asking for longer is refused, at the creation and at an update, with the longest possible hold in the message. An alarm is `Pending` until a sample decides it. An alarm with a hold is decided from the samples already there when it is made, so a value that has been crossing for a minute fires one asking for sixty seconds at once; an alarm with no hold waits for a fresh sample. Updating an alarm changes what its samples are measured against, and the phase follows from the samples there.
+
+What alarms do not do: nothing is sent anywhere when one fires. An alarm on a series that stops reporting keeps its last phase. For paging, use Prometheus rules.
