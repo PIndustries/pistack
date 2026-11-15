@@ -162,6 +162,16 @@ mod tests {
         // instead of the API's refusal.
         assert!(text.contains("/compute/hosts/"));
         assert!(text.contains("Hosts are visible to administrators only."));
+        // A project's limits, and a user's role bindings, read from the API.
+        assert!(text.contains("/identity/projects/"));
+        assert!(text.contains("/quotas"));
+        assert!(text.contains("/identity/bindings"));
+        assert!(text.contains("/identity/roles"));
+        assert!(text.contains("/revoke-tokens"));
+        assert!(text.contains(">Quota<") || text.contains("\"Quota\""));
+        assert!(text.contains("Save limits"));
+        assert!(text.contains("Add role"));
+        assert!(text.contains("Sign out everywhere"));
         assert!(!text.contains("10.66.66."));
         assert!(!text.contains("pistack0"));
         assert!(!text.to_ascii_lowercase().contains("ovn"));
