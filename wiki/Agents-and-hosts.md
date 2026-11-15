@@ -194,6 +194,7 @@ Drain never stops a machine. A machine it cannot move stays where it is, running
 - containers, pods and bare metal
 - a machine that is powered off or not `ready`
 - any machine when the host has no libvirt runtime
+- a machine whose root disk is a file on this host
 - a machine no other host can take
 
 A migration takes time. The machine leaves the list when its new host reports it. Run the command again to see what is still on the host. Running it again is always safe: it does not start a second migration for a machine that is already moving.
@@ -201,6 +202,8 @@ A migration takes time. The machine leaves the list when its new host reports it
 When a migration fails, the machine goes to phase `error` with the message from libvirt. It is still running on the old host.
 
 Live migration does not copy disks. The destination host must already see the machine's disk at the same path.
+
+The agent says whether the directory it writes machine disks into is on an NFS or SMB mount, and the host keeps that answer as the label `pistack.io/disk`. A host without that label set to `shared` is read as keeping its machine disks to itself, so nothing on it is asked to move. Mount the disk directory where every host can see it and the host reports `shared` at its next hello.
 
 When the work is done, `pi host enable agent1` puts the host back.
 

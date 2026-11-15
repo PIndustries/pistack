@@ -472,6 +472,11 @@ pub fn begin_migration(
             source.meta.name
         )));
     }
+    // The hypervisor refuses a migration whose disks stay behind. Asking is
+    // a certain failure, so it is refused here instead.
+    if let Some(reason) = crate::maintain::disk_holds_machine(store, machine, &source) {
+        return Err(ApiError::unprocessable(reason));
+    }
     let payload = MigrateRequest {
         id: machine.meta.id.clone(),
         dest: dest_uri,
@@ -1587,6 +1592,7 @@ mod tests {
         m
     }
 
+    /// A host whose machine disks are on storage every host can see.
     fn host_with(name: &str, node: &str, underlay: Option<&str>, phase: Phase) -> Host {
         let mut h = new_host(
             name,
@@ -1598,7 +1604,12 @@ mod tests {
                 gpus: 0,
             },
             vec!["kvm".into()],
-            std::collections::BTreeMap::new(),
+            [(
+                crate::types::DISK_LABEL.to_owned(),
+                crate::types::DISK_SHARED.to_owned(),
+            )]
+            .into_iter()
+            .collect(),
         );
         h.spec.underlay_ip = underlay.map(str::to_owned);
         h.status.phase = phase;
@@ -1883,5 +1894,46 @@ mod tests {
         assert_eq!(failed.status.phase, Phase::Ready);
         assert_eq!(failed.status.host.as_ref(), Some(&src.meta.id));
         assert!(failed.status.message.contains("virsh migrate failed"));
+    }
+
+    /// A root disk that is a file on the host cannot follow the machine, so
+    /// the hypervisor would refuse the move. The call says so itself and the
+    /// machine is not touched.
+    #[tokio::test]
+    async fn migrate_refuses_a_machine_whose_disk_is_local_to_its_host() {
+        let store = Store::in_memory().unwrap();
+        let queue = CommandQueue::default();
+        let hosts = store.collection::<Host>();
+        // `host_with` says its disks are shared; this host does not say.
+        let mut src = host_with("src", "node-src", Some("10.1.0.1"), Phase::Ready);
+        src.meta.labels.remove(crate::types::DISK_LABEL);
+        let src = hosts.create(src).unwrap();
+        let dest = hosts
+            .create(host_with(
+                "dest",
+                "node-dest",
+                Some("10.1.0.2"),
+                Phase::Ready,
+            ))
+            .unwrap();
+        let machines = store.collection::<Machine>();
+        let m = machines.create(placed("web", &src.meta.id, &[])).unwrap();
+
+        let err = begin_migration(&store, &queue, &m, &dest).unwrap_err();
+        assert_eq!(
+            err.code.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(
+            err.message.contains("root disk is a file on this host"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("share"), "{}", err.message);
+        assert_eq!(queue.pending_count(), 0);
+        let still = machines.get(&m.meta.id).unwrap();
+        assert_eq!(still.status.phase, Phase::Ready);
+        assert_eq!(still.status.host.as_ref(), Some(&src.meta.id));
+        assert!(still.status.message.is_empty(), "{}", still.status.message);
     }
 }

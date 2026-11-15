@@ -44,6 +44,32 @@ fn add_host(store: &Store, name: &str, node: &str, underlay: &str, drivers: &[&s
     store.collection::<Host>().create(h).unwrap()
 }
 
+/// A host that keeps machine disks where every other host can see them.
+fn add_shared_host(
+    store: &Store,
+    name: &str,
+    node: &str,
+    underlay: &str,
+    drivers: &[&str],
+) -> Host {
+    let h = add_host(store, name, node, underlay, drivers);
+    share_disks(store, &h.meta.id);
+    store.collection::<Host>().get(&h.meta.id).unwrap()
+}
+
+/// Say this host keeps machine disks on storage every host can see.
+fn share_disks(store: &Store, id: &Id) {
+    store
+        .collection::<Host>()
+        .modify(id, |h| {
+            h.meta
+                .labels
+                .insert(forge::DISK_LABEL.into(), forge::DISK_SHARED.into());
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// A ready machine placed on `host`, running.
 fn running(store: &Store, name: &str, host: &Id) -> Machine {
     let m = store
@@ -105,8 +131,8 @@ async fn a_refused_migration_leaves_the_machine_running_and_retried() {
         .create(new_size("m.2x4", SIZE))
         .unwrap();
     let q = queue_in(20);
-    let src = add_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
-    let dest = add_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
+    let src = add_shared_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
+    let dest = add_shared_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
     let m = running(&store, "web", &src.meta.id);
 
     let (moving, left) = maintain::drain(&store, Some(&q), Default::default(), &src).unwrap();
@@ -158,7 +184,7 @@ async fn an_unanswered_migration_leaves_the_machine_running() {
         .create(new_size("m.2x4", SIZE))
         .unwrap();
     let q = queue_in(1);
-    let src = add_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
+    let src = add_shared_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
     add_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
     let m = running(&store, "web", &src.meta.id);
 
@@ -186,8 +212,8 @@ async fn a_machine_no_host_can_take_is_left_with_an_actionable_reason() {
         .create(new_size("m.2x4", SIZE))
         .unwrap();
     let q = queue_in(20);
-    let src = add_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
-    let mut down = add_host(&store, "down", "node-down", "10.1.0.2", &["kvm", "libvirt"]);
+    let src = add_shared_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
+    let mut down = add_shared_host(&store, "down", "node-down", "10.1.0.2", &["kvm", "libvirt"]);
     down.status.phase = Phase::Error;
     down.status.message = "no report for 90s".into();
     let down = store.collection::<Host>().update(down, None).unwrap();
@@ -251,7 +277,7 @@ async fn a_source_without_the_runtime_keeps_its_machines() {
         .unwrap();
     let q = queue_in(20);
     let src = add_host(&store, "src", "node-src", "10.1.0.1", &["kvm"]);
-    add_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
+    add_shared_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
     let m = running(&store, "web", &src.meta.id);
 
     let (moving, left) = maintain::drain(&store, Some(&q), Default::default(), &src).unwrap();
@@ -273,7 +299,7 @@ async fn a_machine_that_is_not_ready_is_left_alone() {
         .create(new_size("m.2x4", SIZE))
         .unwrap();
     let q = queue_in(20);
-    let src = add_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
+    let src = add_shared_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
     add_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
     let m = running(&store, "web", &src.meta.id);
     store
@@ -296,8 +322,67 @@ async fn a_machine_that_is_not_ready_is_left_alone() {
     );
 }
 
-/// The agent says a host can live-migrate with the capability it runs a
-/// guest with; drain trusts the same string.
+/// A machine whose root disk is a file on the host is not asked to move:
+/// the hypervisor would refuse it, and the report says so. The same machine
+/// is migrated once its host reports the disk directory as shared.
+#[tokio::test]
+async fn a_machine_with_a_local_root_disk_is_not_asked_to_move() {
+    let store = Store::in_memory().unwrap();
+    store
+        .collection::<Size>()
+        .create(new_size("m.2x4", SIZE))
+        .unwrap();
+    let q = queue_in(20);
+    let src = add_host(&store, "src", "node-src", "10.1.0.1", &["kvm", "libvirt"]);
+    let dest = add_host(&store, "dest", "node-dest", "10.1.0.2", &["kvm", "libvirt"]);
+    let m = running(&store, "web", &src.meta.id);
+
+    let (moving, left) = maintain::drain(&store, Some(&q), Default::default(), &src).unwrap();
+    assert!(moving.is_empty());
+    assert_eq!(left.len(), 1, "{:?}", reasons(&left));
+    assert_eq!(left[0].name, "web");
+    assert!(
+        left[0].reason.contains("root disk is a file on this host"),
+        "{}",
+        left[0].reason
+    );
+    assert!(left[0].reason.contains("share"), "{}", left[0].reason);
+    assert_eq!(q.pending_count(), 0);
+    let still = machine(&store, &m.meta.id);
+    assert_eq!(still.status.phase, Phase::Ready);
+    assert_eq!(still.status.host.as_ref(), Some(&src.meta.id));
+    assert!(still.status.message.is_empty(), "{}", still.status.message);
+
+    share_disks(&store, &src.meta.id);
+    share_disks(&store, &dest.meta.id);
+    let src_now = store.collection::<Host>().get(&src.meta.id).unwrap();
+    let (moving, left) = maintain::drain(&store, Some(&q), Default::default(), &src_now).unwrap();
+    assert!(left.is_empty(), "{:?}", reasons(&left));
+    assert_eq!(moving.len(), 1);
+    assert_eq!(q.pending_count(), 1);
+}
+
+/// A host whose agent says the disk directory is shared takes migrations;
+/// one that never said keeps its machines. An agent upgrade alone must not
+/// start migrations that end in a refusal.
+#[test]
+fn a_host_shares_machine_disks_only_when_its_agent_says_so() {
+    let store = Store::in_memory().unwrap();
+    let mut h = new_host("h", "node-h", SIZE, vec!["libvirt".into()], BTreeMap::new());
+    let m = new_machine("m", None, MachineSpec::default());
+    assert!(!forge::machine_disks_are_shared(&h));
+    assert!(maintain::disk_holds_machine(&store, &m, &h).is_some());
+    h.meta
+        .labels
+        .insert("pistack.io/disk".into(), "local".into());
+    assert!(maintain::disk_holds_machine(&store, &m, &h).is_some());
+    h.meta
+        .labels
+        .insert("pistack.io/disk".into(), "shared".into());
+    assert!(forge::machine_disks_are_shared(&h));
+    assert!(maintain::disk_holds_machine(&store, &m, &h).is_none());
+}
+
 #[test]
 fn a_host_can_live_migrate_when_its_agent_reports_the_runtime() {
     let mut h = new_host("h", "node-h", SIZE, vec!["kvm".into()], BTreeMap::new());

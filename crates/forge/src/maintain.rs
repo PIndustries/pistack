@@ -17,8 +17,8 @@
 use crate::agent_driver::begin_migration;
 use crate::scheduler::{self, Allocations, Strategy};
 use crate::types::{
-    delete_requested, usable_underlay, Host, Machine, MachineKind, PowerState, Size,
-    EVACUATED_FROM_ANNOTATION, NODE_PIN_ANNOTATION,
+    delete_requested, machine_disks_are_shared, usable_underlay, Host, Machine, MachineKind,
+    PowerState, Size, EVACUATED_FROM_ANNOTATION, NODE_PIN_ANNOTATION,
 };
 use pistack_rpc::CommandQueue;
 use pistack_store::Store;
@@ -31,6 +31,9 @@ use std::collections::BTreeMap;
 /// reached only when the agent reports this capability.
 pub const LIVE_MIGRATION_DRIVER: &str = "libvirt";
 
+/// Volume backends whose data is not on the host that attaches it.
+const SHARED_BACKENDS: &[&str] = &["rbd"];
+
 /// Whether `host`'s agent can take part in a live migration, as source or
 /// as destination.
 pub fn can_live_migrate(host: &Host) -> bool {
@@ -38,6 +41,61 @@ pub fn can_live_migrate(host: &Host) -> bool {
         .drivers
         .iter()
         .any(|d| d.trim().eq_ignore_ascii_case(LIVE_MIGRATION_DRIVER))
+}
+
+/// Why `machine` is not asked off `host`: the disk that stays behind, said
+/// in the words `drain` reports and a migrate call returns. `None` when
+/// nothing on this host holds it.
+///
+/// A root disk is a file on its host, so a host that keeps its disks to
+/// itself cannot hand a machine to another. A volume that is not on shared
+/// storage holds its machine the same way; a volume whose type forge cannot
+/// see is counted as local, because nothing says its data is anywhere else.
+/// [`evacuate`] reasons about the same rows.
+pub fn disk_holds_machine(store: &Store, machine: &Machine, host: &Host) -> Option<String> {
+    if !machine_disks_are_shared(host) {
+        return Some(
+            "its root disk is a file on this host, and live migration needs storage both hosts \
+             share"
+                .to_owned(),
+        );
+    }
+    let Ok(volumes) = store.collection::<Volume>().list(None) else {
+        return None;
+    };
+    let attached: Vec<Volume> = volumes
+        .into_iter()
+        .filter(|v| v.status.attached_to.as_ref() == Some(&machine.meta.id))
+        .collect();
+    if attached.is_empty() {
+        return None;
+    }
+    let Ok(types) = store.collection::<VolumeType>().list(None) else {
+        return Some(format!(
+            "its volumes ({}) are on storage this host has not shared, which live migration \
+             cannot move",
+            volume_names(&attached)
+        ));
+    };
+    attached.iter().find_map(|v| {
+        let shared = types.iter().any(|t| {
+            (t.meta.name == v.spec.volume_type || t.meta.id.to_string() == v.spec.volume_type)
+                && SHARED_BACKENDS.contains(&t.spec.backend.trim())
+        });
+        (!shared).then(|| {
+            format!(
+                "volume {} is on storage this host has not shared, which live migration cannot \
+                 move",
+                v.meta.name
+            )
+        })
+    })
+}
+
+fn volume_names(volumes: &[Volume]) -> String {
+    let mut names: Vec<&str> = volumes.iter().map(|v| v.meta.name.as_str()).collect();
+    names.sort_unstable();
+    names.join(", ")
 }
 
 /// A machine that is on its way to another host.
@@ -199,6 +257,10 @@ pub fn drain(
             ));
             continue;
         }
+        if let Some(reason) = disk_holds_machine(store, m, host) {
+            leave(reason);
+            continue;
+        }
         if m.status.phase != Phase::Ready {
             let mut reason = format!(
                 "is {}; only a ready machine can be live-migrated",
@@ -310,9 +372,6 @@ fn no_destination(
 
 // ---- evacuate ----------------------------------------------------------------
 
-/// Volume backends whose data is not on the host that attaches it.
-const SHARED_BACKENDS: &[&str] = &["rbd"];
-
 /// Body of `POST /hosts/{id}/evacuate`.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct EvacuateOptions {
@@ -348,7 +407,11 @@ pub struct EvacuateReport {
 }
 
 // slab's rows, read as views so forge does not depend on slab. They ignore
-// every field they do not need and are never written back.
+// every field they do not need and are never written back. `evacuate` and
+// [`has_local_volume`] read both, so the kind is named once here.
+
+type Volume = Resource<VolumeSpecView, VolumeStatusView>;
+type VolumeType = Resource<VolumeTypeSpecView, NoStatus>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct VolumeSpecView {
@@ -373,6 +436,7 @@ struct VolumeTypeSpecView {
 }
 
 impl Spec for VolumeTypeSpecView {
+    /// slab names its volume types `voltype`; there is no `kind` entry for it.
     const KIND: &'static str = "voltype";
 }
 

@@ -21,7 +21,7 @@
 //! probe runs its argv through the runtime's command probe, which is youki
 //! exec on a youki host.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -485,6 +485,24 @@ fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/pistack"))
 }
 
+/// Label saying whether the directory this host keeps machine root disks
+/// in is on a filesystem the other hosts mount too. `forge` refuses a live
+/// migration of a machine whose disk is only on this host.
+pub const DISK_LABEL: &str = "pistack.io/disk";
+/// A disk directory every host can see. Anything else, an absent answer
+/// included, is read as local.
+pub const DISK_SHARED: &str = "shared";
+
+/// What [`DISK_LABEL`] says about the directory the agent writes guest root
+/// disks into.
+fn disk_label(disk_dir: &std::path::Path) -> String {
+    if facts::on_shared_filesystem(disk_dir) {
+        DISK_SHARED.to_owned()
+    } else {
+        "local".to_owned()
+    }
+}
+
 impl Agent {
     fn hello(&self) -> AgentHello {
         let mut capabilities = self.facts.capabilities.clone();
@@ -493,12 +511,17 @@ impl Agent {
                 capabilities.push(n);
             }
         }
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            DISK_LABEL.into(),
+            disk_label(&crate::runtime::libvirt::images_dir()),
+        );
         AgentHello {
             node_name: self.facts.node_name.clone(),
             capabilities,
             resources: self.facts.resources,
             version: pistack_types::BUILD.to_owned(),
-            labels: Default::default(),
+            labels,
             underlay_ip: self
                 .underlay
                 .clone()
@@ -1598,6 +1621,18 @@ mod tests {
     use crate::runtime::MachineRuntime;
     use async_trait::async_trait;
     use keep::Pki;
+
+    #[test]
+    fn the_disk_label_is_local_unless_the_directory_is_on_a_network_filesystem() {
+        // The packaged directory is a local path on every host this builds
+        // for, and one that is not there at all answers the same way.
+        assert_eq!(
+            disk_label(std::path::Path::new("/nonexistent-disk-dir")),
+            "local"
+        );
+        let dir = std::env::temp_dir();
+        assert_eq!(disk_label(&dir), "local");
+    }
 
     #[test]
     fn plug_uses_cloud_only_when_that_runtime_owns_vms() {
