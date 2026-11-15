@@ -2,7 +2,7 @@
 
 What a private cloud needs, area by area, and where PiStack stands on each.
 
-Read from the code on main at 7f39751, 2026-11-12. Each line is one of:
+Read from the code on main at 2670e74, 2026-11-14. Each line is one of:
 
 - **Done**: in the tree and reachable through the API.
 - **Partial**: some of it works; the line says what does not.
@@ -21,12 +21,10 @@ All fixed on main:
 - #116: a machine could boot any project's image; a cloud-hypervisor guest wrote into the shared image and got no cloud-init. `pi machine create --volume` is refused with a message instead of ignored; attaching at start is still to do.
 - #117: `/cluster`, including the full store snapshot, was open by default. It now needs a member or a join token.
 
-Found by the three-server lab run, fixes in open pull requests or in progress:
+Found by the three-server lab run, in an open pull request, in progress, or since fixed:
 
 - #119: a failed network or load balancer reconcile was retried without pause, and a follower that fell behind a busy leader never caught up, after which no write was confirmed.
-- Hosts cannot follow a leader change: they are sent to the servers' plain HTTP address, where they cannot show their certificate (in progress).
-- An admin cannot read cluster status since #117 (in progress).
-- A server that led and had writes no majority confirmed has to be wiped and rejoined by hand when it returns.
+- A follower that fell behind a busy leader, or that once led and holds entries no majority confirmed, replaces its own store with a snapshot from the leader and starts again. It keeps its id and role, replaces at most once every ten minutes, and its unconfirmed entries are set aside, not merged.
 
 ## Compute
 
@@ -169,7 +167,7 @@ Done
 - Volume from image
 - Volume types
 - Quota per project on volume count and gigabytes, snapshots, and backup count and gigabytes; extend is checked
-- Backup to object storage and restore (no CLI)
+- Backup to object storage and restore, local, LVM and RBD (no CLI)
 - Backends: local file, LVM thin, Ceph RBD
 
 Partial
@@ -178,7 +176,6 @@ Partial
 
 In progress (PR 109)
 - A local or LVM volume stays on its node; machines are placed with their volume
-- RBD backup restore
 
 Missing
 - QoS
@@ -320,7 +317,7 @@ Done
 Partial
 - Remove or replace a server: not possible; a dead one stays in the list
 - Backup works; restore is copying a file by hand
-- Upgrades: no schema version, no upgrade check
+- Upgrades: the store records a schema version and each server checks its own copy on open. Servers do not compare versions with each other, so a release that raises it needs every server stopped and upgraded together. No release has needed a migration yet
 - TLS: the main listener is plain HTTP; HTTPS is a second port
 - Command queue is in memory on the leader. Machine start, stop and delete and volume attach and detach keep their id in the store and are issued again by the next leader, and the host runs each once. A live migration in flight at a leader change is not followed up
 - Health: `/healthz` only
@@ -338,7 +335,7 @@ Done
 - `pi` CLI: 29 nouns
 - Web console: 29 pages
 - Container images, tarball, installer, systemd units
-- Release workflow (never run; there is no build yet)
+- Release workflow: run; `26.11.13.1` published Linux x86_64 and aarch64 tarballs with `SHA256SUMS`. Container images are built by the workflow but none are published yet
 
 Partial
 - CLI has nothing for secrets, certificates, DNS, load balancers, buckets, shares, backups, alarms or metrics

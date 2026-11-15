@@ -3,6 +3,7 @@
 - [Home](Home)
 - [Quick start](Quick-start)
 - [Install](Install)
+- [Upgrading](Upgrading)
 - [Concepts](Concepts)
 
 **Operating**
