@@ -12,6 +12,7 @@ pistack-rpc.workspace = true
 fabric.workspace = true
 gate.workspace = true
 keep.workspace = true
+power.workspace = true
 gauge.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true

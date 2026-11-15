@@ -71,6 +71,9 @@ pub struct Forge {
     strategy: Strategy,
     /// Where what hosts report goes, and where the stats routes read it.
     samples: Arc<gauge::SampleRing>,
+    /// Proof a host is off before its machines are evacuated. Defaults to a
+    /// fencer that drives each host's BMC; a test gives a fake.
+    fencer: Option<Arc<dyn maintain::Fencer>>,
 }
 
 impl Default for Forge {
@@ -83,6 +86,7 @@ impl Default for Forge {
             dev_admin: true,
             strategy: Strategy::Spread,
             samples: gauge::samples(),
+            fencer: None,
         }
     }
 }
@@ -98,6 +102,7 @@ impl Forge {
             dev_admin: false,
             strategy: Strategy::Spread,
             samples: gauge::samples(),
+            fencer: None,
         }
     }
 
@@ -130,6 +135,12 @@ impl Forge {
     /// gives its own window so it reads only what its hosts reported.
     pub fn samples(mut self, samples: Arc<gauge::SampleRing>) -> Self {
         self.samples = samples;
+        self
+    }
+    /// Prove hosts off with `fencer` instead of the BMC fencer built from
+    /// the store. A test gives a fake.
+    pub fn fencer(mut self, fencer: Arc<dyn maintain::Fencer>) -> Self {
+        self.fencer = Some(fencer);
         self
     }
     /// The registry the reconciler consults. Register per-host drivers here.
@@ -224,13 +235,19 @@ impl Module for Forge {
 
     fn router(&self, ctx: ModuleContext) -> Router {
         let store = ctx.store::<Store>();
+        let store = (*store).clone();
+        let fencer = self
+            .fencer
+            .clone()
+            .unwrap_or_else(|| Arc::new(maintain::BmcFencer::new(store.clone())));
         http::router(http::AppState {
-            store: (*store).clone(),
+            store,
             drivers: self.drivers.clone(),
             dev_admin: self.dev_admin,
             queue: self.queue.clone(),
             strategy: self.strategy,
             samples: self.samples.clone(),
+            fencer,
         })
     }
 

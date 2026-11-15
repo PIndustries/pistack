@@ -26,6 +26,7 @@ use chrono::{DateTime, Duration, Utc};
 use pistack_store::Store;
 use pistack_types::{Caller, Id, Meta, Page, Resource, Spec};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 const KIND: &str = "audit";
@@ -80,6 +81,11 @@ pub struct AuditSpec {
     pub status: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// What a module adds about an action beyond its outcome: for an
+    /// evacuation, the power-off that was tried and did not happen. Written
+    /// as it is given; never carries a payload or a credential.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub notes: BTreeMap<String, String>,
 }
 
 impl Spec for AuditSpec {
@@ -260,6 +266,7 @@ pub fn record(store: &Store, e: Entry) {
             carried_by: e.carried_by,
             status: e.status,
             request_id: e.request_id,
+            notes: BTreeMap::new(),
         },
         status: AuditStatus {},
     };

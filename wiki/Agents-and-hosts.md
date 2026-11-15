@@ -233,20 +233,37 @@ What happens to volumes:
 
 These are also skipped: bare metal machines, pods that are pinned to the host by their volumes, and machines that are being deleted or live-migrated.
 
-Evacuate only acts on:
+Evacuate only acts on a host in phase `error` (it stopped reporting) or a host you have disabled. It refuses a host that is up: use drain to empty a working host.
 
-- a host in phase `error`, which means it stopped reporting, or
-- a disabled host, when you add `--confirm-dead`.
+Then it needs proof the host is really off, so it never starts a second copy of a machine that is still running:
 
-It refuses a host that is up.
+- A host that stopped reporting and has [power control](#power-control) is powered off through its BMC and the off state read back before any machine moves. You do not need `--confirm-dead`: the power-off is the proof, and the report says the proof was `power-off`.
+- A host that still reports is a host that works, however it is disabled. Its machines are running there. You must pass `--confirm-dead` before the server will touch anything, and the refusal says so: with power control an evacuation cuts the host's power and hard-stops every machine on it, without power control it risks second copies. Either way, `pi host drain` is how you empty a host that works. Once you have confirmed the host is dead, power control is used if the host has it and the proof is `power-off`.
+- A host that stopped reporting and has no power control needs `--confirm-dead` too, every time and even once it is marked down. The report says the proof was `operator`.
 
-**PiStack cannot power off a host.** Evacuate trusts you that the machines there are not running. If the host is only cut off from the control plane, its machines keep running there while new copies start elsewhere. Two copies then use the same addresses, and both write to any shared volume. Make sure the host is off before you evacuate it.
+A host that is only cut off from the control plane is the danger this guards against: its machines keep running there while new copies start elsewhere, two copies use the same addresses, and both write to any shared volume. Power control is what lets the server settle this instead of taking your word for it.
 
 When the host comes back, its agent still has the old copies. Each heartbeat reports them, and the control plane tells the agent to delete every machine that was evacuated off it. That removes the old root disks too. If you need data from an old root disk, copy it off the host before you start the agent there.
 
 A machine that was evacuated has the condition `Evacuated` and the annotation `pistack.io/evacuated-from`.
 
 Running the command again is safe. It only sees the machines that were skipped the first time.
+
+### Power control
+
+Power control is how the server can cut a host's power from outside it, so an evacuation can prove the host is off. A cloud admin sets it out of band, before the host is ever lost:
+
+```sh
+pi host power set agent1 --kind ipmi --address 10.9.1.8 --user admin --secret agent1-bmc
+pi host power show agent1
+pi host power clear agent1
+```
+
+The password is not given to this command and is not stored on the host. `--secret` is the name of a secret in the secrets service that holds it; only the name is kept, and the password is read only at the moment of a power-off. It never appears in `pi host power show`, in any API reply, or in a log line.
+
+`--kind` is `ipmi` or `redfish`. For IPMI the address is a `host[:port]`; for Redfish it is a URL or a host. The server drives the BMC with `ipmitool` or `curl`, the same path the bare-metal runtime uses.
+
+With power control set, `pi host evacuate` on a host that has stopped reporting powers the host off, confirms it, and then moves the machines; you do not need `--confirm-dead`. If the power-off fails or cannot be confirmed within 60 seconds the evacuation is refused and nothing moves. A BMC that died with its host is common enough — a failed power supply takes both — so you can pass `--confirm-dead` and the evacuation goes ahead on your word; the report and the audit record then both say a power-off was tried and failed, and why. A host that still reports is never powered off without that same `--confirm-dead` first; see [Evacuate](#evacuate-a-dead-host).
 
 ## Runtimes
 

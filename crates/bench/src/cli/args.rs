@@ -755,6 +755,45 @@ pub enum HostCmd {
     /// dead. The machines' root disks were on that host and are NOT moved:
     /// each machine starts again from its image.
     Evacuate(HostEvacuateArgs),
+    /// Set, clear or show how the server powers this host off.
+    ///
+    /// With power control set, an evacuation powers the host off and
+    /// confirms it before any machine is started elsewhere. Without it, an
+    /// evacuation needs --confirm-dead every time.
+    Power {
+        #[command(subcommand)]
+        cmd: HostPowerCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HostPowerCmd {
+    /// Set the host's power control. The password is not given here: it
+    /// lives in a secret and only its name is stored.
+    Set(HostPowerSetArgs),
+    /// Remove the host's power control.
+    Clear(NameArg),
+    /// Show the host's power control, without the password.
+    Show(NameArg),
+}
+
+#[derive(Args, Debug)]
+pub struct HostPowerSetArgs {
+    /// Name or id.
+    pub name: String,
+    /// The transport: ipmi or redfish.
+    #[arg(long)]
+    pub kind: String,
+    /// BMC address: a host[:port] for IPMI, a URL or host for Redfish.
+    #[arg(long)]
+    pub address: String,
+    /// BMC user.
+    #[arg(long)]
+    pub user: String,
+    /// Name of the secret holding the BMC password. The password itself is
+    /// never stored, shown or logged.
+    #[arg(long)]
+    pub secret: String,
 }
 
 #[derive(Args, Debug)]

@@ -883,10 +883,39 @@ async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
 
     h.go_silent(&dead.meta.id).await;
 
-    // Without the flag nothing moves: every machine would lose its disk.
-    let (st, report) =
-        call::<EvacuateReport>(&h.app, &admin(), "POST", "/hosts/dead/evacuate", None).await;
+    // A down host with no power control still needs the operator's word:
+    // without a confirmation nothing is refused-proof and the call is
+    // refused, naming both ways out.
+    let (st, body) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(false, true),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("confirm_dead"), "{text}");
+    assert!(text.contains("power control"), "{text}");
+
+    // With the confirmation, but without the rebuild flag, nothing moves:
+    // every machine would lose its disk.
+    let (st, report) = call::<EvacuateReport>(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(true, false),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
+    assert_eq!(report.proof, forge::maintain::Proof::Operator);
     assert!(report.evacuated.is_empty(), "{report:?}");
     assert_eq!(report.skipped.len(), 5);
     let why = names(&report.skipped);
@@ -902,7 +931,7 @@ async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
         &admin(),
         "POST",
         "/hosts/dead/evacuate",
-        evacuate_body(false, true),
+        evacuate_body(true, true),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -955,7 +984,7 @@ async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
         &admin(),
         "POST",
         "/hosts/dead/evacuate",
-        evacuate_body(false, true),
+        evacuate_body(true, true),
     )
     .await;
     assert!(again.evacuated.is_empty(), "{again:?}");

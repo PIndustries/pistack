@@ -49,6 +49,8 @@ pub struct AppState {
     pub strategy: crate::scheduler::Strategy,
     /// The window host reports land in, which stats are read from.
     pub samples: Arc<gauge::SampleRing>,
+    /// Powers a host off and confirms it before its machines are evacuated.
+    pub fencer: Arc<dyn crate::maintain::Fencer>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -75,6 +77,12 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/{id}/enable", post(enable_host))
         .route("/hosts/{id}/drain", post(drain_host))
         .route("/hosts/{id}/evacuate", post(evacuate_host))
+        .route(
+            "/hosts/{id}/power",
+            get(get_host_power)
+                .put(set_host_power)
+                .delete(clear_host_power),
+        )
         .route("/sizes", get(list_sizes).post(create_size))
         .route(
             "/sizes/{id}",
@@ -914,7 +922,7 @@ async fn evacuate_host(
     scope.require_admin()?;
     let opts: crate::maintain::EvacuateOptions = optional_body(&body)?;
     let host = hosts(&s).resolve(None, &id)?;
-    let (evacuated, skipped) = crate::maintain::evacuate(&s.store, &host, opts)?;
+    let out = crate::maintain::evacuate(&s.store, &host, opts, Some(s.fencer.as_ref())).await?;
     // What was asked of the host no longer applies. If it comes back it
     // must not be handed a start or an attach from before.
     if let Some(queue) = &s.queue {
@@ -925,9 +933,79 @@ async fn evacuate_host(
     }
     Ok(Json(crate::maintain::EvacuateReport {
         host,
-        evacuated,
-        skipped,
+        proof: out.proof,
+        power_off_failed: out.power_off_failed,
+        evacuated: out.evacuated,
+        skipped: out.skipped,
     }))
+}
+
+// ---- host power control --------------------------------------------------------
+
+/// Body of `PUT /hosts/{id}/power`. The password is never here: `secret`
+/// names a secret in the secrets service that holds it.
+#[derive(Debug, Deserialize)]
+pub struct SetHostPower {
+    pub kind: String,
+    pub address: String,
+    pub user: String,
+    pub secret: String,
+}
+
+/// Out-of-band power control is set and cleared by a cloud admin, and read
+/// back without the password. All three return the control (or null) under
+/// `power_control`, never a password.
+fn power_view(host: &Host) -> serde_json::Value {
+    let power = host.spec.power_control.as_ref().map(|pc| {
+        serde_json::json!({
+            "kind": pc.kind,
+            "address": pc.address,
+            "user": pc.user,
+            "secret": pc.secret,
+        })
+    });
+    serde_json::json!({ "power_control": power })
+}
+
+async fn get_host_power(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    Ok(Json(power_view(&host)))
+}
+
+async fn set_host_power(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Json(body): Json<SetHostPower>,
+) -> ApiResult<Json<serde_json::Value>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let pc =
+        crate::types::PowerControl::checked(&body.kind, &body.address, &body.user, &body.secret)?;
+    let host = hosts(&s).modify(&host.meta.id, |h| {
+        h.spec.power_control = Some(pc.clone());
+        Ok(())
+    })?;
+    Ok(Json(power_view(&host)))
+}
+
+async fn clear_host_power(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let host = hosts(&s).modify(&host.meta.id, |h| {
+        h.spec.power_control = None;
+        Ok(())
+    })?;
+    Ok(Json(power_view(&host)))
 }
 
 // ---- sizes -------------------------------------------------------------------
@@ -1256,6 +1334,7 @@ mod tests {
             queue: Some(queue.clone()),
             strategy: Default::default(),
             samples: Arc::new(gauge::SampleRing::memory()),
+            fencer: Arc::new(crate::maintain::BmcFencer::new(store.clone())),
         });
 
         async fn post(app: &axum::Router, path: &str, host: &str) -> (StatusCode, Vec<u8>) {
