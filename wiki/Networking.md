@@ -35,7 +35,7 @@ pi machine create web --image ubuntu-24.04 --size m.2x4 --network app
 | --- | --- |
 | Network | `--kind overlay` (default) or `--kind provider` with `--physnet` and optionally `--vlan`. `--external` marks a network that routers use as their gateway and that floating IPs come from. `--auto-floating-ip` is described below. |
 | Subnet | A CIDR on a network, with a gateway, allocation pools, DNS servers and DHCP on by default. |
-| Port | An address on a network, bound to a machine. Created for you when a machine names a network. |
+| Port | An address on a network, bound to a machine. Created for you when a machine names a network. Can be given allowed address pairs, described below. |
 | Router | Connects subnets to each other and to one external network. |
 | Security group | Rules by direction, protocol, port range and remote CIDR or group. |
 | Floating IP | An address on an external network mapped to a port. |
@@ -61,6 +61,39 @@ pi network set public --auto-floating-ip false
 - A floating IP you create and associate yourself is never touched, and a machine that has one is not given a second.
 
 Upgrading from a build without the setting: until then a network named `fleet`, or the only external network, handed a floating IP to every machine. Those floating IPs stay in place and keep working. No new ones are created until you mark a network. The server logs one warning when it becomes leader while such floating IPs exist and no network is marked. Run `pi fip list` and look for the label to see them.
+
+## Allowed address pairs
+
+By default a port carries traffic for its own MAC and its fixed addresses and nothing else. An allowed address pair says one more address, or one more range of addresses, that the port may carry, and optionally the MAC it arrives under. That is what a virtual address needs: one address answered by whichever of two machines currently holds it, or an address kept while its machine is replaced.
+
+```sh
+pi api PUT /ports/web-0 <<< '{"spec": {
+  "network": "app", "subnet": "app4",
+  "fixed_ips": ["10.1.0.5"], "mac": "02:70:69:11:22:33",
+  "allowed_address_pairs": [
+    {"ip_address": "10.1.0.100"},
+    {"ip_address": "10.1.0.101", "mac_address": "02:70:69:aa:bb:cc"},
+    {"ip_address": "10.1.9.0/28"}
+  ]
+}}'
+```
+
+- `ip_address` is one address (`10.1.0.100`, kept as `10.1.0.100/32`) or a prefix (`10.1.9.0/28`). The whole of an address family is refused: `0.0.0.0/0` and `::/0` would let a machine claim any address there.
+- `mac_address` is the address seen on the wire for that pair. Left out, the pair rides on the port's own MAC.
+- At most ten pairs per port. The same address under the same MAC twice is refused, and so is one MAC written two ways.
+- Pairs need port security on the port. A port with port security off filters nothing, so there is nothing to widen; turning security off with pairs still on the port is refused until both are cleared.
+- Nothing is allocated for a pair. Fabric does not check that the address belongs to a subnet of the network, does not mark it used, and will not stop two ports being given the same pair. What sits behind it is yours: keepalived, or whatever moves the address.
+
+What a backend does with a pair differs, because not every backend filters traffic at a port:
+
+| Backend | Effect |
+| --- | --- |
+| `ovn` | Every pair goes to the logical switch port's `port_security` with its mask, so it passes anti-spoofing. `addresses` takes what it can spell: a single address bare, and a wider prefix not at all — that column is a MAC followed by plain addresses — where only the prefix's MAC is listed, and only when it is not the port's own, which is all the switch needs to know where that MAC lives. Removing the pair removes it from both. |
+| `overlay` | Nothing. The host end of a port comes from the per-host plan, which knows the port's fixed addresses, and the segment's rules are built from those. Pairs are not in that plan. |
+| `hostnat` | Nothing. This backend sets no per-port filter at all: what a guest may send is decided by the libvirt network it sits on. |
+| `mock` | Nothing. It records calls only. |
+
+So a pair is honoured on `ovn` today. On the other backends the record carries it and reports `ready`, and nothing on the host changes.
 
 ## Scheduling
 
@@ -128,7 +161,7 @@ What the server creates:
 
 - a logical switch per network, with a `localnet` port for provider networks and a `localport` for metadata,
 - DHCP options per subnet, with an on-link route to the metadata address,
-- a switch port per port, with port security,
+- a switch port per port, with port security and any allowed address pairs,
 - logical routers with a gateway port, a default route and SNAT,
 - port groups and ACLs for security groups, with a default drop,
 - floating IPs as `dnat_and_snat` rules.

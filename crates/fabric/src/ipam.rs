@@ -10,7 +10,7 @@
 //! IPs); this module keeps no state of its own, so it is trivially correct
 //! under a single-writer store and easy to test.
 
-use crate::types::{AllocationPool, SubnetSpec};
+use crate::types::{AllocationPool, AllowedAddressPair, SubnetSpec};
 use ipnet::IpNet;
 use pistack_types::{ApiError, ApiResult};
 use std::collections::BTreeSet;
@@ -187,6 +187,68 @@ fn broadcast(cidr: IpNet) -> Option<IpAddr> {
     }
 }
 
+/// How many address pairs one port may be given.
+pub const MAX_ALLOWED_PAIRS: usize = 10;
+
+/// The pairs of a port with their MACs canonicalised. A pair that names no
+/// MAC, or one fabric could not parse, keeps `None`: the port's own address.
+pub fn pair_macs(port: &crate::types::Port) -> Vec<(Option<String>, IpNet)> {
+    port.spec
+        .allowed_address_pairs
+        .iter()
+        .map(|p| {
+            (
+                p.mac_address
+                    .as_deref()
+                    .and_then(|m| parse_mac(m).ok())
+                    .map(format_mac),
+                p.ip_address,
+            )
+        })
+        .collect()
+}
+
+/// An address written bare and the same address with its host prefix are one
+/// pair, so both are read as a prefix.
+fn pair_net(net: IpNet) -> String {
+    let t = net.trunc();
+    format!("{}/{}", t.addr(), t.prefix_len())
+}
+
+/// Check a port's allowed address pairs: at most
+/// [`MAX_ALLOWED_PAIRS`] of them, each holding an address or a prefix that
+/// is not the whole family, and each with a MAC that parses when it names
+/// one. Two pairs of the same address and MAC are the same pair, so the
+/// second is refused rather than quietly merged.
+pub fn validate_pairs(pairs: &[AllowedAddressPair]) -> ApiResult<()> {
+    if pairs.len() > MAX_ALLOWED_PAIRS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_ALLOWED_PAIRS} allowed address pairs per port"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for p in pairs {
+        if p.ip_address.prefix_len() == 0 {
+            return Err(ApiError::bad_request(format!(
+                "{} covers every address of its family",
+                p.ip_address
+            )));
+        }
+        let mac = match &p.mac_address {
+            Some(m) => format_mac(parse_mac(m)?),
+            None => String::new(),
+        };
+        if !seen.insert((pair_net(p.ip_address), mac.clone())) {
+            return Err(ApiError::bad_request(format!(
+                "allowed address pair {} with mac {} is listed twice",
+                p.ip_address,
+                if mac.is_empty() { "the port mac" } else { &mac }
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Render a MAC as `aa:bb:cc:dd:ee:ff`.
 pub fn format_mac(b: [u8; 6]) -> String {
     format!(
@@ -235,6 +297,14 @@ pub fn generate_mac(seed: &Uuid, taken: &BTreeSet<String>) -> ApiResult<String> 
 mod tests {
     use super::*;
     use pistack_types::{kind, Id};
+
+    /// A pair's address as the API reads it: a CIDR, or one address given its
+    /// host prefix.
+    fn net(s: &str) -> IpNet {
+        s.parse::<IpNet>()
+            .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
+            .unwrap()
+    }
 
     fn spec(cidr: &str, gw: Option<&str>) -> SubnetSpec {
         SubnetSpec {
@@ -375,5 +445,61 @@ mod tests {
             "multicast rejected"
         );
         assert!(parse_mac("zz:70:69:00:00:01").is_err());
+    }
+
+    fn pair(ip: &str, mac: Option<&str>) -> AllowedAddressPair {
+        AllowedAddressPair {
+            ip_address: net(ip),
+            mac_address: mac.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pair_validation() {
+        assert!(validate_pairs(&[]).is_ok());
+        assert!(validate_pairs(&[pair("10.0.0.9", None)]).is_ok());
+        assert!(validate_pairs(&[pair("10.0.0.0/28", Some("02:00:00:00:00:09"))]).is_ok());
+        assert!(validate_pairs(&[pair("fd00::9", None), pair("fd00::/64", None)]).is_ok());
+        assert!(
+            validate_pairs(&[pair("0.0.0.0/0", None)]).is_err(),
+            "every v4 address"
+        );
+        assert!(
+            validate_pairs(&[pair("::/0", None)]).is_err(),
+            "every v6 address"
+        );
+        assert!(
+            validate_pairs(&[pair("10.0.0.9", Some("nope"))]).is_err(),
+            "mac must parse"
+        );
+        assert!(
+            validate_pairs(&[pair("10.0.0.9", Some("01:00:5e:00:00:01"))]).is_err(),
+            "multicast mac"
+        );
+        assert!(validate_pairs(&[pair("10.0.0.9", None), pair("10.0.0.9", None)]).is_err());
+        assert!(
+            validate_pairs(&[
+                pair("10.0.0.9", None),
+                pair("10.0.0.9", Some("02:00:00:00:00:09")),
+            ])
+            .is_ok(),
+            "same address, different mac"
+        );
+        // `-` separated is the same mac written another way.
+        assert!(validate_pairs(&[
+            pair("10.0.0.9", Some("02:00:00:00:00:09")),
+            pair("10.0.0.9", Some("02-00-00-00-00-09")),
+        ])
+        .is_err());
+        let ten = (0..10).map(|i| pair(&format!("10.0.0.{i}"), None));
+        assert!(validate_pairs(&ten.collect::<Vec<_>>()).is_ok());
+        let eleven = (0..11).map(|i| pair(&format!("10.0.0.{i}"), None));
+        assert!(validate_pairs(&eleven.collect::<Vec<_>>()).is_err());
+    }
+
+    #[test]
+    fn a_bare_address_and_its_host_prefix_are_one_pair() {
+        assert!(validate_pairs(&[pair("10.0.0.9", None), pair("10.0.0.9/32", None)]).is_err());
+        assert!(validate_pairs(&[pair("fd00::9", None), pair("fd00::9/128", None)]).is_err());
     }
 }

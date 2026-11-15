@@ -50,6 +50,7 @@ use crate::types::{
     SecurityGroup, Subnet,
 };
 use async_trait::async_trait;
+use ipnet::IpNet;
 use pistack_store::Store;
 use pistack_types::{kind, ApiError, ApiResult, Id, Leadership, Phase, Resource, Spec};
 use serde::{Deserialize, Serialize};
@@ -805,6 +806,60 @@ pub fn metadata_port_mac(net: &Id) -> String {
     )
 }
 
+/// `<mac> <address>...`, one OVN address entry.
+fn address_entry(mac: &str, ips: impl IntoIterator<Item = String>) -> String {
+    let mut a = mac.to_string();
+    for ip in ips {
+        a.push(' ');
+        a.push_str(&ip);
+    }
+    a
+}
+
+/// One pair as OVN entries: the addresses entry, and the port_security entry.
+struct PairRows {
+    /// What `addresses` gains, if anything. A single address is listed bare;
+    /// a prefix has no place in `addresses` at all, and only its MAC is
+    /// listed — once, and only when it is not the port's own — so the switch
+    /// knows where that MAC lives without the port claiming to own every
+    /// address of the prefix.
+    addresses: Option<String>,
+    /// What `port_security` gains: the pair as it was asked for, mask and all.
+    security: String,
+}
+
+/// A port's allowed address pairs, split the way the two columns want them.
+/// A pair that names no MAC — or one fabric could not parse, which the API
+/// refuses long before a pair reaches here — rides on the port's own MAC.
+fn pair_rows(port: &Port) -> Vec<PairRows> {
+    let own = port.spec.mac.trim();
+    crate::ipam::pair_macs(port)
+        .into_iter()
+        .map(|(mac, net)| {
+            let mac = mac.unwrap_or_else(|| own.to_string());
+            let security = address_entry(&mac, [net.to_string()]);
+            let full = match net {
+                IpNet::V4(_) => 32,
+                IpNet::V6(_) => 128,
+            };
+            let single = net.prefix_len() == full;
+            // The port already answers for its own MAC, so a prefix under it
+            // teaches the switch nothing and lists no new address.
+            let addresses = if single {
+                Some(address_entry(&mac, [net.addr().to_string()]))
+            } else if mac == own {
+                None
+            } else {
+                Some(mac)
+            };
+            PairRows {
+                addresses,
+                security,
+            }
+        })
+        .collect()
+}
+
 fn by_name(name: &str) -> Vec<Value> {
     vec![eq("name", json!(name))]
 }
@@ -1273,9 +1328,15 @@ impl NetBackend for OvnBackend {
     ///   ports are written with their router (see [`Self::ensure_router`]);
     ///   here they only get a binding.
     /// * `addresses = ["<mac> <ip1> <ip2>..."]`, or `["unknown"]` before a
-    ///   mac is assigned.
-    /// * `port_security = ["<mac> <ip1>..."]` when `spec.port_security`,
-    ///   else `[]`.
+    ///   mac is assigned. An allowed address pair joins it only as an
+    ///   address it can name: a single address bare, `"<pair mac or the port
+    ///   mac> <address>"`; a wider prefix never, since the column takes plain
+    ///   addresses, and then only its MAC, `"<pair mac>"`, and only when that
+    ///   mac is not the port's own — that is all the switch needs to know
+    ///   where the mac lives.
+    /// * `port_security` holds every entry `addresses` would carry plus each
+    ///   pair with its mask, `"<pair mac or the port mac> <pair prefix>"`,
+    ///   when `spec.port_security`, so a pair passes anti-spoofing, else `[]`.
     /// * `dhcpv4_options` / `dhcpv6_options` = the network's `DHCP_Options`
     ///   row whose range holds one of the port's addresses.
     /// * `external_ids:pistack:id`, `pistack:device = <device id>`,
@@ -1304,19 +1365,23 @@ impl NetBackend for OvnBackend {
         let ips = &port.spec.fixed_ips;
         let mac = port.spec.mac.trim();
         let (addresses, security) = if mac.is_empty() {
-            ("unknown".to_string(), Vec::new())
+            (json!("unknown"), Vec::new())
         } else {
-            let mut a = mac.to_string();
-            for ip in ips {
-                a.push(' ');
-                a.push_str(&ip.to_string());
-            }
-            let sec = if port.spec.port_security {
-                vec![json!(a.clone())]
+            let rows = pair_rows(port);
+            let own = address_entry(mac, ips.iter().map(IpAddr::to_string));
+            let addresses: Vec<Value> = std::iter::once(own.clone())
+                .chain(rows.iter().filter_map(|r| r.addresses.clone()))
+                .map(|e| json!(e))
+                .collect();
+            let security = if port.spec.port_security {
+                std::iter::once(own)
+                    .chain(rows.into_iter().map(|r| r.security))
+                    .map(|e| json!(e))
+                    .collect()
             } else {
                 Vec::new()
             };
-            (a, sec)
+            (set(addresses), security)
         };
         let dhcp = self
             .run(vec![ovsdb::select(
@@ -1700,8 +1765,8 @@ mod tests {
     use super::*;
     use crate::backend::ovsdb::fake::FakeDb;
     use crate::types::{
-        FloatingIp, FloatingIpSpec, FloatingIpStatus, HostRoute, NetworkSpec, NetworkStatus,
-        PortSpec, PortStatus, Router, RouterSpec, RouterStatus, SecurityGroupSpec,
+        AllowedAddressPair, FloatingIp, FloatingIpSpec, FloatingIpStatus, HostRoute, NetworkSpec,
+        NetworkStatus, PortSpec, PortStatus, Router, RouterSpec, RouterStatus, SecurityGroupSpec,
         SecurityGroupStatus, StaticRoute, SubnetSpec, SubnetStatus,
     };
     use pistack_types::{kind, Meta};
@@ -1982,6 +2047,114 @@ mod tests {
             ovsdb::elems(ls[0].get("ports")),
             vec![meta["_uuid"].clone()]
         );
+    }
+
+    #[tokio::test]
+    async fn an_allowed_pair_rides_the_port_addresses_and_security() {
+        let (db, b) = backend();
+        let n = net(NetworkKind::Overlay);
+        b.ensure_network(&n).await.unwrap();
+        let mut p = port(&n, "fa:16:3e:00:00:31", &["10.20.0.31"]);
+        // A bare address is kept as that address with its host prefix, which
+        // is how the API stores it.
+        let pair = |ip: &str, mac: Option<&str>| AllowedAddressPair {
+            ip_address: ip.parse().unwrap(),
+            mac_address: mac.map(str::to_string),
+        };
+        p.spec.allowed_address_pairs = vec![
+            // A virtual address two machines share, kept on the port's mac.
+            pair("10.20.0.99/32", None),
+            // The same address seen under another machine's mac.
+            pair("10.20.0.98/32", Some("FA-16-3E-00-00-98")),
+            // A whole prefix, so the machine may answer for anything in it.
+            pair("10.20.9.0/28", Some("02:00:00:00:09:00")),
+            // The same prefix under the port's own mac.
+            pair("10.20.8.0/28", None),
+        ];
+        b.ensure_port(&n, &p, &[]).await.unwrap();
+        let lsp = guest_ports(&db);
+        assert_eq!(lsp.len(), 1);
+        // addresses takes plain addresses, so a prefix is not listed there:
+        // only the foreign mac the switch has nowhere else to learn.
+        assert_eq!(
+            ovsdb::canon(&lsp[0]["addresses"]),
+            json!([
+                "set",
+                [
+                    "02:00:00:00:09:00",
+                    "fa:16:3e:00:00:31 10.20.0.31",
+                    "fa:16:3e:00:00:31 10.20.0.99",
+                    "fa:16:3e:00:00:98 10.20.0.98",
+                ]
+            ])
+        );
+        // port_security takes masks, so every pair is there as it was asked.
+        assert_eq!(
+            ovsdb::canon(&lsp[0]["port_security"]),
+            json!([
+                "set",
+                [
+                    "02:00:00:00:09:00 10.20.9.0/28",
+                    "fa:16:3e:00:00:31 10.20.0.31",
+                    "fa:16:3e:00:00:31 10.20.0.99/32",
+                    "fa:16:3e:00:00:31 10.20.8.0/28",
+                    "fa:16:3e:00:00:98 10.20.0.98/32",
+                ]
+            ])
+        );
+
+        let writes = db.writes();
+        b.ensure_port(&n, &p, &[]).await.unwrap();
+        assert_eq!(db.writes(), writes, "a repeat must not write");
+
+        // The pair goes away with the spec entry.
+        p.spec.allowed_address_pairs.remove(2);
+        b.ensure_port(&n, &p, &[]).await.unwrap();
+        let lsp = guest_ports(&db);
+        assert_eq!(
+            ovsdb::canon(&lsp[0]["addresses"]),
+            json!([
+                "set",
+                [
+                    "fa:16:3e:00:00:31 10.20.0.31",
+                    "fa:16:3e:00:00:31 10.20.0.99",
+                    "fa:16:3e:00:00:98 10.20.0.98",
+                ]
+            ])
+        );
+        assert_eq!(
+            ovsdb::canon(&lsp[0]["port_security"]),
+            json!([
+                "set",
+                [
+                    "fa:16:3e:00:00:31 10.20.0.31",
+                    "fa:16:3e:00:00:31 10.20.0.99/32",
+                    "fa:16:3e:00:00:31 10.20.8.0/28",
+                    "fa:16:3e:00:00:98 10.20.0.98/32",
+                ]
+            ])
+        );
+
+        // With port security off the port is filtered by nothing, so the
+        // pairs are only listed as addresses.
+        p.spec.port_security = false;
+        b.ensure_port(&n, &p, &[]).await.unwrap();
+        let lsp = guest_ports(&db);
+        assert_eq!(ovsdb::canon(&lsp[0]["port_security"]), json!(["set", []]));
+        assert_eq!(ovsdb::elems(lsp[0].get("addresses")).len(), 3);
+
+        // A pair whose mac will not parse rides on the port's own mac. The
+        // API refuses such a pair; this is the backend meeting one anyway.
+        let mut junk = p.clone();
+        junk.spec.port_security = true;
+        junk.spec
+            .allowed_address_pairs
+            .push(pair("10.20.0.97/32", Some("not a mac")));
+        b.ensure_port(&n, &junk, &[]).await.unwrap();
+        let lsp = guest_ports(&db);
+        let entries = ovsdb::elems(lsp[0].get("addresses"));
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert!(entries.contains(&json!("fa:16:3e:00:00:31 10.20.0.97")));
     }
 
     #[tokio::test]
