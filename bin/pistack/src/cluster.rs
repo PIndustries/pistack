@@ -5059,7 +5059,11 @@ mod tests {
         let done = fetch_snapshot_with(&api, &dest, &limits).await.unwrap();
         let took = started.elapsed();
         assert_eq!(done.bytes, bytes.len() as u64);
-        assert!(done.largest_chunk <= 4 * piece, "{}", done.largest_chunk);
+        // What one read hands over is the client library's buffer, not the
+        // server's piece: on a busy machine several pieces arrive as one. The
+        // point is that the file is never held whole, so the bound is a size
+        // far under the file and over any buffer the library keeps.
+        assert!(done.largest_chunk <= 1 << 20, "{}", done.largest_chunk);
         assert!(took > limits.stall * 3, "the link was not slow: {took:?}");
         assert!(!dest.with_extension("partial").exists());
         let copy = open_store(dest_dir.path());
