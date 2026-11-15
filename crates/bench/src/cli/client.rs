@@ -55,6 +55,12 @@ impl CliError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, CliError::Api { status: 404, .. })
     }
+    /// True when the server refused a create because that resource name is
+    /// already filed in this project. `name` is what was asked for, since one
+    /// status covers several refusals and only the one naming it is this.
+    pub fn is_name_taken(&self, name: &str) -> bool {
+        matches!(self, CliError::Api { status: 409, message, .. } if message.contains(name))
+    }
 }
 
 impl From<reqwest::Error> for CliError {

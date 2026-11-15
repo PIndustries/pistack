@@ -1040,19 +1040,87 @@ pi cert key <NAME>
 
 `show` includes the certificate PEM; `key` prints the certificate, its private key and the chain, and needs admin. `revoke` is not a deletion — the record stays so its serial stays in the CRL. Certificate authorities have no noun of their own; `pi api GET /secrets/cas` lists them.
 
+## pi dns zone
+
+DNS zones. A zone is an apex, such as `example.cloud.`, that this cloud is authoritative for. `show` takes the resource name, its id, or the apex itself.
+
+```text
+pi dns zone list
+pi dns zone show <NAME>
+pi dns zone create <APEX>
+pi dns zone delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `zone create` | `<APEX>` | Apex of the zone, e.g. example.cloud or example.cloud. A missing final dot is added |
+| `zone create` | `--name <NAME>` | Name the zone is filed under. Default: the apex without its final dot |
+| `zone create` | `--description <DESCRIPTION>` |  |
+| `zone create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `zone create` | `--ttl <TTL>` | Default TTL for records that do not set one, in seconds [default: 3600] |
+| `zone create` | `--email <EMAIL>` | Contact mailbox for the SOA, e.g. hostmaster@example.cloud |
+| `zone create` | `--nameserver <NAMESERVER>` | Authoritative nameserver (repeatable, absolute name). Default: `ns1.<apex>` |
+| `zone create` | `--also-notify <ADDR>` | Address of an outside secondary of this zone (`ip` or `ip:port`, repeatable), told when the serial moves. A primary zone only |
+| `zone create` | `--primary <ADDR>` | Primary to transfer the zone from (`ip` or `ip:port`, repeatable). Makes the zone a secondary |
+
+A zone made with `--primary` is a secondary: it is served only once a zone transfer has filled it and stays `pending` until then, and it takes no record sets — the module refuses those with `record sets belong on primary zones`. `--primary` and `--also-notify` contradict each other and clap refuses the pair. `pi dns zone list -o wide` shows the kind, the primaries a secondary pulls from, and the addresses in `also_notify`.
+
+A field you do not give is left out of the request rather than sent empty, so the module's own default applies and appears in what you read back: no `--email` gives the SOA mailbox `hostmaster`, no `--nameserver` makes the zone authoritative for `ns1.<apex>`. Both are the module's defaults, and the module does not repeat a default back to you, so those wide columns are blank until you set them explicitly.
+
+Deleting a zone deletes every record set in it; the module does not refuse a zone that still has record sets, so `--yes` is the only check on that. A zone labelled `pistack.io/auto=true` also gets machine records written for you; see [Networking](Networking).
+
+## pi dns record
+
+DNS record sets. A record set is one owner name and one type inside a zone, holding one or more records.
+
+```text
+pi dns record list
+pi dns record show <NAME> [--zone <ZONE>]
+pi dns record create <OWNER> <TYPE> --zone <ZONE> --record <DATA>
+pi dns record delete <NAME> [--zone <ZONE>]
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `record list` | `--zone <ZONE>` | Only this zone's record sets (name, id or apex) |
+| `record show` | `--zone <ZONE>` | Look for it in this zone only (name, id or apex) |
+| `record delete` | `--zone <ZONE>` | Look for it in this zone only (name, id or apex) |
+| `record create` | `<OWNER>` | Owner name, relative to the zone (`web`), absolute with a final dot, or `@` for the apex |
+| `record create` | `<TYPE>` | Record type: A, AAAA, CNAME, MX, TXT, SRV, NS or PTR |
+| `record create` | `--name <NAME>` | Name the record set is filed under. Default: `<owner>-<type>` lower-cased, with the zone after it when that name is already taken in the project |
+| `record create` | `--description <DESCRIPTION>` |  |
+| `record create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `record create` | `--zone <ZONE>` | Zone the record lives in (name, id or apex) |
+| `record create` | `--ttl <TTL>` | TTL in seconds. Default: the zone's |
+| `record create` | `--record <DATA>` | Record data (repeatable), presentation format: `10.0.0.4`, `10 mail.example.cloud.`, `"v=spf1 -all"` |
+
+```sh
+pi dns zone create example.cloud --email ops@example.cloud
+pi dns record create web A --zone example.cloud --record 10.0.0.4 --record 10.0.0.5
+pi dns record create @ TXT --zone example.cloud --record 'v=spf1 -all'
+pi dns record list --zone example.cloud
+```
+
+`show` and `delete` take `--zone` for the same thing: the set is looked up among that zone's own, so its short name — `<owner>-<type>` — finds it there even when the name it is filed under carries the zone as well. Without `--zone` a record set is read by the name it is filed under, and nothing else.
+
+A name is unique in a project, not in a zone, so two zones holding the same host cannot both be filed as `www-a`: the first takes the short name and the second gets the zone after it, `www-a.corp.cloud`. The record itself is unchanged by either; only the name it is filed under moves.
+
+One owner name holds one set per type, and a CNAME owner holds nothing else. The owner, the type and the zone of an existing set cannot be changed; delete the set and create it again. A set made without `--ttl` carries no TTL of its own and is served with its zone's; `list` and `show` print that number rather than a blank, while `-o json|yaml` pass the server's row through with the TTL still absent.
+
 ## Not in the CLI yet
 
 These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 
 | What | Path |
 | --- | --- |
-| DNS zones and records | `/dns` |
 | Certificate authorities | `/secrets/cas` |
 | Access keys | `/secrets/access-keys` |
 | Join tokens | `/secrets/join-tokens` |
 | Alarms and posted samples | `/gauge` |
 
 ```sh
-pi api GET /dns/zones
+pi api GET /balancers/balancers
 pi api POST /silo/buckets -d '{"name":"backups"}'
 ```
+
+The zone export — a whole zone in master-file form — has no verb of its own either: `pi api GET /dns/zones/<NAME>/export`.
