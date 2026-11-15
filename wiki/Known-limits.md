@@ -75,7 +75,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Volume encryption does nothing.** The flag is stored.
 - **Volumes cannot shrink.**
 - **Object storage keeps one copy on one server.** No replication, no erasure coding.
-- **The S3 API is partial.** No bucket operations through S3, no `ListObjects` v1, no range reads, no batch delete, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption. Path-style addressing only.
+- **The S3 API is partial.** No bucket operations through S3, no `ListObjects` v1, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption. Path-style addressing only.
 - **NFS share sizes are not enforced.**
 - **No quota on object bytes.** A project can be limited in buckets and not in what it stores in them.
 - **An image upload is checked against `images_bytes` after it is received.** The size is not known before, so an upload that does not fit is stored and then deleted.

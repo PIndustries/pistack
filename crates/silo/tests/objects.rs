@@ -3345,3 +3345,630 @@ async fn native_put_rejects_xml_unsafe_key() {
         "must not reject key before visibility: {err}"
     );
 }
+
+async fn get_with_range(
+    app: &Router,
+    who: &Caller,
+    uri: &str,
+    range: &str,
+) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    call_with_headers(
+        app,
+        "GET",
+        uri,
+        None,
+        "application/octet-stream",
+        Some(who),
+        &[("range", range)],
+    )
+    .await
+}
+
+fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn range_get_answers_206_with_the_requested_bytes() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "ranges").await;
+    let key = "sample.bin";
+    let body: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+    put_key(&app, &who, &bucket, key, &body).await;
+    let uri = format!("/{bucket}/{key}");
+
+    // (header, first byte, byte after the last) — a range naming the whole
+    // object is a plain 200, anything else a 206 with a Content-Range.
+    let cases: &[(&str, usize, usize)] = &[
+        ("bytes=0-9", 0, 10),
+        ("bytes=10-19", 10, 20),
+        ("bytes=990-999", 990, 1000),
+        ("bytes=500-", 500, 1000),
+        ("bytes=-50", 950, 1000),
+        // Longer than the object: a suffix is all that is there.
+        ("bytes=-5000", 0, 1000),
+        // Past the end of the object the answer is what is left.
+        ("bytes=995-5000", 995, 1000),
+        ("bytes=7-7", 7, 8),
+        ("bytes=0-", 0, 1000),
+    ];
+    for (range, lo, hi) in cases {
+        let (status, got, headers) = get_with_range(&app, &who, &uri, range).await;
+        assert_eq!(got, &body[*lo..*hi], "{range}");
+        assert_eq!(
+            header_str(&headers, "accept-ranges").as_deref(),
+            Some("bytes"),
+            "{range}"
+        );
+        if *lo == 0 && *hi == body.len() {
+            assert_eq!(status, StatusCode::OK, "{range}");
+            assert_eq!(header_str(&headers, "content-range"), None, "{range}");
+        } else {
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+            assert_eq!(
+                header_str(&headers, "content-range").as_deref(),
+                Some(format!("bytes {}-{}/{}", lo, hi - 1, body.len()).as_str()),
+                "{range}"
+            );
+        }
+        assert_eq!(
+            header_str(&headers, "content-length").as_deref(),
+            Some((hi - lo).to_string().as_str()),
+            "{range}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn range_get_on_an_empty_object() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "ranges-empty").await;
+    put_key(&app, &who, &bucket, "zero.bin", b"").await;
+    let uri = "/ranges-empty/zero.bin";
+
+    // Nothing is requested and there is nothing to give: the object, whole.
+    for range in ["bytes=0-", "bytes=0-0", "bytes=-", "bytes=-0", "bytes=-9"] {
+        let (status, got, headers) = get_with_range(&app, &who, uri, range).await;
+        assert_eq!(status, StatusCode::OK, "{range}");
+        assert!(got.is_empty(), "{range}");
+        assert_eq!(
+            header_str(&headers, "content-length").as_deref(),
+            Some("0"),
+            "{range}"
+        );
+        assert_eq!(header_str(&headers, "content-range"), None, "{range}");
+    }
+}
+
+#[tokio::test]
+async fn unsatisfiable_range_is_416_invalid_range() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "ranges-416").await;
+    put_key(&app, &who, &bucket, "a.bin", b"0123456789").await;
+    let uri = "/ranges-416/a.bin";
+
+    for range in ["bytes=10-", "bytes=10-20", "bytes=99-", "bytes=-0"] {
+        let (status, body, headers) = get_with_range(&app, &who, uri, range).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{range}");
+        assert_eq!(
+            header_str(&headers, "content-range").as_deref(),
+            Some("bytes */10"),
+            "{range}"
+        );
+        assert_eq!(
+            extract_error_code(&String::from_utf8_lossy(&body)),
+            "InvalidRange"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_range_that_cannot_be_read_answers_the_whole_object() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "ranges-200").await;
+    let body = b"whole object please";
+    put_key(&app, &who, &bucket, "a.bin", body).await;
+    let uri = "/ranges-200/a.bin";
+
+    for range in [
+        "bytes=0-5,10-12",
+        "bytes=12-4",
+        "bytes=",
+        "bytes=-",
+        "bytes=x-y",
+        "bytes=0-5 junk",
+        "items=0-5",
+    ] {
+        let (status, got, headers) = get_with_range(&app, &who, uri, range).await;
+        assert_eq!(status, StatusCode::OK, "{range}");
+        assert_eq!(got, body, "{range}");
+        assert_eq!(header_str(&headers, "content-range"), None, "{range}");
+    }
+}
+
+#[tokio::test]
+async fn head_answers_accept_ranges_and_a_range_header_is_not_a_head_body() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "ranges-head").await;
+    let body: Vec<u8> = (0..64u8).collect();
+    put_key(&app, &who, &bucket, "a.bin", &body).await;
+    let uri = "/ranges-head/a.bin";
+
+    let (status, got, headers) = call(
+        &app,
+        "HEAD",
+        uri,
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(got.is_empty());
+    assert_eq!(
+        header_str(&headers, "accept-ranges").as_deref(),
+        Some("bytes")
+    );
+    assert_eq!(
+        header_str(&headers, "content-length").as_deref(),
+        Some("64")
+    );
+
+    let (status, _, headers) = call_with_headers(
+        &app,
+        "HEAD",
+        uri,
+        None,
+        "application/octet-stream",
+        Some(&who),
+        &[("range", "bytes=0-9")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header_str(&headers, "accept-ranges").as_deref(),
+        Some("bytes")
+    );
+    assert_eq!(
+        header_str(&headers, "content-length").as_deref(),
+        Some("64")
+    );
+
+    // A plain GET says ranges are accepted too.
+    let (status, got, headers) = call(
+        &app,
+        "GET",
+        uri,
+        None,
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, body);
+    assert_eq!(
+        header_str(&headers, "accept-ranges").as_deref(),
+        Some("bytes")
+    );
+}
+
+#[tokio::test]
+async fn range_get_works_on_a_completed_multipart_object() {
+    let (_dir, _client, app, _project, who) = app_multipart(64, 8);
+    let bucket = ensure_bucket(&app, &who, "ranges-mpu").await;
+    let key = "big.bin";
+    let part1 = b"abcdefgh";
+    let part2 = b"ijklmnop";
+    let whole: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+
+    let (_, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploads"),
+        Some(Vec::new()),
+        "application/octet-stream",
+        Some(&who),
+    )
+    .await;
+    let upload_id = extract_upload_id(&String::from_utf8_lossy(&body));
+    let mut etags: Vec<String> = Vec::new();
+    for (n, part) in [(1, part1), (2, part2)] {
+        let (status, _, headers) = call(
+            &app,
+            "PUT",
+            &format!("/{bucket}/{key}?partNumber={n}&uploadId={upload_id}"),
+            Some(part.to_vec()),
+            "application/octet-stream",
+            Some(&who),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        etags.push(
+            headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_matches('"')
+                .to_owned(),
+        );
+    }
+    let refs: Vec<(u32, &str)> = etags
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i as u32 + 1, e.as_str()))
+        .collect();
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+        Some(complete_xml(&refs)),
+        "application/xml",
+        Some(&who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let uri = format!("/{bucket}/{key}");
+    // Spans that cross the join between the two uploaded parts.
+    for (range, lo, hi) in [
+        ("bytes=4-11", 4usize, 12usize),
+        ("bytes=8-", 8, 16),
+        ("bytes=-4", 12, 16),
+    ] {
+        let (status, got, headers) = get_with_range(&app, &who, &uri, range).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(got, &whole[lo..hi], "{range}");
+        assert_eq!(
+            header_str(&headers, "content-range").as_deref(),
+            Some(format!("bytes {}-{}/{}", lo, hi - 1, whole.len()).as_str()),
+            "{range}"
+        );
+        assert_eq!(
+            header_str(&headers, "content-length").as_deref(),
+            Some((hi - lo).to_string().as_str()),
+            "{range}"
+        );
+    }
+
+    // And a 416 across a part boundary.
+    let (status, _, headers) = get_with_range(&app, &who, &uri, "bytes=16-").await;
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        header_str(&headers, "content-range").as_deref(),
+        Some("bytes */16")
+    );
+}
+
+fn delete_xml(keys: &[&str], quiet: Option<bool>) -> Vec<u8> {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Delete>");
+    if let Some(q) = quiet {
+        xml.push_str(&format!("<Quiet>{q}</Quiet>"));
+    }
+    for key in keys {
+        xml.push_str(&format!("<Object><Key>{key}</Key></Object>"));
+    }
+    xml.push_str("</Delete>");
+    xml.into_bytes()
+}
+
+fn deleted_keys(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<Deleted>") {
+        let after = &rest[i + 9..];
+        let Some(j) = after.find("</Deleted>") else {
+            break;
+        };
+        let block = &after[..j];
+        if let Some(k) = block
+            .split("<Key>")
+            .nth(1)
+            .and_then(|s| s.split("</Key>").next())
+        {
+            out.push(k.to_owned());
+        }
+        rest = &after[j..];
+    }
+    out
+}
+
+fn error_entries(xml: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<Error>") {
+        let after = &rest[i + 7..];
+        let Some(j) = after.find("</Error>") else {
+            break;
+        };
+        let block = &after[..j];
+        let key = block
+            .split("<Key>")
+            .nth(1)
+            .and_then(|s| s.split("</Key>").next())
+            .unwrap_or("")
+            .to_owned();
+        let code = block
+            .split("<Code>")
+            .nth(1)
+            .and_then(|s| s.split("</Code>").next())
+            .unwrap_or("")
+            .to_owned();
+        out.push((key, code));
+        rest = &after[j..];
+    }
+    out
+}
+
+async fn delete_objects(
+    app: &Router,
+    who: &Caller,
+    bucket: &str,
+    body: Vec<u8>,
+) -> (StatusCode, String) {
+    let (status, body, _) = call(
+        app,
+        "POST",
+        &format!("/{bucket}?delete"),
+        Some(body),
+        "application/xml",
+        Some(who),
+    )
+    .await;
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn delete_objects_removes_keys_and_counts_a_missing_one_as_deleted() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch").await;
+    for key in ["a.txt", "dir/b.txt", "c&d.txt"] {
+        put_key(&app, &who, &bucket, key, b"x").await;
+    }
+
+    let (status, xml) = delete_objects(
+        &app,
+        &who,
+        &bucket,
+        delete_xml(
+            &["a.txt", "never-there.txt", "dir/b.txt", "c&amp;d.txt"],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(xml.contains("DeleteResult"), "{xml}");
+    assert_eq!(
+        deleted_keys(&xml),
+        vec!["a.txt", "never-there.txt", "dir/b.txt", "c&amp;d.txt"]
+    );
+    assert!(error_entries(&xml).is_empty(), "{xml}");
+
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2")).await;
+    assert!(listed_contents_keys(&xml).is_empty(), "{xml}");
+}
+
+#[tokio::test]
+async fn delete_objects_quiet_reports_only_errors() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-quiet").await;
+    put_key(&app, &who, &bucket, "a.txt", b"x").await;
+
+    let (status, xml) = delete_objects(
+        &app,
+        &who,
+        &bucket,
+        delete_xml(&["a.txt", "gone-already.txt"], Some(true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(deleted_keys(&xml).is_empty(), "{xml}");
+    assert!(error_entries(&xml).is_empty(), "{xml}");
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2")).await;
+    assert!(listed_contents_keys(&xml).is_empty(), "{xml}");
+}
+
+#[tokio::test]
+async fn delete_objects_says_which_key_it_could_not_take() {
+    let (_dir, client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-partial").await;
+    put_key(&app, &who, &bucket, "fine.txt", b"x").await;
+    let reserved = client
+        .put_object(
+            &bucket_id_of(&app, &who, &bucket).await,
+            ".uploads/reserved",
+            b"x".as_slice(),
+            None,
+        )
+        .await;
+    assert!(
+        reserved.is_err(),
+        "the staging namespace stays closed to writers"
+    );
+
+    // A key the object API refuses to name cannot be taken by a batch
+    // either. The answer names it and still deletes the rest: a batch never
+    // fails as a whole over one key.
+    let (status, xml) = delete_objects(
+        &app,
+        &who,
+        &bucket,
+        delete_xml(&["fine.txt", ".uploads/reserved", "fine.txt"], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    // The code is the one the S3 layer gives a refused key, and the message
+    // that came with it.
+    assert_eq!(
+        error_entries(&xml),
+        vec![(".uploads/reserved".to_owned(), "InternalError".to_owned())]
+    );
+    assert!(xml.contains("object key is reserved"), "{xml}");
+    // Reported once per object asked for, so `fine.txt` twice.
+    assert_eq!(deleted_keys(&xml), ["fine.txt", "fine.txt"]);
+
+    let xml = list_objects_v2(&app, &who, &format!("/{bucket}?list-type=2")).await;
+    assert!(listed_contents_keys(&xml).is_empty(), "{xml}");
+}
+
+async fn bucket_id_of(app: &Router, who: &Caller, name: &str) -> pistack_types::Id {
+    let (status, body, _) = call(
+        app,
+        "GET",
+        &format!("/buckets/{name}"),
+        None,
+        "application/json",
+        Some(who),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bucket: Value = serde_json::from_slice(&body).expect("bucket json");
+    use pistack_types::Spec as _;
+    pistack_types::Id::parse(silo::BucketSpec::KIND, bucket["id"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn delete_objects_refuses_a_body_it_cannot_read() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-bad").await;
+
+    for (label, body) in [
+        ("no object", b"<Delete></Delete>".to_vec()),
+        (
+            "unclosed",
+            b"<Delete><Object><Key>a</Key></Delete>".to_vec(),
+        ),
+        ("not xml", b"i am not xml".to_vec()),
+        ("not utf8", vec![b'<', b'D', 0xff, 0xfe, b'>']),
+        ("empty body", Vec::new()),
+    ] {
+        let (status, xml) = delete_objects(&app, &who, &bucket, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {xml}");
+        assert_eq!(extract_error_code(&xml), "MalformedXML", "{label}: {xml}");
+    }
+}
+
+#[tokio::test]
+async fn delete_objects_takes_no_key_that_the_bucket_cannot_hold() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-cap").await;
+
+    // One over the page of a thousand.
+    let keys: Vec<String> = (0..=S3_MAX_KEYS_TEST).map(|n| format!("k{n}")).collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let (status, xml) = delete_objects(&app, &who, &bucket, delete_xml(&refs, None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{xml}");
+    assert_eq!(extract_error_code(&xml), "MalformedXML", "{xml}");
+
+    // Exactly a thousand is accepted, and a bucket with nothing in it answers
+    // each one as deleted.
+    let keys: Vec<String> = (0..S3_MAX_KEYS_TEST).map(|n| format!("k{n}")).collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let (status, xml) = delete_objects(&app, &who, &bucket, delete_xml(&refs, None)).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(deleted_keys(&xml).len(), S3_MAX_KEYS_TEST);
+}
+
+const S3_MAX_KEYS_TEST: usize = 1000;
+
+#[tokio::test]
+async fn delete_objects_needs_a_bucket_the_caller_can_see() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let (status, xml) =
+        delete_objects(&app, &who, "no-such-bucket", delete_xml(&["a"], None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{xml}");
+    assert!(xml.contains("NoSuchBucket"), "{xml}");
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/batch-auth?delete")
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(delete_xml(&["a"], None)))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+async fn delete_objects_with_md5(
+    app: &Router,
+    who: &Caller,
+    bucket: &str,
+    body: Vec<u8>,
+    content_md5: &str,
+) -> (StatusCode, String) {
+    let (status, body, _) = call_with_headers(
+        app,
+        "POST",
+        &format!("/{bucket}?delete"),
+        Some(body),
+        "application/xml",
+        Some(who),
+        &[("content-md5", content_md5)],
+    )
+    .await;
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+fn b64_md5(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(<Md5 as md5::Digest>::digest(bytes).as_slice())
+}
+
+#[tokio::test]
+async fn delete_objects_accepts_a_body_matching_its_content_md5() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-md5").await;
+    put_key(&app, &who, &bucket, "a.txt", b"x").await;
+    put_key(&app, &who, &bucket, "b.txt", b"x").await;
+
+    let body = delete_xml(&["a.txt", "b.txt"], None);
+    let (status, xml) =
+        delete_objects_with_md5(&app, &who, &bucket, body.clone(), &b64_md5(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(deleted_keys(&xml), ["a.txt", "b.txt"]);
+}
+
+#[tokio::test]
+async fn delete_objects_refuses_a_content_md5_that_is_not_the_body() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-md5-bad").await;
+    put_key(&app, &who, &bucket, "a.txt", b"x").await;
+
+    let body = delete_xml(&["a.txt"], None);
+    let other = delete_xml(&["a.txt", "ghost.txt"], None);
+    let (status, xml) = delete_objects_with_md5(&app, &who, &bucket, body, &b64_md5(&other)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{xml}");
+    assert_eq!(extract_error_code(&xml), "BadDigest", "{xml}");
+
+    // Nothing was deleted.
+    let (status, xml) = delete_objects(&app, &who, &bucket, delete_xml(&["a.txt"], None)).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(deleted_keys(&xml), ["a.txt"]);
+}
+
+#[tokio::test]
+async fn delete_objects_refuses_a_content_md5_it_cannot_read() {
+    let (_dir, _client, app, _project, who) = app_with_max(silo::MAX_OBJECT_BYTES);
+    let bucket = ensure_bucket(&app, &who, "batch-md5-bogus").await;
+    put_key(&app, &who, &bucket, "a.txt", b"x").await;
+
+    for (label, bogus) in [
+        ("not base64", "!!!not base64!!!"),
+        ("too short", "aaaaaaaaaaaaAA=="),
+        ("hex, not b64", "d41d8cd98f00b204e9800998ecf8427e"),
+        ("empty", ""),
+    ] {
+        let body = delete_xml(&["a.txt"], None);
+        let (status, xml) = delete_objects_with_md5(&app, &who, &bucket, body, bogus).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {xml}");
+        assert_eq!(extract_error_code(&xml), "InvalidDigest", "{label}: {xml}");
+    }
+
+    // Nothing was deleted.
+    let (status, xml) = delete_objects(&app, &who, &bucket, delete_xml(&["a.txt"], None)).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(deleted_keys(&xml), ["a.txt"]);
+}

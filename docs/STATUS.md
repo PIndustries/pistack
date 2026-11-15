@@ -192,12 +192,12 @@ Missing
 
 Done
 - Buckets and objects
-- S3 path-style: get, put, head, delete, copy, list v2, multipart
+- S3 path-style: get (with range), put, head, delete, batch delete, copy, list v2, multipart
 - SigV4, presigned URLs, streaming uploads
 - Cleanup of abandoned multipart uploads
 
 Partial
-- S3 has no bucket calls, batch delete, range GET, list v1, virtual-host style or tagging
+- S3 has no bucket calls, list v1, virtual-host style or tagging
 - Versioning keeps old bytes but cannot list or fetch them
 - Quota: bucket count per project only; no limit on bytes
 - No CLI

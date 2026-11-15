@@ -14,6 +14,7 @@
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}  (POST: multipart create/complete)
 //! GET                       /{bucket}?list-type=2&…
 //! GET                       /{bucket}?uploads&…  (ListMultipartUploads)
+//! POST                      /{bucket}?delete     (DeleteObjects)
 //!
 //! Between control-plane servers (join token instead of a caller):
 //! GET  /peer/blobs/{bucket-id}/{sha256}   bytes this server holds
@@ -110,7 +111,10 @@ pub fn router_with(client: Client, keep: Option<keep::Client>, region: String) -
         .route("/buckets/{id}", get(get_bucket).delete(delete_bucket))
         .route("/buckets/{id}/objects", get(list_objects))
         .route("/buckets/{id}/objects/{*key}", object_routes)
-        .route("/{bucket}", get(s3::list_or_bucket))
+        .route(
+            "/{bucket}",
+            get(s3::list_or_bucket).post(s3::delete_objects),
+        )
         .route("/{bucket}/{*key}", s3_object)
         .fallback(|| async { ApiError::not_found("no such silo endpoint") })
         // Inner: demand a Caller. Outer: SigV4 may attach one first.

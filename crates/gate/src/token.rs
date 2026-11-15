@@ -837,6 +837,10 @@ mod tests {
             &empty,
             Some("list-type=2")
         ));
+        // The S3 calls with their own query still skip: a batch delete is a
+        // POST on the bucket, and a range read is a GET with a header.
+        assert!(silo_sigv4_skips_bearer("/silo/b", &headers, Some("delete")));
+        assert!(!silo_sigv4_skips_bearer("/silo/b", &empty, Some("delete")));
         assert!(!silo_sigv4_skips_bearer(
             "/other",
             &empty,
