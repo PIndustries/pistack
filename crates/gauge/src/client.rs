@@ -51,7 +51,8 @@ impl Client {
         &self.store
     }
 
-    pub fn ring(&self) -> &SampleRing {
+    /// The window this client writes into.
+    pub fn ring(&self) -> &Arc<SampleRing> {
         &self.samples
     }
 

@@ -17,14 +17,21 @@ use crate::types::{
 use async_trait::async_trait;
 use pistack_store::{Collection, Store};
 use pistack_types::Id;
+use std::sync::Arc;
 
 pub struct AutoscalerController {
     store: Store,
+    samples: Arc<gauge::SampleRing>,
 }
 
 impl AutoscalerController {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self::with_samples(store, gauge::samples())
+    }
+
+    /// A controller that reads samples from `samples`.
+    pub fn with_samples(store: Store, samples: Arc<gauge::SampleRing>) -> Self {
+        Self { store, samples }
     }
 
     fn autoscalers(&self) -> Collection<Autoscaler> {
@@ -50,7 +57,7 @@ impl AutoscalerController {
         let sample = if metric.is_empty() {
             None
         } else {
-            gauge::samples().latest(metric)
+            self.samples.latest(metric)
         };
 
         let (target_id, current) = match self.resolve_target(a)? {
@@ -288,13 +295,14 @@ mod tests {
             .create(scaler("web", "cpu.usage", 40.0, 1, 10))
             .unwrap();
 
-        gauge::samples().push(Sample {
+        let samples = Arc::new(gauge::SampleRing::memory());
+        samples.push(Sample {
             metric: "cpu.usage".into(),
             value: 80.0,
             timestamp: Utc::now(),
         });
 
-        let c = AutoscalerController::new(store.clone());
+        let c = AutoscalerController::with_samples(store.clone(), samples);
         c.converge(&a).unwrap();
 
         let d = store.collection::<Deployment>().get(&d.meta.id).unwrap();

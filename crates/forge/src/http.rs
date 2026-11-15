@@ -46,6 +46,8 @@ pub struct AppState {
     pub queue: Option<CommandQueue>,
     /// How a drain picks destinations. The reconciler's own strategy.
     pub strategy: crate::scheduler::Strategy,
+    /// The window host reports land in, which stats are read from.
+    pub samples: Arc<gauge::SampleRing>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -401,7 +403,7 @@ async fn machine_stats(
     Path(id): Path<String>,
 ) -> ApiResult<Json<crate::stats::Stats>> {
     let machine = load_machine(&s, &scope, &id)?;
-    let gauge = gauge::Gauge.client(s.store.clone());
+    let gauge = gauge::Client::new(s.store.clone(), s.samples.clone());
     Ok(Json(crate::stats::machine_stats(&gauge, &machine)))
 }
 
@@ -646,7 +648,7 @@ async fn host_stats(
 ) -> ApiResult<Json<crate::stats::Stats>> {
     scope.require_admin()?;
     let host = hosts(&s).resolve(None, &id)?;
-    let gauge = gauge::Gauge.client(s.store.clone());
+    let gauge = gauge::Client::new(s.store.clone(), s.samples.clone());
     Ok(Json(crate::stats::host_stats(&gauge, &host)))
 }
 
@@ -1031,6 +1033,7 @@ mod tests {
             dev_admin: true,
             queue: Some(queue.clone()),
             strategy: Default::default(),
+            samples: Arc::new(gauge::SampleRing::memory()),
         });
 
         async fn post(app: &axum::Router, path: &str, host: &str) -> (StatusCode, Vec<u8>) {

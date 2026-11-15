@@ -12,8 +12,9 @@
 //! whose metric selects its series: the alarm is [`AlarmPhase::Firing`]
 //! while any selected series crosses the threshold.
 //!
-//! Every `Gauge` value, including `Arc::new(gauge::Gauge)` in the server
-//! and a heartbeat in another crate, shares one process-wide window.
+//! Samples live in the window a [`Client`] was given. A server has one, so
+//! the module, `/metrics` and host heartbeats all record into the same
+//! window; a test gives its own and sees nothing but what it wrote.
 
 pub mod api;
 pub mod catalog;
@@ -33,9 +34,9 @@ use client::Client as GaugeClient;
 use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::sync::{Arc, OnceLock};
-use store::SampleRing as Ring;
 
-/// The gauge module. Samples live in [`samples`], not on this value.
+/// The gauge module. Its window is the process-wide one; a caller that
+/// wants its own builds a [`Client`] over a fresh [`SampleRing`].
 #[derive(Default)]
 pub struct Gauge;
 
@@ -44,7 +45,7 @@ impl Gauge {
         Self
     }
 
-    /// The process-wide samples.
+    /// The window every `Gauge` client shares.
     pub fn buffer(&self) -> Arc<SampleRing> {
         samples()
     }
@@ -54,11 +55,12 @@ impl Gauge {
     }
 }
 
-/// One window for the process. The server, `/metrics` and host heartbeats
-/// all use it.
+/// The window the server, `/metrics` and host heartbeats share.
 pub fn samples() -> Arc<SampleRing> {
-    static SAMPLES: OnceLock<Arc<Ring>> = OnceLock::new();
-    SAMPLES.get_or_init(|| Arc::new(Ring::memory())).clone()
+    static SAMPLES: OnceLock<Arc<SampleRing>> = OnceLock::new();
+    SAMPLES
+        .get_or_init(|| Arc::new(SampleRing::memory()))
+        .clone()
 }
 
 #[async_trait]
