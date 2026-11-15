@@ -1318,6 +1318,7 @@ async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
         ("kind", a.kind),
         ("resource", a.resource),
         ("outcome", a.outcome),
+        ("carried_by", a.carried_by),
         ("after", a.after),
     ] {
         if let Some(value) = value {
@@ -1360,6 +1361,7 @@ async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
                         row.extend([
                             str_at(r, "/spec/project"),
                             str_at(r, "/spec/api_key"),
+                            str_at(r, "/spec/carried_by"),
                             str_at(r, "/spec/method"),
                             str_at(r, "/spec/path"),
                             str_at(r, "/id"),
@@ -1372,7 +1374,7 @@ async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "when", "who", "from", "action", "kind", "resource", "status",
             ];
             if wide {
-                headers.extend(["project", "api key", "method", "path", "id"]);
+                headers.extend(["project", "api key", "carried-by", "method", "path", "id"]);
             }
             write!(
                 io.stdout,

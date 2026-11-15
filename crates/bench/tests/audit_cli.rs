@@ -26,7 +26,8 @@ async fn audit(State(seen): State<Queries>, RawQuery(query): RawQuery) -> Json<V
                 "spec": {
                     "method": "POST", "path": "/compute/hosts/rack1/drain",
                     "action": "drain", "kind": "hosts", "resource": "rack1",
-                    "principal": "admin", "client": "10.0.0.9", "status": 200
+                    "principal": "admin", "client": "10.0.0.9",
+                    "carried_by": "n2", "status": 200
                 }
             },
             {
@@ -112,6 +113,19 @@ async fn audit_list_prints_a_table_and_says_when_there_is_more() {
 }
 
 #[tokio::test]
+async fn audit_list_wide_shows_the_carrier() {
+    let (url, _) = serve().await;
+    let r = pi(&url, &["audit", "list", "-o", "wide"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert!(lines[0].contains("CARRIED-BY"), "{}", r.out);
+    // The drain was carried by n2; the login reached the leader itself, so
+    // its carrier is empty.
+    assert!(lines[1].contains("n2"), "{}", r.out);
+    assert!(!lines[2].contains("n2"), "{}", r.out);
+}
+
+#[tokio::test]
 async fn audit_list_sends_every_filter() {
     let (url, seen) = serve().await;
     let r = pi(
@@ -135,6 +149,8 @@ async fn audit_list_sends_every_filter() {
             "a b",
             "--outcome",
             "failure",
+            "--carried-by",
+            "n2",
             "--limit",
             "5",
             "--after",
@@ -150,7 +166,7 @@ async fn audit_list_sends_every_filter() {
         seen.lock().unwrap()[0],
         "limit=5&order=asc&since=2026-11-12T07%3A00%3A00%2B00%3A00\
          &until=2026-11-12T09%3A00%3A00%2B00%3A00&principal=alice&project=web\
-         &action=update_quotas&kind=projects&resource=a%20b&outcome=failure&after=audit-1"
+         &action=update_quotas&kind=projects&resource=a%20b&outcome=failure&carried_by=n2&after=audit-1"
     );
     // JSON output is the page as the server sent it.
     let page: Value = serde_json::from_str(&r.out).unwrap();

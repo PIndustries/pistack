@@ -137,11 +137,12 @@ pi audit list
 | `audit list` | `--kind <KIND>` | Resource kind as in the path: machines, bindings, hosts, ... |
 | `audit list` | `--resource <ID>` | Resource id or name, as the request gave it |
 | `audit list` | `--outcome <OUTCOME>` | `success`, `failure`, or one status code such as 403 |
+| `audit list` | `--carried-by <NODE>` | Records a server of the cluster carried to the leader, by its node id |
 | `audit list` | `--limit <LIMIT>` | Most records to print [default: 100] |
 | `audit list` | `--after <ID>` | Continue after this record id (the last one of the page before) |
 | `audit list` | `--oldest-first` | Oldest first instead of newest first |
 
-Records print newest first. The filter is `--in-project` because `--project` is the global option that sets the scope of the request. See [Identity and access](Identity-and-access#audit) for what a record holds.
+Records print newest first. The filter is `--in-project` because `--project` is the global option that sets the scope of the request. `-o wide` adds the project, the API key, the server that carried the request, the method, the path and the record id; the carried-by column is empty when the request reached the leader itself. See [Identity and access](Identity-and-access#audit) for what a record holds.
 
 ## pi user
 
