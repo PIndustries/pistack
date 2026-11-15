@@ -914,7 +914,7 @@ Deleting a balancer deletes its listeners, pools and members with it. A pool a l
 | `lb pool list` | `--balancer <BALANCER>` | Filter to one balancer (name or id) |
 | `lb pool create` | `--balancer <BALANCER>` | Balancer (name or id) the pool belongs to |
 | `lb pool create` | `--protocol <PROTOCOL>` | [default: tcp] [possible values: tcp, udp, http, https] |
-| `lb pool create` | `--algorithm <ALGORITHM>` | [default: round-robin] [possible values: round-robin, least-conn, source-ip] |
+| `lb pool create` | `--algorithm <ALGORITHM>` | [default: round_robin] [possible values: round_robin, least_conn, source_ip] |
 | `lb pool create` | `--health-check` | Add a health monitor with these probe settings |
 | `lb pool create` | `--monitor <MONITOR>` | What the monitor speaks. Default: the pool protocol; a udp pool is probed with a bare connect [default: tcp] [possible values: tcp, http, https] |
 | `lb pool create` | `--interval <INTERVAL>` | Seconds between probes [default: 5] |

@@ -6,7 +6,7 @@
 //! pool. An empty member list does not become a running forwarder.
 
 use crate::provider::ListenerView;
-use crate::types::{Member, OperatingStatus};
+use crate::types::Member;
 use pistack_types::{ApiError, ApiResult};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -118,12 +118,7 @@ pub fn targets(view: &ListenerView) -> Vec<SocketAddr> {
 }
 
 fn is_up(member: &Member) -> bool {
-    member.spec.admin_up
-        && member.spec.weight > 0
-        && matches!(
-            member.status.operating_status,
-            OperatingStatus::Online | OperatingStatus::NoMonitor
-        )
+    crate::picker::eligible(std::slice::from_ref(member)).len() == 1
 }
 
 struct Session {
