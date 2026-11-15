@@ -58,7 +58,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Live migration does not copy disks.** It only works when the destination host already sees the machine's disk at the same path. A failed migration leaves the machine in phase `error` on the old host, still running.
 - **A machine whose disks are local to its host is not drained or migrated.** The agent says whether its machine disk directory is on an NFS or SMB mount, and the answer is `local` unless it says otherwise. A machine on such a host is listed by `pi host drain` with that reason, and a migrate call for it is refused. Mount the disk directory where every host can see it and the host reports `shared` at its next hello. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 - **Evacuating a host loses root disks.** A root disk is a file on its host. An evacuated machine starts from its image, and `pi host evacuate` moves nothing without `--rebuild-from-image`.
-- **Evacuation does not fence.** PiStack cannot power off a host. If an evacuated host is still running its machines, they run twice until its agent reports again, and both copies write to any shared volume.
+- **Fencing needs power control.** An evacuation only proves a host is off through its BMC when a cloud admin has set `pi host power set` on it. Without power control, evacuation relies on `--confirm-dead`, and a host that is only cut off from the control plane runs its machines twice until its agent reports again.
 - **A machine with a local or LVM volume is not evacuated.** The volume was on the dead host.
 - **Pods pinned to a host by a volume are not drained or evacuated.**
 - **The web console has no host controls.** Label, disable, drain and evacuate are in `pi` and the API only.

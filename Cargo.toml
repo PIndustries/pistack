@@ -10,6 +10,7 @@ members = [
     "crates/pistack-cluster",
     "crates/gate",
     "crates/forge",
+    "crates/power",
     "crates/loom",
     "crates/anvil",
     "crates/fabric",
@@ -109,6 +110,7 @@ pistack-rpc = { path = "crates/pistack-rpc" }
 pistack-cluster = { path = "crates/pistack-cluster" }
 gate = { path = "crates/gate" }
 forge = { path = "crates/forge" }
+power = { path = "crates/power" }
 loom = { path = "crates/loom" }
 anvil = { path = "crates/anvil" }
 fabric = { path = "crates/fabric" }

@@ -389,6 +389,9 @@ pi host disable <NAME>
 pi host enable <NAME>
 pi host drain <NAME>
 pi host evacuate <NAME>
+pi host power set <NAME> --kind <KIND> --address <ADDR> --user <USER> --secret <SECRET>
+pi host power show <NAME>
+pi host power clear <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -399,7 +402,11 @@ pi host evacuate <NAME>
 | `host disable` | `--reason <REASON>` | Why, shown by `pi host show` |
 | `host drain` | `--reason <REASON>` | Why, shown by `pi host show` |
 | `host evacuate` | `--rebuild-from-image` | Accept that every evacuated machine loses its root disk and starts again from its image. Without it no machine is moved |
-| `host evacuate` | `--confirm-dead` | The host is disabled but may still be reporting, and you know it is dead. If it is not, its machines will run twice until it reports |
+| `host evacuate` | `--confirm-dead` | Say the host is dead by your word. Needed for a host with no power control, every time; optional for one the server can power off |
+| `host power set` | `--kind <KIND>` | `ipmi` or `redfish` |
+| `host power set` | `--address <ADDR>` | BMC address: a `host[:port]` for IPMI, a URL or host for Redfish |
+| `host power set` | `--user <USER>` | BMC user |
+| `host power set` | `--secret <SECRET>` | Name of the secret holding the BMC password. The password itself is never stored, shown or logged |
 
 `host stats` prints what the host is using now: load, memory, its data disk and how many machines it holds. See [Metrics and alarms](Metrics-and-alarms).
 

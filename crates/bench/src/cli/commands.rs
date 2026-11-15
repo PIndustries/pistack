@@ -1566,7 +1566,7 @@ async fn access_key(ctx: &Ctx, cmd: AccessKeyCmd, io: &mut Io<'_>) -> CliResult<
                 writeln!(io.stderr, "aborted")?;
                 return Ok(());
             }
-            c.delete(&path).await?;
+            let _ = c.delete(&path).await?;
             writeln!(io.stdout, "{} \"{}\" revoked", k.noun, a.name)?;
             Ok(())
         }
@@ -2160,6 +2160,11 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             let list = |ptr: &str| v.pointer(ptr).and_then(Value::as_array).cloned();
             let evacuated = list("/evacuated").unwrap_or_default();
             let skipped = list("/skipped").unwrap_or_default();
+            let failed = str_at(&v, "/power_off_failed");
+            if !failed.is_empty() {
+                writeln!(io.stdout, "WARNING: {failed}. The machines below moved on your \
+                                     confirmation that the host is dead, not on a confirmed power-off.")?;
+            }
             if !evacuated.is_empty() {
                 writeln!(
                     io.stdout,
@@ -2195,9 +2200,10 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             }
             writeln!(
                 io.stdout,
-                "{} evacuated, {} skipped",
+                "{} evacuated, {} skipped (proof: {})",
                 evacuated.len(),
-                skipped.len()
+                skipped.len(),
+                str_at(&v, "/proof")
             )?;
             Ok(())
         }
@@ -2206,6 +2212,61 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             let path = format!("{}/enable", k.item_path(&a.name));
             let v = c.post_empty(&path).await?;
             report(ctx, io, k, &v, "enabled")
+        }
+        HostCmd::Power { cmd } => host_power(ctx, io, k, cmd).await,
+    }
+}
+
+/// `pi host power set|clear|show`. The password never passes through here:
+/// only the name of the secret that holds it.
+async fn host_power(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, cmd: HostPowerCmd) -> CliResult<()> {
+    let c = ctx.client()?;
+    match cmd {
+        HostPowerCmd::Set(a) => {
+            let path = format!("{}/power", k.item_path(&a.name));
+            let body = json!({
+                "kind": a.kind,
+                "address": a.address,
+                "user": a.user,
+                "secret": a.secret,
+            });
+            let v = c.put(&path, &body).await?;
+            let pc = &v["power_control"];
+            writeln!(
+                io.stdout,
+                "host \"{}\" power control set: {} at {} as {} (password from secret \"{}\")",
+                a.name,
+                str_at(pc, "/kind"),
+                str_at(pc, "/address"),
+                str_at(pc, "/user"),
+                str_at(pc, "/secret"),
+            )?;
+            Ok(())
+        }
+        HostPowerCmd::Clear(a) => {
+            let path = format!("{}/power", k.item_path(&a.name));
+            c.delete(&path).await?;
+            writeln!(io.stdout, "host \"{}\" power control cleared", a.name)?;
+            Ok(())
+        }
+        HostPowerCmd::Show(a) => {
+            let path = format!("{}/power", k.item_path(&a.name));
+            let v = c.get_value(&path).await?;
+            match v.get("power_control") {
+                None | Some(Value::Null) => {
+                    writeln!(io.stdout, "host \"{}\" has no power control", a.name)?
+                }
+                Some(pc) => writeln!(
+                    io.stdout,
+                    "host \"{}\" power control: {} at {} as {} (password from secret \"{}\")",
+                    a.name,
+                    str_at(pc, "/kind"),
+                    str_at(pc, "/address"),
+                    str_at(pc, "/user"),
+                    str_at(pc, "/secret"),
+                )?,
+            }
+            Ok(())
         }
     }
 }

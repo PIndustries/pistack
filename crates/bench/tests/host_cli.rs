@@ -155,10 +155,14 @@ async fn evacuate(
             "name": "web",
             "reason": "its root disk is on this host",
         });
-        return Json(json!({"host": host, "evacuated": [], "skipped": [web, pod]})).into_response();
+        return Json(
+            json!({"host": host, "proof": "operator", "evacuated": [], "skipped": [web, pod]}),
+        )
+        .into_response();
     }
     Json(json!({
         "host": host,
+        "proof": "operator",
         "evacuated": [{
             "id": "mach-0199a5e0-aaaa-7000-8000-000000000002",
             "name": "web",
@@ -168,6 +172,42 @@ async fn evacuate(
         "skipped": [pod],
     }))
     .into_response()
+}
+
+/// Records the power-control write and echoes it back, with no password: the
+/// API carries only the secret name.
+async fn power_set(
+    State(m): State<Mock>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    m.writes
+        .lock()
+        .unwrap()
+        .push((format!("/compute/hosts/{id}/power"), body.clone()));
+    Json(json!({ "power_control": body })).into_response()
+}
+
+async fn power_show(State(m): State<Mock>, Path(id): Path<String>) -> axum::response::Response {
+    let _ = m;
+    Json(json!({
+        "power_control": {
+            "kind": "ipmi",
+            "address": "10.9.1.9",
+            "user": "admin",
+            "secret": "rack1-bmc",
+        },
+        "path": id,
+    }))
+    .into_response()
+}
+
+async fn power_clear(State(m): State<Mock>, Path(id): Path<String>) -> axum::response::Response {
+    m.writes
+        .lock()
+        .unwrap()
+        .push((format!("/compute/hosts/{id}/power"), Value::Null));
+    Json(json!({"power_control": null})).into_response()
 }
 
 async fn create_machine(
@@ -207,6 +247,10 @@ async fn serve() -> (String, Mock) {
         .route("/compute/hosts/{id}/enable", post(enable))
         .route("/compute/hosts/{id}/drain", post(drain))
         .route("/compute/hosts/{id}/evacuate", post(evacuate))
+        .route(
+            "/compute/hosts/{id}/power",
+            get(power_show).put(power_set).delete(power_clear),
+        )
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -444,7 +488,51 @@ async fn host_evacuate_is_loud_about_lost_disks() {
         lines[2],
         "machine \"db\" skipped: volume scratch is on local storage on this host and cannot follow the machine"
     );
-    assert_eq!(lines[3], "1 evacuated, 1 skipped");
+    assert_eq!(lines[3], "1 evacuated, 1 skipped (proof: operator)");
+}
+
+#[tokio::test]
+async fn host_power_set_show_clear_move_only_the_secret_name() {
+    let (url, mock) = serve().await;
+
+    let r = pi(
+        &url,
+        &[
+            "host",
+            "power",
+            "set",
+            "rack1",
+            "--kind",
+            "ipmi",
+            "--address",
+            "10.9.1.9",
+            "--user",
+            "admin",
+            "--secret",
+            "rack1-bmc",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(
+        mock.last_write(),
+        (
+            "/compute/hosts/rack1/power".into(),
+            json!({"kind": "ipmi", "address": "10.9.1.9", "user": "admin", "secret": "rack1-bmc"})
+        )
+    );
+    // The CLI never invents a password field; only the secret name travels.
+    assert!(r.out.contains("secret \"rack1-bmc\""), "{}", r.out);
+    assert!(r.out.contains("ipmi at 10.9.1.9 as admin"), "{}", r.out);
+
+    let r = pi(&url, &["host", "power", "show", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("ipmi at 10.9.1.9 as admin"), "{}", r.out);
+    assert!(r.out.contains("secret \"rack1-bmc\""), "{}", r.out);
+
+    let r = pi(&url, &["host", "power", "clear", "rack1"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("power control cleared"), "{}", r.out);
 }
 
 #[tokio::test]
