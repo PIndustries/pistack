@@ -63,7 +63,17 @@ Creating a volume from a snapshot or from another volume copies the data on the 
 
 `pi volume create --image NAME` fills a new volume from an image. It needs `qemu-img` on the server, and the image must be a disk image, not a container image.
 
-Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check. Restoring a backup works for `local` and `lvm` volumes and not for `rbd`. There are no `pi` commands for backups; the API is `/volume/backups`.
+Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check. Restoring a backup works for `local` and `lvm` volumes and not for `rbd`.
+
+```sh
+pi backup create nightly --volume data --bucket backups
+pi backup list
+pi backup show nightly
+pi backup restore nightly --volume data2
+pi backup delete nightly --yes
+```
+
+The bucket has to exist already: `pi api POST /silo/buckets -d '{"name":"backups"}'`. A new backup is `pending` while its bytes are uploaded and `ready` once they are stored; `--wait` holds until then. A restore needs a `ready` backup and returns only when the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
 
 Volumes can grow and cannot shrink. The `--encrypted` flag is stored on the volume and has no effect.
 

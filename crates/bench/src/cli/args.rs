@@ -262,6 +262,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: super::lb::LbCmd,
     },
+    /// Volume backups.
+    Backup {
+        #[command(subcommand)]
+        cmd: crate::cli::backup::BackupCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

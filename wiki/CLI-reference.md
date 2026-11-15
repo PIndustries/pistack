@@ -641,6 +641,29 @@ pi voltype delete <NAME>
 | `voltype create` | `--backend <BACKEND>` | Backend: local, lvm, rbd [default: local] |
 | `voltype create` | `--param <K=V>` | Backend parameter `key=value` (repeatable) |
 
+## pi backup
+
+Volume backups. A backup is one volume's bytes stored in a bucket. The bucket has to exist already.
+
+```text
+pi backup list
+pi backup show <NAME>
+pi backup create --volume <VOLUME> --bucket <BUCKET> <NAME>
+pi backup delete <NAME>
+pi backup restore <BACKUP>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `backup create` | `--description <DESCRIPTION>` |  |
+| `backup create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `backup create` | `--volume <VOLUME>` | Volume to back up (name or id) |
+| `backup create` | `--bucket <BUCKET>` | Bucket to write the backup to (name or id) |
+| `backup create` | `--wait` | Wait until the backup is ready |
+| `backup restore` | `--volume <VOLUME>` | Write into this volume (name or id) instead of making a new one. It must be ready and at least as large as the backup |
+
+A new backup is `pending` while its bytes are uploaded and `ready` once they are stored. `pi backup create --wait` prints each phase and ends on `ready`; a failed upload ends with the reason. A restore needs a `ready` backup and returns once the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
+
 ## pi image
 
 Images.
@@ -906,7 +929,6 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | Secrets, certificates, certificate authorities | `/secrets` |
 | Buckets | `/silo/buckets` |
 | Shares | `/shelf` |
-| Volume backups | `/volume/backups` |
 | Alarms and posted samples | `/gauge` |
 
 ```sh
