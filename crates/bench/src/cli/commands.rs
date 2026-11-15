@@ -82,6 +82,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Autoscaler { cmd } => autoscaler(ctx, cmd, io).await,
         Cmd::Stack { cmd } => stack(ctx, cmd, io).await,
         Cmd::Lb { cmd } => super::lb::dispatch(ctx, cmd, io).await,
+        Cmd::Backup { cmd } => super::backup::backup(ctx, cmd, io).await,
     }
 }
 
