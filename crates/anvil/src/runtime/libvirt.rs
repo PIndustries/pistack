@@ -47,6 +47,23 @@ impl LibvirtRuntime {
             .unwrap_or_else(|| PathBuf::from("/var/lib/libvirt/images/pistack"))
     }
 
+    /// Report the machine's addresses, waiting for a lease when the guest is
+    /// left to DHCP. A start that set the machine's size on the host has
+    /// already started the domain, and must not ask for a second start.
+    async fn addresses(req: &MachineRequest, domain: &str) -> ApiResult<RunningMachine> {
+        let addresses = if req.nics.is_empty() {
+            wait_lease(domain, LEASE_WAIT).await
+        } else {
+            configured_addresses(req)
+        };
+        Ok(RunningMachine {
+            id: req.id.clone(),
+            addresses,
+            power: PowerState::On,
+            message: String::new(),
+        })
+    }
+
     /// Start the defined domain and report its addresses. A port address is
     /// what the guest is configured to use. Waiting for a DHCP lease would
     /// report a different address, or none, when the seed turns DHCP off.
@@ -84,7 +101,9 @@ impl MachineRuntime for LibvirtRuntime {
         match dom_state(&domain).await {
             Ok(state) if state == "running" || state == "paused" => {}
             Ok(_) => {
+                apply_size(&dir, &domain, req).await?;
                 virsh(["start", &domain]).await?;
+                return LibvirtRuntime::addresses(req, &domain).await;
             }
             Err(_) => {
                 provision(&dir, &domain, req).await?;
@@ -334,6 +353,8 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
             ],
         )
         .await?;
+    } else {
+        grow_disk(&disk, gib).await?;
     }
     if let Some(plan) = &req.overlay {
         crate::overlay::apply_plan(plan).await?;
@@ -356,6 +377,114 @@ async fn provision(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult
     virsh(["define", &xml_path.to_string_lossy()])
         .await
         .map(|_| ())
+}
+
+/// Bring an existing shut-off domain in line with the size the request
+/// carries, before it is started. A resize changes the size of a machine
+/// already defined, so the definition on the host has to change too. The
+/// domain is never defined again — libvirt refuses a second define of a
+/// name it already holds — so each piece is set in place: the vcpu count,
+/// then the memory ceiling, then the live-config memory, then the root
+/// disk, which only ever grows. The stored XML beside the disk is rewritten
+/// to match, so what sits on the host says what the host was told.
+///
+/// A request equal to what the domain has changes nothing and runs nothing.
+/// Anything that fails leaves the machine stopped with what was already set
+/// in place, and the start that asked for it fails with the tool's message.
+async fn apply_size(root: &Path, domain: &str, req: &MachineRequest) -> ApiResult<()> {
+    let vcpus = req.resources.vcpus.max(1);
+    let memory = if req.resources.memory_mib == 0 {
+        1024
+    } else {
+        req.resources.memory_mib
+    };
+    let gib = if req.resources.disk_gib == 0 {
+        10
+    } else {
+        req.resources.disk_gib
+    };
+    let vm = root.join("machines").join(domain);
+    let disk = vm.join("disk.qcow2");
+    // The disk holds the size the guest sees on boot, and it only ever
+    // grows, so it goes first: if the definition cannot be retuned the
+    // machine is left stopped on a disk that still fits it, never on a
+    // definition larger than what its root can back.
+    grow_disk(&disk, gib).await?;
+    let xml_path = vm.join("domain.xml");
+    let have = match tokio::fs::read_to_string(&xml_path).await {
+        Ok(xml) => xml,
+        // Nothing to compare against: the stored XML is what a define left
+        // behind, and a domain with none was never ours to size.
+        Err(_) => return Ok(()),
+    };
+    if has_size(&have, vcpus, memory) {
+        return Ok(());
+    }
+    // Both config forms are needed: `--maximum` raises the ceiling the plain
+    // `--config` set is measured against, so a grow past the original count
+    // is not clamped to it.
+    virsh([
+        "setvcpus",
+        domain,
+        &vcpus.to_string(),
+        "--config",
+        "--maximum",
+    ])
+    .await?;
+    virsh(["setvcpus", domain, &vcpus.to_string(), "--config"]).await?;
+    let kib = (memory << 10).to_string();
+    virsh(["setmaxmem", domain, &kib, "--config"]).await?;
+    virsh(["setmem", domain, &kib, "--config"]).await?;
+    let seed = vm.join("seed.iso");
+    // The size changed, not the machine. Only the two numbers the size
+    // carries are rewritten, so a definition with anything else in it —
+    // hotplugged disks, a console path — keeps the rest of what it has.
+    let updated = match retune(&have, vcpus, memory) {
+        Some(xml) => xml,
+        None => domain_xml(domain, memory, vcpus, &disk, &seed, &req.nics)?,
+    };
+    tokio::fs::write(&xml_path, updated)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(())
+}
+
+/// The stored XML with the domain's own `<vcpu>` and `<memory>` set to the
+/// size asked for. `None` when either element is not there to change, which
+/// is a definition this code did not write.
+fn retune(xml: &str, vcpus: u32, memory_mib: u64) -> Option<String> {
+    let mut seen_vcpu = false;
+    let mut seen_mem = false;
+    let out = xml
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            if t.starts_with("<vcpu>") && t.ends_with("</vcpu>") {
+                seen_vcpu = true;
+                l.replace(t, &format!("<vcpu>{vcpus}</vcpu>"))
+            } else if t.starts_with("<memory unit='MiB'>") && t.ends_with("</memory>") {
+                seen_mem = true;
+                l.replace(t, &format!("<memory unit='MiB'>{memory_mib}</memory>"))
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if seen_vcpu && seen_mem {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Whether stored XML already says this many vcpus and this much memory.
+/// Only the element in column zero is read, so a machine block is not
+/// mistaken for the domain's own.
+fn has_size(xml: &str, vcpus: u32, memory_mib: u64) -> bool {
+    let want_vcpu = format!("<vcpu>{vcpus}</vcpu>");
+    let want_mem = format!("<memory unit='MiB'>{memory_mib}</memory>");
+    xml.lines().any(|l| l.trim() == want_vcpu) && xml.lines().any(|l| l.trim() == want_mem)
 }
 
 /// Replace the root disk and the seed of a machine already defined, writing
@@ -542,6 +671,44 @@ pub(super) async fn image_format(path: &Path) -> ApiResult<String> {
         )));
     }
     Ok(format.to_owned())
+}
+
+/// The virtual size of a disk image in bytes, from `qemu-img info`.
+pub(super) async fn image_virtual_size(path: &Path) -> ApiResult<u64> {
+    let out = run(
+        &qemu_img_bin(),
+        ["info", "--output=json", &path.to_string_lossy()],
+    )
+    .await?;
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|e| ApiError::internal(format!("qemu-img info: {e}")))?;
+    v.get("virtual-size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ApiError::internal("qemu-img info reported no virtual size"))
+}
+
+/// Grow the root disk to `gib` when the size asks for more than it has.
+/// A disk already as large or larger is left alone: a resize only ever
+/// grows. The form is `qemu-img resize [-f fmt] filename size`: the size is
+/// the last argument, not a flag. A `--size` flag is unknown to qemu and
+/// fails every grow.
+async fn grow_disk(disk: &Path, gib: u64) -> ApiResult<()> {
+    let want = gib << 30;
+    if image_virtual_size(disk).await? >= want {
+        return Ok(());
+    }
+    run(
+        &qemu_img_bin(),
+        [
+            "resize",
+            "-f",
+            "qcow2",
+            &disk.to_string_lossy(),
+            &format!("{gib}G"),
+        ],
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn wait_lease(domain: &str, budget: Duration) -> Vec<String> {
@@ -2183,8 +2350,6 @@ mod tests {
         );
     }
 
-    static VIRSH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn virsh_script(dir: &std::path::Path, code: i32) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("virsh");
@@ -2204,15 +2369,19 @@ mod tests {
     /// `qemu-img` and `cloud-localds` are the same variables the
     /// cloud-hypervisor tests swap, and env writes race with reads in a
     /// parallel test binary.
+    ///
+    /// A test that swaps `PISTACK_VIRSH` takes this lock too: `virsh` is as
+    /// process-wide as the rest, and a narrower lock let one test swap the
+    /// path while another was reading it.
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
         crate::runtime::youki::youki_env_lock()
     }
 
     /// Tool paths a test points at its own fakes, restored on drop. Read
     /// the same variable once, at call time, while the holder keeps
-    /// `VIRSH_LOCK` or `env_lock`.
+    /// `env_lock`.
     fn tool_env_guard() -> EnvLock {
-        EnvLock::new(&["PISTACK_QEMU_IMG", "PISTACK_CLOUD_LOCALDS"])
+        EnvLock::new(&["PISTACK_QEMU_IMG", "PISTACK_CLOUD_LOCALDS", "PISTACK_VIRSH"])
     }
 
     /// A few environment keys, restored to what they were on drop. Only
@@ -2245,7 +2414,8 @@ mod tests {
 
     #[tokio::test]
     async fn usage_asks_virsh_once_for_every_active_guest() {
-        let _lock = VIRSH_LOCK.lock().await;
+        let _lock = env_lock().lock().await;
+
         let root = tempfile::tempdir().unwrap();
         let recorded = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/virsh-domstats.txt");
         let calls = root.path().join("calls");
@@ -2280,7 +2450,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_records_virsh_argv_and_surfaces_failure() {
-        let _lock = VIRSH_LOCK.lock().await;
+        let _lock = env_lock().lock().await;
         let root = std::env::temp_dir().join(format!("pistack-virsh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ok = virsh_script(&root.join("ok"), 0);
@@ -2591,7 +2761,7 @@ exit 0
 
     #[tokio::test]
     async fn plug_and_unplug_use_the_overlay_bridge_and_a_missing_domain_is_unavailable() {
-        let _lock = VIRSH_LOCK.lock().await;
+        let _lock = env_lock().lock().await;
         let root = std::env::temp_dir().join(format!(
             "pistack-plug-{}-{}",
             std::process::id(),
@@ -2878,7 +3048,7 @@ exit 0
 
     #[tokio::test]
     async fn rbd_attach_uses_the_tool_and_a_missing_tool_is_unavailable() {
-        let _lock = VIRSH_LOCK.lock().await;
+        let _lock = env_lock().lock().await;
         let root = std::env::temp_dir().join(format!(
             "pistack-rbd-{}-{}",
             std::process::id(),
@@ -2983,5 +3153,569 @@ exit 0
             None => std::env::remove_var("PISTACK_LIBVIRT_DIR"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `p` as a single word of shell, quoted so a path with a space in it
+    /// stays one word. A single quote in a path is not something a tempdir
+    /// hands out, so this refuses rather than mis-quote one.
+    fn shq(p: &Path) -> Option<String> {
+        let s = p.to_string_lossy();
+        if s.contains('\'') {
+            return None;
+        }
+        Some(format!("'{s}'"))
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The script a `qemu-img` stand-in is written from. Every disk it is
+    /// asked about lives in the size table: one line per image holding its
+    /// virtual size in bytes, plus a `watched` entry naming each disk of the
+    /// test's own, and a log of the calls made against those.
+    ///
+    /// `info --output=json` answers from the recorded size, so the size a
+    /// test sets is the size the runtime reads back, for a machine's disk and
+    /// for the base image behind it alike. The disk named is the last image
+    /// path that is no flag's own value: a `-b` backing file never becomes the
+    /// image being sized. `create` takes the size off the end, where `create`
+    /// ends, leaves the disk and records its size; a disk nobody watched was
+    /// made elsewhere and is left as it stands. `resize` accepts nothing but
+    /// `resize [-f fmt] filename size`, with the size last and no size flag,
+    /// the way qemu 8.2 answers: `--size` is not an option it has, and a size
+    /// anywhere else fails here in the same argument order that fails on a
+    /// host. A grow is all or nothing and only ever up.
+    ///
+    /// Only a watched disk is logged and resized, so one test's stand-in
+    /// never sizes another's image out of a table it did not write. Nothing
+    /// in here asks for a tool the runner may not have: the stand-in answers
+    /// for every disk itself, and a base image is a plain file whose size the
+    /// test put in the table beside it.
+    ///
+    /// The table and the log are substituted after formatting rather than
+    /// through `format!`. The shell's own `{...}` words would each have to be
+    /// doubled through the template, and one missed pair writes a script that
+    /// dies at its first `resize`.
+    fn fake_qemu_img_body(sizes: &Path, log: &Path) -> String {
+        r#"#!/bin/sh
+SIZES=@SIZES@
+LOG=@LOG@
+disk=""
+flag=""
+prev=""
+for a in "$@"; do
+  # The word after `-b` or `-F` is that flag's own value. A backing file is
+  # never the image being named, and a format is not either.
+  case "$prev" in
+    -b|-F) prev=$a; continue ;;
+    *) : ;;
+  esac
+  prev=$a
+  case "$a" in
+    -*) flag=$a; continue ;;
+  esac
+  case "$a" in
+    *.qcow2|*.img|*.raw)
+      # The last such path is the one named: both `create` and `resize` end
+      # filename size.
+      disk=$a ;;
+    *) : ;;
+  esac
+done
+key=$(basename "$disk")
+if [ -z "$key" ]; then
+  echo "fake qemu-img: no disk named in: $*" >&2
+  exit 2
+fi
+watched=0
+[ -f "$SIZES/watched/$key" ] && watched=1
+case "$1" in
+  info)
+    size=""
+    [ -f "$SIZES/$key" ] && size=$(cat "$SIZES/$key")
+    case "$size" in
+      ''|*[!0-9]*) echo "fake qemu-img: no size kept for $key" >&2; exit 1 ;;
+    esac
+    if [ "$watched" = 1 ]; then echo "$*" >> "$LOG"; fi
+    printf '{"format": "qcow2", "virtual-size": %s}\n' "$size" ;;
+  create)
+    # A disk this stand-in makes becomes its own to answer for: `create` is
+    # the first call against it, so it is watched from here on and a later
+    # `info` or `resize` finds the size recorded here. `create` ends
+    # filename size, so the size is the word off the end.
+    mkdir -p "$SIZES/watched" || exit 1
+    : > "$SIZES/watched/$key"
+    echo "$*" >> "$LOG"
+    last=""
+    for a in "$@"; do last=$a; done
+    size=""
+    gigs=""
+    case "$last" in
+      *G)
+        gigs=$(printf '%s' "${last%G}" | tr -dc 0-9)
+        size=$(( gigs * 1073741824 )) ;;
+      *[0-9])
+        size=$(printf '%s' "$last" | tr -dc 0-9) ;;
+    esac
+    case "$size" in
+      ''|*[!0-9]*) echo "fake qemu-img: create asked with no size: $*" >&2; exit 2 ;;
+    esac
+    mkdir -p "$(dirname "$disk")" || exit 1
+    if ! printf x > "$disk"; then
+      echo "fake qemu-img: create made no disk" >&2
+      exit 1
+    fi
+    echo "$size" > "$SIZES/$key"
+    exit 0 ;;
+  resize)
+    if [ "$watched" != 1 ]; then
+      echo "fake qemu-img: $key is not this stand-in's to grow" >&2
+      exit 1
+    fi
+    echo "$*" >> "$LOG"
+    # Anything but `resize [-f fmt] filename size` is a call a host's qemu
+    # refuses: a flag it does not have, a size that is not last, or no file
+    # before the size.
+    for a in "$@"; do
+      case "$a" in
+        -f|-F) ;;
+        -*) echo "qemu-img: unrecognized option '$a'" >&2; exit 2 ;;
+        *) : ;;
+      esac
+    done
+    last=""
+    before=""
+    for a in "$@"; do before=$last; last=$a; done
+    case "$last" in
+      *[0-9]G|*[0-9]) : ;;
+      *) echo "qemu-img: expected a size after the filename, got '$last'" >&2; exit 2 ;;
+    esac
+    case "$before" in
+      *.qcow2|*.img|*.raw) : ;;
+      *) echo "qemu-img: no filename before the size: $*" >&2; exit 2 ;;
+    esac
+    have=$(cat "$SIZES/$key")
+    want=$last
+    case "$last" in
+      *G)
+        gigs=$(printf '%s' "${last%G}" | tr -dc 0-9)
+        want=$(( gigs * 1073741824 )) ;;
+    esac
+    # A grow is all or nothing and only ever up.
+    if [ "$have" -ge "$want" ]; then
+      echo "qemu-img: $key is already $have bytes, asked for $want" >&2
+      exit 3
+    fi
+    echo "$want" > "$SIZES/$key" ;;
+  *) echo "fake qemu-img: unsupported subcommand '$1'" >&2; exit 1 ;;
+esac
+"#
+        .replace(
+            "@SIZES@",
+            &shq(sizes).expect("a size table path with no single quote in it"),
+        )
+        .replace(
+            "@LOG@",
+            &shq(log).expect("a call log path with no single quote in it"),
+        )
+    }
+
+    /// A `qemu-img` stand-in at `bin`, answering every disk out of `sizes`
+    /// and logging the watched ones to `log`.
+    fn fake_qemu_img(bin: &Path, log: &Path, sizes: &Path) {
+        write_exec(bin, &fake_qemu_img_body(sizes, log));
+    }
+
+    /// The size table a stand-in answers from: the machine's own
+    /// `disk.qcow2`, watched and holding `gib`, in `table`. A test's disk is
+    /// watched by name, so its table cannot be read by another test's.
+    fn fake_sizes(table: &Path, gib: u64) -> PathBuf {
+        std::fs::create_dir_all(table.join("watched")).unwrap();
+        std::fs::write(table.join("watched").join("disk.qcow2"), b"").unwrap();
+        std::fs::write(table.join("disk.qcow2"), format!("{}\n", gib << 30)).unwrap();
+        table.to_path_buf()
+    }
+
+    /// Say the stand-in holds `name` at `gib`: the size an `info` for a disk
+    /// this stand-in did not make answers with.
+    fn fake_size(sizes: &Path, name: &str, gib: u64) {
+        std::fs::write(sizes.join(name), format!("{}\n", gib << 30)).unwrap();
+    }
+
+    /// The base image these machines are backed by, as the stand-in leaves
+    /// it: a plain file, since nothing here reads a header.
+    fn fake_base_image(images: &Path) {
+        let base = images.join("bases").join("resize-base.qcow2");
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(&base, b"FAKEQCOW2").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_grown_disk_is_resized_with_the_size_last() {
+        // Every tool path here is process-wide, so this holds the lock every
+        // runtime's tool tests share.
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(images.join("bases")).unwrap();
+        let qemu = root.path().join("qemu-img");
+        let log = root.path().join("qemu-img.log");
+        // The machine's disk and the base behind it, both sized in the table
+        // the stand-in answers from: 10 GiB to start, the size asked for, so
+        // only the grow to 20 GiB is a change.
+        let sizes = fake_sizes(root.path(), 10);
+        fake_size(&sizes, "resize-base.qcow2", 1);
+        fake_qemu_img(&qemu, &log, &sizes);
+        fake_base_image(&images);
+        write_exec(
+            &root.path().join("cloud-localds"),
+            "#!/bin/sh\nif [ \"$1\" = \"--network-config\" ]; then shift 2; fi\ncat \"$3\" > \"$1\"\n",
+        );
+        // A `virsh` for a host holding nothing yet: the bridge is up, and
+        // `domstate` fails for a domain the host has never seen, the way a
+        // real one does, so the first provision is a provision.
+        write_exec(
+            &root.path().join("virsh"),
+            "#!/bin/sh\ncase \"$*\" in\n  *domstate*) echo \"can't get domain states\" >&2; exit 1 ;;\n  *net-info*) echo \"Active    yes\" ;;\nesac\nexit 0\n",
+        );
+
+        let prev_dir = std::env::var_os("PISTACK_LIBVIRT_DIR");
+        let prev_img = std::env::var_os("PISTACK_QEMU_IMG");
+        let prev_ds = std::env::var_os("PISTACK_CLOUD_LOCALDS");
+        let prev_virsh = std::env::var_os("PISTACK_VIRSH");
+        std::env::set_var("PISTACK_LIBVIRT_DIR", &images);
+        std::env::set_var("PISTACK_QEMU_IMG", &qemu);
+        std::env::set_var("PISTACK_CLOUD_LOCALDS", root.path().join("cloud-localds"));
+        std::env::set_var("PISTACK_VIRSH", root.path().join("virsh"));
+
+        // A machine of its own id, so its disk sits in a directory no other
+        // test's machine has.
+        let mut r = req("resize-base");
+        r.id = Id::parse(kind::MACHINE, "mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5b").unwrap();
+        let domain = domain_name(&r.id).unwrap();
+        let first = provision(&images, &domain, &r).await;
+        // The size grows while the machine is stopped, so the next start
+        // finds a disk smaller than the size and has to resize it.
+        let mut bigger = r.clone();
+        bigger.resources.disk_gib = 20;
+        let grew = provision(&images, &domain, &bigger).await;
+        // A third start at the same size must not grow again.
+        let again = provision(&images, &domain, &bigger).await;
+
+        match prev_dir {
+            Some(v) => std::env::set_var("PISTACK_LIBVIRT_DIR", v),
+            None => std::env::remove_var("PISTACK_LIBVIRT_DIR"),
+        }
+        match prev_img {
+            Some(v) => std::env::set_var("PISTACK_QEMU_IMG", v),
+            None => std::env::remove_var("PISTACK_QEMU_IMG"),
+        }
+        match prev_ds {
+            Some(v) => std::env::set_var("PISTACK_CLOUD_LOCALDS", v),
+            None => std::env::remove_var("PISTACK_CLOUD_LOCALDS"),
+        }
+        match prev_virsh {
+            Some(v) => std::env::set_var("PISTACK_VIRSH", v),
+            None => std::env::remove_var("PISTACK_VIRSH"),
+        }
+
+        first.expect("first provision");
+        grew.expect("grow");
+        again.expect("second start at the same size");
+        let disk = images
+            .join("machines")
+            .join(domain)
+            .join("disk.qcow2")
+            .to_string_lossy()
+            .into_owned();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        // The first provision made the disk; only the second resized it.
+        assert!(calls.contains("create -f qcow2 -F qcow2 -b "), "{calls}");
+        assert_eq!(
+            calls.matches("resize ").count(),
+            1,
+            "the disk did not grow exactly once:\n{calls}"
+        );
+        // The form qemu takes: format after `-f`, then the file, then the
+        // size last. A size flag, or a size anywhere else, is what the
+        // stand-in refuses and what a host's qemu 8.2 refuses.
+        assert_eq!(
+            calls
+                .lines()
+                .find(|l| l.starts_with("resize "))
+                .unwrap_or_default(),
+            format!("resize -f qcow2 {disk} 20G"),
+            "{calls}"
+        );
+        assert!(!calls.contains("--size"), "{calls}");
+    }
+
+    /// A `virsh` for a machine already defined: it answers `domstate` with
+    /// `state`, records every call on one line in `calls`, and fails the
+    /// subcommand named in `fail` the way a host's libvirt fails one.
+    fn write_resize_virsh(dir: &Path, state: &str, fail: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = dir.join("calls");
+        let body = format!(
+            r#"#!/bin/sh
+echo "$*" >> '{out}'
+cmd=""
+skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  if [ "$a" = "-c" ]; then skip=1; continue; fi
+  if [ "$a" = "domifaddr" ]; then exit 0; fi
+  cmd="$a"
+  break
+done
+if [ '{fail}' = set ]; then
+  case "$cmd" in
+    setvcpus|setmaxmem|setmem)
+      echo "setvcpus: operation failed: the host's own words" >&2
+      exit 1 ;;
+  esac
+fi
+case "$cmd" in
+  domstate) echo '{state}' ;;
+  net-info) echo "Active    yes" ;;
+  domifaddr) ;;
+esac
+exit 0
+"#,
+            out = out.display(),
+            state = state,
+            fail = fail,
+        );
+        write_exec(&dir.join("virsh"), &body);
+        dir.join("virsh")
+    }
+
+    /// The tool paths a start of a stopped machine runs against, restored on
+    /// drop. Call with every env lock held.
+    struct ResizeEnv {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for ResizeEnv {
+        fn drop(&mut self) {
+            for (k, v) in self.prev.iter() {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn resize_env(virsh: &Path, qemu: &Path, images: &Path) -> ResizeEnv {
+        let keys = ["PISTACK_VIRSH", "PISTACK_QEMU_IMG", "PISTACK_LIBVIRT_DIR"];
+        let prev = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var("PISTACK_VIRSH", virsh);
+        std::env::set_var("PISTACK_QEMU_IMG", qemu);
+        std::env::set_var("PISTACK_LIBVIRT_DIR", images);
+        ResizeEnv { prev }
+    }
+
+    /// A machine already defined on this host, shut off at 1 vcpu, 1024 MiB
+    /// and a 10 GiB disk, with the XML a define left beside its disk. Its
+    /// base image is a plain file: nothing in these tests reads a header, so
+    /// no real qemu-img is asked to make one.
+    fn stopped_machine(images: &Path, r: &MachineRequest) -> PathBuf {
+        let domain = domain_name(&r.id).unwrap();
+        let vm = images.join("machines").join(&domain);
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::write(
+            vm.join("domain.xml"),
+            domain_xml(
+                &domain,
+                r.resources.memory_mib,
+                r.resources.vcpus,
+                &vm.join("disk.qcow2"),
+                &vm.join("seed.iso"),
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(vm.join("console.log"), b"").unwrap();
+        std::fs::write(vm.join("disk.qcow2"), b"").unwrap();
+        fake_base_image(images);
+        vm
+    }
+
+    /// A machine resized while stopped gets its new vcpus, memory and root
+    /// disk on the host before it is started: four config calls, the grow,
+    /// and the start. The domain is never defined or undefined again.
+    #[tokio::test]
+    async fn starting_a_shut_off_machine_at_a_new_size_sets_it_on_the_host() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let virshd = root.path().join("virshd");
+        let virsh = write_resize_virsh(&virshd, "shut off", "");
+        let qemu = root.path().join("qemu-img");
+        let log = root.path().join("qemu-img.log");
+        let sizes = fake_sizes(root.path(), 10);
+        fake_size(&sizes, "resize-base.qcow2", 1);
+        fake_qemu_img(&qemu, &log, &sizes);
+        let _env = resize_env(&virsh, &qemu, &images);
+
+        // s.1x1 up to m.2x4, the cluster's case.
+        let mut r = req("resize-base");
+        r.id = Id::parse(kind::MACHINE, "mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5c").unwrap();
+        let vm = stopped_machine(&images, &r);
+        r.resources.vcpus = 2;
+        r.resources.memory_mib = 4096;
+        r.resources.disk_gib = 20;
+
+        let out = LibvirtRuntime.start(&r).await.unwrap();
+        assert_eq!(out.power, PowerState::On);
+
+        let calls = std::fs::read_to_string(virshd.join("calls")).unwrap();
+        let asked: Vec<&str> = calls
+            .lines()
+            .map(|l| l.trim_start_matches("-c qemu:///system ").trim())
+            .collect();
+        // The four calls, in the order that works: the ceiling before the
+        // count it must sit under, each `--config` so the shut-off domain
+        // takes it.
+        let want = [
+            format!("domstate {}", domain_name(&r.id).unwrap()),
+            "setvcpus pistack-mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5c 2 --config --maximum"
+                .to_owned(),
+            "setvcpus pistack-mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5c 2 --config".to_owned(),
+            "setmaxmem pistack-mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5c 4194304 --config"
+                .to_owned(),
+            "setmem pistack-mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5c 4194304 --config".to_owned(),
+            "start pistack-mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5c".to_owned(),
+        ];
+        let got: Vec<&str> = asked
+            .iter()
+            .copied()
+            .filter(|l| {
+                l.starts_with("setvcpus")
+                    || l.starts_with("setmaxmem")
+                    || l.starts_with("setmem")
+                    || l.starts_with("start ")
+                    || l.starts_with("domstate ")
+            })
+            .collect();
+        assert_eq!(got, want, "{calls}");
+        assert_eq!(
+            calls.matches("start pistack-mach").count(),
+            1,
+            "the guest was started exactly once: {calls}"
+        );
+        assert!(
+            !calls.contains("define") && !calls.contains("undefine"),
+            "a domain that exists is never defined again: {calls}"
+        );
+        // The disk grew, with the size last, before the start was asked for.
+        let qcalls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            qcalls.lines().find(|l| l.starts_with("resize ")).unwrap(),
+            format!("resize -f qcow2 {} 20G", vm.join("disk.qcow2").display()),
+            "{qcalls}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sizes.join("disk.qcow2"))
+                .unwrap()
+                .trim(),
+            "21474836480"
+        );
+        // The stored XML says what the host was told, and nothing else moved.
+        let xml = std::fs::read_to_string(vm.join("domain.xml")).unwrap();
+        assert!(xml.contains("<vcpu>2</vcpu>"), "{xml}");
+        assert!(xml.contains("<memory unit='MiB'>4096</memory>"), "{xml}");
+        assert!(xml.contains("<console type='file'>"), "{xml}");
+    }
+
+    /// A start at the size the machine already has is only a start: no
+    /// config call, no resize.
+    #[tokio::test]
+    async fn a_start_at_the_same_size_runs_only_the_start() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let virshd = root.path().join("virshd");
+        let virsh = write_resize_virsh(&virshd, "shut off", "");
+        let qemu = root.path().join("qemu-img");
+        let log = root.path().join("qemu-img.log");
+        let sizes = fake_sizes(root.path(), 10);
+        fake_size(&sizes, "resize-base.qcow2", 1);
+        fake_qemu_img(&qemu, &log, &sizes);
+        let _env = resize_env(&virsh, &qemu, &images);
+
+        let mut r = req("resize-base");
+        r.id = Id::parse(kind::MACHINE, "mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5d").unwrap();
+        let vm = stopped_machine(&images, &r);
+        let before = std::fs::read_to_string(vm.join("domain.xml")).unwrap();
+
+        LibvirtRuntime.start(&r).await.unwrap();
+
+        let calls = std::fs::read_to_string(virshd.join("calls")).unwrap();
+        assert_eq!(
+            calls.matches("start pistack-mach").count(),
+            1,
+            "the guest was started exactly once: {calls}"
+        );
+        for verb in ["setvcpus", "setmaxmem", "setmem", "define", "undefine"] {
+            assert!(
+                !calls.contains(verb),
+                "{verb} ran at the same size: {calls}"
+            );
+        }
+        // The disk already fits the size, so qemu-img is never asked to
+        // resize it.
+        let qcalls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!qcalls.contains("resize "), "{qcalls}");
+        assert_eq!(
+            std::fs::read_to_string(vm.join("domain.xml")).unwrap(),
+            before
+        );
+    }
+
+    /// A definition that cannot be retuned stops the start: the machine is
+    /// left shut off, never started at a size it does not have.
+    #[tokio::test]
+    async fn a_failed_setvcpus_fails_the_start_and_never_starts_the_guest() {
+        let _lock = env_lock().lock().await;
+        let _tools = tool_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let virshd = root.path().join("virshd");
+        // The first config call the host refuses: a size cannot be set.
+        let virsh = write_resize_virsh(&virshd, "shut off", "set");
+        let qemu = root.path().join("qemu-img");
+        let log = root.path().join("qemu-img.log");
+        let sizes = fake_sizes(root.path(), 10);
+        fake_size(&sizes, "resize-base.qcow2", 1);
+        fake_qemu_img(&qemu, &log, &sizes);
+        let _env = resize_env(&virsh, &qemu, &images);
+
+        let mut r = req("resize-base");
+        r.id = Id::parse(kind::MACHINE, "mach-018f4a2b-1c4d-7e5f-8a6b-0c1d2e3f4a5e").unwrap();
+        let vm = stopped_machine(&images, &r);
+        r.resources.vcpus = 2;
+        r.resources.memory_mib = 4096;
+        r.resources.disk_gib = 20;
+
+        let e = LibvirtRuntime.start(&r).await.unwrap_err();
+        assert!(e.message.contains("setvcpus"), "{}", e.message);
+        let calls = std::fs::read_to_string(virshd.join("calls")).unwrap();
+        assert!(!calls.contains("start pistack-mach"), "{calls}");
+        // The definition is as it was: 1 vcpu, 1 GiB.
+        let xml = std::fs::read_to_string(vm.join("domain.xml")).unwrap();
+        assert!(xml.contains("<vcpu>1</vcpu>"), "{xml}");
+        assert!(xml.contains("<memory unit='MiB'>1024</memory>"), "{xml}");
     }
 }

@@ -298,6 +298,39 @@ async fn rebuild(
     }
 }
 
+/// A resize takes the new size, refuses one it has never heard of, and
+/// writes it to the machine so a later show reports it.
+async fn resize(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let size = body["size"].as_str().unwrap_or("");
+    if size.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "bad_request", "size is required");
+    }
+    if size == "huge" {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "size 'huge' not found",
+        );
+    }
+    let mut machines = m.machines.lock().unwrap();
+    let Some(mut v) = find(&machines, &id) else {
+        return gone(&id);
+    };
+    v["spec"]["size"] = json!(size);
+    v["status"]["message"] = json!("resize requested");
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    machines.insert(name, v.clone());
+    Json(v).into_response()
+}
+
 fn find_pod(pods: &BTreeMap<String, Value>, id: &str) -> Option<Value> {
     pods.get(id).cloned().or_else(|| {
         pods.values()
@@ -718,6 +751,7 @@ async fn serve_with(mock: Mock) -> String {
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
         .route("/compute/machines/{id}/rebuild", post(rebuild))
+        .route("/compute/machines/{id}/resize", post(resize))
         .route("/compute/machines/{id}/{action}", post(power_action))
         .route("/loom/pods/{id}", get(show_pod))
         .route("/loom/pods/{id}/exec", post(exec_pod))
@@ -942,6 +976,28 @@ async fn login_then_machines_end_to_end() {
         assert_eq!(got[0], json!({}), "no body without --image");
         assert_eq!(got[1], json!({"image": "noble"}));
     }
+
+    // Resize sends the new size and the server records it.
+    let r = pi(&cfg, "", &["machine", "resize", "web", "--size", "m.4x8"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.starts_with("machine \"web\" resize requested"),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        mock.machines.lock().unwrap()["web"]["spec"]["size"],
+        "m.4x8"
+    );
+    // A size the server does not know is its error, printed once.
+    let r = pi(&cfg, "", &["machine", "resize", "web", "--size", "huge"]).await;
+    assert_eq!(r.code, 1);
+    assert_eq!(r.err.trim(), "error: size 'huge' not found");
+    assert!(r.out.is_empty());
+    // The size is required.
+    let r = pi(&cfg, "", &["machine", "resize", "web"]).await;
+    assert_eq!(r.code, 2);
+    assert!(r.err.contains("--size"), "{}", r.err);
 
     // Delete without --yes and no tty refuses; with --yes it goes.
     let r = pi(&cfg, "", &["machine", "delete", "web"]).await;

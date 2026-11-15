@@ -415,6 +415,327 @@ async fn unschedulable_machine_stays_pending_with_reason() {
     }
 }
 
+/// A resize needs the machine stopped, a size that exists, room on its
+/// host for what the new size adds, and a root disk that is not shrunk.
+#[tokio::test]
+async fn resize_refuses_until_the_machine_is_stopped_then_moves_it() {
+    let h = harness().await;
+    let app = &h.app;
+
+    let body = serde_json::json!({
+        "name": "web",
+        "spec": {"size": "m.2x4", "image": "ubuntu-24.04"}
+    });
+    let (_, m) = call::<Machine>(app, "POST", "/machines", Some(body)).await;
+    let id = m.meta.id.to_string();
+    wait_for(app, &id, |m| m.status.phase == Phase::Ready).await;
+    let (_, hosts0) = call::<Page<Host>>(app, "GET", "/hosts", None).await;
+
+    // Running: refused, and told to stop it.
+    let (st, bytes) = raw(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "l.4x8"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("stop"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (_, still) = call::<Machine>(app, "GET", &format!("/machines/{id}"), None).await;
+    assert_eq!(still.spec.size, "m.2x4");
+
+    // Stopped and confirmed off.
+    let (st, _) = call::<Machine>(app, "POST", &format!("/machines/{id}/stop"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    wait_for(app, &id, |m| m.status.power == forge::PowerState::Off).await;
+
+    // A size that does not exist.
+    let (st, _) = raw(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The same size is a no-op that changes nothing.
+    let (st, same) = call::<Machine>(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "m.2x4"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(same.spec.size, "m.2x4");
+    // The no-op changed nothing; only the reconciler's own writes show.
+    assert!(same.spec.size == "m.2x4" && same.status.power == forge::PowerState::Off);
+    let (st, _) = call::<Machine>(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "m.2x4"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, after) = call::<Machine>(app, "GET", &format!("/machines/{id}"), None).await;
+    assert_eq!(after.meta.revision, same.meta.revision);
+
+    // Smaller root disk than the machine's own: refused.
+    let (st, bytes) = raw(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "s.1x1"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("smaller"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    // Grow in place. The host must have room for two more vcpus.
+    let (st, grown) = call::<Machine>(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "l.4x8"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(grown.spec.size, "l.4x8");
+
+    // A size the host cannot hold: refused while stopped, and the machine
+    // keeps its size. The message says there is no room and no move.
+    let (st, bytes) = raw(
+        app,
+        "POST",
+        &format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "xl.8x16"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("no room"), "{text}");
+    assert!(text.contains("not moved"), "{text}");
+    let (_, still) = call::<Machine>(app, "GET", &format!("/machines/{id}"), None).await;
+    assert_eq!(still.spec.size, "l.4x8");
+
+    // Started again on the same host with the new size's resources.
+    let (st, _) = call::<Machine>(app, "POST", &format!("/machines/{id}/start"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let m = wait_for(app, &id, |m| m.status.power == forge::PowerState::On).await;
+    assert_eq!(m.status.host.as_ref(), Some(&hosts0.items[0].meta.id));
+    let (_, hosts1) = call::<Page<Host>>(app, "GET", "/hosts", None).await;
+    assert_eq!(
+        hosts0.items[0].spec.capacity.memory_mib - hosts1.items[0].status.free.memory_mib,
+        8192
+    );
+}
+
+/// A project's quota is checked for the difference a resize adds, and the
+/// usage counters follow the machine's new size.
+#[tokio::test]
+async fn resize_is_checked_against_the_projects_quota() {
+    use gate::{Project, ProjectSpec, ProjectStatus};
+    use pistack_types::{kind, Caller, Id, Meta};
+
+    let store = Store::in_memory().unwrap();
+    let shutdown = CancellationToken::new();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: shutdown.clone(),
+        public_url: "http://test".into(),
+        node_name: "testbox".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    let forge = Forge::default();
+    let app = forge.router(ctx.clone());
+    forge.start(ctx).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while store.collection::<Size>().list(None).unwrap().len() < 4 {
+        assert!(tokio::time::Instant::now() < deadline, "sizes never seeded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut spec = ProjectSpec::default();
+    spec.quotas.insert("vcpus".into(), 4);
+    spec.quotas.insert("memory_mib".into(), 6144);
+    let project = store
+        .collection::<Project>()
+        .create(Project {
+            meta: Meta::new(kind::PROJECT, "research", None),
+            spec,
+            status: ProjectStatus::default(),
+        })
+        .unwrap()
+        .meta
+        .id;
+    let member = Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "alice".into(),
+        project: Some(project.clone()),
+        roles: vec!["member".into()],
+        system: false,
+    };
+    let send = |method: &'static str, path: String, body: Option<serde_json::Value>| {
+        let (app, member) = (app.clone(), member.clone());
+        async move {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .extension(member);
+            let body = match body {
+                Some(v) => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(serde_json::to_vec(&v).unwrap())
+                }
+                None => Body::empty(),
+            };
+            let resp = app.oneshot(req.body(body).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, v)
+        }
+    };
+    let usage = |resource: &str| {
+        let p = store.collection::<Project>().get(&project).unwrap();
+        p.status.usage.get(resource).copied().unwrap_or(0)
+    };
+
+    // m.2x4 is 2 vcpus and 4096 MiB; l.4x8 is 4 and 8192.
+    let (st, made) = send(
+        "POST",
+        "/machines".into(),
+        Some(serde_json::json!({"name": "web", "spec": {"size": "m.2x4", "image": "ubuntu"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{made}");
+    let id = made["id"].as_str().unwrap().to_owned();
+    assert_eq!(usage("vcpus"), 2);
+    assert_eq!(usage("memory_mib"), 4096);
+
+    // Off first.
+    let wait_power = |want: forge::PowerState| {
+        let app = app.clone();
+        let member = member.clone();
+        let id = id.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/machines/{id}"))
+                    .extension(member.clone())
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                let m: Machine =
+                    serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                        .unwrap();
+                if m.status.power == want {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "power never {want:?}; last {m:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let (st, _) = send("POST", format!("/machines/{id}/stop"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    wait_power(forge::PowerState::Off).await;
+
+    // l.4x8 adds two vcpus and 4096 MiB: the project stands at two vcpus
+    // under a limit of four and 4096 MiB under a limit of 6144. The vcpus
+    // are asked for first.
+    let (st, e) = send(
+        "POST",
+        format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "l.4x8"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"]["code"], "quota_exceeded");
+    assert_eq!(
+        e["error"]["message"],
+        "quota exceeded for memory_mib in project 'research': 4096 used + 4096 requested > 6144"
+    );
+    let (_, still) = send("GET", format!("/machines/{id}"), None).await;
+    assert_eq!(still["spec"]["size"], "m.2x4");
+    assert_eq!(usage("vcpus"), 2);
+    assert_eq!(usage("memory_mib"), 4096);
+
+    // A size under every limit goes, and usage follows. s.1x1 is smaller
+    // in disk than m.2x4, so the shrink lands on a size made to fit. An
+    // admin makes it; a member does not create sizes.
+    let admin = Caller {
+        principal: member.principal.clone(),
+        principal_name: "root".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sizes")
+                .extension(admin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "t.1x1", "vcpus": 1, "memory_mib": 1024, "disk_gib": 20,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let (st, m) = send(
+        "POST",
+        format!("/machines/{id}/resize"),
+        Some(serde_json::json!({"size": "t.1x1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["spec"]["size"], "t.1x1");
+    assert_eq!(usage("vcpus"), 1);
+    assert_eq!(usage("memory_mib"), 1024);
+    assert_eq!(usage("disk_gib"), 20);
+
+    shutdown.cancel();
+}
+
 /// A project with limits, and a member of it calling the API.
 #[tokio::test]
 async fn a_member_is_refused_at_the_projects_limit_and_a_delete_frees_it() {

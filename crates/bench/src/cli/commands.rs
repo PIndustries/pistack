@@ -1891,6 +1891,18 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
         MachineCmd::Stop(a) => power(ctx, io, k, a, "stop").await,
         MachineCmd::Reboot(a) => power(ctx, io, k, a, "reboot").await,
         MachineCmd::Rebuild(a) => machine_rebuild(ctx, io, k, a).await,
+        MachineCmd::Resize(a) => {
+            do_action(
+                ctx,
+                io,
+                k,
+                &a.name,
+                "resize",
+                Some(json!({ "size": a.size })),
+            )
+            .await?;
+            Ok(())
+        }
         MachineCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
     }
 }

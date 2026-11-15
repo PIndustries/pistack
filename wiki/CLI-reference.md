@@ -282,6 +282,7 @@ pi machine start <NAME>
 pi machine stop <NAME>
 pi machine reboot <NAME>
 pi machine rebuild <NAME>
+pi machine resize <NAME> --size <SIZE>
 pi machine stats <NAME>
 ```
 
@@ -306,6 +307,9 @@ pi machine stats <NAME>
 | `machine rebuild` | `--image <IMAGE>` | Image the new root disk is a copy of (name or id). Default: the image the machine has |
 | `machine rebuild` | `-y, --yes` | Do not ask for confirmation |
 | `machine rebuild` | `--wait` | Wait until the machine is ready again (or failed) |
+| `machine resize` | `--size <SIZE>` | New size name or id |
+
+`machine resize` changes the size of a machine. It must be stopped first; a running one is refused. The new size must be one of the sizes the project may use. A larger root disk takes effect on the next start.
 
 `machine stats` prints the current value of each of the machine's usage series, and for a counter how fast it is rising. A machine that is off, or one whose runtime does not measure, has none. See [Metrics and alarms](Metrics-and-alarms).
 
