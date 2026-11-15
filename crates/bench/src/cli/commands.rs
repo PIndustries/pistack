@@ -83,6 +83,8 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Stack { cmd } => stack(ctx, cmd, io).await,
         Cmd::Lb { cmd } => super::lb::dispatch(ctx, cmd, io).await,
         Cmd::Backup { cmd } => super::backup::backup(ctx, cmd, io).await,
+        Cmd::Bucket { cmd } => super::bucket::bucket(ctx, cmd, io).await,
+        Cmd::Object { cmd } => super::bucket::object(ctx, cmd, io).await,
     }
 }
 

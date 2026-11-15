@@ -389,12 +389,7 @@ impl Client {
     pub async fn get_to_file(&self, path: &str, out: &Path) -> CliResult<u64> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
-        let resp = self.request(Method::GET, path).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(parse_error(status, &text));
-        }
+        let resp = self.open_get(path).await?;
         let mut file = tokio::fs::File::create(out)
             .await
             .map_err(|e| CliError::usage(format!("creating {}: {e}", out.display())))?;
@@ -408,6 +403,38 @@ impl Client {
         file.flush().await?;
         Ok(n)
     }
+
+    /// Stream a response body straight to `out` (an object read to stdout).
+    /// Returns bytes written.
+    pub async fn get_to_writer(&self, path: &str, out: &mut dyn std::io::Write) -> CliResult<u64> {
+        let resp = self.open_get(path).await?;
+        pump(resp, out).await
+    }
+
+    /// A successful `GET`, or the error the server answered with.
+    async fn open_get(&self, path: &str) -> CliResult<reqwest::Response> {
+        let resp = self.request(Method::GET, path).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            return Err(parse_error(status, &text));
+        }
+        Ok(resp)
+    }
+}
+
+/// Copy a response body into `out` a chunk at a time.
+async fn pump(resp: reqwest::Response, out: &mut dyn std::io::Write) -> CliResult<u64> {
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut n = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        n += chunk.len() as u64;
+        out.write_all(&chunk)?;
+    }
+    out.flush()?;
+    Ok(n)
 }
 
 #[cfg(test)]
