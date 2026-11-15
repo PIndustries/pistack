@@ -9,6 +9,12 @@
 //! accepted, before the reconciler has removed it. A backup counts the
 //! size of the volume it was taken from, which is known when it is asked
 //! for; the bytes it ends up holding are not known until it is written.
+//!
+//! A volume offered to another project counts where it still is. An offer
+//! holds nothing back from the giver's total and reserves nothing for the
+//! taker: the receiving project is asked for the whole move when it accepts,
+//! so a transfer that finds no room there fails there and the volume never
+//! leaves.
 
 use crate::types::{Backup, Snapshot, Volume};
 use gate::quota::{self, BACKUPS, BACKUPS_GIB, SNAPSHOTS, VOLUMES, VOLUMES_GIB};
