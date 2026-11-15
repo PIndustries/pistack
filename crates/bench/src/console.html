@@ -358,6 +358,35 @@
   .strip .srv { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0.65rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.84rem; }
   .strip .facts.bad { color: var(--bad); }
   .strip .facts { margin-left: auto; color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .quota { display: flex; gap: 1rem; align-items: center; padding: 0.7rem 1rem; border-bottom: 1px solid var(--line); }
+  .quota:last-child { border-bottom: 0; }
+  .quota .what { flex: 0 0 9.5rem; min-width: 0; overflow-wrap: anywhere; }
+  .quota .bar { flex: 1; min-width: 4rem; }
+  .quota .meter { margin: 0; }
+  .quota .used { color: var(--muted); flex: 0 0 auto; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
+  .quota .used.bad { color: var(--bad); }
+  .quota input { width: 7rem; }
+  .quota.edit .what, .quota.edit .bar { flex: 0 0 auto; }
+  .rowlines { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .rowlines .empty { padding: 1.6rem 1rem; margin: 0; text-align: center; color: var(--muted); }
+  .rowlines .line { display: flex; align-items: center; border-bottom: 1px solid var(--line); min-height: 2.7rem; }
+  .rowlines button.line-open {
+    display: flex; flex: 1; gap: 1rem; align-items: center; min-width: 0;
+    padding: 0.6rem 1rem; background: transparent; border: 0; border-radius: 0;
+    text-align: left;
+  }
+  .rowlines .line:hover { background: var(--hover); }
+  .rowlines button.line-open > b { flex: 0 0 12rem; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .rowlines .line-actions { flex: 0 0 auto; padding-right: 1rem; }
+  .rowlines .line-actions button { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
+  .rowlines button.line-open > span { flex: 1; min-width: 0; color: var(--muted); font-size: 0.86rem; }
+  .rowlines button.line-open::after { content: "▾"; color: var(--muted); }
+  .rowlines button.line-open[aria-expanded="true"]::after { content: "▴"; }
+  .rowlines .panel { border: 0; border-radius: 0; background: none; padding: 0; }
+  .panel + .tools { margin: 0.8rem 0 0; }
+  .who-lines { padding: 0.2rem 1rem 0.7rem; }
+  .who-lines p { margin: 0.25rem 0; color: var(--muted); font-size: 0.85rem; }
+  .who-lines .mono { color: var(--text); }
   .feed { list-style: none; margin: 0; padding: 0; }
   .feed li { display: flex; gap: 0.8rem; align-items: baseline; padding: 0.6rem 1rem; border-bottom: 1px solid var(--line); min-width: 0; }
   .feed li:last-child { border-bottom: 0; }
@@ -630,18 +659,21 @@ const VIEWS = {
   projects: {
     title: "Projects",
     path: "/identity/projects",
+    note: "Open a project for its limits. A limit is a ceiling: a request that would pass it is refused.",
     cols: [
       ["Name", i => i.name],
-      ["ID", i => i.id],
+      ["Parent", i => projectName(i.spec && i.spec.parent)],
       ["Enabled", i => yesNo(i.spec && i.spec.enabled)],
     ],
   },
   users: {
     title: "Users",
     path: "/identity/principals",
+    note: "Open a user for the roles it holds and where they apply.",
     cols: [
       ["Name", i => i.name],
       ["Kind", i => i.spec && i.spec.kind],
+      ["Default project", i => projectName(i.spec && i.spec.default_project)],
       ["Enabled", i => yesNo(i.spec && i.spec.enabled)],
     ],
   },
@@ -837,6 +869,20 @@ const counts = {};
 // Which create forms are open, by view name.
 const formOpen = {};
 let lastErr = "";
+// A page build in flight. The timed refresh will not start a second one on
+// top of it.
+let rendering = false;
+// Is an open panel on screen right now? An answer about the page, so a
+// page that is not the panel's own cannot be taken for one. A panel is
+// held open by what is on screen, not only by what the state remembers:
+// it belongs to the lines it was drawn into, so it is matched against
+// them. The moment the view changes, whatever the route came through —
+// menu, address, Back — the next build replaces the lines, the panel goes
+// with them, and nothing here keeps it.
+function panelHeld() {
+  if (!openProject && !openUser) return false;
+  return !!document.querySelector("#view .rowlines > .line-slot");
+}
 let readOnly = false;
 let renderGen = 0;
 let openMachine = null;
@@ -844,6 +890,12 @@ let openHost = null;
 let machineFips = [];
 // One-time key secret. Shown in the DOM, then dropped. Not stored.
 let keyOnce = null;
+// The project a limits panel is open under, and the user a roles panel is
+// open under. Both are dropped when you leave the page.
+let openProject = null;
+let openUser = null;
+// Project names, so a line can say what an id points at.
+const projectNames = new Map();
 
 function el(tag, text, cls) {
   const n = document.createElement(tag);
@@ -883,6 +935,8 @@ function showLogin() {
   keyOnce = null;
   openMachine = null;
   openHost = null;
+  openProject = null;
+  openUser = null;
   document.getElementById("shell").hidden = true;
   document.getElementById("login").hidden = false;
 }
@@ -898,7 +952,7 @@ function setErr(msg) {
 }
 function option(value, label) {
   const o = el("option", label == null ? value : label);
-  o.value = value;
+  o.value = String(value);
   return o;
 }
 function yesNo(v) {
@@ -1017,8 +1071,8 @@ function onCreate(form, go, work) {
     setErr("");
     go.disabled = true;
     try {
-      await work();
-      await render();
+      // A work that redrew its own panel and says so needs no page build.
+      if (await work() !== true) await render();
     } catch (e) {
       setErr(e.message);
     }
@@ -1141,9 +1195,12 @@ async function switchProject(want) {
     const data = await api("POST", "/identity/tokens/self/switch", { project: want });
     setToken(data.token);
     try { localStorage.setItem("pistack.project", want); } catch (e) { /* private window */ }
-    // A different project is a different cloud, so the page open on the
+    // A different project is a different cloud, so what was open on the
     // old one goes with it.
-    if (current === "machines" || current === "hosts") { openMachine = null; openHost = null; }
+    openMachine = null;
+    openHost = null;
+    openProject = null;
+    openUser = null;
     keyOnce = null;
     sampleCache = { at: 0, rows: [] };
     for (const k of Object.keys(formOpen)) formOpen[k] = false;
@@ -1178,6 +1235,8 @@ function go(view, fromHash, id) {
   const openable = id && view === "hosts" ? id : null;
   openHost = view === "hosts" ? openable : null;
   openMachine = view === "machines" ? (id || null) : null;
+  openProject = null;
+  openUser = null;
   for (const n of document.querySelectorAll("nav button[data-view]")) n.removeAttribute("aria-current");
   const b = navButton(view);
   let group = "";
@@ -1210,6 +1269,18 @@ function hashView() {
 window.addEventListener("popstate", () => {
   if (!token()) return;
   const at = hashView();
+  go(at.view, true, at.id);
+});
+// The address is a way in from outside the page as much as from Back:
+// typing `#/projects` in the bar, a bookmark, a link. A held-open panel
+// must not survive a view the address has left, so the address gets its
+// own listener: hashchange fires on every hash move, which a menu click
+// answers for itself and a Back answers through popstate.
+window.addEventListener("hashchange", () => {
+  if (!token() || document.getElementById("shell").hidden) return;
+  const at = hashView();
+  if (at.view === current && (at.view !== "hosts" || at.id === openHost)
+      && (at.view !== "machines" || !at.id || at.id === openMachine)) return;
   go(at.view, true, at.id);
 });
 
@@ -1313,6 +1384,12 @@ function applyFilter() {
     if (tr.querySelector("td.empty")) continue;
     tr.hidden = !!q && !tr.textContent.toLowerCase().includes(q);
   }
+  // The lines that open a panel filter the same way. The open one is never
+  // hidden: a panel is part of the line it belongs to.
+  for (const holder of document.querySelectorAll("#view .rowlines > div.line")) {
+    const held = holder.nextElementSibling && holder.nextElementSibling.classList.contains("line-slot");
+    holder.hidden = !!q && !held && !holder.textContent.toLowerCase().includes(q);
+  }
 }
 document.getElementById("filter").addEventListener("input", applyFilter);
 
@@ -1326,7 +1403,15 @@ liveBox.addEventListener("change", () => {
 setInterval(() => {
   if (!liveBox.checked || document.hidden || !token()) return;
   if (document.getElementById("shell").hidden) return;
-  if (openMachine || openHost || formOpen[current]) return;
+  // What is open stays open: a machine, a host, an open limits or roles
+  // panel, a form being filled in.
+  if (openMachine || openHost || openProject || openUser || formOpen[current]) return;
+  // A panel is held open by what is on screen, not only by what the state
+  // remembers: a click that has not finished drawing still counts.
+  if (panelHeld()) return;
+  // Nor over a build still in flight: a slow page (an overview reads a
+  // dozen lists) would otherwise have its build cancelled by the next tick.
+  if (rendering) return;
   const view = document.getElementById("view");
   if (view.contains(document.activeElement) || view.querySelector(".once")) return;
   render(true);
@@ -3612,6 +3697,433 @@ function activityFeed(records, empty) {
   return ul;
 }
 
+// ---- limits and roles ------------------------------------------------------
+
+// The order the limits are shown in, and how each is counted: compute, then
+// storage, then network, then the rest. A resource not named here keeps its
+// own name and counts one at a time.
+const QUOTAS = [
+  ["vcpus", "vCPUs", ""],
+  ["memory_mib", "Memory", "mib"],
+  ["machines", "Machines", ""],
+  ["disk_gib", "Disk", "gib"],
+  ["volumes", "Volumes", ""],
+  ["volumes_gib", "Volume space", "gib"],
+  ["snapshots", "Snapshots", ""],
+  ["backups", "Backups", ""],
+  ["backups_gib", "Backup space", "gib"],
+  ["images", "Images", ""],
+  ["images_bytes", "Image data", "bytes"],
+  ["buckets", "Buckets", ""],
+  ["secrets", "Secrets", ""],
+  ["certificates", "Certificates", ""],
+  ["access_keys", "Access keys", ""],
+  ["networks", "Networks", ""],
+  ["subnets", "Subnets", ""],
+  ["routers", "Routers", ""],
+  ["security_groups", "Security groups", ""],
+  ["ports", "Ports", ""],
+  ["floating_ips", "Floating IPs", ""],
+];
+function quotaInfo(resource) {
+  return QUOTAS.find(q => q[0] === resource) || [resource, resource, ""];
+}
+function quotaValue(resource, n) {
+  const scale = quotaInfo(resource)[2];
+  if (scale === "mib") return gib(n) + " GiB";
+  if (scale === "gib") return n + " GiB";
+  if (scale === "bytes") return fmtBytes(n);
+  return String(n);
+}
+// The resources in a report, in that order, with an unknown name last.
+function quotaNames(report) {
+  const have = Object.keys((report && report.quotas) || {});
+  const known = QUOTAS.map(q => q[0]).filter(r => have.includes(r));
+  return known.concat(have.filter(r => !known.includes(r)).sort());
+}
+// One resource: its bar and `used of limit`, or `used` alone with no limit.
+function quotaLine(resource, line) {
+  const row = el("div", null, "quota");
+  row.dataset.resource = resource;
+  const used = Number(line.used) || 0;
+  const limit = line.limit == null ? null : Number(line.limit);
+  row.append(el("span", quotaInfo(resource)[1], "what"));
+  if (limit == null) {
+    row.append(el("span", null, "bar"), el("span", quotaValue(resource, used) + " used", "used"));
+    return row;
+  }
+  // A meter turns at nineteen twentieths; a limit worth acting on is nearer.
+  const bar = meter(used, limit);
+  if (limit > 0 && used * 10 >= limit * 9) bar.classList.add("high", "full");
+  const words = quotaValue(resource, used) + " of " + quotaValue(resource, limit);
+  row.append(bar, el("span", words, used >= limit ? "used bad" : "used"));
+  return row;
+}
+// The same lines with the limits in number boxes. An empty box means no
+// limit. Only the boxes that changed go, in one write, and the panel is
+// read again so it shows what the server now holds.
+function quotaEditor(project, named, lines, done) {
+  const panel = el("div", null, "panel");
+  const held = {};
+  for (const r of named) {
+    const row = el("div", null, "quota edit");
+    const input = el("input");
+    input.type = "number";
+    input.min = "0";
+    input.step = "1";
+    input.placeholder = "no limit";
+    input.setAttribute("aria-label", quotaInfo(r)[1] + " limit");
+    const holder = el("span", null, "bar");
+    holder.append(input);
+    row.append(el("span", quotaInfo(r)[1], "what"), holder);
+    const figure = el("span", null, "used");
+    row.append(figure);
+    panel.append(row);
+    held[r] = { input, figure, was: "" };
+  }
+  for (const r of named) {
+    const limit = lines[r].limit;
+    const used = Number(lines[r].used) || 0;
+    held[r].was = limit == null ? "" : String(limit);
+    held[r].input.value = held[r].was;
+    held[r].figure.textContent = limit == null
+      ? quotaValue(r, used) + " used"
+      : quotaValue(r, used) + " of " + quotaValue(r, limit);
+    held[r].figure.className = limit != null && used >= limit ? "used bad" : "used";
+  }
+  const tools = el("div", null, "tools");
+  const save = el("button", "Save limits"); save.type = "button"; save.className = "primary";
+  const cancel = el("button", "Cancel"); cancel.type = "button";
+  save.addEventListener("click", async () => {
+    const quotas = {};
+    setErr("");
+    try {
+      for (const r of named) {
+        const now = held[r].input.value.trim();
+        if (now === held[r].was) continue;
+        if (now === "") quotas[r] = null;
+        else quotas[r] = intField(now, quotaInfo(r)[1], 0);
+      }
+    } catch (e) { setErr(e.message); return; }
+    if (!Object.keys(quotas).length) { done(); return; }
+    save.disabled = true;
+    try {
+      const fresh = await api("PUT", "/identity/projects/" + encodeURIComponent(project) + "/quotas", { quotas });
+      for (const r of Object.keys((fresh && fresh.quotas) || {})) {
+        if (lines[r]) { lines[r].limit = fresh.quotas[r].limit; lines[r].used = fresh.quotas[r].used; }
+      }
+      // The write is through: back to the bars, which now show what the
+      // server holds.
+      done();
+    } catch (e) { setErr(e.message); save.disabled = false; }
+  });
+  cancel.addEventListener("click", () => done());
+  tools.append(save, cancel);
+  const wrap = el("div");
+  wrap.append(panel, tools);
+  return wrap;
+}
+// One project's limits, with Edit for a caller that may change them.
+// `cappedOnly` is the overview's ask: nothing at all comes back when the
+// report cannot be read or nothing in it has a limit.
+async function quotaBlock(project, cappedOnly) {
+  let report = null;
+  try {
+    report = await api("GET", "/identity/projects/" + encodeURIComponent(project) + "/quotas");
+  } catch (e) {
+    if (cappedOnly) return null;
+    const box = el("div", null, "panel");
+    box.append(el("p", "The limits could not be read: " + e.message));
+    return box;
+  }
+  let named = quotaNames(report);
+  if (cappedOnly) named = named.filter(r => report.quotas[r].limit != null);
+  // Each resource keeps its own copy, so the answer to a write can replace
+  // one line without taking the others with it.
+  const lines = {};
+  for (const r of named) lines[r] = { limit: report.quotas[r].limit, used: report.quotas[r].used };
+  const out = el("div");
+  const show = () => {
+    const box = el("div", null, "panel");
+    for (const r of named) box.append(quotaLine(r, lines[r]));
+    if (cappedOnly) { out.replaceChildren(box); return; }
+    // The panel is one node end to end: the limits and the Edit that owns
+    // them, so the slot takes the whole of it in one go. A limit is set by
+    // an admin alone — the same rule every other write on the page follows.
+    if (!readOnly) {
+      const tools = el("div", null, "tools");
+      const edit = el("button", "Edit"); edit.type = "button";
+      edit.addEventListener("click", () => out.replaceChildren(quotaEditor(String(project), named, lines, show)));
+      tools.append(edit);
+      const wrap = el("div");
+      wrap.append(box, tools);
+      out.replaceChildren(wrap);
+      return;
+    }
+    out.replaceChildren(box);
+  };
+  show();
+  return out;
+}
+
+function projectName(id) {
+  if (!id) return "";
+  return projectNames.get(String(id)) || shortId(id);
+}
+function nameOf(item) {
+  return (item && item.name) || (item && item.meta && item.meta.name) || "";
+}
+// The pages an id on a projects or users line points into: project names,
+// and for users the roles and projects the add-role form offers. A page
+// that will not answer leaves the short id on the line.
+function loadNames(view, gen) {
+  const roles = view === "users" ? api("GET", "/identity/roles?limit=1000").catch(() => null) : Promise.resolve(null);
+  return Promise.all([roles, api("GET", "/identity/projects?limit=1000").catch(() => null)]).then((pages) => {
+    if (gen !== renderGen) return [[], []];
+    for (const p of itemsOf(pages[1])) projectNames.set(String(p.id), p.name);
+    return [itemsOf(pages[0]), itemsOf(pages[1])].map((l) => l || []);
+  });
+}
+// Where a binding applies: the project it names, or the whole cloud.
+function bindingScope(binding) {
+  const scope = (binding.spec && binding.spec.scope) || {};
+  if (scope.project) return projectName(scope.project);
+  const tail = String(binding.name || "").split(":").pop();
+  if (tail && tail !== "system") return projectName(tail);
+  return "whole cloud";
+}
+function bindingHolder(binding) {
+  const parts = String(binding.name || "").split(":");
+  return parts.length > 1 ? parts[0] : shortId(binding.spec && binding.spec.principal);
+}
+// A binding is shown by name, and deleted by id.
+function bindingLine(binding, refresh) {
+  const where = bindingScope(binding);
+  const row = el("div", null, "quota");
+  const what = el("span", (binding.spec && binding.spec.role) || "—", "what");
+  const scope = el("span", "held in " + where, "bar");
+  row.append(what, document.createTextNode(" "), scope);
+  if (refresh) {
+    const off = el("button", "Remove"); off.type = "button"; off.className = "danger";
+    off.addEventListener("click", async () => {
+      if (!confirm("Take " + (binding.spec && binding.spec.role) + " in " + where + " off " + bindingHolder(binding) + "?")) return;
+      setErr("");
+      off.disabled = true;
+      try { await api("DELETE", "/identity/bindings/" + encodeURIComponent(binding.id)); }
+      catch (e) { setErr(e.message); off.disabled = false; return; }
+      await refresh();
+    });
+    row.append(off);
+  }
+  return row;
+}
+// One user's roles, and what may be done about them. Drawn into the slot
+// under the open line, so a change redraws in place.
+async function userPanel(name, roles, projects, gen, put, who) {
+  const out = el("div");
+  if (who) out.append(who);
+  const box = el("div", null, "panel");
+  let mine = [];
+  try {
+    const [bindings, principals] = await Promise.all([
+      api("GET", "/identity/bindings?limit=1000"),
+      api("GET", "/identity/principals?name=" + encodeURIComponent(name)),
+    ]);
+    if (gen !== renderGen) return out;
+    const me = itemsOf(principals).find(p => nameOf(p) === name);
+    mine = me ? itemsOf(bindings).filter(b => b.spec && String(b.spec.principal) === String(me.id)) : [];
+  } catch (e) {
+    if (gen !== renderGen) return out;
+    box.append(el("p", "You are not allowed to see which roles are held."));
+    out.append(box);
+    put(out);
+    return out;
+  }
+  if (!mine.length) box.append(el("p", "No role is held anywhere."));
+  // A change here is drawn by a fresh panel, from this same slot, rather
+  // than a page-wide redraw: the write itself already left a full page
+  // build behind it, and that build cannot see a binding that lands after.
+  // The newest build answers, not the one this panel was drawn under: a
+  // write from a panel older than the page still shows its result.
+  const again = () => userPanel(name, roles, projects, renderGen, put, who);
+  for (const b of mine) box.append(bindingLine(b, readOnly ? null : again));
+  out.append(box);
+  put(out);
+  if (readOnly) return out;
+
+  const tools = el("div", null, "tools");
+  const form = el("form");
+  form.className = "create";
+  form.append(el("strong", "Add role"));
+  const fields = el("div"); fields.className = "row";
+  const role = el("select");
+  role.setAttribute("aria-label", "Role for " + name);
+  role.append(option("", "Role…"));
+  for (const r of roles) role.append(option(r.name, r.name));
+  const scopeSel = el("select");
+  scopeSel.setAttribute("aria-label", "Where that role applies for " + name);
+  scopeSel.append(option("", "Whole cloud"));
+  for (const p of projects) scopeSel.append(option(nameOf(p), nameOf(p)));
+  fields.append(field("Role", role), field("Where", scopeSel));
+  const add = el("button", "Add"); add.type = "submit"; add.className = "primary";
+  form.append(fields, add);
+  onCreate(form, add, async () => {
+    if (!role.value) throw new Error("Pick a role first.");
+    const body = { principal: name, role: role.value };
+    if (scopeSel.value) body.project = scopeSel.value;
+    await api("POST", "/identity/bindings", body);
+    await again();
+    // The panel answers for the write; no page-wide build follows it.
+    return true;
+  });
+  const sign = el("button", "Sign out everywhere"); sign.type = "button";
+  sign.title = "Refuse every token issued to this user up to now";
+  sign.addEventListener("click", async () => {
+    if (!confirm("Refuse every token " + name + " holds? They have to sign in again.")) return;
+    setErr("");
+    sign.disabled = true;
+    try { await api("POST", "/identity/principals/" + encodeURIComponent(name) + "/revoke-tokens"); }
+    catch (e) { setErr(e.message); sign.disabled = false; }
+  });
+  tools.append(form, el("span", null, "grow"), sign);
+  out.append(tools);
+  put(out);
+  return out;
+}
+
+// One line per entry, and the open one grows a panel below itself. The
+// panel is only in the document while it is shown: `open` is what was open
+// when the page was drawn, `openTo` records a new choice, and `draw` fills
+// the slot under the line. `title` writes the line's own heading, so a row
+// can carry controls beside its name.
+function detailLines(items, title, sub, open, idOf, openTo, draw, controls) {
+  const lines = el("div", null, "rowlines");
+  if (!items.length) {
+    lines.append(el("p", "Nothing here yet.", "empty"));
+    return lines;
+  }
+  const slots = [];
+  for (const item of items) {
+    const id = idOf(item);
+    // A line is a div holding two siblings: the button that opens the
+    // panel — name and sub text only — and its controls at the right end
+    // of the row. A control inside the button would be invalid markup,
+    // and a click landing on the name must reach the button, so the
+    // handler does not care what the event passed through.
+    const holder = el("div", null, "line");
+    const btn = el("button", null, "line-open");
+    btn.type = "button";
+    const name = el("b");
+    btn.append(name, el("span", sub(item) || ""));
+    title(item, name);
+    holder.append(btn);
+    const acts = controls(item);
+    if (acts && acts.childNodes.length) holder.append(acts);
+    const slot = el("div", null, "line-slot");
+    slots.push(slot);
+    lines.append(holder);
+    // The panel belongs to its line: it sits after the line it opened
+    // from, whether it was open when the page was drawn or just clicked.
+    if (String(open) === String(id)) holder.after(slot);
+    // One fill at a time. A redraw replaces the slot whole, so a change in
+    // the panel never stacks on the panel it came from; and a draw that
+    // came from an older fill is dropped, never left to land late. The
+    // draw is handed the newest build, not the one that first drew it: a
+    // change made from a panel older than the page is still drawn.
+    let token = 0;
+    slot.fill = (...nodes) => {
+      slot.replaceChildren(...nodes);
+      if (slot.isConnected) applyFilter();
+    };
+    const fill = () => {
+      const mine = ++token;
+      slot.replaceChildren();
+      // The sink is handed out node by node: `put(who, node)`, `put(out)`.
+      const put = (...nodes) => {
+        if (mine === token && slot.isConnected) slot.fill(...nodes);
+      };
+      // A draw that came from a build since replaced is dropped: its page
+      // is gone, and putting its nodes down would bury the page standing.
+      const at = renderGen;
+      if (mine === token && at === renderGen) {
+        Promise.resolve(draw(item, put, at)).catch((e) => { if (mine === token) setErr(e.message); });
+      }
+    };
+
+    btn.setAttribute("aria-expanded", String(String(open) === String(id)));
+    if (String(open) === String(id)) fill();
+    btn.addEventListener("click", () => {
+      const wasOpen = btn.getAttribute("aria-expanded") === "true";
+      for (const other of lines.querySelectorAll("button.line-open")) other.setAttribute("aria-expanded", "false");
+      for (const s of slots) if (s.isConnected) s.remove();
+      if (wasOpen) { open = null; openTo(null); }
+      else { open = id; openTo(id); holder.after(slot); btn.setAttribute("aria-expanded", "true"); fill(); }
+      applyFilter();
+    });
+  }
+  return lines;
+}
+// Projects and users are lines that open a panel, not a table of rows.
+function renderLines(items, roles, projects, gen) {
+  const onProjects = current === "projects";
+  const path = VIEWS[current].path;
+  let open = onProjects ? openProject : openUser;
+  // What the page loses by not being a table any more: the enabled or
+  // disabled word sits in the panel now, and Delete sits beside the name,
+  // with the same confirm every other page gives it.
+  const controls = (item) => {
+    const td = el("span", null, "line-actions");
+    if (readOnly) return td;
+    const del = el("button", "Delete"); del.type = "button"; del.className = "danger";
+    del.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!confirm("Delete " + (item.name || item.id) + "? This cannot be undone.")) return;
+      setErr("");
+      del.disabled = true;
+      try { await api("DELETE", path + "/" + item.id); await render(); }
+      catch (e) { setErr(e.message); del.disabled = false; }
+    });
+    td.append(del);
+    return td;
+  };
+  return detailLines(
+    items,
+    (item, name) => { name.textContent = nameOf(item); },
+    (item) => {
+      const bits = [onProjects ? "limits" : "roles"];
+      if (onProjects) {
+        bits.unshift(item.spec && item.spec.parent ? "under " + projectName(item.spec.parent) : "top level");
+      } else {
+        if (item.spec && item.spec.kind) bits.unshift(String(item.spec.kind));
+        if (item.spec && item.spec.default_project) bits.push("defaults to " + projectName(item.spec.default_project));
+      }
+      return bits.filter(Boolean).join(" · ");
+    },
+    open,
+    (item) => String(item.id),
+    (id) => { open = id; if (onProjects) openProject = id; else openUser = id; },
+    (item, put, gen) => {
+      // What the two pages share, above whatever panel they draw: the id in
+      // the mono style, and enabled or disabled — the table's own columns.
+      const who = el("div", null, "panel who-lines");
+      const live = !(item.spec && item.spec.enabled === false);
+      const idLine = el("p", "ID ");
+      idLine.append(el("span", String(item.id), "mono"));
+      who.append(idLine);
+      who.append(el("p", "Status " + (live ? "enabled" : "disabled"), live ? "enabled" : "disabled"));
+      if (onProjects) {
+        return quotaBlock(String(item.id), false).then((node) => {
+          if (!node) return;
+          put(who, node);
+        });
+      }
+      return userPanel(nameOf(item), roles, projects, gen, put, who);
+    },
+    controls
+  );
+}
+
 async function renderDns(root, gen) {
   let zones = [];
   let records = [];
@@ -3715,11 +4227,13 @@ async function renderOverview(root, gen) {
   }));
   // Extras that only some callers may read. The page is whole without them.
   const quiet = (p) => p.catch(() => null);
-  const [cluster, samples, auditPage, info] = await Promise.all([
+  const here = myProjects.find(p => p.current) || myProjects[0];
+  const [cluster, samples, auditPage, info, capped] = await Promise.all([
     quiet(api("GET", "/cluster")),
     quiet(usageSamples()),
     quiet(api("GET", "/identity/audit?order=desc&limit=8")),
     quiet(api("GET", "/", undefined, false)),
+    here ? quiet(quotaBlock(String(here.id || here.name), true)) : Promise.resolve(null),
   ]);
   if (gen !== renderGen) return;
   for (const v of wanted) if (!failed.includes(VIEWS[v].title)) setCount(v, got[v].length);
@@ -3759,6 +4273,12 @@ async function renderOverview(root, gen) {
     tile("alarms", "Alarms firing", firing.length, "of " + got.alarms.length, "", null, firing.length > 0),
   );
   root.append(tiles);
+
+  // What the project you are working in is capped at, when anything caps it.
+  if (capped) {
+    root.append(el("h3", "Quota"));
+    root.append(capped);
+  }
 
   // The servers that run this cloud, as the one answering sees them.
   if (cluster && Array.isArray(cluster.members)) {
@@ -3896,12 +4416,24 @@ async function render(soft) {
   // A detail page stays on screen while its list is read again underneath:
   // `soft` swaps the nodes in, an open detail page keeps them out. The list
   // is built either way, so its nav count stays true without flashing the
-  // page the user is on.
-  const detail = !!(openMachine || openHost);
+  // page the user is on. An open limits or roles panel is a held-open page
+  // too: it lives in the lines, so any build that replaces `#view` would
+  // drop it out from under the click that opened it.
+  const detail = !!(openMachine || openHost || panelHeld());
   const root = (soft || detail) ? el("div") : live;
   if (!soft && !detail) live.replaceChildren();
   setErr("");
-  await renderInto(root, view, gen);
+  // `rendering` says a page is being built. Two builds at once — a timed
+  // refresh arriving while the last is still reading — cancel each other
+  // through renderGen, and a page that swaps itself out mid-draw loses the
+  // panel the user just opened.
+  rendering = true;
+  try {
+    await renderInto(root, view, gen);
+  } finally {
+    // The newest build is the one still holding the flag.
+    if (gen === renderGen) rendering = false;
+  }
   if (gen !== renderGen) return;
   if (root !== live && !(detail && lastErr)) {
     if (!detail) live.replaceChildren(...root.childNodes);
@@ -4211,6 +4743,13 @@ async function renderInto(root, view, gen) {
   }
   setCount(current, items.length);
   chip.textContent = String(items.length);
+  // These two pages are lines that open a panel, not a table of rows.
+  if (current === "projects" || current === "users") {
+    const lists = await loadNames(current, gen);
+    if (gen !== renderGen) return;
+    root.append(renderLines(items, lists[0], lists[1], gen));
+    return;
+  }
   root.append(simpleTable(view.cols, items));
   const table = root.lastElementChild;
   const body = table.querySelector("tbody");
