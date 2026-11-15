@@ -809,6 +809,41 @@ pub fn wants_forward(headers: &axum::http::HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("leader"))
 }
 
+/// The headers of the hop this request is leaving, so a request carried on
+/// does not arrive with them: the six an intermediary never passes, the
+/// `Connection` line itself, and every name that line asks to be dropped.
+fn hop_by_hop(headers: &axum::http::HeaderMap) -> Vec<axum::http::HeaderName> {
+    const STOPPED: [&str; 7] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+    ];
+    let mut out: Vec<axum::http::HeaderName> = STOPPED
+        .iter()
+        .map(|name| axum::http::HeaderName::from_static(name))
+        .collect();
+    for value in headers.get_all(axum::http::header::CONNECTION) {
+        // A name that cannot be a header is not one to drop either.
+        for word in value
+            .to_str()
+            .map(str::to_owned)
+            .unwrap_or_default()
+            .split(',')
+        {
+            if let Ok(name) = word.trim().parse::<axum::http::HeaderName>() {
+                if name != axum::http::header::CONNECTION {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Carry a request to the leader and hand its answer back. The caller's
 /// token goes with it and the leader checks it as it would any other. The
 /// header that asked for this does not, so a server that turns out not to
@@ -846,13 +881,34 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .to_owned();
-    const PASSED: [&str; 5] = [
-        "authorization",
-        "content-type",
-        "if-match",
-        "accept",
-        "x-request-id",
-    ];
+    // Everything the client sent goes on, bar what belongs to the hop the
+    // request is leaving and what this server puts on itself. A name asked
+    // to be dropped by a `Connection` line goes too: on a connection that
+    // says `keep-alive` it is one more hop-by-hop header.
+    let mut drop = hop_by_hop(&parts.headers);
+    drop.extend(CARRIED_HEADERS.iter().cloned());
+    // The address the client signed for goes with a signed object request
+    // and nowhere else: any other request is answered under the address it
+    // arrived on, which here is the leader's own.
+    if !carry_signed_host(&parts.uri, &parts.headers) {
+        drop.push(axum::http::header::HOST);
+    }
+    // Kept in order and repeats, so a header the signature covers arrives
+    // with the same value it left with.
+    let mut passed: Vec<(axum::http::HeaderName, axum::http::HeaderValue)> = Vec::new();
+    let mut named: Option<axum::http::HeaderName> = None;
+    for (name, value) in parts.headers.into_iter() {
+        if let Some(name) = name {
+            named = Some(name);
+        }
+        let name = match named.as_ref() {
+            Some(name) => name.clone(),
+            None => continue,
+        };
+        if !drop.contains(&name) {
+            passed.push((name, value));
+        }
+    }
     let sent = handle
         .peers
         .send(
@@ -864,16 +920,17 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
                     .request(parts.method.clone(), format!("{base}{path}"))
                     .timeout(Duration::from_secs(60))
                     .body(body.clone());
-                for name in PASSED {
-                    if let Some(value) = parts.headers.get(name) {
-                        out = out.header(name, value.clone());
-                    }
+                // The client named the server it meant, not the address this
+                // server reaches the leader on, so a signature covering
+                // `host` is checked there against what the client sent.
+                for (name, value) in &passed {
+                    out = out.header(name.clone(), value.clone());
                 }
-                let out = with_join(as_node(out, &handle.node_id));
-                match client_ip {
+                let out = match client_ip {
                     Some(ip) => out.header(keep::peer::CLIENT_ADDR_HEADER, ip.to_string()),
                     None => out,
-                }
+                };
+                with_join(as_node(out, &handle.node_id))
             },
         )
         .await;
@@ -2369,6 +2426,41 @@ fn store_err(err: impl std::fmt::Display) -> ApiError {
 }
 
 pub use keep::peer::{peer_key, PEER_HEADER};
+
+/// True when a request carried for a client should keep the address it was
+/// signed for rather than the one the client used to reach this server.
+///
+/// A signature is computed over the `host` the client meant, and the leader
+/// is the server that checks it. On a carried request the client could not
+/// reach the leader — which is why the request is being carried — so it
+/// signed for an address the leader cannot derive from the connection, and
+/// the leader has to be told that address rather than guess one.
+///
+/// Only a request the client signed itself qualifies: an S3 request under
+/// `/silo`, by header or by presigned query, that named a `host`. A bearer
+/// request carries its credentials in the token, so the name it was sent to
+/// is not part of them, and passing that name on would let a caller pick the
+/// address the leader answers under.
+fn carry_signed_host(uri: &axum::http::Uri, headers: &axum::http::HeaderMap) -> bool {
+    let path = uri.path();
+    if !(path == "/silo" || path.starts_with("/silo/"))
+        || !headers.contains_key(axum::http::header::HOST)
+    {
+        return false;
+    }
+    let signed = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    // A presigned request can carry a `Credential=` query parameter too, and
+    // that is what silo looks at when there is no `Authorization` header.
+    let query = uri.query().or_else(|| path.split_once('?').map(|(_, q)| q));
+    signed.is_some_and(silo::sigv4::is_aws4_authorization)
+        || (signed.is_none()
+            && query.is_some_and(|q| {
+                q.split(['&', '?'])
+                    .any(|pair| pair.split('=').next() == Some("X-Amz-Credential"))
+            }))
+}
 
 /// Who may call `/cluster`. The routes hand out the whole store, admit new
 /// servers and count votes, so by default the caller must be a member or
@@ -5159,6 +5251,452 @@ mod tests {
             .as_u16()
     }
 
+    /// A leader that answers S3 requests for real and a follower that carries
+    /// what it is asked to. The follower knows the leader's address the way
+    /// any follower does — from the membership — and the membership names
+    /// `sim.internal`, an address the client could not have reached. So
+    /// whatever the carrier sends in place of what the client sent shows up
+    /// in the leader's answer.
+    struct Signed {
+        follower_api: String,
+        store: Store,
+        /// The bucket the client writes into.
+        bucket: pistack_types::Id,
+        /// Where the leader keeps object bytes.
+        objects: std::path::PathBuf,
+        access_key_id: String,
+        secret: Vec<u8>,
+        region: String,
+        _dirs: Vec<tempfile::TempDir>,
+    }
+
+    fn amz_now() -> String {
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+    }
+
+    async fn signed_cluster() -> Signed {
+        let leader_dir = tempfile::tempdir().unwrap();
+        let follower_dir = tempfile::tempdir().unwrap();
+        // The records of one cloud, read by both. Bytes still live in each
+        // server's own data directory, so what lands on the leader's disk was
+        // written by the request the leader answered.
+        let store = Store::in_memory().unwrap();
+        let leader_store = store.clone();
+        let follower_store = store.clone();
+        let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_api = format!("http://{}", leader_listener.local_addr().unwrap());
+        let follower_api = format!("http://{}", follower_listener.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim", "http://sim.internal:11443"),
+            Member::voter("sim2", "http://sim2.internal:11443"),
+        ];
+        seed_voter(&leader_store, "sim", &members, 5);
+        seed_voter(&follower_store, "sim2", &members, 5);
+        gate::Keys::load_or_create(&store).unwrap();
+        // The cloud's one secret, so the follower's peer key and its bearer
+        // tokens both check out on the leader.
+        store
+            .put_meta(
+                gate::token::META_JWT_SECRET,
+                &"c2VjcmV0LWZvci10aGlzLWNsb3Vk".to_owned(),
+            )
+            .unwrap();
+        // The project, its member, and the access key that member signs with.
+        let project = store
+            .collection::<gate::Project>()
+            .create(gate::Project {
+                meta: pistack_types::Meta::new(pistack_types::kind::PROJECT, "s3-proj", None),
+                spec: Default::default(),
+                status: Default::default(),
+            })
+            .unwrap()
+            .meta
+            .id;
+        let alice = store
+            .collection::<gate::Principal>()
+            .create(gate::Principal {
+                meta: pistack_types::Meta::new(pistack_types::kind::PRINCIPAL, "s3-alice", None),
+                spec: Default::default(),
+                status: Default::default(),
+            })
+            .unwrap()
+            .meta
+            .id;
+        store
+            .collection::<gate::RoleBinding>()
+            .create(gate::RoleBinding {
+                meta: pistack_types::Meta::new(
+                    gate::KIND_BINDING,
+                    "s3-bind",
+                    Some(project.clone()),
+                ),
+                spec: gate::RoleBindingSpec {
+                    principal: alice.clone(),
+                    role: "member".into(),
+                    scope: gate::Scope::Project {
+                        project: project.clone(),
+                    },
+                },
+                status: Default::default(),
+            })
+            .unwrap();
+        let keep = keep::Client::open(&store).unwrap();
+        let created = keep
+            .create_access_key(&project, &alice, "carried")
+            .expect("access key");
+        // The bucket the client writes into.
+        let silo =
+            silo::Client::new(store.clone(), leader_dir.path().join("silo")).with_min_part_bytes(8);
+        let bucket = silo
+            .create_bucket(
+                pistack_types::Meta::new(
+                    pistack_types::kind::BUCKET,
+                    "widgets",
+                    Some(project.clone()),
+                ),
+                Default::default(),
+            )
+            .unwrap()
+            .meta
+            .id;
+        let region = silo::DEFAULT_REGION.to_owned();
+
+        let leader_ready = Established {
+            role: Role::Voter,
+            leader: true,
+            leader_api: leader_api.clone(),
+            term: 5,
+            members: members.clone(),
+        };
+        let follower_ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: leader_api.clone(),
+            term: 5,
+            members: members.clone(),
+        };
+        let leader_handle = Arc::new(handle_from(
+            "sim".into(),
+            leader_api.clone(),
+            "c1".into(),
+            leader_store.clone(),
+            leader_dir.path().join("state.redb"),
+            &leader_ready,
+            None,
+            Leadership::new(true),
+        ));
+        // What the gateway has around every route: the peer key check, the
+        // carrier's headers taken off a stranger, and the leader's own write
+        // answer. On the follower too, so the carrier starts from what an
+        // ordinary request would have been given.
+        let leader_app = router(leader_handle.clone())
+            .nest(
+                "/silo",
+                silo::http::router_with(silo, Some(keep), region.clone()),
+            )
+            .layer(middleware::from_fn_with_state(
+                leader_store.clone(),
+                strip_carrier_headers,
+            ))
+            .layer(middleware::from_fn_with_state(
+                leader_handle.clone(),
+                reject_follower_writes,
+            ));
+        let follower_handle = Arc::new(handle_from(
+            "sim2".into(),
+            follower_api.clone(),
+            "c1".into(),
+            follower_store.clone(),
+            follower_dir.path().join("state.redb"),
+            &follower_ready,
+            None,
+            Leadership::new(false),
+        ));
+        // The carrier signs with its own peer key, as a server does. Both
+        // handles share the store, so the key is this server's own either way.
+        set_peer_store(&follower_store);
+        let follower_app = router(follower_handle.clone())
+            .layer(middleware::from_fn_with_state(
+                follower_store.clone(),
+                strip_carrier_headers,
+            ))
+            .layer(middleware::from_fn_with_state(
+                follower_handle.clone(),
+                reject_follower_writes,
+            ));
+        for (listener, app) in [
+            (leader_listener, leader_app),
+            (follower_listener, follower_app),
+        ] {
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+                )
+                .await
+                .ok();
+            });
+        }
+        Signed {
+            follower_api,
+            store,
+            bucket,
+            objects: leader_dir.path().join("silo"),
+            access_key_id: created.access_key.access_key_id,
+            secret: created.secret_access_key.into_bytes(),
+            region,
+            _dirs: vec![leader_dir, follower_dir],
+        }
+    }
+
+    /// A signed request, sent to `to`, with `host` the address the client
+    /// signed for. Everything the signature covers is on the wire.
+    async fn signed_send(
+        w: &Signed,
+        to: &str,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        host: &str,
+    ) -> (u16, Vec<u8>) {
+        let payload = silo::sigv4::hex_sha256(body);
+        let date = amz_now();
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".into(), host.into()),
+            ("x-amz-content-sha256".into(), payload.clone()),
+            ("x-amz-date".into(), date.clone()),
+        ];
+        if method == "PUT" || method == "POST" {
+            headers.push(("content-length".into(), body.len().to_string()));
+        }
+        headers.sort();
+        let signed: Vec<String> = headers.iter().map(|(k, _)| k.clone()).collect();
+        let sig = silo::sigv4::sign_request(
+            method,
+            path,
+            query,
+            &headers,
+            &payload,
+            &w.access_key_id,
+            &w.secret,
+            &w.region,
+            &date,
+        );
+        let stamp: String = date.chars().take(8).collect();
+        let uri = if query.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{path}?{query}")
+        };
+        let mut request = http_client()
+            .request(method.parse().unwrap(), format!("{to}{uri}"))
+            .header("x-pistack-forward", "leader")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={}/{stamp}/{}/s3/aws4_request, SignedHeaders={}, Signature={sig}",
+                    w.access_key_id,
+                    w.region,
+                    signed.join(";")
+                ),
+            );
+        for (k, v) in &headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+        let answer = request.body(body.to_vec()).send().await.unwrap();
+        let status = answer.status().as_u16();
+        let bytes = answer.bytes().await.unwrap().to_vec();
+        (status, bytes)
+    }
+
+    fn extract_code(body: &[u8]) -> String {
+        let text = String::from_utf8_lossy(body).into_owned();
+        text.split("<Code>")
+            .nth(1)
+            .and_then(|s| s.split("</Code>").next())
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    async fn signed_put(
+        w: &Signed,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        host: &str,
+    ) -> (u16, Vec<u8>) {
+        signed_send(w, &w.follower_api, "PUT", path, query, body, host).await
+    }
+
+    async fn signed_post(
+        w: &Signed,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        host: &str,
+    ) -> (u16, Vec<u8>) {
+        signed_send(w, &w.follower_api, "POST", path, query, body, host).await
+    }
+
+    /// The headers of the hop the request is leaving are the only ones a
+    /// carrier may take off, so a header the caller signed reaches the
+    /// leader as it was sent.
+    #[test]
+    fn only_the_hops_headers_are_taken_off_a_carried_request() {
+        let headers: axum::http::HeaderMap = [
+            ("connection", "keep-alive, X-Hold"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-authorization", "Basic zzz"),
+            ("te", "trailers"),
+            ("trailer", "x-amz-checksum-crc32c"),
+            ("transfer-encoding", "chunked"),
+            ("x-hold", "dropped by the Connection line"),
+            ("x-pistack-forward", "leader"),
+            ("x-pistack-node", "sim2"),
+            ("x-pistack-client-addr", "203.0.113.7"),
+            ("x-pistack-cluster", "the carrier's key"),
+            ("x-amz-date", "20261115T000000Z"),
+            ("x-amz-content-sha256", "abcd"),
+            ("x-amz-trailer", "x-amz-checksum-crc32c"),
+            ("if-match", "\"etag\""),
+            ("x-request-id", "r-1"),
+        ]
+        .iter()
+        .map(|(n, v)| {
+            (
+                axum::http::HeaderName::from_lowercase(n.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            )
+        })
+        .collect();
+        let mut gone = hop_by_hop(&headers);
+        gone.extend(CARRIED_HEADERS.iter().cloned());
+        let kept: Vec<String> = headers
+            .keys()
+            .filter(|name| !gone.contains(name))
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "x-pistack-forward",
+                "x-amz-date",
+                "x-amz-content-sha256",
+                "x-amz-trailer",
+                "if-match",
+                "x-request-id",
+            ]
+        );
+        // `host` is not in the list: whether it goes is decided by who signed
+        // the request, not by the hop.
+        assert!(!gone.contains(&axum::http::header::HOST));
+    }
+
+    /// Only a request the client signed itself may carry its own `host` on.
+    #[test]
+    fn only_a_signed_object_request_carries_its_host() {
+        let host = axum::http::header::HOST;
+        let auth = axum::http::header::AUTHORIZATION;
+        let named = |uri: &str, authorization: Option<&str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(host.clone(), "s3.example:8443".parse().unwrap());
+            if let Some(value) = authorization {
+                headers.insert(auth.clone(), value.parse().unwrap());
+            }
+            carry_signed_host(&uri.parse().unwrap(), &headers)
+        };
+        let signed = "AWS4-HMAC-SHA256 Credential=AKIA/20261115/us-east-1/s3/aws4_request, \
+                      SignedHeaders=host, Signature=aa";
+        assert!(named("/silo/widgets/k.txt", Some(signed)));
+        // A presigned request carries no header: its credential is in the query.
+        assert!(named(
+            "/silo/widgets/k.txt?X-Amz-Credential=AKIA%2F20261115%2Fus-east-1%2Fs3%2Faws4_request",
+            None
+        ));
+        // A bearer token proves the caller by itself, so the name the request
+        // was sent to is not part of it and must not be carried over.
+        assert!(!named("/silo/widgets/k.txt", Some("Bearer piq_abc")));
+        assert!(!named("/silo/widgets/k.txt", None));
+        // Outside the S3 surface nothing is signed against the name.
+        assert!(!named("/identity/projects", Some(signed)));
+        assert!(!named("/siloevil/k", Some(signed)));
+        // A request that named no host has nothing to carry.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(auth.clone(), signed.parse().unwrap());
+        assert!(!carry_signed_host(
+            &"/silo/widgets/k.txt".parse().unwrap(),
+            &headers
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_signed_write_carried_to_the_leader_still_verifies() {
+        let w = signed_cluster().await;
+        // The name the client was told to use. It reaches nothing: the
+        // leader answers on a port the client never learned, which is the
+        // whole reason the request is being carried.
+        let host = "s3.example:8443";
+        let path = "/silo/widgets/carried.txt";
+        let payload = b"carried payload";
+        let (status, body) = signed_put(&w, path, "", payload, host).await;
+        assert_eq!(status, 200, "{status}: {}", String::from_utf8_lossy(&body));
+        let objects = silo::Client::new(w.store.clone(), &w.objects);
+        let (_, bytes) = objects.get_object(&w.bucket, "carried.txt").await.unwrap();
+        assert_eq!(bytes, payload);
+
+        // A POST with a body: create the upload, then complete it with the
+        // part written above. Both are carried, both are signed.
+        let (status, body) = signed_post(&w, path, "uploads", b"", host).await;
+        assert_eq!(status, 200, "{status}: {}", String::from_utf8_lossy(&body));
+        let upload = String::from_utf8_lossy(&body)
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|s| s.split("</UploadId>").next())
+            .expect("an upload id")
+            .to_owned();
+        let (status, body) = signed_put(
+            &w,
+            path,
+            &format!("partNumber=1&uploadId={upload}"),
+            b"abcdefgh",
+            host,
+        )
+        .await;
+        assert_eq!(status, 200, "{status}: {}", String::from_utf8_lossy(&body));
+        let (_, body) = signed_post(&w, path, &format!("uploadId={upload}"), b"", host).await;
+        // An empty complete-list is refused, and refused by the handler that
+        // checks the body — past the signature.
+        assert_eq!(
+            extract_code(&body),
+            "InvalidRequest",
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A request with no body is carried as well as one with a body: its
+        // signature covers `host` too, and it still verifies on the leader.
+        // A read of something that is not there proves the whole chain ran:
+        // the caller was resolved from the key before the key was looked up.
+        let (status, body) = signed_send(
+            &w,
+            &w.follower_api,
+            "GET",
+            "/silo/widgets/not-here.txt",
+            "",
+            b"",
+            host,
+        )
+        .await;
+        assert_eq!(status, 404, "{status}: {}", String::from_utf8_lossy(&body));
+    }
+
+    /// A SigV4 request the client signs for a name the leader does not
+    /// answer on — the usual case, since a client that could reach the
+    /// leader would not ask a follower to carry anything. It is the leader
+    /// that checks the signature, so the carried request has to reach it
+    /// with every header the client signed, `host` among them.
     #[tokio::test]
     async fn a_follower_carries_a_write_to_the_leader_when_asked() {
         let (sim, sim2, sim3) = three_voters(4).await;
