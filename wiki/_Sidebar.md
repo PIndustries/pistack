@@ -12,6 +12,7 @@
 - [Agents and hosts](Agents-and-hosts)
 - [Networking](Networking)
 - [Storage](Storage)
+- [Stacks and parameters](Stacks-and-parameters)
 - [Identity and access](Identity-and-access)
 - [Metrics and alarms](Metrics-and-alarms)
 

@@ -16,6 +16,13 @@ use tower::ServiceExt;
 fn router(dir: &std::path::Path) -> axum::Router {
     let (events, _rx) = tokio::sync::broadcast::channel(64);
     let store = Store::open(dir.join("blueprint.redb"), events).expect("temp store");
+    mounted(store)
+}
+
+/// The blueprint and fabric routes over one store, so a test can apply a stack
+/// and then read the rows it wrote.
+fn mounted(store: Store) -> axum::Router {
+    let (events, _rx) = tokio::sync::broadcast::channel(64);
     let ctx = ModuleContext {
         store: Arc::new(store.clone()),
         events: store.events(),
@@ -27,7 +34,17 @@ fn router(dir: &std::path::Path) -> axum::Router {
     let module = Blueprint;
     assert_eq!(module.info().name, "blueprint");
     assert_eq!(module.info().prefix, "blueprint");
-    module.router(ctx)
+    let fabric_ctx = ModuleContext {
+        store: ctx.store.clone(),
+        events,
+        shutdown: pistack_types::module::CancellationToken::new(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    module
+        .router(ctx)
+        .nest("/network", fabric::Fabric::default().router(fabric_ctx))
 }
 
 async fn call(
@@ -77,7 +94,7 @@ async fn call_if_match(
 async fn create_apply_and_reject_empty_document() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = router(dir.path());
-    let document = r#"{"kind":"network","name":"app","spec":{}}"#;
+    let document = r#"{"kind":"network","name":"{{ param.size }}","spec":{}}"#;
 
     let (status, created) = call(
         &app,
@@ -88,6 +105,7 @@ async fn create_apply_and_reject_empty_document() {
             "spec": {
                 "name": "web",
                 "document": document,
+                "declared": [{"name": "size", "default": "tiny", "description": "network name"}],
                 "parameters": {"size": "small"}
             }
         })),
@@ -111,6 +129,7 @@ async fn create_apply_and_reject_empty_document() {
     assert_eq!(created_ids.len(), 1, "{applied}");
     let net_id = created_ids[0].as_str().unwrap();
     assert!(net_id.starts_with("net-"), "{net_id}");
+    assert_eq!(net_name(&app, net_id).await, "small");
     assert!(
         applied["status"]["message"]
             .as_str()
@@ -119,8 +138,8 @@ async fn create_apply_and_reject_empty_document() {
         "{applied}"
     );
     assert_eq!(applied["spec"]["document"], document);
-    // One write marks the stack applying, one stores the result.
-    assert_eq!(applied["revision"], 3);
+    // The applying mark and the result are stored by one write.
+    assert_eq!(applied["revision"], 2);
 
     let (status, rejected) = call(
         &app,
@@ -406,4 +425,410 @@ async fn missing_caller_is_unauthorized() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"]["code"], "unauthorized");
     assert_eq!(body["error"]["message"], "no credentials");
+}
+
+/// The name a network row carries. The store is open to the router, so the
+/// row is read over HTTP from the fabric routes on the same store.
+async fn net_name(app: &axum::Router, id: &str) -> String {
+    let (status, net) = call(app, "GET", &format!("/network/networks/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{net}");
+    net["name"].as_str().expect("network name").to_owned()
+}
+
+/// The mtu a network row carries.
+async fn net_mtu(app: &axum::Router, id: &str) -> u64 {
+    let (status, net) = call(app, "GET", &format!("/network/networks/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{net}");
+    net["spec"]["mtu"].as_u64().expect("network mtu")
+}
+
+/// A stack whose network is named from `size` and whose mtu comes from `mtu`.
+fn param_doc() -> &'static str {
+    "kind: network\nname: \"{{ param.size }}-net\"\nspec:\n  mtu: \"{{ param.mtu }}\"\n"
+}
+
+fn declared() -> Value {
+    json!([
+        {"name": "size", "default": "small", "description": "how the network is named"},
+        {"name": "mtu", "default": "1450"}
+    ])
+}
+
+#[tokio::test]
+async fn a_value_is_substituted_where_the_document_names_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "web",
+            "spec": {
+                "name": "web",
+                "document": param_doc(),
+                "declared": declared(),
+                "parameters": {"size": "big", "mtu": "1500"}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["spec"]["document"], param_doc());
+
+    let (status, applied) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["status"]["phase"], "ready");
+    let net_id = applied["status"]["created"][0].as_str().unwrap();
+    assert_eq!(net_name(&app, net_id).await, "big-net");
+    // The stored document keeps its references; only the rows are substituted.
+    assert_eq!(applied["spec"]["document"], param_doc());
+}
+
+#[tokio::test]
+async fn a_default_is_used_when_no_value_is_given() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "web",
+            "spec": {
+                "name": "web",
+                "document": param_doc(),
+                "declared": declared(),
+                "parameters": {"size": "big"}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap();
+
+    let (status, applied) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    let net_id = applied["status"]["created"][0].as_str().unwrap();
+    assert_eq!(net_name(&app, net_id).await, "big-net");
+
+    // The mtu default reaches the row as the number 1450, not the text.
+    assert_eq!(net_mtu(&app, net_id).await, 1450);
+}
+
+#[tokio::test]
+async fn a_missing_value_without_a_default_is_refused_before_any_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "web",
+            "spec": {
+                "name": "web",
+                "document": param_doc(),
+                "declared": [
+                    {"name": "size", "default": "small", "description": "how the network is named"},
+                    {"name": "mtu"}
+                ]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, failed) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{failed}");
+    let message = failed["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("mtu") && message.contains("default"),
+        "{failed}"
+    );
+
+    let (status, stored) = call(&app, "GET", &format!("/stacks/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    assert_eq!(stored["status"]["phase"], "accepted", "{stored}");
+    assert!(stored["status"]["managed"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_value_for_an_undeclared_parameter_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, refused) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "web",
+            "spec": {
+                "name": "web",
+                "document": param_doc(),
+                "declared": declared(),
+                "parameters": {"colour": "blue"}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("colour"),
+        "{refused}"
+    );
+
+    let (status, listed) = call(&app, "GET", "/stacks", None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(listed["items"].as_array().unwrap().is_empty(), "{listed}");
+}
+
+#[tokio::test]
+async fn a_reference_to_an_undeclared_parameter_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "web",
+            "spec": {
+                "name": "web",
+                "document": "kind: network\nname: \"{{ param.gone }}\"\nspec: {}\n",
+                "declared": [],
+                "parameters": {}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, failed) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{failed}");
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("gone"),
+        "{failed}"
+    );
+    let (status, stored) = call(&app, "GET", &format!("/stacks/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    assert_eq!(stored["status"]["phase"], "accepted", "{stored}");
+}
+
+#[tokio::test]
+async fn a_reference_where_no_value_belongs_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    for (stack, document) in [
+        ("kinded", "kind: \"{{ param.k }}\"\nname: n\nspec: {}\n"),
+        (
+            "keyed",
+            "kind: network\nname: n\nspec:\n  \"{{ param.k }}\": local\n",
+        ),
+    ] {
+        let (status, created) = call(
+            &app,
+            "POST",
+            "/stacks",
+            Some(json!({
+                "name": stack,
+                "spec": {
+                    "name": stack,
+                    "document": document,
+                    "declared": [{"name": "k", "default": "network"}]
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_str().unwrap().to_owned();
+
+        let (status, failed) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{stack}: {failed}");
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("where a value belongs"),
+            "{stack}: {failed}"
+        );
+        let (status, stored) = call(&app, "GET", &format!("/stacks/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{stored}");
+        assert_eq!(stored["status"]["phase"], "accepted", "{stack}: {stored}");
+    }
+}
+
+#[tokio::test]
+async fn a_changed_value_updates_only_the_rows_that_use_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, named) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "named",
+            "spec": {
+                "name": "named",
+                "document": "kind: network\nname: \"{{ param.size }}-net\"\nspec: {}\n",
+                "declared": [{"name": "size", "default": "small"}]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{named}");
+    let named_id = named["id"].as_str().unwrap().to_owned();
+    let (status, first) = call(&app, "POST", &format!("/stacks/{named_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let old_net = first["status"]["created"][0].as_str().unwrap().to_owned();
+    assert_eq!(net_name(&app, &old_net).await, "small-net");
+
+    let (status, edited) = call(
+        &app,
+        "PUT",
+        &format!("/stacks/{named_id}"),
+        Some(json!({"spec": {
+            "name": "named",
+            "document": "kind: network\nname: \"{{ param.size }}-net\"\nspec: {}\n",
+            "declared": [{"name": "size", "default": "small"}],
+            "parameters": {"size": "big"}
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let (status, second) = call(&app, "POST", &format!("/stacks/{named_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    // The old row is no longer named by the document, so it goes and a new one
+    // comes: the stack now manages one network, not two.
+    assert_eq!(second["status"]["created"].as_array().unwrap().len(), 1);
+    assert_eq!(second["status"]["managed"].as_array().unwrap().len(), 1);
+    assert_ne!(second["status"]["managed"][0], serde_json::json!(old_net));
+    let gone = second["status"]["managed"][0].as_str().unwrap().to_owned();
+    assert_eq!(net_name(&app, &gone).await, "big-net");
+
+    // A stack whose only reference is in a value keeps its row and updates it.
+    let (status, sized) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "sized",
+            "spec": {
+                "name": "sized",
+                "document": "kind: network\nname: kept-net\nspec:\n  mtu: \"{{ param.mtu }}\"\n",
+                "declared": [{"name": "mtu", "default": "1450"}]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{sized}");
+    let sized_id = sized["id"].as_str().unwrap().to_owned();
+    let (status, first) = call(&app, "POST", &format!("/stacks/{sized_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let net_id = first["status"]["created"][0].as_str().unwrap().to_owned();
+
+    let (status, edited) = call(
+        &app,
+        "PUT",
+        &format!("/stacks/{sized_id}"),
+        Some(json!({"spec": {
+            "name": "sized",
+            "document": "kind: network\nname: kept-net\nspec:\n  mtu: \"{{ param.mtu }}\"\n",
+            "declared": [{"name": "mtu", "default": "1450"}],
+            "parameters": {"mtu": "1500"}
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let (status, second) = call(&app, "POST", &format!("/stacks/{sized_id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert!(second["status"]["created"].as_array().unwrap().is_empty());
+    assert_eq!(second["status"]["updated"], json!([net_id]), "{second}");
+    assert_eq!(second["status"]["managed"], json!([net_id]));
+
+    assert_eq!(net_mtu(&app, &net_id).await, 1500);
+    // The other stack's network was not touched by this apply: it still
+    // carries the name the value gave it.
+    assert_eq!(net_name(&app, &gone).await, "big-net");
+}
+
+#[tokio::test]
+async fn history_and_rollback_keep_each_revisions_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(dir.path());
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/stacks",
+        Some(json!({
+            "name": "web",
+            "spec": {
+                "name": "web",
+                "document": param_doc(),
+                "declared": declared(),
+                "parameters": {"size": "small", "mtu": "1450"}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, first) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let net_id = first["status"]["created"][0].as_str().unwrap().to_owned();
+    assert_eq!(net_name(&app, &net_id).await, "small-net");
+
+    let (status, edited) = call(
+        &app,
+        "PUT",
+        &format!("/stacks/{id}"),
+        Some(json!({"spec": {
+            "name": "web",
+            "document": param_doc(),
+            "declared": declared(),
+            "parameters": {"size": "big", "mtu": "1500"}
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let (status, second) = call(&app, "POST", &format!("/stacks/{id}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["status"]["revision"], 2);
+    assert_eq!(second["status"]["created"].as_array().unwrap().len(), 1);
+    let big_net = second["status"]["managed"][0].as_str().unwrap().to_owned();
+    assert_eq!(net_name(&app, &big_net).await, "big-net");
+
+    let history = second["status"]["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2, "{second}");
+    assert_eq!(history[0]["spec"]["parameters"]["size"], "small");
+    assert_eq!(history[0]["spec"]["parameters"]["mtu"], "1450");
+    assert_eq!(history[1]["spec"]["parameters"]["size"], "big");
+    assert_eq!(history[1]["spec"]["parameters"]["mtu"], "1500");
+    assert_eq!(history[0]["spec"]["declared"], declared());
+
+    let (status, back) = call(&app, "POST", &format!("/stacks/{id}/rollback"), None).await;
+    assert_eq!(status, StatusCode::OK, "{back}");
+    assert_eq!(back["spec"]["parameters"]["size"], "small");
+    assert_eq!(back["spec"]["parameters"]["mtu"], "1450");
+    assert_eq!(back["status"]["revision"], 3);
+    let rolled = back["status"]["managed"][0].as_str().unwrap();
+    assert_eq!(net_name(&app, rolled).await, "small-net");
 }
