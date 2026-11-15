@@ -36,6 +36,8 @@ pi user list
 
 Only an admin can create, list or delete principals. A principal can change its own password and email. Passwords are stored as argon2id hashes.
 
+A password being set is measured then, not later: at least 12 characters, and not the principal's name in any case. A password already stored is verified as it was stored, so a password set before the rule keeps working at sign-in. A refusal says which of the two the password failed. `PISTACK_ADMIN_PASSWORD` is measured the same way, and a server told to found itself with a password too short to keep says so and does not start.
+
 A service account is a principal for a program. It is meant to authenticate with an API key instead of a password.
 
 ## Projects and scope
@@ -137,6 +139,22 @@ pi login http://10.0.0.11:8443 --name alice
 - A token carries the principal and project. On every request the server checks that the principal still exists and is enabled, and reads its roles.
 
 Disabling or deleting a principal refuses its tokens from the next request, with `401 token revoked`.
+
+### Failing a password too often
+
+Two counts are kept, and either one brings a refusal down.
+
+Ten failed password sign-ins for one name from one client address inside 15 minutes stop that name being tried *from that address* for the rest of the window. Another address can still sign in to that name with the right password. This is the point: the wall counts the guesser, not the name, so nobody who merely knows the admin's name can hold the admin out of the admin's own account by failing at it ten times every quarter hour.
+
+The address counted is the one the audit log records for the request — the address of the connection the gateway accepted, or, where a server of the cluster carried the request, the client behind it. A sign-in that works clears the count for its own address and that address alone; other addresses keep what they have accumulated, because one address getting in says nothing about another.
+
+Two hundred failures for one name from any address inside 15 minutes stop that name being tried from everywhere for the rest of the window. This is the ceiling for a caller spreading its guesses over many addresses, one or a few from each: no single address ever reaches its own ten, and the name's total still fills. It is deliberately far above what one user signing in badly can reach, so the cost of the wider wall falls on a distributed guesser and not on a person who mistypes.
+
+What is counted is the name in the request, so a name no principal holds is counted too and answered the same way: the wall cannot be read as a list of the names the cloud holds. While a count says no, the attempt is refused with `429` and the code `rate_limited`, with a `Retry-After` header naming the seconds left, before the store is read and before any password is checked, and the reply says nothing about whether the name exists and nothing about which of the two counts refused.
+
+Both counts are in one server's memory, not in the store: every server keeps its own, and a restart starts clean. A caller who can reach every server gets those ceilings per server, not per cloud. A refusal is written to the audit log like any other refusal, with the name that was tried and no id. Logging in with an API key is not counted and is never held out: a key is not a guessable secret.
+
+Both counts are bounded in memory, so a caller inventing names or addresses cannot grow a server's tables past `MAX_NAMES` and `MAX_COUNTS`; a name or address that is tried again after its table has been walked past is simply counted afresh.
 
 A single token cannot be cancelled. The server keeps no list of the tokens it has issued, so there is nothing to mark. What you can do is refuse every token one user holds:
 

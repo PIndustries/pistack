@@ -24,6 +24,10 @@
 //! ```
 //!
 //! `{id}` accepts a name or an id. `PUT` honours `If-Match: <revision>`.
+//!
+//! A name being signed in to is counted against the address the audit log
+//! will record it from — `ClientAddr`, or the client behind a carrier when
+//! one of this cluster carried the request. See [`lockout`].
 
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Query, Request, State},
@@ -37,9 +41,14 @@ use pistack_store::{Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Caller, Id, ListQuery, Meta, Page};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+
+/// Failed sign-ins per name, shared by every handler of this server.
+type Lockouts = Arc<Mutex<lockout::Lockouts>>;
 
 use crate::{
-    binding_name, credentials, paginate, policy,
+    binding_name, credentials, lockout, paginate, policy,
     token::{AuthCaller, DEFAULT_TTL, MAX_TTL},
     types::*,
     AppState, TryGetByName,
@@ -193,12 +202,16 @@ pub struct TokenResponse {
 /// A login has no caller, so the handler says who it was for. The audit
 /// layer reads this off the response: the principal and key once they are
 /// known, or the name that was tried. Never the password or the key secret.
-async fn login(State(st): State<AppState>, Body(req): Body<TokenRequest>) -> Response {
+async fn login(
+    State(st): State<AppState>,
+    from: crate::audit::SigninAddr,
+    Body(req): Body<TokenRequest>,
+) -> Response {
     let mut subject = crate::audit::Subject {
         principal: req.name.clone().filter(|_| req.api_key.is_none()),
         ..Default::default()
     };
-    let mut response = match issue_login(&st, req, &mut subject) {
+    let mut response = match issue_login(&st, from.0, req, &mut subject) {
         Ok(token) => Json(token).into_response(),
         Err(err) => err.into_response(),
     };
@@ -208,6 +221,7 @@ async fn login(State(st): State<AppState>, Body(req): Body<TokenRequest>) -> Res
 
 fn issue_login(
     st: &AppState,
+    from: IpAddr,
     req: TokenRequest,
     subject: &mut crate::audit::Subject,
 ) -> ApiResult<TokenResponse> {
@@ -241,16 +255,47 @@ fn issue_login(
             .password
             .as_deref()
             .ok_or_else(|| ApiError::bad_request("password required"))?;
-        let p = store
-            .collection::<Principal>()
-            .try_get_by_name(name)?
-            .ok_or_else(invalid)?;
-        let hash = p.spec.password_hash.as_deref().ok_or_else(invalid)?;
-        if !credentials::verify_password(password, hash) {
-            tracing::info!(principal = name, "failed password login");
+        // Both counts for the name are consulted before the store is read, so
+        // a name being worked over is refused without a password check and a
+        // refusal says nothing about whether the name exists. The wait a
+        // caller is in is its own address's or the name's, never another
+        // address's. A login with an API key never touches either count.
+        let now = Utc::now();
+        let name = name.to_owned();
+        if let Some(wait) = held(&st.lockouts, &name, from, now) {
+            subject.principal = Some(name);
+            tracing::info!("sign-in refused: the name is in a wait after failed attempts");
+            return Err(too_many(wait));
+        }
+        let p = store.collection::<Principal>().try_get_by_name(&name)?;
+        let hash = p
+            .as_ref()
+            .filter(|p| p.spec.kind == PrincipalKind::User)
+            .and_then(|p| p.spec.password_hash.as_deref());
+        // A principal with no password of its own has nothing to sign in with
+        // on any server, and is refused as one in a wait is.
+        if p.as_ref().is_some_and(|p| !p.spec.enabled) {
+            subject.principal = Some(name);
             return Err(invalid());
         }
-        (p, None, None)
+        // A name that is not there, a service account and a wrong password are
+        // all counted and answered the same, so the wall cannot be used to
+        // find out which names the cloud holds.
+        if !hash.is_some_and(|h| credentials::verify_password(password, h)) {
+            // The name that was tried, and nobody's id: a failure that named
+            // an id would say whether the cloud holds that name.
+            let locked = failed(&st.lockouts, &name, from, Utc::now());
+            subject.principal = Some(name);
+            tracing::info!("failed password login");
+            if locked {
+                return Err(too_many(crate::lockout::WINDOW));
+            }
+            return Err(invalid());
+        }
+        let principal = p.expect("a password was verified against it");
+        succeeded(&st.lockouts, &name, from);
+        subject.principal = Some(name);
+        (principal, None, None)
     };
 
     // A project that was asked for, or that a key names, must be one the
@@ -276,6 +321,42 @@ fn issue_login(
     subject.principal_id = Some(principal.meta.id.clone());
     subject.project = project.clone();
     issue_token(st, &principal, project, key, ttl)
+}
+
+/// How long this name must be waited on, `None` when it may be tried now from
+/// `from`. The lockout tables are this process's own; a poisoned one is
+/// treated as empty rather than taking sign-ins down with it.
+fn held(lockouts: &Lockouts, name: &str, from: IpAddr, now: DateTime<Utc>) -> Option<Duration> {
+    let guard = lockouts.as_ref().lock().unwrap_or_else(|e| e.into_inner());
+    match guard.attempt(name, from, now) {
+        lockout::Attempt::Try => None,
+        lockout::Attempt::Locked(left) => Some(left),
+    }
+}
+
+/// Count a failed password attempt against the name and the address it came
+/// from. Says whether this one brought a wait down.
+fn failed(lockouts: &Lockouts, name: &str, from: IpAddr, now: DateTime<Utc>) -> bool {
+    let mut guard = lockouts.as_ref().lock().unwrap_or_else(|e| e.into_inner());
+    guard.failed(name, from, now)
+}
+
+/// A sign-in that worked clears what was counted for the name from the
+/// address that signed in, and that address alone.
+fn succeeded(lockouts: &Lockouts, name: &str, from: IpAddr) {
+    let mut guard = lockouts.as_ref().lock().unwrap_or_else(|e| e.into_inner());
+    guard.succeeded(name, from);
+}
+
+/// The refusal for a name in a wait. Nothing about the password is known or
+/// said: the attempt was refused before it was looked at. Whether the wait is
+/// the caller's address's or the name's is not said either — that would tell
+/// a caller which address it arrived from.
+fn too_many(left: Duration) -> ApiError {
+    ApiError::rate_limited(
+        "too many failed sign-ins for this name; try again later",
+        left,
+    )
 }
 
 /// Resolve roles from bindings and sign a token. Library entry point so
@@ -800,8 +881,13 @@ async fn create_principal(
         Some(p) => Some(crate::resolve_project(&st.store, p)?.meta.id),
         None => None,
     };
+    // The rule is asked of the name the principal will be called, and only
+    // here: a password already stored is verified as it was stored.
     let password_hash = match req.password.as_deref() {
-        Some(pw) => Some(credentials::hash_password(pw)?),
+        Some(pw) => {
+            credentials::check_password(pw, &req.name)?;
+            Some(credentials::hash_password(pw)?)
+        }
         None => None,
     };
     let mut meta = Meta::new(kind::PRINCIPAL, req.name, None);
@@ -861,6 +947,7 @@ async fn update_principal(
         p.spec.email = Some(e);
     }
     if let Some(pw) = req.password.as_deref() {
+        credentials::check_password(pw, &p.meta.name)?;
         p.spec.password_hash = Some(credentials::hash_password(pw)?);
     }
     if let Some(e) = req.enabled {
