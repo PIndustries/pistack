@@ -277,6 +277,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ObjectCmd,
     },
+    /// Shared filesystems (shelf).
+    Share {
+        #[command(subcommand)]
+        cmd: super::share::ShareCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
