@@ -1,0 +1,50 @@
+  /* The launch wizard's lesson, made general: a plain display rule on a
+     class beats the hidden attribute, so the attribute is given the last
+     word for every element. */
+  [hidden] { display: none !important; }
+  /* display is only set when the section is shown. A plain display rule
+     beats the hidden attribute, which left the login card on top of the
+     console after sign-in. */
+  #login:not([hidden]) {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 1.5rem;
+    background: radial-gradient(900px 480px at 50% -10%, rgba(52, 199, 89, .10), transparent 60%);
+  }
+  /* The pi tile, as on the P.Industries site. */
+  .mark {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 0.5rem;
+    background: linear-gradient(150deg, #8df06a, #159a3c);
+    box-shadow: 0 0 16px rgba(75, 222, 128, .45);
+    color: #04130a;
+    font-size: 1.05rem;
+    font-weight: 900;
+    line-height: 1;
+  }
+  #login .mark { width: 2.4rem; height: 2.4rem; border-radius: 0.65rem; font-size: 1.4rem; }
+  #login h1 { display: flex; align-items: center; gap: 0.7rem; }
+  #login form, .card, form.create, .detail, .once, .tile, .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 1.25rem;
+  }
+  #login form { box-shadow: var(--shadow); }
+  #login form, .card { width: min(400px, 100%); }
+  #login button.primary { width: 100%; margin-top: 1rem; padding: 0.55rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }
+  h2, h3 { font-weight: 650; }
+  h2 { font-size: 1.2rem; margin: 0; letter-spacing: -0.01em; }
+  h3 { font-size: 0.82rem; margin: 1.4rem 0 0.5rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .sub { color: var(--muted); margin: 0 0 1rem; }
+  label { display: block; margin: 0.7rem 0 0.25rem; color: var(--muted); font-size: 0.8rem; }
+  input, select, textarea { width: 100%; }
+  textarea { min-height: 4.5rem; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+  .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: end; }
+  .row > * { flex: 1; min-width: 8rem; }

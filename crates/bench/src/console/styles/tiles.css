@@ -1,0 +1,20 @@
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.8rem; }
+  button.tile { display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; text-align: left; padding: 0.95rem 1rem; background: var(--panel); border-color: var(--line); min-height: 6.6rem; }
+  button.tile:hover:not(:disabled) { background: var(--panel-2); }
+  .tile .label { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tile .value { font-size: 1.7rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.25; font-variant-numeric: tabular-nums; }
+  .tile .value small { font-size: 0.85rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .tile .hint { color: var(--muted); font-size: 0.8rem; }
+  .tile .hint.bad { color: var(--bad); }
+  .meter { height: 6px; border-radius: 999px; background: var(--panel-2); overflow: hidden; margin: 0.45rem 0 0.3rem; border: 1px solid var(--line); }
+  .meter i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .meter.high i { background: var(--wait); }
+  .meter.full i { background: var(--bad); }
+  td .meter { width: 5rem; display: inline-block; vertical-align: middle; margin: 0 0.5rem 0 0; }
+  .panel td { white-space: nowrap; }
+  .panel table.wrap td:last-child { white-space: normal; }
+  .panel { padding: 0; overflow-x: auto; }
+  .panel > p { margin: 0; padding: 1.4rem; color: var(--muted); text-align: center; }
+  .panel table { border: 0; border-radius: 0; }
+  .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 0 1.2rem; }
+

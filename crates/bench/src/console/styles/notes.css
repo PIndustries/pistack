@@ -1,0 +1,11 @@
+  .rules { margin: 0.25rem 0 0; padding-left: 1.1rem; color: var(--muted); }
+  .detail { width: min(820px, 100%); }
+  .detail p { margin: 0.3rem 0; }
+  .detail .k { color: var(--muted); display: inline-block; min-width: 9.5rem; }
+  .once { color: var(--ok); border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 1rem; word-break: break-all; }
+  #err, #note, #login-err:not(:empty) { border-radius: 10px; padding: 0.6rem 0.9rem; margin: 0 0 1rem; }
+  #err { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad); display: none; }
+  #login-err:not(:empty) { background: var(--bad-bg); color: var(--bad); }
+  #note { color: var(--muted); border-left: 3px solid var(--line-strong); border-radius: 0; padding: 0.1rem 0 0.1rem 0.8rem; max-width: 70ch; }
+  #note:empty { display: none; }
+  .muted { color: var(--muted); }
