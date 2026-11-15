@@ -18,6 +18,10 @@ use std::time::Duration;
 
 const POLL: Duration = Duration::from_secs(1);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a wait keeps asking for a resource the same command just
+/// created, while the server it reads from has not caught up with the
+/// server that answered the create.
+const ABSENT_GRACE: Duration = Duration::from_secs(10);
 
 pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<i32> {
     match cmd {
@@ -292,7 +296,7 @@ async fn do_create(
     let v = c.post(k.path, &body).await?;
     report(ctx, io, k, &v, "created")?;
     if wait {
-        return wait_ready(&c, io, k, &str_at(&v, "/id")).await;
+        return wait_ready(&c, io, k, &Just::of(&v, "")).await;
     }
     Ok(v)
 }
@@ -304,7 +308,7 @@ async fn do_delete(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: DeleteArgs) -> Cl
         writeln!(io.stderr, "aborted")?;
         return Ok(());
     }
-    let (status, _) = c.delete(&path).await?;
+    let (status, v) = c.delete(&path).await?;
     let verb = if status == reqwest::StatusCode::ACCEPTED {
         "deletion requested"
     } else {
@@ -312,7 +316,7 @@ async fn do_delete(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: DeleteArgs) -> Cl
     };
     writeln!(io.stdout, "{} \"{}\" {verb}", k.noun, a.name)?;
     if a.wait && status == reqwest::StatusCode::ACCEPTED {
-        wait_gone(&c, io, k, &a.name).await?;
+        wait_gone(&c, io, k, &Just::of(&v, &a.name)).await?;
     }
     Ok(())
 }
@@ -336,12 +340,96 @@ async fn do_action(
     Ok(v)
 }
 
+/// A resource a command has just written: its id, and the name the user
+/// called it by. A server that does not lead answers reads from its own copy,
+/// which lags the one that took the write, so the row can be missing for a
+/// moment.
+#[derive(Clone)]
+struct Just {
+    id: String,
+    name: String,
+}
+
+impl Just {
+    /// The resource the create or action endpoint handed back.
+    fn of(v: &Value, name: &str) -> Just {
+        Just {
+            id: str_at(v, "/id"),
+            name: if name.is_empty() {
+                str_at(v, "/name")
+            } else {
+                name.to_owned()
+            },
+        }
+    }
+    /// How to ask for it: by id when there is one. The create and action
+    /// endpoints answer with the row they wrote, so the id in hand is that
+    /// row and reading by it cannot be answered from a name index that
+    /// reached this server earlier than the row did.
+    fn key(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        }
+    }
+    /// A 404 this command's own write arriving late could explain. A 404
+    /// about anything else is not that, and stays the error it looks like.
+    /// The server puts what it was asked for in the message, so a 404 that
+    /// names neither of this resource's two names is about a third thing.
+    fn could_be_my_row(&self, e: &CliError) -> bool {
+        let CliError::Api {
+            status: 404,
+            message,
+            details,
+            ..
+        } = e
+        else {
+            return false;
+        };
+        let key = self.key();
+        let names = [key, &self.name, &self.id];
+        names.iter().any(|n| !n.is_empty() && message.contains(*n))
+            || details
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == self.id)
+    }
+    /// What the user called this resource by.
+    fn says(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// The row of `just`, asked for again while the server's copy catches up. A
+/// 404 that could be about it is retried until the grace is up, then returned
+/// as the error it looks like. Anything else comes back at once.
+async fn read_just(c: &Client, k: &KindDef, just: &Just) -> CliResult<Value> {
+    let until = tokio::time::Instant::now() + ABSENT_GRACE;
+    loop {
+        match c.get_value(&k.item_path(just.key())).await {
+            Ok(v) => return Ok(v),
+            Err(e) if !just.could_be_my_row(&e) => return Err(e),
+            Err(e) => {
+                if tokio::time::Instant::now() >= until {
+                    return Err(e);
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        }
+    }
+}
+
 /// Poll until `status.phase` is `ready` or `error`, printing each change.
-async fn wait_ready(c: &Client, io: &mut Io<'_>, k: &KindDef, id: &str) -> CliResult<Value> {
+async fn wait_ready(c: &Client, io: &mut Io<'_>, k: &KindDef, just: &Just) -> CliResult<Value> {
     let start = tokio::time::Instant::now();
     let mut last = String::new();
     loop {
-        let v = c.get_value(&k.item_path(id)).await?;
+        let v = read_just(c, k, just).await?;
         let phase = str_at(&v, "/status/phase");
         if phase != last {
             let msg = str_at(&v, "/status/message");
@@ -380,27 +468,32 @@ async fn wait_ready(c: &Client, io: &mut Io<'_>, k: &KindDef, id: &str) -> CliRe
     }
 }
 
-async fn wait_gone(c: &Client, io: &mut Io<'_>, k: &KindDef, name: &str) -> CliResult<()> {
+/// Poll until the resource is gone. What the delete answered with is a row
+/// the server had a moment ago; a 404 naming something else is not this
+/// resource leaving but a copy that does not have it, so the row asked for is
+/// the one that answers.
+async fn wait_gone(c: &Client, io: &mut Io<'_>, k: &KindDef, just: &Just) -> CliResult<()> {
     let start = tokio::time::Instant::now();
     let mut last = String::new();
+    let says = just.says().to_owned();
     loop {
-        match c.get_value(&k.item_path(name)).await {
+        match c.get_value(&k.item_path(&just.name)).await {
             Ok(v) => {
                 let phase = str_at(&v, "/status/phase");
                 if phase != last {
-                    writeln!(io.stdout, "{} \"{name}\": {phase}", k.noun)?;
+                    writeln!(io.stdout, "{} \"{says}\": {phase}", k.noun)?;
                     last = phase;
                 }
             }
             Err(e) if e.is_not_found() => {
-                writeln!(io.stdout, "{} \"{name}\": gone", k.noun)?;
+                writeln!(io.stdout, "{} \"{says}\": gone", k.noun)?;
                 return Ok(());
             }
             Err(e) => return Err(e),
         }
         if start.elapsed() > WAIT_TIMEOUT {
             return Err(CliError::usage(format!(
-                "timed out waiting for {} \"{name}\" to go away",
+                "timed out waiting for {} \"{says}\" to go away",
                 k.noun
             )));
         }
@@ -1704,14 +1797,15 @@ async fn power(
     if a.wait {
         let c = ctx.client()?;
         let want = if action == "stop" { "off" } else { "on" };
-        let id = str_at(&v, "/id");
+        let just = Just::of(&v, &a.name);
+        let says = just.says().to_owned();
         let start = tokio::time::Instant::now();
         let mut last = String::new();
         loop {
-            let cur = c.get_value(&k.item_path(&id)).await?;
+            let cur = read_just(&c, k, &just).await?;
             let p = str_at(&cur, "/status/power");
             if p != last {
-                writeln!(io.stdout, "machine \"{}\": power {p}", a.name)?;
+                writeln!(io.stdout, "machine \"{says}\": power {p}")?;
                 last = p.clone();
             }
             if p == want {
@@ -2754,6 +2848,46 @@ async fn stack(ctx: &Ctx, cmd: StackCmd, io: &mut Io<'_>) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_404_about_this_row_can_be_a_copy_that_lags() {
+        let gone = |msg: &str, id: Option<&str>| CliError::Api {
+            status: 404,
+            code: "not_found".into(),
+            message: msg.into(),
+            details: id.map_or_else(Default::default, |i| {
+                json!({"id": i}).as_object().unwrap().clone()
+            }),
+        };
+        let just = Just::of(&json!({"id": "mach-9", "name": "web"}), "");
+        assert_eq!(just.key(), "mach-9");
+        assert_eq!(just.says(), "web");
+        assert!(just.could_be_my_row(&gone("mach 'mach-9' not found", None)));
+        assert!(just.could_be_my_row(&gone("mach 'web' not found", None)));
+        assert!(just.could_be_my_row(&gone("mach 'x' not found", Some("mach-9"))));
+        // Some other row, or a row of another kind: not this command's doing.
+        assert!(!just.could_be_my_row(&gone("vol 'data' not found", None)));
+        assert!(!just.could_be_my_row(&gone("mach 'x' not found", Some("vol-1"))));
+        assert!(!just.could_be_my_row(&gone("no route", None)));
+        // A row with no id is asked for, and answered, by name.
+        let nameless = Just::of(&json!({"name": "web"}), "");
+        assert_eq!(nameless.key(), "web");
+        assert_eq!(nameless.says(), "web");
+        assert!(nameless.could_be_my_row(&gone("mach 'web' not found", None)));
+        assert!(!nameless.could_be_my_row(&gone("mach 'mach-9' not found", None)));
+        // Only a 404 can be a lag.
+        assert!(!just.could_be_my_row(&CliError::Api {
+            status: 410,
+            code: "gone".into(),
+            message: "mach-9 gone".into(),
+            details: Default::default(),
+        }));
+        // A delete names the resource the user asked for, whatever the
+        // server answered with.
+        let deleted = Just::of(&json!({"id": "mach-9"}), "web");
+        assert_eq!(deleted.says(), "web");
+        assert_eq!(deleted.key(), "mach-9");
+    }
 
     #[test]
     fn compact_drops_nulls_recursively() {
