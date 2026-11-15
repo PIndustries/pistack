@@ -1,0 +1,23 @@
+  #shell:not([hidden]) > div { min-width: 0; }
+  header {
+    display: flex; gap: 0.8rem; justify-content: space-between; align-items: center;
+    padding: 0.6rem 1.4rem; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .crumbs { display: flex; align-items: center; gap: 0.45rem; flex-shrink: 0; white-space: nowrap; }
+  .crumbs span { color: var(--muted); }
+  .crumbs span:not(:empty)::after { content: "/"; margin-left: 0.45rem; opacity: 0.6; }
+  .head-tools { display: flex; align-items: center; gap: 0.5rem; }
+  #filter { width: 13rem; font-size: 0.86rem; }
+  .live { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; font-size: 0.8rem; white-space: nowrap; cursor: pointer; }
+  .live input { width: auto; accent-color: var(--accent); }
+  .scope:not([hidden]) { display: flex; align-items: center; gap: 0.6rem; }
+  .scope label { display: flex; align-items: center; gap: 0.35rem; margin: 0; }
+  .scope label > span { font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+  .scope select { width: auto; max-width: 8.5rem; padding: 0.35rem 1.6rem 0.35rem 0.6rem; font-weight: 550; text-overflow: ellipsis; }
+  #who { color: var(--muted); font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16rem; }
+  #menu { display: none; }
+  header button { white-space: nowrap; }
+  main { padding: 1.3rem 1.4rem 3rem; min-width: 0; overflow-x: auto; }

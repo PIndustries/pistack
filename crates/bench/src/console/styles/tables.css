@@ -1,0 +1,13 @@
+
+  table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; padding: 0.55rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--hover); }
+  th { color: var(--muted); font-weight: 600; font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; background: var(--panel-2); white-space: nowrap; }
+  td button { padding: 0.22rem 0.55rem; font-size: 0.82rem; }
+  td.empty { color: var(--muted); text-align: center; padding: 2rem 1rem; }
+  .phase { text-transform: lowercase; white-space: nowrap; }
+  .phase:not(:empty)::before { content: ""; display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: currentColor; margin-right: 0.45rem; vertical-align: 0.05em; opacity: 0.9; }
+  .phase.ready, .phase.on, .phase.running, .phase.succeeded, .phase.ok, .phase.accepted { color: var(--ok); }
+  .phase.error, .phase.off, .phase.failed, .phase.firing { color: var(--bad); }
+  .phase.pending, .phase.creating, .phase.deleting, .phase.unknown { color: var(--wait); }

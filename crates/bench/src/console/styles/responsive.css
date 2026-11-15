@@ -1,0 +1,14 @@
+  @media (max-width: 860px) {
+    #login:not([hidden]) { padding: 1rem; }
+    #shell:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+    #side { position: fixed; z-index: 20; width: 260px; transform: translateX(-100%); transition: transform .16s; box-shadow: var(--shadow); }
+    #shell.nav-open #side { transform: none; }
+    #menu { display: inline-block; }
+    header { padding: 0.55rem 0.8rem; }
+    main { padding: 1rem 0.8rem 3rem; }
+    #filter { width: 100%; min-width: 4rem; }
+    .head-tools { min-width: 0; }
+    .scope label > span { display: none; }
+    .scope select { max-width: 7.5rem; }
+    #who, .live span { display: none; }
+  }

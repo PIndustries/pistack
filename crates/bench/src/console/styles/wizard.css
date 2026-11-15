@@ -1,0 +1,33 @@
+  /* The launch wizard: steps on the left, one step's choices on the right. */
+  /* Only when shown: a plain display rule beats the hidden attribute. */
+  form.wiz:not([hidden]) { display: grid; grid-template-columns: 12.5rem minmax(0, 1fr); gap: 0; padding: 0; overflow: hidden; }
+  .wiz .steps { border-right: 1px solid var(--line); padding: 1rem 0.6rem; background: var(--panel-2); display: flex; flex-direction: column; gap: 0.15rem; }
+  .wiz .steps strong { padding: 0 0.6rem 0.7rem; font-size: 1rem; }
+  .wiz .steps button { display: flex; align-items: center; gap: 0.6rem; text-align: left; background: none; border: 0; padding: 0.5rem 0.6rem; border-radius: 8px; color: var(--muted); }
+  .wiz .steps button:hover:not(:disabled) { background: var(--hover); border-color: transparent; }
+  .wiz .steps button[aria-current="step"] { background: var(--active); color: var(--text); }
+  .wiz .steps .n { flex: none; width: 1.35rem; height: 1.35rem; border-radius: 50%; display: grid; place-items: center; font-size: 0.72rem; font-weight: 700; border: 1px solid var(--line-strong); }
+  .wiz .steps button.done .n { background: var(--accent); color: var(--ink); border-color: transparent; }
+  .wiz .steps button.missing .n { border-color: var(--bad); color: var(--bad); }
+  .wiz .body { padding: 1.1rem 1.3rem 1rem; min-width: 0; display: flex; flex-direction: column; min-height: 23rem; }
+  .wiz .body h4 { margin: 0 0 0.2rem; font-size: 1.05rem; }
+  .wiz .body .lead { color: var(--muted); margin: 0 0 1rem; font-size: 0.88rem; max-width: 70ch; }
+  .wiz .pane { flex: 1; }
+  .wiz .pane > .sub { margin: 0.8rem 0 0; font-size: 0.84rem; max-width: 75ch; }
+  .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.6rem; }
+  .opts button { display: block; text-align: left; padding: 0.7rem 0.85rem; background: var(--field); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+  .opts button b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .opts button span { display: block; color: var(--muted); font-size: 0.8rem; margin-top: 0.15rem; }
+  .opts button[aria-pressed="true"] { border-color: var(--accent); background: var(--active); box-shadow: inset 0 0 0 1px var(--accent); }
+  .opts button:disabled { opacity: 0.5; }
+  .opts .nothing { grid-column: 1 / -1; color: var(--muted); border: 1px dashed var(--line); border-radius: 10px; padding: 1.2rem; text-align: center; }
+  .wiz .foot { display: flex; align-items: center; gap: 0.5rem; margin-top: 1.1rem; padding-top: 0.9rem; border-top: 1px solid var(--line); }
+  .wiz .foot .sum { flex: 1; min-width: 0; color: var(--muted); font-size: 0.84rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wiz .foot .sum b { color: var(--text); font-weight: 550; }
+  .wiz .review { margin: 0; }
+  @media (max-width: 860px) {
+    form.wiz:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+    .wiz .steps { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    .wiz .steps strong { display: none; }
+    .wiz .steps button { white-space: nowrap; }
+  }

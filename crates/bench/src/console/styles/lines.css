@@ -1,0 +1,14 @@
+  .tabs { display: flex; gap: 0.2rem; border-bottom: 1px solid var(--line); margin: 0 0 1rem; overflow-x: auto; }
+  .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 0.55rem 0.85rem; color: var(--muted); font-weight: 550; white-space: nowrap; }
+  .tabs button:hover:not(:disabled) { color: var(--text); border-color: transparent; border-bottom-color: var(--line-strong); }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0 2rem; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0.6rem 1.1rem; }
+  .kv p { display: flex; gap: 1rem; margin: 0; padding: 0.5rem 0; border-bottom: 1px solid var(--line); min-width: 0; }
+  .kv .k { color: var(--muted); flex: 0 0 8.5rem; }
+  .kv .v { min-width: 0; overflow-wrap: anywhere; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86em; }
+  .strip { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0.7rem 0.9rem; margin: 0.8rem 0 1.2rem; }
+  .strip .name { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 0.4rem; }
+  .strip .srv { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0.65rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); font-size: 0.84rem; }
+  .strip .facts.bad { color: var(--bad); }
+  .strip .facts { margin-left: auto; color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }

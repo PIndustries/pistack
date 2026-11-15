@@ -1,0 +1,12 @@
+  .panel + .tools { margin: 0.8rem 0 0; }
+  .who-lines { padding: 0.2rem 1rem 0.7rem; }
+  .who-lines p { margin: 0.25rem 0; color: var(--muted); font-size: 0.85rem; }
+  .who-lines .mono { color: var(--text); }
+  .feed { list-style: none; margin: 0; padding: 0; }
+  .feed li { display: flex; gap: 0.8rem; align-items: baseline; padding: 0.6rem 1rem; border-bottom: 1px solid var(--line); min-width: 0; }
+  .feed li:last-child { border-bottom: 0; }
+  .feed .when { color: var(--muted); flex: 0 0 4.6rem; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .feed .what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed .what b { font-weight: 600; }
+  .feed .code { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .feed li.bad .code, .feed li.bad .what { color: var(--bad); }

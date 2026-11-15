@@ -1,0 +1,15 @@
+
+  /* Machine page and overview: header, tabs, charts, activity. */
+  .crumb { background: none; border: 0; padding: 0; color: var(--muted); font-size: 0.86rem; cursor: pointer; }
+  .crumb:hover:not(:disabled) { color: var(--text); border-color: transparent; }
+  .mhead { display: flex; align-items: flex-start; gap: 1rem; flex-wrap: wrap; margin: 0.5rem 0 1.1rem; }
+  .mhead .who { flex: 1; min-width: 14rem; }
+  .mhead h2 { font-size: 1.55rem; display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
+  .mhead .meta { color: var(--muted); margin: 0.35rem 0 0; font-size: 0.88rem; }
+  .mhead .meta b { color: var(--text); font-weight: 500; }
+  .mhead .acts { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.16rem 0.6rem; border-radius: 999px; border: 1px solid var(--line-strong); font-size: 0.74rem; font-weight: 600; letter-spacing: 0.02em; text-transform: lowercase; color: var(--muted); }
+  .pill::before { content: ""; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: currentColor; }
+  .pill.ready, .pill.on, .pill.running, .pill.leader { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 9%, transparent); }
+  .pill.error, .pill.failed, .pill.off { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: var(--bad-bg); }
+  .pill.pending, .pill.creating, .pill.deleting, .pill.updating { color: var(--wait); border-color: color-mix(in srgb, var(--wait) 40%, transparent); }
