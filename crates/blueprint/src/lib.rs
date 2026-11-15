@@ -4,7 +4,13 @@
 //! Declarative stacks, workflows and kits.
 //!
 //! A stack is a PiStack resource (`Resource<StackSpec, StackStatus>`): YAML
-//! or JSON text in `spec.document`, plus `spec.parameters`.
+//! or JSON text in `spec.document`, the parameters it declares in
+//! `spec.declared`, and the values given for them in `spec.parameters`.
+//! A value written `"{{ param.NAME }}"` in the document is replaced at apply
+//! with its value, or with its declared default when no value was given. An
+//! apply that has a value for nothing declared, a name nothing declares, or a
+//! parameter with neither a value nor a default is refused before any row is
+//! written, and the message names the parameter.
 //!
 //! [`Client::apply_stack`] re-validates the document and, when it is a YAML
 //! stream of resources (a single JSON object is a one-document stream),
