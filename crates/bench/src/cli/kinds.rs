@@ -134,25 +134,25 @@ fn host_path(v: &Value, _: DateTime<Utc>) -> String {
 
 macro_rules! col {
     ($h:literal, $f:ident) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
             get: $f,
         }
     };
     ($h:literal, $ptr:literal) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
-            get: |v, _| str_at(v, $ptr),
+            get: |v, _| $crate::cli::output::str_at(v, $ptr),
         }
     };
     ($h:literal, short $ptr:literal) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
-            get: |v, _| short_id(&str_at(v, $ptr)),
+            get: |v, _| $crate::cli::output::short_id(&$crate::cli::output::str_at(v, $ptr)),
         }
     };
     ($h:literal, list $ptr:literal) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
             get: |v, _| {
                 v.pointer($ptr)

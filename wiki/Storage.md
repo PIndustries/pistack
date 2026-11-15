@@ -138,6 +138,8 @@ Objects are files on the server's disk under `<data_dir>/silo`. There is one cop
 
 Requests are authenticated with a bearer token, or with AWS Signature Version 4 using an access key from `pi access-key create`. See [Identity and access](Identity-and-access).
 
+Buckets and objects also have native API and CLI commands: `pi bucket` for the buckets, `pi object` for the keys inside one. A get without `--out` streams the bytes to stdout, and a put streams the file up.
+
 ### What is implemented
 
 - `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects`
@@ -149,7 +151,7 @@ Requests are authenticated with a bearer token, or with AWS Signature Version 4 
 
 ### What is not
 
-- Bucket operations through S3. `CreateBucket`, `DeleteBucket` and `ListBuckets` are not there. Create buckets through the native API: `pi api POST /silo/buckets -d '{"name":"backups"}'`.
+- Bucket operations through S3. `CreateBucket`, `DeleteBucket` and `ListBuckets` are not there. Create buckets with `pi bucket create`, or through the native API: `pi api POST /silo/buckets -d '{"name":"backups"}'`.
 - `ListObjects` version 1.
 - ACLs, bucket policies, lifecycle rules, tagging, CORS, server-side encryption.
 - Reading old versions. A bucket can keep earlier generations of an object, but there is no call to fetch one.

@@ -664,6 +664,41 @@ pi backup restore <BACKUP>
 
 A new backup is `pending` while its bytes are uploaded and `ready` once they are stored. `pi backup create --wait` prints each phase and ends on `ready`; a failed upload ends with the reason. A restore needs a `ready` backup and returns once the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
 
+## pi bucket
+
+Object storage buckets.
+
+```text
+pi bucket list
+pi bucket show <NAME>
+pi bucket create <NAME>
+pi bucket delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `bucket create` | `--description <DESCRIPTION>` |  |
+| `bucket create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `bucket create` | `--versioning` | Keep the previous bytes when a key is written again |
+
+## pi object
+
+Objects in a bucket. A get without `--out` writes the bytes to stdout; a put streams the file up.
+
+```text
+pi object list <BUCKET> [--prefix <PREFIX>]
+pi object put <BUCKET> <KEY> <FILE>
+pi object get <BUCKET> <KEY> [--out <FILE>]
+pi object delete <BUCKET> <KEY>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `object list` | `--prefix <PREFIX>` | Only keys starting with this |
+| `object get` | `--out <FILE>` | Write to this file instead of stdout |
+| `object delete` | `-y, --yes` | Do not ask for confirmation |
+
+
 ## pi image
 
 Images.
@@ -927,7 +962,6 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | --- | --- |
 | DNS zones and records | `/dns` |
 | Secrets, certificates, certificate authorities | `/secrets` |
-| Buckets | `/silo/buckets` |
 | Shares | `/shelf` |
 | Alarms and posted samples | `/gauge` |
 

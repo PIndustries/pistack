@@ -267,6 +267,16 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: crate::cli::backup::BackupCmd,
     },
+    /// Object storage buckets.
+    Bucket {
+        #[command(subcommand)]
+        cmd: BucketCmd,
+    },
+    /// Objects in a bucket.
+    Object {
+        #[command(subcommand)]
+        cmd: ObjectCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -348,6 +358,16 @@ pub struct ListArgs {
     /// Label selector `key=value` (repeatable).
     #[arg(short = 'l', long = "selector", value_name = "K=V")]
     pub selector: Vec<String>,
+}
+
+/// A bucket whose keys are being listed.
+#[derive(Args, Debug, Default)]
+pub struct ObjectListArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Only keys starting with this.
+    #[arg(long)]
+    pub prefix: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1516,6 +1536,67 @@ crud!(
     /// Re-apply an earlier revision.
     Rollback(StackRollback),
 );
+
+// ---- object storage ----------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct BucketCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Keep the previous bytes when a key is written again.
+    #[arg(long)]
+    pub versioning: bool,
+}
+
+crud!(BucketCmd, BucketCreate);
+
+#[derive(Subcommand, Debug)]
+pub enum ObjectCmd {
+    /// List keys (or keys under a prefix).
+    #[command(alias = "ls")]
+    List(ObjectListArgs),
+    /// Upload a file under a key.
+    Put(ObjectPutArgs),
+    /// Read an object.
+    #[command(alias = "fetch")]
+    Get(ObjectGetArgs),
+    /// Delete an object.
+    #[command(alias = "rm")]
+    Delete(ObjectDeleteArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ObjectPutArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// File to upload.
+    pub file: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct ObjectGetArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// Write to this file instead of stdout (`-` is stdout).
+    #[arg(long = "out", value_name = "FILE")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ObjectDeleteArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
 
 #[cfg(test)]
 mod tests {
