@@ -17,8 +17,8 @@
 
 use axum::{
     body::{Body, HttpBody},
-    extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{FromRequestParts, Request, State},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -101,6 +101,34 @@ pub type AuditEvent = Resource<AuditSpec, AuditStatus>;
 /// sets it from the socket; a proxy in front shows up as the proxy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientAddr(pub IpAddr);
+
+/// The address a sign-in is counted against: the one the record of it will
+/// name. Where neither is known — a socket the gateway could not name, and no
+/// carrier either — the loopback address stands, so an attempt is always
+/// counted against something.
+pub struct SigninAddr(pub IpAddr);
+
+impl SigninAddr {
+    /// The address `record` would name for a request: the client a server of
+    /// this cluster carried it for, otherwise the connection's own peer. A
+    /// carrier's address is only ever put in an extension by a member of this
+    /// cluster, whose peer key was checked before the request was read.
+    pub fn of(ext: &axum::http::Extensions) -> Option<IpAddr> {
+        ext.get::<Carried>()
+            .map(|c| c.client)
+            .or_else(|| ext.get::<ClientAddr>().map(|c| c.0))
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for SigninAddr {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self::of(&parts.extensions).map_or(SigninAddr(LOCAL), SigninAddr))
+    }
+}
+
+/// The address a sign-in is counted against when nothing names one.
+const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// Request extension the gateway sets when a server of this cluster carried
 /// the request: the client behind it and the node id of the carrier. The
