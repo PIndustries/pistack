@@ -58,7 +58,11 @@ pub fn age(created: &str, now: DateTime<Utc>) -> String {
     }
 }
 
-/// Render a list of resources of one kind.
+/// Render a list of resources of one kind. Table rows are ordered by name:
+/// what a person reads must not shuffle between runs on whatever order the
+/// backend happened to scan in. `-o name`, `-o json` and `-o yaml` pass the
+/// page through as the module returned it, so a script sees the same stream it
+/// would get from `pi api`.
 pub fn print_list(out: &mut dyn Write, fmt: Format, kind: &KindDef, items: &[Value]) -> Result<()> {
     match fmt.output {
         Output::Json => {
@@ -73,6 +77,8 @@ pub fn print_list(out: &mut dyn Write, fmt: Format, kind: &KindDef, items: &[Val
             }
         }
         Output::Table | Output::Wide => {
+            let mut items: Vec<&Value> = items.iter().collect();
+            items.sort_by_key(|it| (str_at(it, "/name"), str_at(it, "/id")));
             let cols: Vec<&Column> = if fmt.output == Output::Wide {
                 kind.columns.iter().chain(kind.wide.iter()).collect()
             } else {
@@ -244,10 +250,11 @@ mod tests {
             lines[0].contains("PHASE") && lines[0].ends_with("AGE"),
             "{s}"
         );
-        assert!(lines[1].starts_with("web   mach-00000001  ready"), "{s}");
-        assert!(lines[1].contains("m.2x4") && lines[1].contains("10.1.0.5"));
-        assert!(lines[1].trim_end().ends_with("5m"), "{s}");
-        assert!(lines[2].starts_with("db    mach-00000003  pending"), "{s}");
+        // Rows come out by name, whatever order the page arrived in.
+        assert!(lines[1].starts_with("db    mach-00000003  pending"), "{s}");
+        assert!(lines[1].contains("postgres") && lines[1].trim_end().ends_with("5m"));
+        assert!(lines[2].starts_with("web   mach-00000001  ready"), "{s}");
+        assert!(lines[2].contains("m.2x4") && lines[2].contains("10.1.0.5"));
         // No trailing whitespace, no border characters.
         assert!(!s.contains('|') && !s.contains('+'));
         assert!(s.lines().all(|l| l == l.trim_end()));

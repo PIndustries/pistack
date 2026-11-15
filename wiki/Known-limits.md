@@ -101,7 +101,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 ## CLI
 
-- **No commands for** DNS, load balancers, secrets and certificates, buckets, shares, volume backups, or alarms. Use `pi api`.
+- **No commands for** alarms and posted samples, certificate authorities, access keys, or join tokens. Use `pi api`.
 - **`--project` does not re-scope a token.** A token's project is fixed at login.
 - **`pi machine list --all` does not cross projects** for a token scoped to a project.
 - **Dev mode creates resources with no project** when no token is sent. They are invisible after you log in.

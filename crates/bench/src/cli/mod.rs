@@ -11,6 +11,7 @@ pub mod bucket;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod dns;
 pub mod kinds;
 pub mod lb;
 pub mod output;

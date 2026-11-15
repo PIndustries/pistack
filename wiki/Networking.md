@@ -293,6 +293,22 @@ When a zone's records change, the primary sends a NOTIFY to every address a seco
 
 A secondary that is an ordinary DNS server outside this cloud holds nothing here, so it cannot be discovered from the secondaries the cloud lists. A primary zone names it directly in `also_notify`: a list of addresses, each an `ip` or an `ip:port` with port 53 assumed when bare, up to sixteen, no repeats. A serial change is notified to every `also_notify` address as well as to the in-cloud secondaries, each asked once, with the same retries and backoff. The field is set at create and update through the zone routes, and only a primary zone takes it — a secondary that names `also_notify` is refused. Dynamic update is not implemented — records change through the API.
 
-A zone labelled `pistack.io/auto=true` gets an address record for every machine in its project, named `<machine>.<zone>`, using the floating IP when the machine has one.
+A zone labelled `pistack.io/auto=true` gets an address record for every machine in its project, named `<machine>.<zone>`, using the floating IP when the machine has one. Those sets carry `pistack.io/managed-by=beacon-auto`; the next pass overwrites anything you change on them by hand, so make your own records somewhere else.
 
-`pi` has no zone commands yet. The API is under `/dns`.
+Zones and record sets are managed with `pi`:
+
+```sh
+pi dns zone create example.cloud --email ops@example.cloud --ttl 3600
+pi dns zone create example.cloud --also-notify 203.0.113.53   # tell an outside secondary
+pi dns zone create copy.cloud --primary 198.51.100.9:53       # a secondary, filled by AXFR
+pi dns record create web A --zone example.cloud --record 10.0.0.4 --record 10.0.0.5
+pi dns record create @ TXT --zone example.cloud --record 'v=spf1 -all'
+pi dns record list --zone example.cloud
+pi dns record delete web-a --zone example.cloud --yes
+pi dns zone show example.cloud
+pi dns zone delete example.cloud
+```
+
+A record set is one owner name and one type: `web` plus `A`, with one record per `--record`. The owner can be relative to the zone, absolute with a final dot, or `@` for the apex. `show` and `delete` with `--zone` look inside that zone, where the set's short name `<owner>-<type>` is enough to find it; a filed name and an id work there too, and without `--zone` only the filed name does. Names are unique across a project rather than per zone, so a set takes the short name while it is free and the zone after it (`web-a.example.cloud`) when another zone already holds that name. Without `--ttl` the set takes the zone's, which is what a listing prints. The server keeps one set per owner and type, allows a CNAME owner nothing else, and refuses a CNAME or an apex NS that would fight the zone's own SOA and NS.
+
+`pi dns zone delete` takes the zone's record sets with it, and the module does not stop it to ask whether the zone is empty. What `pi` does not do yet is edit a zone in place or hand you the master file; for the latter, `pi api GET /dns/zones/<NAME>/export`.

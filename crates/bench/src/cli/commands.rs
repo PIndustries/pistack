@@ -8,6 +8,7 @@
 use super::args::*;
 use super::client::{CliError, CliResult, Client};
 use super::config::Profile;
+use super::dns::dns;
 use super::kinds::{self, KindDef, UpdateStyle};
 use super::output::{self, print_list, print_one, print_value, short_id, str_at, Output};
 use super::{Ctx, Io};
@@ -88,6 +89,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Share { cmd } => super::share::share(ctx, cmd, io).await,
         Cmd::Secret { cmd } => crate::cli::secret::secret(ctx, cmd, io).await,
         Cmd::Cert { cmd } => crate::cli::secret::cert(ctx, cmd, io).await,
+        Cmd::Dns { cmd } => dns(ctx, cmd, io).await,
     }
 }
 
@@ -252,7 +254,18 @@ pub(crate) fn report(
 
 // ---- generic verbs --------------------------------------------------------------
 
-async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>> {
+pub(crate) async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>> {
+    list_walk(c, k, a, &[]).await
+}
+
+/// The same walk with query pairs the noun needs and `ListArgs` has no field
+/// for — a zone to restrict a record set listing to, say.
+pub(crate) async fn list_walk(
+    c: &Client,
+    k: &KindDef,
+    a: &ListArgs,
+    extra: &[(&str, String)],
+) -> CliResult<Vec<Value>> {
     let mut query: Vec<String> = Vec::new();
     if a.all {
         query.push("all=true".into());
@@ -266,6 +279,9 @@ async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>
             }
         }
         query.push(format!("labels={}", a.selector.join(",")));
+    }
+    for (key, value) in extra {
+        query.push(format!("{key}={}", query_escape(value)));
     }
     let mut items = Vec::new();
     let mut after: Option<String> = None;
@@ -1313,7 +1329,7 @@ fn audit_time(raw: &str, now: chrono::DateTime<chrono::Utc>) -> CliResult<String
     Ok((now - chrono::Duration::seconds(secs)).to_rfc3339())
 }
 
-fn query_escape(v: &str) -> String {
+pub(crate) fn query_escape(v: &str) -> String {
     v.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {

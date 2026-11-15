@@ -292,6 +292,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: CertCmd,
     },
+    /// DNS zones and records.
+    Dns {
+        #[command(subcommand)]
+        cmd: crate::cli::dns::DnsCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
