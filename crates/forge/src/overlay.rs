@@ -1280,6 +1280,7 @@ mod tests {
                     external_network: Some(ext.meta.id.clone()),
                     interfaces: vec![sub.meta.id],
                     routes: vec![],
+                    vpc: None,
                 },
             )
             .unwrap();
@@ -1633,6 +1634,7 @@ mod tests {
                     external_network: Some(ext.meta.id.clone()),
                     interfaces: vec![sub.meta.id],
                     routes: vec![],
+                    vpc: None,
                 },
             )
             .unwrap();
@@ -1752,6 +1754,7 @@ mod tests {
                     external_network: None,
                     interfaces: vec![sub.meta.id],
                     routes: vec![],
+                    vpc: None,
                 },
             )
             .unwrap();

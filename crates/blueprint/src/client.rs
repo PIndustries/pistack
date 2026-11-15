@@ -751,6 +751,7 @@ fn router_spec(
     }
     Ok(fabric::RouterSpec {
         external_network,
+        vpc: None,
         interfaces,
         routes: doc.routes,
     })

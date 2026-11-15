@@ -2229,6 +2229,7 @@ mod tests {
             meta: Meta::new(kind::ROUTER, "r", tenant.meta.project.clone()),
             spec: RouterSpec {
                 external_network: Some(outside.meta.id.clone()),
+                vpc: None,
                 interfaces: vec![tsub.meta.id.clone()],
                 routes: vec![StaticRoute {
                     destination: "192.168.0.0/16".parse().unwrap(),
