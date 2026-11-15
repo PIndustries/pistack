@@ -287,7 +287,11 @@ It never binds `0.0.0.0` by default. If the port is taken the server does not st
 PISTACK_DNS_LISTEN=127.0.0.1:15353 pistack server ...
 ```
 
-The server answers only for its own zones and refuses everything else. It does not recurse or forward. Record types are A, AAAA, CNAME, MX, TXT, SRV, NS and PTR. Secondary zones are filled by zone transfer over TCP. Dynamic update and NOTIFY are not implemented.
+The server answers only for its own zones and refuses everything else. It does not recurse or forward. Record types are A, AAAA, CNAME, MX, TXT, SRV, NS and PTR. Secondary zones are filled by zone transfer over TCP.
+
+When a zone's records change, the primary sends a NOTIFY to every address a secondary zone lists for that apex, and the secondary pulls at once rather than waiting for its refresh timer. A NOTIFY is acted on only when it names a zone this server holds as secondary and arrives from a host that zone lists as a primary; anything else is refused and pulls nothing.
+
+A secondary that is an ordinary DNS server outside this cloud holds nothing here, so it cannot be discovered from the secondaries the cloud lists. A primary zone names it directly in `also_notify`: a list of addresses, each an `ip` or an `ip:port` with port 53 assumed when bare, up to sixteen, no repeats. A serial change is notified to every `also_notify` address as well as to the in-cloud secondaries, each asked once, with the same retries and backoff. The field is set at create and update through the zone routes, and only a primary zone takes it — a secondary that names `also_notify` is refused. Dynamic update is not implemented — records change through the API.
 
 A zone labelled `pistack.io/auto=true` gets an address record for every machine in its project, named `<machine>.<zone>`, using the floating IP when the machine has one.
 
