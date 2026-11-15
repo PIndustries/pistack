@@ -954,6 +954,36 @@ pi stack rollback <NAME>
 | `stack update` | `-d, --document <DOCUMENT>` | Replacement document; `@file` or `-` for stdin |
 | `stack rollback` | `--revision <REVISION>` | Revision from status.history (default: previous) |
 
+## pi share
+
+Shared filesystems (shelf). A share is exported over `nfs` or mounted as `cephfs`, and carries the list of who may mount it.
+
+```text
+pi share list
+pi share show <NAME>
+pi share create <NAME>
+pi share delete <NAME>
+pi share access list <NAME>
+pi share access allow --cidr <CIDR> <NAME>
+pi share access deny --cidr <CIDR> <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `share create` | `--description <DESCRIPTION>` |  |
+| `share create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `share create` | `--protocol <PROTOCOL>` | Protocol: nfs or cephfs [default: nfs] |
+| `share create` | `--size <GIB>` | Size in GiB [default: 10] |
+| `share create` | `--cidr <CIDR>` | Allow a client CIDR to mount (repeatable) |
+| `share create` | `--mode <MODE>` | Mode for the CIDRs given: read or write [default: write] |
+| `share access allow` | `--cidr <CIDR>` | Client CIDR, for example 10.0.0.0/24 |
+| `share access allow` | `--mode <MODE>` | Mount mode for the rule [default: write] |
+| `share access deny` | `--cidr <CIDR>` | Client CIDR, for example 10.0.0.0/24 |
+
+`access list` prints the client CIDR rules. An NFS share with no CIDR rule stays pending: there is nothing to export until a client is named. A rule naming a principal rather than a CIDR is not shown here; `pi share show` lists the whole record.
+
+The API has no endpoint for one rule, so `allow` and `deny` read the share, edit its access list and send the whole spec back with `If-Match` set to the revision they read. If the share was written in between, the command reports a revision mismatch and changes nothing; run it again.
+
 ## Not in the CLI yet
 
 These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
@@ -962,7 +992,6 @@ These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 | --- | --- |
 | DNS zones and records | `/dns` |
 | Secrets, certificates, certificate authorities | `/secrets` |
-| Shares | `/shelf` |
 | Alarms and posted samples | `/gauge` |
 
 ```sh

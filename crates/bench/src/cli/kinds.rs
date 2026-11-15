@@ -199,6 +199,30 @@ fn ingress_hosts(v: &Value, _: DateTime<Utc>) -> String {
         .unwrap_or_default()
 }
 
+/// `10.0.0.0/24=ro,10.1.0.0/16=rw`. A rule naming a principal rather than a
+/// CIDR shows that instead.
+fn access_rules(v: &Value, _: DateTime<Utc>) -> String {
+    v.pointer("/spec/access")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|rule| {
+                    let who = rule
+                        .get("cidr")
+                        .or_else(|| rule.get("principal"))
+                        .and_then(Value::as_str)?;
+                    match rule.get("mode").and_then(Value::as_str) {
+                        Some("read") => Some(format!("{who}=ro")),
+                        Some("write") => Some(format!("{who}=rw")),
+                        _ => Some(who.to_owned()),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 const WIDE_PROJECT: &[Column] = &[
     col!("FULL-ID", full_id),
     col!("PROJECT", project),
@@ -811,6 +835,30 @@ pub static KINDS: &[KindDef] = &[
             col!("AGE", created),
         ],
         wide: WIDE_PROJECT,
+    },
+    KindDef {
+        noun: "share",
+        aliases: &["shares"],
+        path: "/shelf/shares",
+        id_prefix: "share",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("PHASE", phase),
+            col!("PROTOCOL", "/spec/protocol"),
+            col!("SIZE-GIB", "/spec/size_gib"),
+            col!("ACCESS", access_rules),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("CLIENTS", count "/spec/access"),
+            col!("MESSAGE", "/status/message"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
     },
 ];
 

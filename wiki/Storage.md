@@ -163,7 +163,13 @@ An S3 client has to be set to path-style addressing, given `http://<server>/silo
 
 ## Shared filesystems
 
-`shelf` creates shares and exports them. There are no `pi` commands for it; the API is under `/shelf`.
+`shelf` creates shares and exports them. See [pi share](CLI-reference#pi-share) for the commands; the API is under `/shelf`.
+
+```sh
+pi share create home --protocol nfs --size 200 --cidr 10.0.0.0/24 --mode read
+pi share access list home
+pi share access allow home --cidr 10.0.1.0/24 --mode write
+```
 
 | Backend | What happens | Needs |
 | --- | --- | --- |
@@ -173,6 +179,8 @@ An S3 client has to be set to path-style addressing, given `http://<server>/silo
 A server that is not root runs the export step through `sudo -n` and the helper named in `PISTACK_SHELF_HELPER`. Install `scripts/pistack-shelf-helper` as `/usr/local/sbin/pistack-shelf-helper`; its header has the sudoers line.
 
 An NFS share with no CIDR, or a CephFS share when `ceph` or `PISTACK_CEPH_FS` is missing, stays `pending`. The size of an NFS share is recorded and not enforced.
+
+`pi share access allow` and `deny` change one client rule. The API takes the whole spec, so the commands read the share, edit its list and write it back with `If-Match` on the revision they read; a share that moved in between is refused rather than overwritten.
 
 ## Where the data is
 
