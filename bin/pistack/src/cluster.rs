@@ -803,6 +803,16 @@ const CARRIED_HEADERS: [axum::http::HeaderName; 3] = [
 ];
 /// On the answer to a write: the log entry that write was held at.
 pub const COMMIT_HEADER: &str = "x-pistack-commit";
+/// On a request, from a client that knows what it just wrote: the log entry
+/// that write was held at, read off the leader's answer. A server in a
+/// cluster that receives this and whose own store has not reached that entry
+/// waits for it before answering, up to [`FORWARD_CATCH_UP`], then answers
+/// either way. A client that sent a write straight to the leader — a body too
+/// large for a follower to carry — and reads from a follower next is the one
+/// this is for: without it the follower can answer that the write is not
+/// there. A value that is not a number is ignored, a server already at that
+/// entry answers at once, and a server in no cluster has no log to wait on.
+pub const WAIT_COMMIT_HEADER: &str = "x-pistack-wait-commit";
 /// On every answer of a follower that knows who leads: the leader's API
 /// address, the same one a 409 "not the leader" refusal puts in
 /// `details.leader`. A client about to send a body too large to carry — a
@@ -821,6 +831,29 @@ pub fn wants_forward(headers: &axum::http::HeaderMap) -> bool {
         .get(FORWARD_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("leader"))
+}
+
+/// The log entry a request asked to be held to, if it named one that is a
+/// number at all. Anything else — absent, unreadable, not a number — names
+/// nothing and is ignored.
+fn wait_for_commit(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(WAIT_COMMIT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// Hold a request until this server's store has reached `index`, polling every
+/// 10 ms, and no longer than [`FORWARD_CATCH_UP`]. Answers on the spot when
+/// the store is there already, and when it never gets there: the wait is a
+/// favour, not a promise, and a caller that asked for one is owed an ordinary
+/// answer either way. A store that cannot say where it stands has nothing to
+/// wait on either.
+async fn wait_for_commit_reached(handle: &ClusterHandle, index: u64) {
+    let until = Instant::now() + FORWARD_CATCH_UP;
+    while handle.store.commit_index().is_ok_and(|have| have < index) && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// The headers of the hop being left, so a request carried on does not
@@ -981,10 +1014,7 @@ pub async fn forward_to_leader(handle: &ClusterHandle, req: axum::extract::Reque
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     if let Some(index) = held_at {
-        let until = Instant::now() + FORWARD_CATCH_UP;
-        while handle.store.commit_index().is_ok_and(|have| have < index) && Instant::now() < until {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_commit_reached(handle, index).await;
     }
     let mut out = Response::new(axum::body::Body::from(bytes));
     *out.status_mut() = status;
@@ -1083,6 +1113,25 @@ pub async fn name_the_leader(
         response.headers_mut().insert(LEADER_HEADER, value);
     }
     response
+}
+
+/// A request may name the log entry the client knows its own write was held
+/// at. This server holds the request until its store has it, then answers —
+/// with whatever it has if the entry never arrives. Placed over every route,
+/// `/healthz` included, since the cheap probe a client makes before reading
+/// back a large upload is as good a place to ask as anywhere. The leader is at
+/// every entry the leader has answered for, so it waits for nothing; a server
+/// in no cluster is not asked at all, since the gateway puts this layer on
+/// only where a cluster handle exists.
+pub async fn wait_for_named_commit(
+    State(handle): State<std::sync::Arc<ClusterHandle>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if let Some(index) = wait_for_commit(req.headers()) {
+        wait_for_commit_reached(&handle, index).await;
+    }
+    next.run(req).await
 }
 
 pub async fn reject_follower_writes(
@@ -6073,6 +6122,208 @@ mod tests {
                 format!("{}: {}", name.as_str(), value.to_str().unwrap_or("<bytes>"))
             })
             .collect()
+    }
+
+    /// A page of writes the leader already holds and a follower is behind.
+    fn page_from(commit: u64, count: u64) -> Vec<LogEntry> {
+        (1..=count)
+            .map(|step| LogEntry {
+                index: commit + step,
+                term: 5,
+                ops: vec![pistack_store::LogOp {
+                    table: "meta".into(),
+                    key: format!("held-{commit}-{step}"),
+                    value: Some(serde_json::to_vec("held").unwrap()),
+                }],
+            })
+            .collect()
+    }
+
+    /// A follower with a store parked at `commit`, behind the wait layer and
+    /// the layer that refuses a write it cannot hold. Every answer says where
+    /// this server's log stood when the route ran, so a test can see whether
+    /// the answer was given before or after the store was advanced.
+    async fn waiting_follower(commit: u64) -> (Store, Arc<ClusterHandle>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let members = vec![
+            Member::voter("sim", "http://10.0.0.11:8443"),
+            Member::voter("sim2", "http://10.0.0.12:8443"),
+        ];
+        seed_voter(&store, "sim2", &members, 5);
+        store
+            .apply_entries(&page_from(0, commit))
+            .expect("a parked store");
+        assert_eq!(store.commit_index().unwrap(), commit);
+        let ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: "http://10.0.0.11:8443".into(),
+            term: 5,
+            members,
+        };
+        let handle = Arc::new(handle_from(
+            "sim2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store.clone(),
+            dir.path().join("state.redb"),
+            &ready,
+            None,
+            Leadership::new(false),
+        ));
+        let answered_from = store.clone();
+        let app = Router::new()
+            .route(
+                "/healthz",
+                axum::routing::get(move || {
+                    let store = answered_from.clone();
+                    async move {
+                        let where_it_stood = store.commit_index().unwrap();
+                        Response::new(Body::from(format!("answered at {where_it_stood}")))
+                    }
+                }),
+            )
+            .route(
+                "/mutate",
+                axum::routing::post(|req: axum::extract::Request| async move {
+                    Response::new(Body::from(format!("{} answered", req.method())))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                reject_follower_writes,
+            ))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                wait_for_named_commit,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .ok();
+        });
+        // The tempdir goes with the task, not the test: the store is open.
+        std::mem::forget(dir);
+        (store, handle, base)
+    }
+
+    /// A client that wrote to the leader and reads from a follower can name
+    /// the entry its write was held at. The follower holds the request until
+    /// its own store reaches it, so the read sees the write instead of being
+    /// told it is not there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_holds_a_request_to_an_entry_it_has_not_reached() {
+        let (store, _handle, base) = waiting_follower(3).await;
+        let client = http_client();
+        let held = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                store.apply_entries(&page_from(3, 2)).unwrap();
+            })
+        };
+        let asked = Instant::now();
+        let answer = client
+            .get(format!("{base}/healthz"))
+            .header(WAIT_COMMIT_HEADER, "5")
+            .send()
+            .await
+            .unwrap();
+        let took = asked.elapsed();
+        assert_eq!(answer.status(), StatusCode::OK);
+        let body = answer.text().await.unwrap();
+        held.await.unwrap();
+        assert_eq!(body, "answered at 5", "the answer waited for the entry");
+        assert!(
+            took >= Duration::from_millis(100),
+            "the answer came before the store caught up: {took:?}"
+        );
+        assert!(
+            took < FORWARD_CATCH_UP,
+            "the answer outlived the catch-up window: {took:?}"
+        );
+    }
+
+    /// Naming an entry this server already holds asks for nothing: the answer
+    /// is the ordinary one and comes at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_at_the_named_entry_answers_at_once() {
+        let (_store, _handle, base) = waiting_follower(3).await;
+        let asked = Instant::now();
+        let answer = http_client()
+            .get(format!("{base}/healthz"))
+            .header(WAIT_COMMIT_HEADER, "3")
+            .send()
+            .await
+            .unwrap();
+        let took = asked.elapsed();
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(answer.text().await.unwrap(), "answered at 3");
+        assert!(took < Duration::from_millis(100), "{took:?}");
+    }
+
+    /// The wait is a favour, not a promise. An entry no one will ever reach is
+    /// held for one catch-up window and then answered normally: a client that
+    /// named the wrong number is not refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_that_never_reaches_the_named_entry_answers_anyway() {
+        let (_store, _handle, base) = waiting_follower(3).await;
+        let asked = Instant::now();
+        let answer = http_client()
+            .get(format!("{base}/healthz"))
+            .header(WAIT_COMMIT_HEADER, "9999")
+            .send()
+            .await
+            .unwrap();
+        let took = asked.elapsed();
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(answer.text().await.unwrap(), "answered at 3");
+        assert!(
+            took >= FORWARD_CATCH_UP,
+            "it answered before giving up: {took:?}"
+        );
+        assert!(
+            took < FORWARD_CATCH_UP + Duration::from_millis(500),
+            "it waited past the window: {took:?}"
+        );
+    }
+
+    /// A value that is not a log entry names nothing and is ignored. A write
+    /// carrying one is still refused where a write must be held to the leader,
+    /// refused at once: the wait is not a way to make a follower take one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_ignores_a_value_that_is_not_an_entry() {
+        let (_store, _handle, base) = waiting_follower(3).await;
+        let client = http_client();
+        for value in ["not-a-number", "5x", "", "-1", "١٢"] {
+            let asked = Instant::now();
+            let answer = client
+                .get(format!("{base}/healthz"))
+                .header(WAIT_COMMIT_HEADER, value)
+                .send()
+                .await
+                .unwrap();
+            let took = asked.elapsed();
+            assert_eq!(answer.status(), StatusCode::OK, "{value:?}");
+            assert_eq!(answer.text().await.unwrap(), "answered at 3", "{value:?}");
+            assert!(took < Duration::from_millis(100), "{value:?}: {took:?}");
+        }
+        let asked = Instant::now();
+        let refused = client
+            .post(format!("{base}/mutate"))
+            .header(WAIT_COMMIT_HEADER, "not-a-number")
+            .send()
+            .await
+            .unwrap();
+        let took = asked.elapsed();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert!(took < Duration::from_millis(100), "{took:?}");
     }
 
     /// A ranged read of an object, signed for a name the leader does not
