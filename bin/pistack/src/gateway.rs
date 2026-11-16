@@ -169,6 +169,10 @@ pub fn build(
             handle.clone(),
             crate::cluster::reject_follower_writes,
         ));
+        app = app.layer(middleware::from_fn_with_state(
+            handle.clone(),
+            crate::cluster::wait_for_named_commit,
+        ));
         // Outside both: every answer this follower gives, a refusal of its
         // own or one carried from the leader, names the leader. `/healthz`
         // is routed inside `app`, under this layer, so the cheap probe a
