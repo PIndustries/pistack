@@ -109,6 +109,8 @@ mod tests {
         assert!(text.contains("data-view=\"stacks\""));
         assert!(text.contains("data-view=\"shares\""));
         assert!(text.contains("data-view=\"alarms\""));
+        assert!(text.contains("data-view=\"keypairs\""));
+        assert!(text.contains("/compute/keypairs"));
         assert!(text.contains("/loom/pods"));
         assert!(text.contains("/loom/deployments"));
         assert!(text.contains("/loom/statefulsets"));
@@ -132,6 +134,17 @@ mod tests {
         assert!(text.contains("Create stack"));
         assert!(text.contains("Create share"));
         assert!(text.contains("Create alarm"));
+        // The key pairs page: nav entry, view, create form, and the private
+        // key a generated pair returns, shown once then dropped.
+        assert!(text.contains("data-view=\"keypairs\">Key pairs</button>"));
+        assert!(text.contains("title: \"Key pairs\""));
+        assert!(text.contains(
+            "A key pair made here has its private key shown once on this page, then dropped."
+        ));
+        assert!(text.contains("Create key pair"));
+        assert!(text.contains("leave empty to make a new pair"));
+        assert!(text.contains("Save this private key now. It is not kept."));
+        assert!(text.contains("keypairOnce"));
         assert!(text.contains("\"Apply\""));
         assert!(text.contains("#7e9b86"));
         // The navigation is grouped and opens on the overview.
@@ -148,7 +161,7 @@ mod tests {
         }
         assert_eq!(
             text.matches("<button type=\"button\" data-view=\"").count(),
-            30
+            31
         );
         assert!(text.contains("Needs attention"));
         assert!(text.contains("Control plane"));
@@ -175,6 +188,35 @@ mod tests {
         assert!(!text.contains("10.66.66."));
         assert!(!text.contains("pistack0"));
         assert!(!text.to_ascii_lowercase().contains("ovn"));
+    }
+
+    /// A private key the page never got to show must not outlive the session
+    /// that made it. Wherever the console drops a one-time API key secret it
+    /// drops the key pair's private key beside it. Outside the render path
+    /// (`core/renderIntoTools.js`) that is two places, both clearing `keyOnce`
+    /// and then `keypairOnce`: `core/showLogin.js` on sign-out, and
+    /// `scope/switchProject.js` on a project switch.
+    #[test]
+    fn keypair_once_is_dropped_with_key_once() {
+        let text = CONSOLE_HTML;
+        // 2 = `showLogin` (sign-out) and `switchProject` (project switch);
+        // +1 is `renderIntoTools`, which clears after it shows the value. The
+        // declarations (`let keyOnce = null;`) are not clears and do not match.
+        const PLACES: usize = 2;
+        let key_once = text.matches(";\n  keyOnce = null;").count()
+            + text.matches(";\n    keyOnce = null;").count();
+        let keypair_once = text.matches(";\n  keypairOnce = null;").count()
+            + text.matches(";\n    keypairOnce = null;").count();
+        assert_eq!(
+            key_once,
+            PLACES + 1,
+            "a new place clears keyOnce; the same place must clear keypairOnce"
+        );
+        assert_eq!(
+            keypair_once,
+            PLACES + 1,
+            "keypairOnce is not cleared everywhere keyOnce is"
+        );
     }
 
     /// A folder of console pieces read straight off disk.

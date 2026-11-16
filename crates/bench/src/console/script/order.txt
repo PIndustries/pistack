@@ -1,5 +1,6 @@
 core/views.js
 core/state.js
+core/keypairOnce.js
 core/el.js
 api/token.js
 api/api.js
@@ -76,6 +77,7 @@ forms/create/buckets.js
 forms/create/projects.js
 forms/create/users.js
 forms/create/keys.js
+forms/create/keypairs.js
 forms/create/dns.js
 forms/create/pods.js
 forms/create/deployments.js

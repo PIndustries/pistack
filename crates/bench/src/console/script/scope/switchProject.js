@@ -13,6 +13,7 @@ async function switchProject(want) {
     openProject = null;
     openUser = null;
     keyOnce = null;
+    keypairOnce = null;
     sampleCache = { at: 0, rows: [] };
     for (const k of Object.keys(formOpen)) formOpen[k] = false;
     setWho(data.caller || {}, "signed in");
