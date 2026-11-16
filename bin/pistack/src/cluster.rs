@@ -41,8 +41,12 @@
 //! to ([`first_contact`]).
 
 pub(crate) mod resync;
+mod s3carry;
+mod s3refuse;
 
 pub use resync::{auto_resync_value, AUTO_RESYNC_ENV};
+pub use s3carry::S3Carry;
+use s3refuse::{s3_body_too_large, s3_slow_down};
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -839,7 +843,7 @@ pub const WAIT_COMMIT_HEADER: &str = "x-pistack-wait-commit";
 pub const LEADER_HEADER: &str = "x-pistack-leader";
 /// The largest body a follower holds to pass on. Past it the client is
 /// told where the leader is, as before.
-const FORWARD_LIMIT: usize = 8 * 1024 * 1024;
+pub const FORWARD_LIMIT: usize = 8 * 1024 * 1024;
 /// How long a follower waits for its own store to reach a write it carried.
 const FORWARD_CATCH_UP: Duration = Duration::from_secs(2);
 
@@ -1151,8 +1155,14 @@ pub async fn wait_for_named_commit(
     next.run(req).await
 }
 
+/// Refuse a write on a server that does not lead, carry it to the leader where
+/// the client asked — or where it could not ask and means the same thing — and
+/// hold the leader's own write until a majority has it.
+///
+/// `s3` is the address space of this server's S3 API. A write landing there is
+/// carried without a word from the client; see [`S3Carry`].
 pub async fn reject_follower_writes(
-    State(handle): State<std::sync::Arc<ClusterHandle>>,
+    State((handle, s3)): State<(std::sync::Arc<ClusterHandle>, S3Carry)>,
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -1241,10 +1251,33 @@ pub async fn reject_follower_writes(
         req.headers_mut().remove(FORWARD_HEADER);
         return forward_to_leader(&handle, req).await;
     }
+    // An S3 client asked for nothing of the kind because it cannot: there is
+    // no header an aws-cli, a boto3 or an s3cmd will put on a request for it,
+    // and a JSON 409 says nothing to a client that reads XML. A write on the
+    // S3 surface is therefore taken as one that asked, and carried.
+    if s3.carries(&path) {
+        return forward_s3_write(&handle, req, &s3).await;
+    }
     let leader = locked(&handle.leader_api);
     ApiError::conflict("not the leader")
         .with_detail("leader", leader)
         .into_response()
+}
+
+/// Carry a client's S3 write to the leader. The body is read no further than
+/// [`S3Carry::limit`], and what cannot be held is answered the way the object
+/// store answers anything else it refuses: S3 XML at 503, naming the server
+/// that would take it, so the client reports the leader rather than a
+/// malformed response.
+async fn forward_s3_write(
+    handle: &ClusterHandle,
+    req: axum::extract::Request,
+    s3: &S3Carry,
+) -> Response {
+    if s3_body_too_large(req.headers(), s3.limit()) {
+        return s3_slow_down(&locked(&handle.leader_api), s3.limit());
+    }
+    forward_to_leader(handle, req).await
 }
 
 /// Wait until a majority of voters holds the log through `index`, written in
@@ -2824,7 +2857,14 @@ fn http_client() -> reqwest::Client {
 fn leader_route(handle: &ClusterHandle, path: &str) -> String {
     match guard(&handle.stand_in).as_ref() {
         Some((api, at)) if path.starts_with(at.as_str()) => api.clone(),
-        _ => locked(&handle.leader_api),
+        // No stand-in, or one for another path. A test may have given this
+        // handle an address no request can reach, for what it names to a
+        // client it cannot serve; that address is not where a carry goes, so
+        // a carry follows the membership instead, as it does on a server.
+        _ => leader_addresses(&handle.store, &handle.node_id)
+            .ok()
+            .flatten()
+            .map_or_else(|| locked(&handle.leader_api), |(api, _)| api),
     }
 }
 
@@ -3477,7 +3517,7 @@ mod tests {
         let app = router(handle.clone())
             .route("/mutate", axum::routing::post(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3807,7 +3847,7 @@ mod tests {
                         axum::routing::post(|| async { "ok" }),
                     )
                     .layer(middleware::from_fn_with_state(
-                        follower,
+                        (follower, S3Carry::default()),
                         reject_follower_writes,
                     ))
                     .layer(axum::Extension(keep::PeerIdentity {
@@ -3840,7 +3880,7 @@ mod tests {
         let app = Router::new()
             .route("/compute/machines", axum::routing::post(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
-                follower.clone(),
+                (follower.clone(), S3Carry::default()),
                 reject_follower_writes,
             ));
         let request = axum::http::Request::post("/compute/machines")
@@ -3982,7 +4022,7 @@ mod tests {
                 }),
             )
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ))
             .layer(middleware::from_fn(
@@ -5482,9 +5522,14 @@ mod tests {
         let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let leader_api = format!("http://{}", leader_listener.local_addr().unwrap());
         let follower_api = format!("http://{}", follower_listener.local_addr().unwrap());
+        // The membership names the two listeners these tests serve on, so a
+        // follower's carry finds the leader. What the follower tells a client
+        // it cannot serve is a different address again, and one no request can
+        // reach — set on the follower's handle below, as a follower's is
+        // before it learns where the leader answers.
         let members = vec![
-            Member::voter("sim", "http://sim.internal:11443"),
-            Member::voter("sim2", "http://sim2.internal:11443"),
+            Member::voter("sim", leader_api.as_str()),
+            Member::voter("sim2", follower_api.as_str()),
         ];
         seed_voter(&leader_store, "sim", &members, 5);
         seed_voter(&follower_store, "sim2", &members, 5);
@@ -5598,7 +5643,7 @@ mod tests {
                 strip_carrier_headers,
             ))
             .layer(middleware::from_fn_with_state(
-                leader_handle.clone(),
+                (leader_handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ));
         let follower_handle = Arc::new(handle_from(
@@ -5628,7 +5673,7 @@ mod tests {
                 strip_carrier_headers,
             ))
             .layer(middleware::from_fn_with_state(
-                follower_handle.clone(),
+                (follower_handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ));
         for (listener, app) in [
@@ -5644,11 +5689,13 @@ mod tests {
                 .ok();
             });
         }
-        // A listener on the leader's address answering with headers that no
-        // other route puts on an answer by itself: the waiting time of a
-        // sign-in refused too often, a cookie said twice, and a hop of the
-        // leader's own connection. The follower is pointed at it below, so
-        // whatever reaches the client is the carry's doing and nothing else's.
+        // A listener answering with headers that no other route puts on an
+        // answer by itself: the waiting time of a sign-in refused too often, a
+        // cookie said twice, and a hop of the leader's own connection. The
+        // follower is pointed at it below for one path only, so whatever
+        // reaches the client there is the carry's doing and nothing else's,
+        // while every other carried request goes to the leader above and is
+        // answered for real.
         let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_api = format!("http://{}", echo_listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(String::new()));
@@ -5680,7 +5727,16 @@ mod tests {
             }
         });
         tokio::spawn(async move { axum::serve(echo_listener, echo).await.ok() });
+        // Carries go to the leader's real listener, as the membership points
+        // them on a server, except on one path where the echo listener above
+        // stands in: that answer is the only one in these tests no route but
+        // the leader's own could have produced.
         *guard(&follower_handle.stand_in) = Some((echo_api, "/refused-at-the-leader".to_owned()));
+        // What this follower tells a client it cannot serve: an address no
+        // request can reach, as a follower's is before it learns where the
+        // leader answers. The membership above still names the leader's real
+        // listener, which is where a carry goes.
+        *guard(&follower_handle.leader_api) = "http://sim.internal:11443".to_owned();
         Signed {
             follower_api,
             leader_api,
@@ -5695,14 +5751,17 @@ mod tests {
         }
     }
 
-    /// A signed request, sent to `to`, with `host` the address the client
-    /// signed for. Everything the signature covers is on the wire.
     /// A signed request the client signs for `host`, sent to `to`, with
     /// `extra` headers the signature covers, and the answer kept whole: what
     /// a signed request gets back is more than a status and a body once the
     /// headers matter.
+    ///
+    /// `asked` is whether the client sent `x-pistack-forward: leader`. An S3
+    /// client cannot send it, so a request with it is one the client asked to
+    /// have carried and one without is what a real client's request looks
+    /// like.
     #[allow(clippy::too_many_arguments)]
-    async fn signed_call(
+    async fn signed_call_at(
         w: &Signed,
         to: &str,
         method: &str,
@@ -5711,7 +5770,8 @@ mod tests {
         body: &[u8],
         host: &str,
         extra: &[(&str, &str)],
-    ) -> reqwest::Response {
+        asked: bool,
+    ) -> Result<reqwest::Response, reqwest::Error> {
         let payload = silo::sigv4::hex_sha256(body);
         let date = amz_now();
         let mut headers: Vec<(String, String)> = vec![
@@ -5746,7 +5806,6 @@ mod tests {
         };
         let mut request = http_client()
             .request(method.parse().unwrap(), format!("{to}{uri}"))
-            .header(FORWARD_HEADER, "leader")
             .header(
                 "authorization",
                 format!(
@@ -5756,10 +5815,35 @@ mod tests {
                     signed.join(";")
                 ),
             );
+        if asked {
+            request = request.header(FORWARD_HEADER, "leader");
+        }
         for (k, v) in &headers {
             request = request.header(k.as_str(), v.as_str());
         }
-        request.body(body.to_vec()).send().await.unwrap()
+        request.body(body.to_vec()).send().await
+    }
+
+    /// As [`signed_call_at`], with the client having asked to be carried —
+    /// the console's way, and what every signed test here did before an S3
+    /// client needed the same path without asking.
+    #[allow(clippy::too_many_arguments)]
+    async fn signed_call(
+        w: &Signed,
+        to: &str,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        host: &str,
+        extra: &[(&str, &str)],
+    ) -> reqwest::Response {
+        // A signed request asks to be carried, whatever its path: the console
+        // sends the header itself, and the surface under the S3 mount is one
+        // prefix wider than the `/silo` mount these routes carry unasked.
+        signed_call_at(w, to, method, path, query, body, host, extra, true)
+            .await
+            .unwrap()
     }
 
     /// As [`signed_call`], with only the status and the body read off.
@@ -5773,6 +5857,34 @@ mod tests {
         host: &str,
     ) -> (u16, Vec<u8>) {
         let answer = signed_call(w, to, method, path, query, body, host, &[]).await;
+        let status = answer.status().as_u16();
+        let bytes = answer.bytes().await.unwrap().to_vec();
+        (status, bytes)
+    }
+
+    /// As [`signed_send`], from a client that asked for nothing: the request
+    /// an aws cli, a boto3 or an s3cmd actually sends.
+    async fn plain_send(
+        w: &Signed,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        host: &str,
+    ) -> (u16, Vec<u8>) {
+        let answer = signed_call_at(
+            w,
+            &w.follower_api,
+            method,
+            path,
+            query,
+            body,
+            host,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
         let status = answer.status().as_u16();
         let bytes = answer.bytes().await.unwrap().to_vec();
         (status, bytes)
@@ -5959,6 +6071,191 @@ mod tests {
         assert_eq!(status, 404, "{status}: {}", String::from_utf8_lossy(&body));
     }
 
+    /// An S3 client cannot ask to be carried: there is no header an aws cli,
+    /// a boto3 or an s3cmd will put on a request, and a JSON 409 tells a
+    /// client that reads XML nothing. So a write on the S3 surface is carried
+    /// on its own — signed, so the leader still checks it — while a write
+    /// anywhere else is still refused as it always was.
+    /// A follower answering a client directly: a write of its own it refuses,
+    /// and the S3 refusals it owes a client that reads XML.
+    async fn plain_follower() -> (tempfile::TempDir, String, std::sync::Arc<ClusterHandle>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let members = vec![
+            Member::voter("sim", "http://10.0.0.11:8443"),
+            Member::voter("sim2", "http://10.0.0.12:8443"),
+        ];
+        seed_voter(&store, "sim2", &members, 5);
+        let ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: "http://10.0.0.11:8443".into(),
+            term: 5,
+            members,
+        };
+        let handle = std::sync::Arc::new(handle_from(
+            "sim2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store,
+            dir.path().join("state.redb"),
+            &ready,
+            None,
+            Leadership::new(false),
+        ));
+        let app = Router::new().fallback(|| async { "answered here" }).layer(
+            middleware::from_fn_with_state(
+                (handle.clone(), S3Carry::default()),
+                reject_follower_writes,
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .ok();
+        });
+        (dir, base, handle)
+    }
+
+    /// One HTTP request written to a socket, and whatever the server gives
+    /// back before it closes the connection. A client that is told its body is
+    /// too large is refused before the body is read, so its own write fails on
+    /// a socket the server stopped wanting; what it still gets is the answer.
+    async fn ask_raw(addr: &str, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|why| panic!("nothing listens at {addr}: {why}"));
+        // A server that refuses a body from its length hangs up before the
+        // body is all written, so this write can fail on a broken pipe. The
+        // answer it sent is read out either way; the bytes it wrote first are
+        // still in the socket.
+        stream.write_all(request.as_bytes()).await.ok();
+        let mut got = Vec::new();
+        match tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut got)).await {
+            Ok(read) => {
+                read.ok();
+            }
+            Err(_) => panic!("the server at {addr} answered nothing to a PUT"),
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    }
+
+    /// A write too large for a follower to hold is still refused, and on the
+    /// S3 surface the refusal is the document an S3 client reads: 503, a code
+    /// it retries, and the leader it has to go to instead. The same body
+    /// anywhere else is refused in this server's own shape, and an S3 body
+    /// small enough to hold is carried rather than refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_refuses_a_write_too_large_to_carry_in_s3_shape() {
+        let (dir, base, handle) = plain_follower().await;
+        let addr = base.trim_start_matches("http://").to_owned();
+        async fn put(addr: &str, path: &str, body: &str) -> String {
+            ask_raw(
+                addr,
+                format!(
+                    "PUT {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .await
+        }
+        let addr = &addr;
+
+        // Carried, not refused: this follower knows no leader it can reach, so
+        // the answer comes back on the leader's behalf and this server's own
+        // route is never reached.
+        let carried = put(addr, "/silo/widgets/small.bin", "small enough to hand on").await;
+        assert!(carried.starts_with("HTTP/1.1 503"), "{carried}");
+        assert!(carried.contains("could not reach the leader"), "{carried}");
+        assert!(!carried.contains("answered here"), "{carried}");
+
+        // Too large: refused off the declared length, as S3 XML, naming the
+        // leader the client has to go to.
+        let too_big = "x".repeat(FORWARD_LIMIT + 1);
+        let refused = put(addr, "/silo/widgets/big.bin", &too_big).await;
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert!(refused.contains("<Code>SlowDown</Code>"), "{refused}");
+        assert!(refused.contains("http://10.0.0.11:8443"), "{refused}");
+        assert!(refused.contains("8 MiB"), "{refused}");
+        assert!(
+            refused
+                .to_ascii_lowercase()
+                .contains("content-type: application/xml"),
+            "{refused}"
+        );
+
+        // The same size off the S3 surface is this server's own refusal, in
+        // its own shape, saying the same thing it always said.
+        let elsewhere = put(addr, "/compute/machines/big.bin", &too_big).await;
+        assert!(elsewhere.starts_with("HTTP/1.1 409"), "{elsewhere}");
+        assert!(elsewhere.contains("not the leader"), "{elsewhere}");
+        assert!(!elsewhere.contains("SlowDown"), "{elsewhere}");
+
+        drop(dir);
+        drop(handle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_s3_write_reaching_a_follower_is_carried_without_asking() {
+        let w = signed_cluster().await;
+        let host = "s3.example:8443";
+        let path = "/silo/widgets/unasked.txt";
+        let payload = b"carried though nobody asked";
+
+        let (status, body) = plain_send(&w, "PUT", path, "", payload, host).await;
+        assert_eq!(status, 200, "{status}: {}", String::from_utf8_lossy(&body));
+        // The leader has the bytes, so the follower did not answer this and
+        // the leader checked a signature it was handed untouched.
+        let objects = silo::Client::new(w.store.clone(), &w.objects);
+        let (_, bytes) = objects.get_object(&w.bucket, "unasked.txt").await.unwrap();
+        assert_eq!(bytes, payload);
+        // A carried S3 write is answered by the leader, not by this server.
+        assert!(
+            locked(&w.answered).is_empty(),
+            "the stand-in leader was asked: {}",
+            locked(&w.answered)
+        );
+
+        // Multipart: create the upload and put a part, both unsigned headers
+        // of any kind beyond what an S3 client sends, both signed for a host
+        // the client can reach and the leader cannot.
+        let (status, body) = plain_send(&w, "POST", path, "uploads", b"", host).await;
+        assert_eq!(status, 200, "{status}: {}", String::from_utf8_lossy(&body));
+        let upload = String::from_utf8_lossy(&body)
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|s| s.split("</UploadId>").next())
+            .expect("an upload id")
+            .to_owned();
+        let (status, body) = plain_send(
+            &w,
+            "PUT",
+            path,
+            &format!("partNumber=1&uploadId={upload}"),
+            b"part-one!",
+            host,
+        )
+        .await;
+        assert_eq!(status, 200, "{status}: {}", String::from_utf8_lossy(&body));
+
+        // A write off the S3 surface with no request to be carried is still
+        // the leader's, and the follower says so in its own voice.
+        let refused = http_client()
+            .post(format!("{}/log-something", w.follower_api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = refused.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "not the leader");
+    }
+
     /// A server asks another for object bytes whether or not the one it
     /// asked leads: `POST /silo/peer/pull/{object}/{sha256}` and `GET
     /// /silo/peer/blobs/…` prove the caller with the peer key in their own
@@ -6037,7 +6334,7 @@ mod tests {
             // An ordinary write, so the follower has something to refuse.
             .route("/log-something", logger)
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6083,8 +6380,11 @@ mod tests {
             .unwrap();
         assert_eq!(logged.status(), StatusCode::OK);
 
-        // An ordinary write is still the leader's, and names the leader.
-        for path in ["/silo/buckets", "/log-something"] {
+        // An ordinary write is still the leader's, and names the leader. The
+        // native bucket write under the S3 mount is too, because it comes from
+        // the console, which asks to be carried when it wants that; see the
+        // S3 surface carried unasked below.
+        for path in ["/log-something", "/compute/machines"] {
             let refused = client
                 .post(format!("{base}{path}"))
                 .header(PEER_HEADER, &key)
@@ -6233,7 +6533,7 @@ mod tests {
             .route("/healthz", axum::routing::get(|| async { "ok" }))
             .route("/mutate", axum::routing::post(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ))
             .layer(middleware::from_fn_with_state(
@@ -6455,7 +6755,7 @@ mod tests {
                 }),
             )
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ))
             .layer(middleware::from_fn_with_state(
@@ -6824,7 +7124,7 @@ mod tests {
                 strip_carrier_headers,
             ))
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ));
         let serve_stop = CancellationToken::new();
@@ -7259,7 +7559,7 @@ mod tests {
         // gate, with the caller the token layer would have attached.
         let app = admin_router(sim.handle.clone())
             .layer(middleware::from_fn_with_state(
-                sim.handle.clone(),
+                (sim.handle.clone(), S3Carry::default()),
                 reject_follower_writes,
             ))
             .layer(middleware::from_fn(
@@ -7950,7 +8250,7 @@ mod tests {
                     }),
                 )
                 .layer(middleware::from_fn_with_state(
-                    handle.clone(),
+                    (handle.clone(), S3Carry::default()),
                     reject_follower_writes,
                 ))
                 .layer(middleware::from_fn_with_state(

@@ -1427,7 +1427,9 @@ fn s3_error(err: ApiError) -> Response {
         .into_response()
 }
 
-fn error_xml(code: &str, message: &str) -> String {
+/// The `<Error>` document every S3 route answers with. Also what a follower
+/// gives an S3 client it cannot serve, so the shape is not invented twice.
+pub fn error_xml(code: &str, message: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{}</Code><Message>{}</Message></Error>",
         code,
