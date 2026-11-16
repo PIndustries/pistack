@@ -155,12 +155,36 @@ const LEADER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// single server send no such header.
 const LEADER_HEADER: &str = "x-pistack-leader";
 
+/// The commit index a server reached with the write it just answered, on the
+/// answer to that write. Only a write that went somewhere other than the
+/// server `pi` was given carries anything the client still needs.
+const COMMIT_HEADER: &str = "x-pistack-commit";
+
+/// A request header asking a server to hold the request until its own store
+/// has applied that commit index — bounded on the server side — and only then
+/// answer. A read sent with it is answered from a store at least that current.
+const WAIT_COMMIT_HEADER: &str = "x-pistack-wait-commit";
+
+/// How long the wait for the server `pi` was given to catch up is allowed to
+/// take. The server holds a waited request for at most 2 s; this covers that
+/// and the round trip, and a wait that outruns it is abandoned: the command
+/// has its answer either way.
+const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The highest commit index a write reached on some other server, shared the
+/// way notices are: one cell per command, filled by the client that wrote,
+/// emptied by the wait before the command exits.
+pub type PendingCommit = Arc<Mutex<Option<u64>>>;
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     base: String,
     token: Option<String>,
     notices: Notices,
+    /// The highest commit index seen on a write answered by another server;
+    /// see [`Client::catch_up`].
+    pending_commit: PendingCommit,
     /// Carries every read and write to whichever server answered last, so a
     /// wait after a write keeps reading where the write happened.
     home: Arc<Mutex<Option<String>>>,
@@ -221,6 +245,7 @@ impl Client {
             base: url.trim_end_matches('/').to_owned(),
             token,
             notices: Notices::default(),
+            pending_commit: PendingCommit::default(),
             home: Arc::new(Mutex::new(None)),
         })
     }
@@ -228,6 +253,13 @@ impl Client {
     /// Collect this client's notices in `notices`.
     pub fn with_notices(mut self, notices: Notices) -> Client {
         self.notices = notices;
+        self
+    }
+
+    /// Remember elsewhere-written commits in `pending` — the cell the command
+    /// waits on before it exits, beside the notices it prints.
+    pub fn with_pending_commit(mut self, pending: PendingCommit) -> Client {
+        self.pending_commit = pending;
         self
     }
 
@@ -287,6 +319,89 @@ impl Client {
     #[cfg(test)]
     fn settled(&self) -> String {
         self.address("/")
+    }
+
+    /// Where a request to `url` will answer from: `url` itself when it names
+    /// a server of its own, else the server this client settles on.
+    fn answered_from(&self, url: &str) -> String {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return url.trim_end_matches('/').to_owned();
+        }
+        self.home
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.base.clone())
+    }
+
+    /// True when a request to `url` will be answered by the server `pi` was
+    /// given: the base itself, or a whole address on the base's own origin.
+    fn answered_by_base(&self, url: &str) -> bool {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return self.answered_from(url) == self.base;
+        }
+        match (reqwest::Url::parse(url), reqwest::Url::parse(&self.base)) {
+            (Ok(there), Ok(here)) => there.origin() == here.origin(),
+            _ => false,
+        }
+    }
+
+    /// Note the commit index a write reached, when the server that answered
+    /// it is not the one `pi` was given: that server is behind what was just
+    /// written, and the command must not exit before it has applied it.
+    /// A write answered by the base is nothing to wait for — that server
+    /// applied the write before it answered.
+    fn note_commit(&self, url: &str, resp: &reqwest::Response) {
+        if self.answered_by_base(url) {
+            return;
+        }
+        let Some(n) = resp
+            .headers()
+            .get(COMMIT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        else {
+            return;
+        };
+        let mut held = self
+            .pending_commit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if held.is_none_or(|seen| n > seen) {
+            *held = Some(n);
+        }
+    }
+
+    /// Let the server `pi` was given catch up with what this command wrote
+    /// elsewhere, before the command exits: one `GET /healthz` asking it to
+    /// hold the answer until its store has applied the highest such commit,
+    /// then forget it. Nothing is written elsewhere — or the wait fails in
+    /// any way — and nothing happens or is said: the command already has its
+    /// answer, and a server that will not catch up in time is nobody's error.
+    pub async fn catch_up(&self) {
+        let held = {
+            let mut held = self
+                .pending_commit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            held.take()
+        };
+        let Some(n) = held else { return };
+        let _ = async {
+            let resp = self
+                .http
+                .get(format!("{}/healthz", self.base))
+                .header(WAIT_COMMIT_HEADER, n.to_string())
+                .timeout(CATCH_UP_TIMEOUT)
+                .send()
+                .await?;
+            // Read to the end before the connection goes back to the pool: a
+            // half-taken answer left on the wire answers the next request
+            // over it, the same trap `find_leader` reads around.
+            let _ = resp.bytes().await?;
+            Ok::<(), reqwest::Error>(())
+        }
+        .await;
     }
 
     /// Remember `leader` as the server to send the rest of this client's
@@ -396,6 +511,7 @@ impl Client {
             .send()
             .await
             .map_err(|e| CliError::Transport(format!("{e} ({url})")))?;
+        self.note_commit(&url, &resp);
         self.finish(resp).await
     }
 
@@ -524,12 +640,13 @@ impl Client {
         let stream = tokio_util::io::ReaderStream::with_capacity(f, 256 * 1024);
         let body = reqwest::Body::wrap_stream(stream);
         let resp = self
-            .request_url(Method::PUT, url)
+            .request_url(Method::PUT, url.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body)
             .send()
             .await?;
+        self.note_commit(&url, &resp);
         Ok(self.finish(resp).await?.1)
     }
 
@@ -1198,5 +1315,232 @@ mod tests {
         assert_eq!(c.url("/compute/machines"), "http://h:1/compute/machines");
         assert_eq!(c.url("compute/machines"), "http://h:1/compute/machines");
         assert_eq!(c.url("http://x/y"), "http://x/y");
+    }
+
+    /// The server `pi` was given, and a follower besides: refuses writes with
+    /// a 409 naming `leader`, and answers a `GET /healthz` carrying
+    /// `x-pistack-wait-commit` by recording the index. Counts every request.
+    async fn waiting_follower(leader: &str) -> (String, Arc<Mutex<Vec<u64>>>, Arc<Mutex<u32>>) {
+        use axum::body::Body;
+        use axum::extract::Request;
+        use axum::response::Response;
+        use serde_json::json;
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let hits = Arc::new(Mutex::new(0));
+        let w = waits.clone();
+        let h = hits.clone();
+        let named = leader.to_owned();
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let w = w.clone();
+            let h = h.clone();
+            let named = named.clone();
+            async move {
+                *h.lock().unwrap() += 1;
+                if *req.method() == Method::GET && req.uri().path() == "/healthz" {
+                    if let Some(v) = req
+                        .headers()
+                        .get(WAIT_COMMIT_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                    {
+                        w.lock().unwrap().push(v);
+                    }
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(json!({"status": "ok"}).to_string()))
+                        .unwrap();
+                }
+                Response::builder()
+                    .status(StatusCode::CONFLICT)
+                    .body(Body::from(
+                        json!({"error": {"code": "conflict", "message": "not the leader",
+                        "details": {"leader": named}}})
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), waits, hits)
+    }
+
+    /// A leader: answers a write with `commit` in the header it carries and
+    /// counts what it saw.
+    async fn leader(commit: u64) -> (String, Arc<Mutex<u32>>) {
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use serde_json::json;
+        let hits = Arc::new(Mutex::new(0));
+        let count = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let count = count.clone();
+            async move {
+                *count.lock().unwrap() += 1;
+                let mut head = HeaderMap::new();
+                head.insert(COMMIT_HEADER, commit.to_string().parse().unwrap());
+                (head, axum::Json(json!({"id": "mach-1"}))).into_response()
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn the_server_pi_was_given_is_waited_for_after_a_write_elsewhere() {
+        use serde_json::json;
+        // `pi` was given a follower; the follower refuses the write and names
+        // the leader, which answers it carrying commit 42. The wait that
+        // follows goes to the follower `pi` was given, and nowhere else.
+        let (leader_url, leader_hits) = leader(42).await;
+        let (base, waits, hits) = waiting_follower(&leader_url).await;
+        let pending = PendingCommit::default();
+        let c = Client::new(&base, Some("t".into()), false)
+            .unwrap()
+            .with_pending_commit(pending.clone());
+        c.post("/compute/machines", &json!({"name": "web"}))
+            .await
+            .expect("the leader answers the write");
+        assert_eq!(*leader_hits.lock().unwrap(), 1, "answered once");
+        assert_eq!(
+            *pending.lock().unwrap(),
+            Some(42),
+            "the commit the leader carried is remembered"
+        );
+        // The wait: exactly one held health check at the base, naming the commit.
+        c.catch_up().await;
+        assert_eq!(
+            *waits.lock().unwrap(),
+            vec![42],
+            "the base was waited for once, at commit 42"
+        );
+        // The cell is empty: a second wait sends nothing anywhere.
+        c.catch_up().await;
+        assert_eq!(
+            *hits.lock().unwrap(),
+            2,
+            "refused once, waited once, and the second wait sent nothing"
+        );
+        assert_eq!(waits.lock().unwrap().len(), 1, "waited once in all");
+    }
+
+    #[tokio::test]
+    async fn a_write_answered_by_the_base_waits_for_nobody() {
+        // A server that answers a write applied it before it answered: even
+        // carrying the commit header, the base has nothing to catch up with.
+        use serde_json::json;
+        // A leader that answers with the header, reached through a client
+        // whose base is that same server — answered by the base, header and
+        // all — and one whose base is elsewhere: the very same answer, this
+        // time a write done somewhere the base has not seen.
+        let (base, hits) = leader(9).await;
+        let pending = PendingCommit::default();
+        let c = Client::new(&base, Some("t".into()), false)
+            .unwrap()
+            .with_pending_commit(pending.clone());
+        c.post("/compute/machines", &json!({"name": "web"}))
+            .await
+            .unwrap();
+        assert!(
+            pending.lock().unwrap().is_none(),
+            "a write the base answered is nothing to wait for"
+        );
+        c.catch_up().await;
+        assert_eq!(*hits.lock().unwrap(), 1, "only the write itself");
+
+        // The same server, now an answer somewhere else: recorded.
+        let elsewhere = PendingCommit::default();
+        let d = Client::new("http://base.invalid", Some("t".into()), false)
+            .unwrap()
+            .with_pending_commit(elsewhere.clone());
+        d.settle(&base);
+        d.post("/compute/machines", &json!({"name": "web2"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *elsewhere.lock().unwrap(),
+            Some(9),
+            "the same answer from another server is a commit to wait for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_retried_to_an_address_at_the_base_is_not_elsewhere() {
+        // A retry sent as a whole address that names the base's own origin is
+        // answered by the server pi was given: nothing to wait for, header or
+        // no header.
+        use serde_json::json;
+        let (base, hits) = leader(9).await;
+        let pending = PendingCommit::default();
+        let c = Client::new(&base, Some("t".into()), false)
+            .unwrap()
+            .with_pending_commit(pending.clone());
+        c.send_json(
+            Method::POST,
+            format!("{base}/compute/machines"),
+            Some(&json!({"name": "web"})),
+            None,
+        )
+        .await
+        .expect("the base answers the retry");
+        assert_eq!(*hits.lock().unwrap(), 1);
+        assert!(
+            pending.lock().unwrap().is_none(),
+            "an answer from the base's own origin is not elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_for_the_highest_commit_written() {
+        // Two writes elsewhere: the first reaches 7, the second only 5.
+        // The wait is for 7 — 5 needs no waiting once 7 has arrived.
+        use serde_json::json;
+        let (leader7, _h7) = leader(7).await;
+        let (base, waits, hits) = waiting_follower(&leader7).await;
+        let pending = PendingCommit::default();
+        let c = Client::new(&base, Some("t".into()), false)
+            .unwrap()
+            .with_pending_commit(pending.clone());
+        c.post("/compute/machines", &json!({"name": "a"}))
+            .await
+            .unwrap();
+        let (leader5, _h5) = leader(5).await;
+        c.settle(&leader5);
+        c.post("/compute/machines", &json!({"name": "b"}))
+            .await
+            .unwrap();
+        c.catch_up().await;
+        assert_eq!(
+            *waits.lock().unwrap(),
+            vec![7],
+            "waited once, for the higher commit"
+        );
+        assert_eq!(
+            *hits.lock().unwrap(),
+            2,
+            "refused once, waited once — the second write went to its leader directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_base_that_never_answers_is_still_a_clean_exit() {
+        // A port nobody listens on: the wait fails, and the failure is nobody's
+        // error — the command has its answer already.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let pending = PendingCommit::default();
+        *pending.lock().unwrap() = Some(42);
+        let c = Client::new(&format!("http://{addr}"), Some("t".into()), false)
+            .unwrap()
+            .with_pending_commit(pending.clone());
+        c.catch_up().await;
+        assert!(
+            pending.lock().unwrap().is_none(),
+            "the commit is spent even when the wait fails"
+        );
     }
 }
