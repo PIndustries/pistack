@@ -803,6 +803,13 @@ const CARRIED_HEADERS: [axum::http::HeaderName; 3] = [
 ];
 /// On the answer to a write: the log entry that write was held at.
 pub const COMMIT_HEADER: &str = "x-pistack-commit";
+/// On every answer of a follower that knows who leads: the leader's API
+/// address, the same one a 409 "not the leader" refusal puts in
+/// `details.leader`. A client about to send a body too large to carry — a
+/// long upload — reads it off a cheap `GET /healthz` and goes to the leader
+/// with the body instead. The leader's own answers carry no such header,
+/// and a follower that does not know the leader yet sends none.
+pub const LEADER_HEADER: &str = "x-pistack-leader";
 /// The largest body a follower holds to pass on. Past it the client is
 /// told where the leader is, as before.
 const FORWARD_LIMIT: usize = 8 * 1024 * 1024;
@@ -1046,6 +1053,36 @@ pub fn carried_client(headers: &HeaderMap, store: &Store) -> Option<(IpAddr, Str
         .filter(|id| !id.trim().is_empty() && id.len() <= 128)
         .map(str::to_owned)?;
     Some((client, by))
+}
+
+/// Every answer this server gives while it does not lead names the leader,
+/// when its address is known. Placed over every route, so it covers the
+/// refusals of the layers below it and an answer carried from the leader
+/// alike — and a carried answer is exactly the one place the header could
+/// arrive twice, since the leader's own answer crosses [`carried_headers`]
+/// as it stands. The leader answers nothing on this server, so its absent
+/// header leaves this layer's copy the only one; should a leader ever start
+/// naming itself, this writes over what crossed rather than repeating it.
+/// The address is one this follower can parse back out of a header value,
+/// so a value that cannot be one names nothing.
+pub async fn name_the_leader(
+    State(handle): State<std::sync::Arc<ClusterHandle>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let response = next.run(req).await;
+    if handle.leader.load(Ordering::Acquire) {
+        return response;
+    }
+    let leader = locked(&handle.leader_api);
+    if leader.is_empty() {
+        return response;
+    }
+    let mut response = response;
+    if let Ok(value) = axum::http::HeaderValue::from_str(&leader) {
+        response.headers_mut().insert(LEADER_HEADER, value);
+    }
+    response
 }
 
 pub async fn reject_follower_writes(
@@ -5846,6 +5883,107 @@ mod tests {
         )
         .await;
         assert_eq!(status, 404, "{status}: {}", String::from_utf8_lossy(&body));
+    }
+
+    /// A follower's answer, however it came about, names the leader exactly
+    /// once: its own refusal, and an answer carried from a leader that names
+    /// nothing of itself. A leader's own answer and a follower that does not
+    /// know the leader yet name nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_names_the_leader_on_every_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let members = vec![
+            Member::voter("sim", "http://10.0.0.11:8443"),
+            Member::voter("sim2", "http://10.0.0.12:8443"),
+        ];
+        seed_voter(&store, "sim2", &members, 5);
+        let ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: String::new(),
+            term: 5,
+            members,
+        };
+        let handle = Arc::new(handle_from(
+            "sim2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store.clone(),
+            dir.path().join("state.redb"),
+            &ready,
+            None,
+            Leadership::new(false),
+        ));
+        handle.leader.store(false, Ordering::Relaxed);
+        let app = Router::new()
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/mutate", axum::routing::post(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                reject_follower_writes,
+            ))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                name_the_leader,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .ok();
+        });
+        let client = http_client();
+
+        // No leader known yet: nothing to name. A write refused while no
+        // leader is known is the same: the body says what the header would.
+        let probe = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert!(!probe.headers().contains_key(LEADER_HEADER));
+        let refused = client.post(format!("{base}/mutate")).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert!(!refused.headers().contains_key(LEADER_HEADER));
+
+        *guard(&handle.leader_api) = "http://10.0.0.11:8443".into();
+        let probe = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert_eq!(
+            probe.headers().get_all(LEADER_HEADER).iter().count(),
+            1,
+            "{:?}",
+            lines(probe.headers())
+        );
+        assert_eq!(
+            probe.headers().get(LEADER_HEADER).unwrap(),
+            "http://10.0.0.11:8443"
+        );
+        // The refusal of a write names the leader the way the body does.
+        let refused = client.post(format!("{base}/mutate")).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            refused.headers().get_all(LEADER_HEADER).iter().count(),
+            1,
+            "{:?}",
+            lines(refused.headers())
+        );
+        assert_eq!(
+            refused.headers().get(LEADER_HEADER).unwrap(),
+            "http://10.0.0.11:8443"
+        );
+        assert!(refused.text().await.unwrap().contains("not the leader"));
+
+        // This server leads: its own answers name no one else.
+        handle.leader.store(true, Ordering::Release);
+        let probe = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert!(!probe.headers().contains_key(LEADER_HEADER));
+        let allowed = client.post(format!("{base}/mutate")).send().await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert!(!allowed.headers().contains_key(LEADER_HEADER));
     }
 
     /// What the gateway does with a read only the leader can answer: a
