@@ -979,3 +979,133 @@ impl pistack_types::Kind for RawMachine {
         &mut self.meta
     }
 }
+
+/// The reported bug, end to end and with no restart.
+///
+/// One zone, three servers. The leader takes every write; a follower copies
+/// the same rows out of the log, straight into its backend, so nothing on this
+/// node is ever written through a `Collection` and nothing used to be sent on
+/// the event bus. The DNS handler kept the catalog it compiled the first time
+/// a query asked it something: a zone the leader deleted was answered for good,
+/// and a zone created after this server started was never answered at all.
+///
+/// The follower here answers from its own handler, and its store changes only
+/// through `apply_entries`, with pages read out of a second, leading store, the
+/// way the follow loop hands them over.
+#[tokio::test]
+async fn a_follower_answers_and_stops_answering_as_the_leader_deletes() {
+    let leader_store = Store::in_memory().unwrap();
+    leader_store.set_record_log(true);
+    let leader = Client::new(leader_store.clone());
+
+    let follower = Store::in_memory().unwrap();
+    let handler =
+        server::Handler::new(Client::new(follower.clone()), server::SecondaryCache::new());
+    handler.watch(follower.events().subscribe(), Default::default());
+
+    // First catch-up: a zone with nothing in it, so the handler has a catalog
+    // compiled at all. Answered, and only the apex: nothing points at `web`.
+    let zone = new_zone(&leader, "gone.cloud.");
+    follow_once(&leader_store, &follower).await;
+    assert_eq!(
+        code(&handler, "gone.cloud.", Rt::SOA).await,
+        ResponseCode::NoError,
+        "a follower answers the zone it was handed"
+    );
+    assert_eq!(
+        code(&handler, "web.gone.cloud.", Rt::A).await,
+        ResponseCode::NXDomain
+    );
+
+    // A record set appears while the server is running.
+    record(&leader, &zone.meta.id, "web", &["10.0.0.4"]);
+    follow_once(&leader_store, &follower).await;
+    wait_code(&handler, "web.gone.cloud.", Rt::A, ResponseCode::NoError).await;
+
+    // The leader deletes the record set. It goes, and the zone stays.
+    let rec = leader
+        .recordsets_in_zone(&zone.meta.id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.spec.name == "web.gone.cloud.")
+        .unwrap();
+    leader.recordsets().delete(&rec.meta.id).unwrap();
+    follow_once(&leader_store, &follower).await;
+    wait_code(&handler, "web.gone.cloud.", Rt::A, ResponseCode::NXDomain).await;
+    assert_eq!(
+        code(&handler, "gone.cloud.", Rt::SOA).await,
+        ResponseCode::NoError
+    );
+
+    // The leader deletes the zone. The follower stops answering for the name
+    // entirely, exactly as it answers for a name it never saw.
+    leader.zones().delete(&zone.meta.id).unwrap();
+    follow_once(&leader_store, &follower).await;
+    wait_code(&handler, "gone.cloud.", Rt::SOA, ResponseCode::Refused).await;
+
+    // And one made afterwards is answered: a follower is not left with whatever
+    // its store held the first time anything asked it a question.
+    let _later = new_zone(&leader, "later.cloud.");
+    follow_once(&leader_store, &follower).await;
+    wait_code(&handler, "later.cloud.", Rt::SOA, ResponseCode::NoError).await;
+}
+
+/// Hand the follower everything the leader has logged and not yet given it.
+async fn follow_once(leader: &Store, follower: &Store) {
+    let from = follower.commit_index().unwrap();
+    let page = leader.read_log(from, 64).unwrap();
+    follower.apply_entries(&page).unwrap();
+    // The watcher runs beside the query path. Let it take the events.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn new_zone(client: &Client, apex: &str) -> Zone {
+    client
+        .create_zone(
+            pistack_types::Meta::new(kind::ZONE, apex.trim_end_matches('.'), None),
+            ZoneSpec {
+                name: apex.into(),
+                ..ZoneSpec::default()
+            },
+        )
+        .unwrap()
+}
+
+fn record(client: &Client, zone: &Id, name: &str, records: &[&str]) {
+    client
+        .upsert_record(
+            zone,
+            name,
+            beacon::RecordType::A,
+            None,
+            records.iter().map(|r| r.to_string()).collect(),
+            "test",
+        )
+        .unwrap();
+}
+
+/// What the handler answers, as a response code, with no socket in the way.
+async fn code(handler: &server::Handler, name: &str, rt: Rt) -> ResponseCode {
+    let name = Name::from_str(name).unwrap();
+    match handler.resolve(&name, rt).unwrap() {
+        Some(a) => a.code,
+        // No zone of ours covers the name: the server refuses it.
+        None => ResponseCode::Refused,
+    }
+}
+
+async fn wait_code(handler: &server::Handler, name: &str, rt: Rt, want: ResponseCode) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if code(handler, name, rt).await == want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{name} never came to answer {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

@@ -40,7 +40,7 @@
 //! fingerprint of the CA it was given, and over plain http only when told
 //! to ([`first_contact`]).
 
-mod resync;
+pub(crate) mod resync;
 
 pub use resync::{auto_resync_value, AUTO_RESYNC_ENV};
 

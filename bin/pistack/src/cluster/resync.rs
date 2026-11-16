@@ -285,6 +285,42 @@ async fn attempt(handle: &std::sync::Arc<ClusterHandle>, leader: &str) -> anyhow
     tokio::task::spawn_blocking(move || install(&handle, &incoming, &status)).await?
 }
 
+/// Set in a store that was installed from another server's snapshot, and
+/// cleared once this server has told its watchers about it.
+///
+/// A store replaced under a running server cannot be announced where it stands.
+/// The file is swapped and the process starts again on the new one, so no
+/// watcher of the old store is left alive to hear anything — watchers exist
+/// only once modules start, which is after the move. Every watcher therefore
+/// compiles whatever the new store holds the first time it is asked, and a DNS
+/// server that had been answering for a zone the leader deleted would go on
+/// answering from a store it never saw change.
+///
+/// So the replacement is noted here, at the moment it is made, and read on the
+/// way back up once watchers exist. It travels in the store rather than sitting
+/// beside it: the note belongs to the file it describes, so it survives a crash
+/// between the two, and it goes away by itself if a later replacement or a
+/// restore moves this store out.
+pub(crate) const REPLACED_KEY: &str = "store_replaced";
+
+/// True when the store this server is opening is one it installed from a
+/// snapshot and has not yet told anybody about.
+pub(crate) fn awaiting_announce(store: &Store) -> anyhow::Result<bool> {
+    Ok(store.get_meta::<bool>(REPLACED_KEY)?.unwrap_or(false))
+}
+
+/// Tell every watcher on this node that the rows it read may be gone, then
+/// clear the note so the boot after this one does not say it again — every
+/// watcher has since derived from this store and needs no fresh start.
+pub(crate) fn announce_replaced(store: &Store) -> anyhow::Result<()> {
+    store.delete_meta(REPLACED_KEY)?;
+    store.announce_all_changed();
+    tracing::info!(
+        "this server's store was replaced on the last boot: every watcher told it may have changed entirely"
+    );
+    Ok(())
+}
+
 /// Check the snapshot, make it this server's, and swap the files.
 fn install(
     handle: &ClusterHandle,
@@ -336,6 +372,8 @@ fn install(
     let lost = lost_entries(&handle.store, &new)?;
     new.put_meta("node_id", &handle.node_id)?;
     new.put_meta("cluster_voted_for", &voted)?;
+    // Read before the swap, on the next start, and cleared there.
+    new.put_meta(REPLACED_KEY, &true)?;
     // Close it before it is renamed and opened again.
     drop(new);
 
@@ -414,6 +452,22 @@ pub(super) fn finish_interrupted(data_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The replacement notes itself inside the store it installs, and the note
+    /// is what the next start reads: nothing else about a store says where it
+    /// came from.
+    #[test]
+    fn an_installed_store_awaits_being_announced() {
+        let store = Store::in_memory().unwrap();
+        assert!(!awaiting_announce(&store).unwrap());
+        store.put_meta(REPLACED_KEY, &true).unwrap();
+        assert!(awaiting_announce(&store).unwrap());
+        announce_replaced(&store).unwrap();
+        // Told once. The boot after this one has derived from the store already.
+        assert!(!awaiting_announce(&store).unwrap());
+        // And telling it again is not a fault.
+        announce_replaced(&store).unwrap();
+    }
 
     #[test]
     fn only_zero_turns_it_off() {
