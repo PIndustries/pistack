@@ -721,11 +721,28 @@ pub fn admin_router(handle: std::sync::Arc<ClusterHandle>) -> Router {
         .with_state(handle)
 }
 
+/// Routes under a module's prefix that a server calls another server on.
+/// Each one checks its caller with the peer key in its own handler.
+fn module_peer_route(path: &str) -> bool {
+    path.starts_with("/silo/peer/") || path.starts_with("/secrets/peer/")
+}
+
+/// Routes the leader gate lets through on any server, held to neither the
+/// leader's answer nor the confirm step. Only a route that writes no
+/// record of its own to the store may be listed here: a follower that
+/// writes one diverges from the log, and on the leader the write must stay
+/// held until its entry is confirmed. A route that logs — `POST
+/// /secrets/peer/renew-certificate` records the certificate it issues — is
+/// a write like any other and is not listed, whatever its prefix says.
+fn answers_without_the_log(path: &str) -> bool {
+    path.starts_with("/silo/peer/")
+}
+
 /// Whether a request is one server calling another. `as_server` is whether
 /// it carries a peer key or a join token: the status and the removal of a
 /// member are also an administrator's, who sends neither.
 fn is_peer_call(path: &str, as_server: bool) -> bool {
-    if path.starts_with("/silo/peer/") || path.starts_with("/secrets/peer/") {
+    if module_peer_route(path) {
         return true;
     }
     if path == "/cluster" || path.starts_with("/cluster/members") {
@@ -1164,8 +1181,16 @@ pub async fn reject_follower_writes(
                 .insert(gate::audit::Carried { client, by });
         }
     }
-    // The peer routes answer for themselves. Removing a member is an
-    // operator's write and is held to the leader like any other.
+    // Some peer routes answer for themselves, on any server. Removing a
+    // member is an operator's write and is held to the leader like any
+    // other. A route that logs nothing is not held to the confirm step
+    // either: it has no entry of its own to hold an answer to, and it must
+    // not be charged for whatever else was logged while it ran. A peer
+    // route that does log — a follower would refuse it and the leader
+    // would hold it — is not exempt at all.
+    if answers_without_the_log(&path) {
+        return next.run(req).await;
+    }
     let peer = path.starts_with("/cluster") && !path.starts_with("/cluster/members");
     if (read && !rpc) || path == "/healthz" || path == "/" || peer {
         return next.run(req).await;
@@ -5932,6 +5957,245 @@ mod tests {
         )
         .await;
         assert_eq!(status, 404, "{status}: {}", String::from_utf8_lossy(&body));
+    }
+
+    /// A server asks another for object bytes whether or not the one it
+    /// asked leads: `POST /silo/peer/pull/{object}/{sha256}` and `GET
+    /// /silo/peer/blobs/…` prove the caller with the peer key in their own
+    /// handler and log nothing, so the leader gate lets them through and
+    /// this server answers them. A peer call that logs is not exempt: `POST
+    /// /secrets/peer/renew-certificate` records the certificate it issues,
+    /// so a follower refuses it like any other write and only the leader
+    /// answers it, held to the confirm step. An ordinary write to a
+    /// follower is still refused, and a peer write is never charged to the
+    /// confirm step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_answers_the_module_peer_routes_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let members = vec![
+            Member::voter("sim", "http://10.0.0.11:8443"),
+            Member::voter("sim2", "http://10.0.0.12:8443"),
+        ];
+        seed_voter(&store, "sim2", &members, 5);
+        // What the peer key is derived from, so this store has one and a
+        // caller can prove itself with it.
+        store
+            .put_meta(gate::token::META_JWT_SECRET, &"c2VjcmV0".to_owned())
+            .unwrap();
+        let key = peer_key(&store).unwrap();
+        let ready = Established {
+            role: Role::Voter,
+            leader: false,
+            leader_api: "http://10.0.0.11:8443".into(),
+            term: 5,
+            members,
+        };
+        let handle = Arc::new(handle_from(
+            "sim2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store.clone(),
+            dir.path().join("state.redb"),
+            &ready,
+            None,
+            Leadership::new(false),
+        ));
+        // A peer asked to pull waits for the object's record to reach it.
+        // There is no such record here, so after that wait the handler gives
+        // up with 503 — the inner route's own answer, not this server's
+        // refusal.
+        let object = pistack_types::Id::new(<silo::ObjectSpec as pistack_types::Spec>::KIND);
+        let silo_route = format!("/silo/peer/pull/{object}/{}", "0".repeat(64));
+        // An ordinary write, as a controller's would be: it logs, so a
+        // follower refuses it and the leader holds it to the confirm step.
+        // The gate alone decides this: the route stands behind it and never
+        // runs on a follower.
+        let logger = axum::routing::post({
+            let store = store.clone();
+            move || async move {
+                store
+                    .put_meta("logged-elsewhere", &"yes".to_owned())
+                    .unwrap();
+                "ok"
+            }
+        });
+        let renew = axum::routing::post(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"cert_pem":"stub","ca_pem":"stub"}"#,
+            )
+        });
+        let app = router(handle.clone())
+            .nest(
+                "/silo",
+                silo::http::router(silo::Client::new(store.clone(), dir.path().join("silo"))),
+            )
+            // The leader's route, exactly as the gateway mounts it. Only
+            // the gate stands between a follower and it.
+            .route("/secrets/peer/renew-certificate", renew)
+            // An ordinary write, so the follower has something to refuse.
+            .route("/log-something", logger)
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                reject_follower_writes,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::listen::GatewayPeer>(),
+            )
+            .await
+            .ok();
+        });
+        let client = http_client();
+        handle.leader.store(false, Ordering::Relaxed);
+
+        let pulled = client
+            .post(format!("{base}{silo_route}"))
+            .header(PEER_HEADER, &key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = pulled.text().await.unwrap();
+        assert!(
+            body.contains("has not reached this server"),
+            "the pull was not answered by the route itself: {body}"
+        );
+        // A caller that proves nothing is refused by the route, not here.
+        let stranger = client
+            .post(format!("{base}{silo_route}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stranger.status(), StatusCode::UNAUTHORIZED);
+        // `/cluster/log` is a peer route too, and a follower answers it.
+        let logged = client
+            .get(format!(
+                "{base}/cluster/log?after=0&term=5&fterm=5&node=sim"
+            ))
+            .header(PEER_HEADER, &key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logged.status(), StatusCode::OK);
+
+        // An ordinary write is still the leader's, and names the leader.
+        for path in ["/silo/buckets", "/log-something"] {
+            let refused = client
+                .post(format!("{base}{path}"))
+                .header(PEER_HEADER, &key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::CONFLICT, "{path}");
+            let body: serde_json::Value = refused.json().await.unwrap();
+            assert_eq!(body["error"]["message"], "not the leader", "{path}");
+            assert_eq!(
+                body["error"]["details"]["leader"], "http://10.0.0.11:8443",
+                "{path}"
+            );
+        }
+        // A follower asked to carry a write still tries the leader and is
+        // answered on the leader's behalf, not with this server's refusal.
+        let carried = client
+            .post(format!("{base}/log-something"))
+            .header(FORWARD_HEADER, "leader")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(carried.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !carried.text().await.unwrap().contains("not the leader"),
+            "a carried write was refused by this follower itself"
+        );
+        // A peer call that logs is no exception: it names the leader rather
+        // than reaching the route behind the gate, even from a member.
+        let renewed = client
+            .post(format!("{base}/secrets/peer/renew-certificate"))
+            .header(PEER_HEADER, &key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(renewed.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = renewed.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "not the leader");
+        assert_eq!(
+            body["error"]["details"]["leader"], "http://10.0.0.11:8443",
+            "a follower answered the renew itself"
+        );
+
+        // A follower that is not the leader answers a peer write and logs
+        // nothing at all: there is no entry to wait on and none appears.
+        assert_eq!(store.commit_index().unwrap(), 0);
+
+        // This server leads a two-server cluster and its follower confirms
+        // by pulling: a write of this server's own is held to that and
+        // answered with where the log stood for it. A peer route answered
+        // while that entry is logged is answered by the route alone — its
+        // own 503, no commit header, and no wait behind it for the pull that
+        // is on its way.
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_api = format!("http://{}", second.local_addr().unwrap());
+        let members = vec![
+            Member::voter("sim2", &base),
+            Member::voter("sim3", &second_api),
+        ];
+        store.put_meta("members", &members).unwrap();
+        // Only a server that records a log appends an entry to it.
+        store.set_record_log(true);
+        let second = serve_voter("sim3", second, &members, false, 5, &base).await;
+        handle.leader.store(true, Ordering::Relaxed);
+        *guard(&handle.leader_api) = base.clone();
+        *guard(&handle.confirm_wait) = Duration::from_secs(10);
+        let before = store.commit_index().unwrap();
+        let pulled = {
+            let base = base.clone();
+            let key = key.clone();
+            let silo_route = silo_route.clone();
+            tokio::spawn(async move {
+                http_client()
+                    .post(format!("{base}{silo_route}"))
+                    .header(PEER_HEADER, key)
+                    .send()
+                    .await
+                    .unwrap()
+            })
+        };
+        // Midway through the record wait the leader writes: it is held to a
+        // confirmation, so its answer is late by a whole follow tick.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let write = tokio::spawn({
+            let base = base.clone();
+            let client = client.clone();
+            async move { client.post(format!("{base}/log-something")).send().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        run(&second);
+        let logged = write
+            .await
+            .unwrap()
+            .expect("the leader's write is answered");
+        assert_eq!(logged.status(), StatusCode::OK);
+        assert!(
+            logged.headers().contains_key(COMMIT_HEADER),
+            "{:?}",
+            lines(logged.headers())
+        );
+        let pulled = pulled.await.unwrap();
+        assert!(store.commit_index().unwrap() > before);
+        assert_eq!(pulled.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !pulled.headers().contains_key(COMMIT_HEADER),
+            "{:?}",
+            lines(pulled.headers())
+        );
+        // The route logs nothing of its own either.
+        assert_eq!(store.commit_index().unwrap(), before + 1);
+        second.kill();
     }
 
     /// A follower's answer, however it came about, names the leader exactly
