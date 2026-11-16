@@ -230,6 +230,33 @@ mod tests {
         );
     }
 
+    /// The header of a machine offers the two destructive-but-routine things
+    /// the API can do and the page used not to: a new root disk from an
+    /// image, and a different size while the machine is off.
+    #[tokio::test]
+    async fn console_can_rebuild_and_resize_a_machine() {
+        let app = Router::new().route("/", get(console_page));
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 2 << 20).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(">Rebuild<") || text.contains("\"Rebuild\""),
+            "no Rebuild button"
+        );
+        assert!(
+            text.contains(">Resize<") || text.contains("\"Resize\""),
+            "no Resize button"
+        );
+        assert!(text.contains("/compute/machines/"), "no machine calls");
+        assert!(text.contains("/rebuild"), "no rebuild call");
+        assert!(text.contains("/resize"), "no resize call");
+        assert!(text.contains("/compute/sizes"), "no size list read");
+        assert!(text.contains("Everything on its root disk is lost."));
+    }
+
     /// A folder of console pieces read straight off disk.
     fn console_dir() -> std::path::PathBuf {
         format!("{}/src/console", env!("CARGO_MANIFEST_DIR")).into()

@@ -2,6 +2,8 @@ machineHost.js
 placeCount.js
 machineTab.js
 renderMachineHead.js
+machineRebuild.js
+machineResize.js
 renderMachineHeader.js
 renderMachineUsage.js
 renderMachineTabs.js

@@ -7,7 +7,10 @@
   .mhead h2 { font-size: 1.55rem; display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
   .mhead .meta { color: var(--muted); margin: 0.35rem 0 0; font-size: 0.88rem; }
   .mhead .meta b { color: var(--text); font-weight: 500; }
-  .mhead .acts { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+  .mhead .acts { display: flex; gap: 0.45rem; flex-wrap: wrap; align-items: center; }
+  .mhead .resizebox { display: flex; gap: 0.45rem; align-items: center; flex-wrap: nowrap; }
+  .mhead .resizebox[hidden] { display: none; }
+  .mhead .resizebox select { width: auto; max-width: 15rem; }
   .pill { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.16rem 0.6rem; border-radius: 999px; border: 1px solid var(--line-strong); font-size: 0.74rem; font-weight: 600; letter-spacing: 0.02em; text-transform: lowercase; color: var(--muted); }
   .pill::before { content: ""; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: currentColor; }
   .pill.ready, .pill.on, .pill.running, .pill.leader { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 9%, transparent); }

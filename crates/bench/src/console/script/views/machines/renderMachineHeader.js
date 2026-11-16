@@ -27,12 +27,14 @@
   const start = act("Start", "primary", "/start");
   const stop = act("Stop", "", "/stop");
   const reboot = act("Reboot", "", "/reboot");
+  const rebuild = machineRebuild(machine, st, spec, mid, render);
+  const resize = machineResize(machine, st, spec, mid, gen, render);
   const del = act("Delete", "danger", "", "DELETE", () => { openMachine = null; });
   // Only what makes sense for the state it is in.
   start.hidden = power === "on";
   stop.hidden = power !== "on";
   reboot.disabled = power !== "on";
-  acts.append(start, stop, reboot, del);
+  acts.append(start, stop, reboot, rebuild, resize, del);
   head.append(who, acts);
   root.append(head);
   if (st.message && ["error", "failed"].includes(String(st.phase).toLowerCase())) {
