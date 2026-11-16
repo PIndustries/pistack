@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::client::{Client, Create, RestoreRequest, UpdateMeta};
+use crate::redact::without_secret_hash;
 use crate::types::*;
 
 pub fn router(client: Client) -> Router {
@@ -387,7 +388,7 @@ async fn offer_volume(
     // The secret goes out once, here, and is not in the record afterwards.
     let offered = c.offer_volume(&v.meta.id)?;
     Ok(created(json!({
-        "transfer": offered.transfer,
+        "transfer": without_secret_hash(offered.transfer),
         "secret": offered.secret,
     })))
 }
@@ -399,10 +400,12 @@ async fn list_volume_transfers(
 ) -> ApiResult<Json<Page<Transfer>>> {
     let caller = caller(ext)?;
     let v = load_volume(&c, &caller, &id)?;
-    Ok(Json(page(
-        c.list_offers_for_volume(&v.meta.id)?,
-        &ListQuery::default(),
-    )))
+    let offers = c
+        .list_offers_for_volume(&v.meta.id)?
+        .into_iter()
+        .map(without_secret_hash)
+        .collect();
+    Ok(Json(page(offers, &ListQuery::default())))
 }
 
 async fn list_transfers(
@@ -418,6 +421,7 @@ async fn list_transfers(
         .list_transfers(None)?
         .into_iter()
         .filter(|t| transfer_visible(&caller, t))
+        .map(without_secret_hash)
         .collect();
     Ok(Json(page(mine, &q)))
 }
@@ -435,7 +439,7 @@ async fn get_transfer(
             t.meta.id
         )));
     }
-    Ok(Json(t))
+    Ok(Json(without_secret_hash(t)))
 }
 
 async fn accept_transfer(
@@ -467,7 +471,7 @@ async fn cancel_transfer(
             t.meta.id
         )));
     }
-    Ok(Json(c.cancel_transfer(&t.meta.id)?))
+    Ok(Json(without_secret_hash(c.cancel_transfer(&t.meta.id)?)))
 }
 
 // ---- snapshots ------------------------------------------------------------
