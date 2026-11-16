@@ -254,7 +254,7 @@ Role bindings.
 ```text
 pi binding list
 pi binding show <NAME>
-pi binding create --principal <PRINCIPAL> --role <ROLE>
+pi binding create --principal <PRINCIPAL> --role <ROLE> (--in-project <PROJECT> | --system)
 pi binding delete <NAME>
 ```
 
@@ -262,7 +262,8 @@ pi binding delete <NAME>
 | --- | --- | --- |
 | `binding create` | `--principal <PRINCIPAL>` | Principal (name or id) |
 | `binding create` | `--role <ROLE>` | Role name |
-| `binding create` | `--in-project <PROJECT>` | Project (name or id); omit for system scope |
+| `binding create` | `--in-project <PROJECT>` | Project (name or id) |
+| `binding create` | `--system` | Bind across the whole cloud, not one project |
 
 ## pi key
 

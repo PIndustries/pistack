@@ -576,9 +576,12 @@ pub struct BindingCreate {
     /// Role name.
     #[arg(long)]
     pub role: String,
-    /// Project (name or id); omit for system scope.
-    #[arg(long = "in-project", value_name = "PROJECT")]
+    /// Project (name or id).
+    #[arg(long = "in-project", value_name = "PROJECT", conflicts_with = "system")]
     pub in_project: Option<String>,
+    /// Bind across the whole cloud, not one project.
+    #[arg(long)]
+    pub system: bool,
 }
 crud!(BindingCmd, BindingCreate);
 

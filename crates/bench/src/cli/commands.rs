@@ -1561,11 +1561,7 @@ async fn binding(ctx: &Ctx, cmd: BindingCmd, io: &mut Io<'_>) -> CliResult<()> {
         BindingCmd::Show(a) => do_show(ctx, io, k, a).await,
         BindingCmd::Delete(a) => do_delete(ctx, io, k, a).await,
         BindingCmd::Create(a) => {
-            let body = compact(json!({
-                "principal": a.principal,
-                "role": a.role,
-                "project": opt(a.in_project),
-            }));
+            let body = compact(super::binding::create_body(&a)?);
             do_create(ctx, io, k, body, false).await.map(|_| ())
         }
     }

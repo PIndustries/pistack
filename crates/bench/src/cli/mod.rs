@@ -8,6 +8,7 @@
 pub mod alarm;
 pub mod args;
 pub mod backup;
+mod binding;
 pub mod bucket;
 pub mod client;
 pub mod commands;
