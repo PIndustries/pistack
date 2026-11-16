@@ -117,12 +117,14 @@ impl HostNat {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| {
-            ApiError::unavailable(format!(
-                "floating ip helper {}: {e}",
-                self.program.display()
-            ))
-        })?;
+        let mut child = super::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+            .await
+            .map_err(|e| {
+                ApiError::unavailable(format!(
+                    "floating ip helper {}: {e}",
+                    self.program.display()
+                ))
+            })?;
         if let Some(body) = stdin_body {
             if let Some(mut sin) = child.stdin.take() {
                 if let Err(e) = sin.write_all(body).await {
