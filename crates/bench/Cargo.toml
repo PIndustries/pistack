@@ -41,6 +41,7 @@ base64.workspace = true
 
 [dev-dependencies]
 beacon.workspace = true
+fabric.workspace = true
 relay.workspace = true
 shelf.workspace = true
 slab.workspace = true

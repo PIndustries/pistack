@@ -172,6 +172,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: NetworkCmd,
     },
+    /// VPCs and the subnets cut from them.
+    Vpc {
+        #[command(subcommand)]
+        cmd: crate::cli::vpc::VpcCmd,
+    },
     /// Subnets.
     Subnet {
         #[command(subcommand)]

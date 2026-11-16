@@ -19,6 +19,7 @@ pub mod lb;
 pub mod output;
 pub mod secret;
 pub mod share;
+pub mod vpc;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
