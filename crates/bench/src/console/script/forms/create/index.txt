@@ -9,6 +9,7 @@ buckets.js
 projects.js
 users.js
 keys.js
+keypairs.js
 dns.js
 pods.js
 deployments.js

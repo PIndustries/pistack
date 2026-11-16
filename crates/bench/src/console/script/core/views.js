@@ -121,6 +121,16 @@ const VIEWS = {
       ["Size", i => i.status && i.status.size_bytes],
     ],
   },
+  keypairs: {
+    title: "Key pairs",
+    path: "/compute/keypairs",
+    note: "A key pair made here has its private key shown once on this page, then dropped.",
+    cols: [
+      ["Name", i => i.name],
+      ["Type", i => i.spec && i.spec.key_type],
+      ["Fingerprint", i => i.spec && i.spec.fingerprint],
+    ],
+  },
   buckets: {
     title: "Buckets",
     path: "/silo/buckets",

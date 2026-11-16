@@ -1,6 +1,7 @@
 function showLogin() {
   clearToken();
   keyOnce = null;
+  keypairOnce = null;
   openMachine = null;
   openHost = null;
   openProject = null;

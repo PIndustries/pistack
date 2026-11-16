@@ -1,5 +1,6 @@
 views.js
 state.js
+keypairOnce.js
 el.js
 showLogin.js
 showApp.js
