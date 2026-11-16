@@ -140,6 +140,21 @@ const MSG_NOT_LEADER: &str = "not the leader";
 const MSG_BODY_TOO_LARGE: &str =
     "the request is too large to pass on to the leader; send it to the leader";
 
+/// Largest body a follower will take on to carry to the leader. Mirrors the
+/// server's own carry limit: past this a follower answers the too-large
+/// refusal only after reading this much, and a client still writing the body
+/// may never see the answer at all.
+const CARRY_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// How long the wait for a leader's address is allowed to take before the
+/// upload is handed to the server `pi` was given anyway.
+const LEADER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The answer any server that knows who leads carries, even an unauthenticated
+/// `GET /healthz`: the API address of the leader. The leader itself and a
+/// single server send no such header.
+const LEADER_HEADER: &str = "x-pistack-leader";
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -151,11 +166,28 @@ pub struct Client {
     home: Arc<Mutex<Option<String>>>,
 }
 
+/// The address a server gave us for the leader, if we may send this client's
+/// requests there instead: a different server on the same scheme. The token
+/// goes with them, so a server reached over https is never followed to an
+/// http address. Both the address a refusal names and the one a server
+/// carries in a header are put through here.
+fn leader_on_this_scheme(base: &str, named: &str) -> Option<String> {
+    let leader = named.trim().trim_end_matches('/');
+    if leader.is_empty() {
+        return None;
+    }
+    let there = reqwest::Url::parse(leader).ok()?;
+    let here = reqwest::Url::parse(base).ok()?;
+    if there.scheme() != here.scheme() || there.origin() == here.origin() {
+        return None;
+    }
+    Some(leader.to_owned())
+}
+
 /// The leader a refusal names, if a request sent to `base` may be sent there
-/// instead: a different server on the same scheme. The token goes with the
-/// retry, so a server reached over https is never followed to an http address.
-/// Two refusals name a leader: a follower asked to carry a write it does not
-/// lead, and a follower whose buffer cannot hold the body it was handed.
+/// instead. Two refusals name a leader: a follower asked to carry a write it
+/// does not lead, and a follower whose buffer cannot hold the body it was
+/// handed.
 fn named_leader(base: &str, err: &CliError) -> Option<String> {
     let CliError::Api {
         status,
@@ -174,17 +206,7 @@ fn named_leader(base: &str, err: &CliError) -> Option<String> {
     if !refused {
         return None;
     }
-    let leader = details
-        .get("leader")?
-        .as_str()?
-        .trim()
-        .trim_end_matches('/');
-    let there = reqwest::Url::parse(leader).ok()?;
-    let here = reqwest::Url::parse(base).ok()?;
-    if there.scheme() != here.scheme() || there.origin() == here.origin() {
-        return None;
-    }
-    Some(leader.to_owned())
+    leader_on_this_scheme(base, details.get("leader")?.as_str()?)
 }
 
 impl Client {
@@ -227,7 +249,16 @@ impl Client {
     /// The single place a request is built. A write carries the forward
     /// header; a read does not.
     fn request_url(&self, method: Method, url: String) -> reqwest::RequestBuilder {
-        let mut r = self.http.request(method.clone(), url);
+        self.request_on(&self.http, method, url)
+    }
+
+    fn request_on(
+        &self,
+        http: &reqwest::Client,
+        method: Method,
+        url: String,
+    ) -> reqwest::RequestBuilder {
+        let mut r = http.request(method.clone(), url);
         if let Some(t) = &self.token {
             r = r.bearer_auth(t);
         }
@@ -269,6 +300,21 @@ impl Client {
         }
     }
 
+    /// Say where the leader is and take the rest of this client's requests
+    /// there. Recorded once, however many requests a single upload produces.
+    fn settle_on_leader(&self, leader: &str) {
+        let notice = format!(
+            "{} is not the leader; sending the request to {leader}",
+            self.base
+        );
+        let mut notices = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        if !notices.contains(&notice) {
+            notices.push(notice);
+        }
+        drop(notices);
+        self.settle(leader);
+    }
+
     /// Where to send `path` again after `err`, when a follower refused it
     /// and named the leader — either because it does not lead, or because
     /// the body is too large for it to carry. Says so on stderr, and the
@@ -279,16 +325,57 @@ impl Client {
             return None;
         }
         let leader = named_leader(&self.base, err)?;
-        let notice = format!(
-            "{} is not the leader; sending the request to {leader}",
-            self.base
-        );
-        let mut notices = self.notices.lock().unwrap_or_else(|e| e.into_inner());
-        if !notices.contains(&notice) {
-            notices.push(notice);
-        }
-        self.settle(&leader);
+        self.settle_on_leader(&leader);
         Some(format!("{leader}/{}", path.trim_start_matches('/')))
+    }
+
+    /// Ask the server this client would send `path` to who leads, and settle
+    /// there when it answers. Worth doing before a body too large for a
+    /// follower to carry: past [`CARRY_LIMIT`] a follower gives up on the
+    /// forward partway through, and a client still writing the body may never
+    /// read the refusal that says so.
+    ///
+    /// Nothing here can stop an upload from going out. No probe when the
+    /// leader is already known, when the path names a server of its own, or
+    /// when the file is small enough to carry; no probe answer is trusted
+    /// unless a refusal of the same address would be.
+    async fn find_leader(&self, path: &str, len: u64) {
+        if len <= CARRY_LIMIT
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+            || self
+                .home
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
+            return;
+        }
+        let answered = async {
+            let resp = self
+                .http
+                .get(format!("{}/healthz", self.base))
+                .timeout(LEADER_PROBE_TIMEOUT)
+                .send()
+                .await
+                .ok()?;
+            let named = resp
+                .headers()
+                .get(LEADER_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_owned());
+            // The whole answer is read before the connection goes back to the
+            // pool, whatever it said. An answer only half taken off a
+            // connection leaves the rest of it on the wire, and the next
+            // request over that connection — the upload — is answered with
+            // what is left of the health check.
+            let _ = resp.bytes().await;
+            leader_on_this_scheme(&self.base, &named?)
+        }
+        .await;
+        if let Some(leader) = answered {
+            self.settle_on_leader(&leader);
+        }
     }
 
     async fn send_json(
@@ -406,11 +493,19 @@ impl Client {
         self.call(Method::DELETE, path, None).await
     }
 
-    /// Stream a file as the request body (image upload). A follower's
-    /// refusal is followed to the leader like [`Client::call`]: the stream
-    /// the follower partly consumed is discarded and the file opened again,
-    /// so the leader is handed the whole body and not the tail of it.
+    /// Stream a file as the request body (image upload). A file too large for
+    /// a follower to carry is offered to [`CARRY_LIMIT`] first, so it goes
+    /// straight to the leader rather than being written into a server that
+    /// has already given up on it. A follower's refusal is followed to the
+    /// leader like [`Client::call`] either way: the stream the follower
+    /// partly consumed is discarded and the file opened again, so the leader
+    /// is handed the whole body and not the tail of it.
     pub async fn put_file(&self, path: &str, file: &Path) -> CliResult<Value> {
+        let len = tokio::fs::metadata(file)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.find_leader(path, len).await;
         let first = self.put_file_to(self.address(path), file).await;
         let Err(err) = &first else {
             return first;
@@ -528,6 +623,25 @@ mod tests {
         assert_eq!(e.to_string(), "HTTP 400: Failed to parse the request body");
         let e = parse_error(StatusCode::BAD_GATEWAY, "");
         assert_eq!(e.to_string(), "HTTP 502 Bad Gateway");
+    }
+
+    #[test]
+    fn only_an_address_on_this_scheme_is_taken_as_a_leader() {
+        let base = "http://10.0.0.12:8443";
+        assert_eq!(
+            leader_on_this_scheme(base, "http://10.0.0.13:8443/").as_deref(),
+            Some("http://10.0.0.13:8443")
+        );
+        // Never from https to http, or the other way.
+        assert_eq!(
+            leader_on_this_scheme("https://10.0.0.12:8444", "http://10.0.0.13:8443"),
+            None
+        );
+        assert_eq!(leader_on_this_scheme(base, "https://10.0.0.13:8444"), None);
+        // Itself, nothing, or something that is not an address.
+        assert_eq!(leader_on_this_scheme(base, base), None);
+        assert_eq!(leader_on_this_scheme(base, "   "), None);
+        assert_eq!(leader_on_this_scheme(base, "10.0.0.13"), None);
     }
 
     #[test]
@@ -816,6 +930,266 @@ mod tests {
             "said once where the upload went"
         );
         assert_eq!(c.settled(), format!("http://{leader_addr}/"));
+    }
+
+    /// A server that keeps every byte it is put. The body is read off the
+    /// stream rather than buffered by an extractor, as a real leader reads an
+    /// upload: no length limit sits between the two.
+    async fn carrier() -> (String, Arc<Mutex<Vec<u8>>>) {
+        use axum::extract::Request;
+        use futures::StreamExt;
+        use serde_json::json;
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let log = got.clone();
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let log = log.clone();
+            async move {
+                let mut acc = Vec::new();
+                let mut stream = req.into_body().into_data_stream();
+                while let Some(chunk) = stream.next().await {
+                    acc.extend_from_slice(&chunk.expect("the body arrives"));
+                }
+                *log.lock().unwrap() = acc;
+                axum::Json(json!({"key": "payload"}))
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), got)
+    }
+
+    /// A follower that names `leader` in its `GET /healthz` answer, or names
+    /// nobody when `leader` is `None`. Counts the health answers and keeps the
+    /// SHA-256 of whatever body is streamed to it, empty when none arrives.
+    async fn pointer(leader: Option<String>) -> (String, Arc<Mutex<u32>>, Arc<Mutex<Vec<u8>>>) {
+        use axum::body::Body;
+        use axum::extract::Request;
+        use axum::response::Response;
+        use serde_json::json;
+        use sha2::Digest;
+        let healths = Arc::new(Mutex::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let h = healths.clone();
+        let b = bodies.clone();
+        let named = leader.clone();
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let h = h.clone();
+            let b = b.clone();
+            let named = named.clone();
+            async move {
+                if *req.method() == Method::GET && req.uri().path() == "/healthz" {
+                    *h.lock().unwrap() += 1;
+                    let mut head = Response::builder().header("content-type", "application/json");
+                    if let Some(n) = named {
+                        head = head.header(LEADER_HEADER, n);
+                    }
+                    return head
+                        .body(Body::from(json!({"status": "ok"}).to_string()))
+                        .unwrap();
+                }
+                use futures::StreamExt;
+                let mut hasher = sha2::Sha256::new();
+                let mut any = false;
+                let mut stream = req.into_body().into_data_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.expect("the body arrives");
+                    hasher.update(&chunk);
+                    any = !chunk.is_empty() || any;
+                }
+                *b.lock().unwrap() = if any {
+                    hasher.finalize().to_vec()
+                } else {
+                    Vec::new()
+                };
+                Response::builder()
+                    .body(Body::from(json!({"key": "payload"}).to_string()))
+                    .unwrap()
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), healths, bodies)
+    }
+
+    /// A file bigger than one the forward will carry, with its digest.
+    fn past_the_carry_limit() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
+        use sha2::Digest;
+        let bytes = vec![0xa5u8; CARRY_LIMIT as usize + 1024 * 1024];
+        let digest = sha2::Sha256::digest(&bytes).to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("payload");
+        std::fs::write(&file, &bytes).unwrap();
+        (dir, file, digest)
+    }
+
+    /// The digest of bytes as a server received them.
+    fn digest_of(bytes: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes).to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_long_upload_asks_who_leads_before_it_streams() {
+        let (leader_url, leader_got) = carrier().await;
+        let (url, healths, first_bodies) = pointer(Some(leader_url.clone())).await;
+        let (_dir, file, digest) = past_the_carry_limit();
+        let notices = Notices::default();
+        let c = Client::new(&url, Some("t".into()), false)
+            .unwrap()
+            .with_notices(notices.clone());
+
+        let v = c.put_file("/silo/buckets/b/objects/payload", &file).await;
+        assert_eq!(v.unwrap()["key"], "payload");
+        assert_eq!(*healths.lock().unwrap(), 1, "probed once");
+        assert!(
+            first_bodies.lock().unwrap().is_empty(),
+            "the follower was not handed the body it cannot carry"
+        );
+        assert_eq!(
+            digest_of(leader_got.lock().unwrap().as_slice()).as_slice(),
+            digest.as_slice(),
+            "the leader received every byte"
+        );
+        assert_eq!(
+            notices.lock().unwrap().clone(),
+            vec![format!(
+                "{url} is not the leader; sending the request to {leader_url}"
+            )],
+            "said once where the upload went"
+        );
+        assert_eq!(c.settled(), format!("{leader_url}/"));
+    }
+
+    #[tokio::test]
+    async fn a_short_upload_is_streamed_without_a_probe() {
+        use axum::body::Bytes;
+        use serde_json::json;
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let log = got.clone();
+        let healths = Arc::new(Mutex::new(0));
+        let count = healths.clone();
+        let app = axum::Router::new().fallback(move |body: Bytes| {
+            let log = log.clone();
+            let count = count.clone();
+            async move {
+                if body.is_empty() {
+                    *count.lock().unwrap() += 1;
+                }
+                *log.lock().unwrap() = body.to_vec();
+                axum::Json(json!({"key": "payload"}))
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("payload");
+        let bytes = vec![7u8; 64 * 1024];
+        std::fs::write(&file, &bytes).unwrap();
+        let c = Client::new(&format!("http://{addr}"), Some("t".into()), false).unwrap();
+        let v = c.put_file("/silo/buckets/b/objects/payload", &file).await;
+        assert_eq!(v.unwrap()["key"], "payload");
+        assert_eq!(got.lock().unwrap().as_slice(), bytes.as_slice());
+        assert_eq!(
+            *healths.lock().unwrap(),
+            0,
+            "a body the server can carry needs no leader"
+        );
+        assert_eq!(c.settled(), format!("http://{addr}/"));
+    }
+
+    #[tokio::test]
+    async fn an_upload_streams_to_the_server_given_when_nobody_is_named() {
+        let (url, healths, bodies) = pointer(None).await;
+        let (_dir, file, digest) = past_the_carry_limit();
+        let notices = Notices::default();
+        let c = Client::new(&url, Some("t".into()), false)
+            .unwrap()
+            .with_notices(notices.clone());
+
+        let v = c.put_file("/silo/buckets/b/objects/payload", &file).await;
+        assert_eq!(v.unwrap()["key"], "payload");
+        assert_eq!(*healths.lock().unwrap(), 1, "probed, and got nothing");
+        assert_eq!(
+            bodies.lock().unwrap().as_slice(),
+            digest.as_slice(),
+            "the server pi was given received every byte"
+        );
+        assert!(
+            notices.lock().unwrap().is_empty(),
+            "nothing was claimed about a leader"
+        );
+        assert_eq!(c.settled(), format!("{url}/"));
+    }
+
+    #[tokio::test]
+    async fn a_probed_connection_carries_the_next_upload_too() {
+        // The probe and the uploads share one pooled client, so an upload can
+        // be handed a connection the probe took its answer off. A probe that
+        // reads only as far as the header leaves the rest of the health answer
+        // on that connection, and the next request over it is answered with
+        // what is left of it. The leader is named, so the follower is probed
+        // and never handed a body: two uploads must both reach the leader
+        // whole, the second over a connection the first put back.
+        let (leader_url, leader_got) = carrier().await;
+        let (url, _healths, follower_bodies) = pointer(Some(leader_url)).await;
+        let (_dir, file, digest) = past_the_carry_limit();
+        let c = Client::new(&url, Some("t".into()), false).unwrap();
+
+        for _ in 0..2 {
+            let v = c.put_file("/silo/buckets/b/objects/payload", &file).await;
+            assert_eq!(v.unwrap()["key"], "payload");
+            assert_eq!(
+                digest_of(leader_got.lock().unwrap().as_slice()).as_slice(),
+                digest.as_slice(),
+                "the leader received every byte"
+            );
+        }
+        assert!(
+            follower_bodies.lock().unwrap().is_empty(),
+            "the follower was handed no body either time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_upload_is_not_followed_down_to_http() {
+        // The scheme rule itself is checked against the shared helper in
+        // `only_an_address_on_this_scheme_is_taken_as_a_leader`: a leader named
+        // below the client's own scheme is refused. End to end, an https client
+        // given a follower it cannot reach over https settles on nothing: the
+        // probe cannot read an answer, so the header naming a plain http leader
+        // is never even looked at, and the upload goes out over https to the
+        // address it was given — nowhere the http leader.
+        let (url, healths, bodies) = pointer(Some("http://leader.invalid".into())).await;
+        let base = url.replace("http://", "https://");
+        let notices = Notices::default();
+        let c = Client::new(&base, Some("t".into()), false)
+            .unwrap()
+            .with_notices(notices.clone());
+        let (_dir, file, _) = past_the_carry_limit();
+        let err = match c.put_file("/silo/buckets/b/objects/payload", &file).await {
+            Ok(_) => panic!("the https follower is not reachable over http"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, CliError::Transport(_)),
+            "the upload stayed on the scheme it was given: {err}"
+        );
+        // The probe reached the address over https and got nothing it could use;
+        // the http leader was never handed a body and nothing was settled on.
+        assert!(
+            bodies.lock().unwrap().is_empty(),
+            "no body left this client"
+        );
+        assert!(
+            notices.lock().unwrap().is_empty(),
+            "an http leader named to an https client is nobody"
+        );
+        assert_eq!(c.settled(), format!("{base}/"), "never left https");
+        let _ = healths;
     }
 
     #[test]
