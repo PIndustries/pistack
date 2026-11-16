@@ -8,7 +8,7 @@ use axum::http::{header, Request, StatusCode};
 use pistack_store::Store;
 use pistack_types::{kind, Caller, Id, Module, ModuleContext};
 use serde_json::{json, Value};
-use shelf::Shelf;
+use shelf::{AccessMode, Share, ShareAccess, ShareSpec, Shelf};
 use std::sync::{Arc, OnceLock};
 use tower::ServiceExt;
 
@@ -814,6 +814,111 @@ async fn failed_export_is_retried_after_backoff() {
         "exportfs ran again after backoff, log lines {calls}"
     );
     stop_loop(shutdown).await;
+    clear_share_tools();
+}
+
+#[tokio::test]
+async fn reconciler_runs_only_on_the_node_that_leads() {
+    let _guard = shelf_lock().lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shelf = dir.path().join("shares");
+    let exports_path = dir.path().join("pistack.exports");
+    std::env::set_var("PISTACK_SHELF_DIR", &shelf);
+    std::env::set_var("PISTACK_EXPORTS_FILE", &exports_path);
+    std::env::set_var("PISTACK_SHELF_EUID", "0");
+    std::env::remove_var("PISTACK_SHELF_HELPER");
+    std::env::set_var("PISTACK_SHELF_RETRY_MS", "50");
+    std::env::set_var("PISTACK_CEPH_BIN", dir.path().join("no-ceph"));
+    executable(dir.path(), "exportfs", "#!/bin/sh\nexit 0\n");
+    std::env::set_var("PISTACK_EXPORTFS", dir.path().join("exportfs"));
+
+    let store = open_store(dir.path());
+    let shutdown = pistack_types::module::CancellationToken::new();
+    let leadership = pistack_types::Leadership::new(false);
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: shutdown.clone(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: leadership.clone(),
+    };
+    Shelf.start(ctx).await.expect("start shelf");
+
+    // File a due share the way a leader's write path would: revision 1,
+    // status never observing it. A follower's store refuses the status
+    // write, so the fence stands the follower down.
+    let share = Share {
+        meta: pistack_types::Meta::new(kind::SHARE, "led", None),
+        spec: ShareSpec {
+            name: "led".into(),
+            protocol: "nfs".into(),
+            size_gib: 1,
+            access: vec![ShareAccess {
+                principal: None,
+                cidr: Some("10.7.0.0/24".into()),
+                mode: AccessMode::Read,
+            }],
+        },
+        status: shelf::ShareStatus::default(),
+    };
+    let id = share.meta.id.clone();
+    store
+        .collection::<Share>()
+        .create(share.clone())
+        .expect("file share");
+    store.set_write_fence(true);
+    drop(store.events().send(pistack_types::Event {
+        kind: kind::SHARE.to_owned(),
+        id: id.clone(),
+        project: None,
+        action: pistack_types::EventAction::Updated,
+        revision: 1,
+        at: chrono::Utc::now(),
+    }));
+
+    // Not leader: no pass runs, so no exports file and no attempted status write.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !exports_path.exists(),
+        "a follower must not run the export helper"
+    );
+    assert_eq!(
+        store
+            .collection::<Share>()
+            .get(&id)
+            .expect("get share")
+            .status
+            .phase,
+        pistack_types::Phase::Pending,
+        "a follower must not reconcile"
+    );
+
+    // Promote: the loop starts, does its first pass, and exports the share.
+    store.set_write_fence(false);
+    leadership.set(true);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = store.collection::<Share>().get(&id).expect("get share");
+        if got.status.phase == pistack_types::Phase::Ready
+            && got.status.observed_revision == got.meta.revision
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leader never reconciled the share: {:?}",
+            got.status
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let exports = std::fs::read_to_string(&exports_path).expect("exports file");
+    assert!(
+        exports.contains("10.7.0.0/24(ro,sync,no_subtree_check)"),
+        "{exports}"
+    );
+
+    shutdown.cancel();
     clear_share_tools();
 }
 
