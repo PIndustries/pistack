@@ -100,6 +100,7 @@ impl Silo {
         Client::new(store.clone(), Self::data_root())
             .with_max_object_bytes(self.config.max_object_bytes)
             .with_peers(Peers::from_cluster(store))
+            .with_put_copies(self.config.put_copies)
     }
 }
 
