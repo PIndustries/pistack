@@ -4,6 +4,7 @@ routers.js
 security.js
 volumes.js
 fips.js
+vpcs.js
 images.js
 buckets.js
 projects.js

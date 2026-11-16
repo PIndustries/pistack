@@ -30,6 +30,19 @@ const VIEWS = {
     ],
   },
   topology: { title: "Topology" },
+  vpcs: {
+    title: "VPCs",
+    path: "/network/vpcs",
+    note: "A VPC is a private address space with its own router. Subnets are cut from its blocks.",
+    cols: [
+      ["Name", i => i.name],
+      ["Phase", i => i.status && i.status.phase],
+      ["Blocks", i => ((i.spec && i.spec.cidrs) || []).join(", ")],
+      ["Subnets", i => i.status && i.status.subnets],
+      ["External network", i => i.spec && i.spec.external_network],
+      ["Message", i => i.status && i.status.message],
+    ],
+  },
   networks: {
     title: "Networks",
     path: "/network/networks",
