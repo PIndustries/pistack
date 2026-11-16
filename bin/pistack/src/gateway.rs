@@ -166,8 +166,16 @@ pub fn build(
             reads_at_leader,
         ));
         app = app.layer(middleware::from_fn_with_state(
-            handle,
+            handle.clone(),
             crate::cluster::reject_follower_writes,
+        ));
+        // Outside both: every answer this follower gives, a refusal of its
+        // own or one carried from the leader, names the leader. `/healthz`
+        // is routed inside `app`, under this layer, so the cheap probe a
+        // client uses before a large upload is answered here too.
+        app = app.layer(middleware::from_fn_with_state(
+            handle,
+            crate::cluster::name_the_leader,
         ));
         // Over every route: object bytes for other servers are under the
         // silo module, not under /cluster.
@@ -840,6 +848,125 @@ mod tests {
             status(&app, "GET", "/compute/machines/web/stats").await,
             StatusCode::OK
         );
+    }
+
+    /// A follower names the leader on `/healthz` (which the cluster layers
+    /// already let through) and on its 409; the leader names no one.
+    async fn answers_naming_leader(leader: bool) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let established = crate::cluster::Established {
+            role: pistack_cluster::Role::Voter,
+            leader,
+            leader_api: if leader {
+                "http://10.0.0.12:8443".into()
+            } else {
+                "http://10.0.0.11:8443".into()
+            },
+            term: 1,
+            members: Vec::new(),
+        };
+        let handle = std::sync::Arc::new(crate::cluster::handle_from(
+            "n2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store.clone(),
+            dir.path().join("state.redb"),
+            &established,
+            None,
+            pistack_types::Leadership::new(leader),
+        ));
+        let app = Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .fallback(|| async { "ok" })
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                crate::cluster::reject_follower_writes,
+            ))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                crate::cluster::name_the_leader,
+            ));
+        let mut named = 0;
+        for (method, path) in [("GET", "/healthz"), ("POST", "/compute/machines")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let values: Vec<_> = response
+                .headers()
+                .get_all(crate::cluster::LEADER_HEADER)
+                .iter()
+                .collect();
+            assert!(values.len() <= 1, "{method} {path}: {values:?}");
+            if values
+                .first()
+                .is_some_and(|value| *value == "http://10.0.0.11:8443")
+            {
+                named += 1;
+            }
+        }
+        named
+    }
+
+    #[tokio::test]
+    async fn a_follower_names_the_leader_on_healthz_and_on_a_refusal() {
+        assert_eq!(answers_naming_leader(false).await, 2);
+        assert_eq!(answers_naming_leader(true).await, 0);
+    }
+
+    /// A server in no cluster at all names no one, on any answer.
+    #[tokio::test]
+    async fn a_server_with_no_cluster_names_no_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        gate::Keys::load_or_create(&store).unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let ctx = pistack_types::ModuleContext::for_test(
+            std::sync::Arc::new(store.clone()),
+            events,
+            tokio_util::sync::CancellationToken::new(),
+            "http://127.0.0.1:8443",
+            "solo",
+        );
+        let asm = crate::server::Assembly {
+            modules: Vec::new(),
+            forge: std::sync::Arc::new(forge::Forge::default()),
+            queue: pistack_rpc::CommandQueue::default(),
+            images: std::sync::Arc::new(mold::LocalDirStore::new(dir.path().join("images"))),
+        };
+        let verifier = gate::Verifier::from_store(&store).unwrap();
+        let app = super::build(&asm, ctx, verifier, true, None);
+        for (method, path) in [
+            ("GET", "/healthz"),
+            ("POST", "/compute/machines"),
+            ("GET", "/"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(crate::cluster::LEADER_HEADER),
+                "{method} {path}"
+            );
+        }
     }
 
     /// A server holding one ready image, with the agent transport on a real
