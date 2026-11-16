@@ -963,7 +963,6 @@ async fn backup_create_wait_watches_the_service_reach_ready() {
     // reconciler beside the router and the CLI's first poll, so it is not
     // asserted; `ready` exactly once is the thing the wait has to get right.
     assert!(r.out.contains("backup \"nightly\": ready"), "{r:?}");
-    assert!(r.out.contains("backup \"nightly\": pending"), "{r:?}");
     assert_eq!(
         r.out.matches("backup \"nightly\": ready").count(),
         1,
