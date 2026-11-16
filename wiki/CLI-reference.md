@@ -342,6 +342,7 @@ pi machine stats <NAME>
 | `machine create` | `--image <IMAGE>` | Image name |
 | `machine create` | `--network <NETWORK>` | Network (repeatable) |
 | `machine create` | `--volume <VOLUME>` | Volume (repeatable) |
+| `machine create` | `--near-volume <VOLUME>` | Place the machine where this volume can attach (repeatable). Nothing is attached; use `pi volume attach` once it runs |
 | `machine create` | `--kind <KIND>` | [default: vm] [possible values: vm, container, metal] |
 | `machine create` | `--ssh-key <KEY>` | SSH public key (repeatable); `@file` reads a file |
 | `machine create` | `--keypair <KEYPAIR>` | Key pair (name or id) whose public key the machine also gets |
