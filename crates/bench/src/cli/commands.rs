@@ -1896,6 +1896,7 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "image": a.image,
                 "networks": a.networks,
                 "volumes": a.volumes,
+                "near_volumes": a.near_volumes,
                 "ssh_keys": keys,
                 "keypair": opt(a.keypair),
                 "user_data": user_data,
