@@ -1,0 +1,11 @@
+  .rules li button.x, .taglist button.x { padding: 0 0.3rem; margin-left: 0.35rem; line-height: 1.2; font-size: 0.8rem; }
+  .taglist { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+  .taglist .tag { border: 1px solid var(--line-strong); border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.8rem; white-space: nowrap; }
+  .taglist select { width: auto; padding: 0.15rem 1.4rem 0.15rem 0.4rem; font-size: 0.8rem; }
+  .tools { display: flex; gap: 0.5rem; align-items: center; margin: 0 0 1rem; flex-wrap: wrap; }
+  .tools .grow { flex: 1; }
+  .chip { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 999px; padding: 0.05rem 0.55rem; font-variant-numeric: tabular-nums; }
+  .chip:empty { display: none; }
+  form.create { margin: 0 0 1.2rem; width: auto; }
+  form.create p { color: var(--muted); font-size: 0.85rem; max-width: 80ch; }
+

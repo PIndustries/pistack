@@ -1,0 +1,9 @@
+  .quota { display: flex; gap: 1rem; align-items: center; padding: 0.7rem 1rem; border-bottom: 1px solid var(--line); }
+  .quota:last-child { border-bottom: 0; }
+  .quota .what { flex: 0 0 9.5rem; min-width: 0; overflow-wrap: anywhere; }
+  .quota .bar { flex: 1; min-width: 4rem; }
+  .quota .meter { margin: 0; }
+  .quota .used { color: var(--muted); flex: 0 0 auto; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
+  .quota .used.bad { color: var(--bad); }
+  .quota input { width: 7rem; }
+  .quota.edit .what, .quota.edit .bar { flex: 0 0 auto; }

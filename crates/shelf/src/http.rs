@@ -100,13 +100,15 @@ fn list_visible(store: &pistack_store::Store, caller: &Caller) -> ApiResult<Vec<
     Ok(items)
 }
 
+/// One share, by name, by full id or by the short id a table prints.
+///
+/// [`Collection::resolve_scoped`] finds the row; `caller.system` then decides
+/// what the caller may reach, exactly as the list does. Resolving a name
+/// only inside the token's project hid every share a project-scoped admin
+/// token had created through the cloud scope, which is what each
+/// `pi share` verb then tripped over.
 fn load(store: &pistack_store::Store, caller: &Caller, name_or_id: &str) -> ApiResult<Share> {
-    let scope = if caller.system {
-        None
-    } else {
-        caller.project.as_ref()
-    };
-    let share = shares(store).resolve(scope, name_or_id)?;
+    let share = shares(store).resolve_scoped(caller.project.as_ref(), name_or_id)?;
     if !caller.system && share.meta.project != caller.project {
         return Err(ApiError::not_found(format!(
             "share {} not found",
@@ -158,8 +160,8 @@ async fn create_share(
     share.meta.labels = req.labels;
     share.meta.annotations = req.annotations;
     realize::prepare(&store, &mut share).await?;
-    share.status.observed_revision = 1;
     let share = shares(&store).create(share)?;
+
     Ok((StatusCode::CREATED, Json(share)))
 }
 

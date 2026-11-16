@@ -16,6 +16,7 @@
 pub mod api;
 pub mod audit;
 pub mod credentials;
+pub mod lockout;
 pub mod policy;
 pub mod quota;
 pub mod token;
@@ -28,7 +29,7 @@ use pistack_types::{
     kind, ApiError, Id, Kind, ListQuery, Meta, Module, ModuleContext, ModuleInfo, Page,
 };
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use policy::authorize;
 pub use quota::check_quota_in;
@@ -48,6 +49,9 @@ pub const META_ADMIN_PROJECT: &str = "gate/admin_project";
 pub struct AppState {
     pub store: Store,
     pub keys: Keys,
+    /// Failed password sign-ins per name, in this process's memory. Every
+    /// server of the cloud keeps its own.
+    pub lockouts: Arc<Mutex<lockout::Lockouts>>,
 }
 
 impl FromRef<AppState> for Verifier {
@@ -85,6 +89,7 @@ impl Gate {
         let st = AppState {
             store: (*store).clone(),
             keys,
+            lockouts: Arc::new(Mutex::new(lockout::Lockouts::new())),
         };
         // If another caller raced us, keep theirs; both came from the same store.
         let _ = self.state.set(st.clone());
@@ -125,6 +130,26 @@ impl Module for Gate {
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
         let state = self.state(&ctx)?;
         bootstrap_with(&state.store, self.password_file.as_deref())?;
+        // A cloud upgraded from before key ids has its key set and peer
+        // secret saved by whichever server leads; only a leader's writes
+        // replicate.
+        let (store, leadership, shutdown) = (
+            state.store.clone(),
+            ctx.leadership.clone(),
+            ctx.shutdown.clone(),
+        );
+        tokio::spawn(async move {
+            leadership
+                .run_while_leader(shutdown, move |_active| {
+                    let store = store.clone();
+                    async move {
+                        if let Err(e) = token::ensure_saved(&store) {
+                            tracing::warn!(error = %e, "gate: could not save the signing key set");
+                        }
+                    }
+                })
+                .await;
+        });
         spawn_audit_sweep(&ctx, state.store, audit::Retention::from_env());
         Ok(())
     }
@@ -218,6 +243,11 @@ pub fn bootstrap_with(store: &Store, password_file: Option<&Path>) -> anyhow::Re
         Ok(p) if !p.is_empty() => (p, true),
         _ => (credentials::random_password(), false),
     };
+    // The rule applies here like anywhere a password is set. A server told to
+    // bootstrap with a password too short to keep is a server that cannot
+    // sign in to, so it says so and does not start.
+    credentials::check_password(&password, ADMIN_NAME)
+        .map_err(|e| anyhow::anyhow!("{ADMIN_PASSWORD_ENV}: {}", e.message))?;
     let password_hash = credentials::hash_password(&password)
         .map_err(|e| anyhow::anyhow!("hashing admin password: {e}"))?;
     let admin = principals.create(Principal {
@@ -406,6 +436,38 @@ mod tests {
         assert_eq!(one.total, 1);
     }
 
+    /// The bootstrap tests read and write the admin-password environment
+    /// variable, which is one process-wide slot shared by every test thread.
+    /// A test that sets it to a short password and leaves it set is a test the
+    /// next one to read the environment is not expecting, so the two that
+    /// touch it take the slot one at a time rather than over each other.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_bootstrap_password_too_weak_to_keep_is_refused() {
+        // A server that came up with a password the sign-in rule would refuse
+        // is a server nobody can sign in to, so it says so instead.
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let had = std::env::var_os(ADMIN_PASSWORD_ENV);
+        std::env::set_var(ADMIN_PASSWORD_ENV, "short");
+        let store = Store::in_memory().unwrap();
+        let e = bootstrap(&store).unwrap_err().to_string();
+        assert!(e.contains(ADMIN_PASSWORD_ENV), "{e}");
+        assert!(e.contains("at least 12 characters"), "{e}");
+        assert!(store
+            .collection::<Principal>()
+            .list(None)
+            .unwrap()
+            .is_empty());
+        std::env::set_var(ADMIN_PASSWORD_ENV, "admin-has-a-new-one");
+        bootstrap(&store).unwrap();
+        assert_eq!(store.collection::<Principal>().list(None).unwrap().len(), 1);
+        match had {
+            Some(v) => std::env::set_var(ADMIN_PASSWORD_ENV, v),
+            None => std::env::remove_var(ADMIN_PASSWORD_ENV),
+        }
+    }
+
     #[test]
     fn a_generated_password_goes_to_a_file_only_its_owner_can_read() {
         use std::os::unix::fs::PermissionsExt;
@@ -419,6 +481,8 @@ mod tests {
 
     #[test]
     fn bootstrap_is_idempotent_and_uses_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ADMIN_PASSWORD_ENV);
         let store = Store::in_memory().unwrap();
         bootstrap(&store).unwrap();
         bootstrap(&store).unwrap();

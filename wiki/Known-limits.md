@@ -11,10 +11,16 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **A join by discovery is plain HTTP.** Discovery announces the API address, so a server that joins that way needs `--insecure-join`.
 - **TLS between servers was tried on one machine.** Three servers on loopback joined, replicated and elected with `required`. It has not been run across machines or through an upgrade from an older release.
 - **`reader` is not read-only.** Only `gate` and `keep` enforce it. In the other modules a `reader` token can create and delete resources in its project. Fixed by [PIndustries/pistack#103](https://github.com/PIndustries/pistack/pull/103), not merged.
-- **The token signing key does not rotate.** A token stops working when its principal is disabled or deleted, when the API key it came from is deleted, or when it expires. There is no way to cancel one token on its own.
+- **One token cannot be cancelled.** A token stops working when its principal is disabled or deleted, when the API key it came from is deleted, when its signing key is retired, or when it expires. `pi user revoke-tokens` refuses all of one user's tokens at once; there is no way to pick one.
+- **The token signing key rotates only by hand.** `pi signing-key rotate` is an admin's command. Nothing runs it on a schedule.
 - **Custom roles grant nothing.** Authorization knows only `admin`, `member` and `reader`. The policy engine in `crates/pistack-policy` is not wired in.
 - **The root key is in the store by default.** With the `software` backend, a copy of `state.redb` is enough to read every secret. The Vault backend has not been run against a production Vault.
-- **Agent certificates are not renewed.** They are valid for 365 days.
+- **The cloud CA does not rotate.** The issuing CA lasts 5 years and the root 10. Every certificate in the cloud ends with the issuing CA, and there is no command or working manual procedure to replace it. See [Identity and access](Identity-and-access#how-long-the-cloud-ca-lasts).
+- **Only an agent on HTTPS renews its certificate.** Renewal is proved with the certificate, and a certificate is only shown over HTTPS. Agents that connect over plain HTTP, which is the only way that works end to end today, keep the certificate they enrolled with.
+- **A host cannot be removed for good.** There is no command for it. Revoke the host's certificates through `/secrets` to cut it off and stop it renewing.
+- **A renewed certificate does not revoke the one before it.** The old one stays valid until its own date, about four months later.
+- **Root key rotation is offline and for the software backend.** `pistack keep rotate-root-key` needs every server stopped and, in a cluster, the same key file on each. Under Vault only the wrapping key rotates.
+- **Nothing checks that every server runs the same build before a signing key is rotated.** A server still on a build without key ids refuses the new tokens, and loses the cluster when the first key is retired.
 
 ## Control plane
 
@@ -36,9 +42,9 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Only the store is replicated.** Images, local volumes, objects and shares are files on one server's disk.
 - **The config file is mostly not applied.** Only `[modules.silo]` and `[modules.keep]` are read.
 - **No watch API.** Clients poll.
-- **Metrics have no history.** A server keeps the last 60 points of each series in memory, for at most an hour, and loses them when it restarts. History needs a Prometheus server scraping `/metrics`. See [Metrics and alarms](Metrics-and-alarms).
+- **Metrics have no history.** A server keeps the last 240 points of each series in memory, for at most an hour, and loses them when it restarts. History needs a Prometheus server scraping `/metrics`. See [Metrics and alarms](Metrics-and-alarms).
 - **Host and machine metrics are on the leader only.** Agents report to the leader, so after a failover the new leader starts with none and fills up within a heartbeat or two.
-- **Alarms fire on the first sample and tell nobody.** `for_seconds` is stored and ignored, and there are no notifications or webhooks.
+- **Alarms tell nobody.** There are no notifications or webhooks. `for_seconds` is measured on the stamps of the samples of its series, so a hold can only be as long as the window reaches: an hour.
 - **The audit log is for cloud admins only, and it is not complete.** A project member cannot read their own project's records. Ordinary reads, object uploads and a control-plane server joining are not recorded, and the client address is whatever connected to the server, so a proxy hides the real one. See [Identity and access](Identity-and-access#audit).
 - **A pod is not refused by a quota.** The machine behind a pod counts towards its project's `machines`, `vcpus`, `memory_mib` and `disk_gib`, but the pod controller creates it without checking the limits.
 - **Quota usage is shown from the last change.** The number `pi quota show` prints for a resource is written when something of that kind is created or deleted in the project. The check that refuses a request always counts the records.
@@ -48,10 +54,11 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **The agent is Linux only.** Elsewhere it reports no memory and nothing is placed on it.
 - **Cloud Hypervisor and bare metal are not selectable.** The runtimes are in the source, and the agent never picks them. A machine of kind `metal` is only placed on a mock host.
 - **Hosts cannot be removed.** A host that is gone for good stays in the list.
-- **Drain only moves running virtual machines on libvirt hosts.** Containers, pods, bare metal and stopped machines are reported and left where they are.
+- **Drain only moves running virtual machines on libvirt hosts whose machine disks are shared.** Containers, pods, bare metal, stopped machines and machines whose disks are on the host itself are reported and left where they are.
 - **Live migration does not copy disks.** It only works when the destination host already sees the machine's disk at the same path. A failed migration leaves the machine in phase `error` on the old host, still running.
+- **A machine whose disks are local to its host is not drained or migrated.** The agent says whether its machine disk directory is on an NFS or SMB mount, and the answer is `local` unless it says otherwise. A machine on such a host is listed by `pi host drain` with that reason, and a migrate call for it is refused. Mount the disk directory where every host can see it and the host reports `shared` at its next hello. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 - **Evacuating a host loses root disks.** A root disk is a file on its host. An evacuated machine starts from its image, and `pi host evacuate` moves nothing without `--rebuild-from-image`.
-- **Evacuation does not fence.** PiStack cannot power off a host. If an evacuated host is still running its machines, they run twice until its agent reports again, and both copies write to any shared volume.
+- **Fencing needs power control.** An evacuation only proves a host is off through its BMC when a cloud admin has set `pi host power set` on it. Without power control, evacuation relies on `--confirm-dead`, and a host that is only cut off from the control plane runs its machines twice until its agent reports again.
 - **A machine with a local or LVM volume is not evacuated.** The volume was on the dead host.
 - **Pods pinned to a host by a volume are not drained or evacuated.**
 - **The web console has no host controls.** Label, disable, drain and evacuate are in `pi` and the API only.
@@ -68,7 +75,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Volume encryption does nothing.** The flag is stored.
 - **Volumes cannot shrink.**
 - **Object storage keeps one copy on one server.** No replication, no erasure coding.
-- **The S3 API is partial.** No bucket operations through S3, no `ListObjects` v1, no range reads, no batch delete, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption. Path-style addressing only.
+- **The S3 API is partial.** No bucket operations through S3, no `ListObjects` v1, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption. Path-style addressing only.
 - **NFS share sizes are not enforced.**
 - **No quota on object bytes.** A project can be limited in buckets and not in what it stores in them.
 - **An image upload is checked against `images_bytes` after it is received.** The size is not known before, so an upload that does not fit is stored and then deleted.
@@ -94,7 +101,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 ## CLI
 
-- **No commands for** DNS, load balancers, secrets and certificates, buckets, shares, volume backups, or alarms. Use `pi api`.
+- **No commands for** certificate authorities, access keys, or join tokens. Use `pi api`.
 - **`--project` does not re-scope a token.** A token's project is fixed at login.
 - **`pi machine list --all` does not cross projects** for a token scoped to a project.
 - **Dev mode creates resources with no project** when no token is sent. They are invisible after you log in.

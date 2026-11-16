@@ -12,6 +12,10 @@
 //! GET    /projects/{id}/quotas   limit and usage per resource (member/reader of it, or admin)
 //! PUT    /projects/{id}/quotas   set or clear single limits (admin)
 //! GET|POST /principals, GET|PUT|DELETE /principals/{id}   (admin; GET self allowed)
+//! POST   /principals/{id}/revoke-tokens   refuse every token issued up to now (admin, or self)
+//! GET    /signing-keys           ids and dates of the token signing keys (admin)
+//! POST   /signing-keys/rotate    sign with a new key; the old one verifies for a while (admin)
+//! POST   /signing-keys/retire    drop every key but the current one now (admin)
 //! GET|POST /roles, GET|PUT|DELETE /roles/{id}             (read: any caller; write: admin)
 //! GET|POST /bindings, GET|DELETE /bindings/{id}           (admin)
 //! GET|POST /keys, GET|DELETE /keys/{id}                   (own keys, or any as admin)
@@ -20,6 +24,10 @@
 //! ```
 //!
 //! `{id}` accepts a name or an id. `PUT` honours `If-Match: <revision>`.
+//!
+//! A name being signed in to is counted against the address the audit log
+//! will record it from — `ClientAddr`, or the client behind a carrier when
+//! one of this cluster carried the request. See [`lockout`].
 
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Query, Request, State},
@@ -33,9 +41,14 @@ use pistack_store::{Store, StoreError};
 use pistack_types::{kind, ApiError, ApiResult, Caller, Id, ListQuery, Meta, Page};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+
+/// Failed sign-ins per name, shared by every handler of this server.
+type Lockouts = Arc<Mutex<lockout::Lockouts>>;
 
 use crate::{
-    binding_name, credentials, paginate, policy,
+    binding_name, credentials, lockout, paginate, policy,
     token::{AuthCaller, DEFAULT_TTL, MAX_TTL},
     types::*,
     AppState, TryGetByName,
@@ -45,6 +58,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/tokens", post(login))
         .route("/tokens/self", get(whoami))
+        .route("/tokens/self/projects", get(my_projects))
+        .route("/tokens/self/switch", post(switch_project))
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{id}",
@@ -58,6 +73,10 @@ pub fn router(state: AppState) -> Router {
                 .put(update_principal)
                 .delete(delete_principal),
         )
+        .route("/principals/{id}/revoke-tokens", post(revoke_tokens))
+        .route("/signing-keys", get(list_signing_keys))
+        .route("/signing-keys/rotate", post(rotate_signing_key))
+        .route("/signing-keys/retire", post(retire_signing_keys))
         .route("/roles", get(list_roles).post(create_role))
         .route(
             "/roles/{id}",
@@ -183,12 +202,16 @@ pub struct TokenResponse {
 /// A login has no caller, so the handler says who it was for. The audit
 /// layer reads this off the response: the principal and key once they are
 /// known, or the name that was tried. Never the password or the key secret.
-async fn login(State(st): State<AppState>, Body(req): Body<TokenRequest>) -> Response {
+async fn login(
+    State(st): State<AppState>,
+    from: crate::audit::SigninAddr,
+    Body(req): Body<TokenRequest>,
+) -> Response {
     let mut subject = crate::audit::Subject {
         principal: req.name.clone().filter(|_| req.api_key.is_none()),
         ..Default::default()
     };
-    let mut response = match issue_login(&st, req, &mut subject) {
+    let mut response = match issue_login(&st, from.0, req, &mut subject) {
         Ok(token) => Json(token).into_response(),
         Err(err) => err.into_response(),
     };
@@ -198,6 +221,7 @@ async fn login(State(st): State<AppState>, Body(req): Body<TokenRequest>) -> Res
 
 fn issue_login(
     st: &AppState,
+    from: IpAddr,
     req: TokenRequest,
     subject: &mut crate::audit::Subject,
 ) -> ApiResult<TokenResponse> {
@@ -231,21 +255,62 @@ fn issue_login(
             .password
             .as_deref()
             .ok_or_else(|| ApiError::bad_request("password required"))?;
-        let p = store
-            .collection::<Principal>()
-            .try_get_by_name(name)?
-            .ok_or_else(invalid)?;
-        let hash = p.spec.password_hash.as_deref().ok_or_else(invalid)?;
-        if !credentials::verify_password(password, hash) {
-            tracing::info!(principal = name, "failed password login");
+        // Both counts for the name are consulted before the store is read, so
+        // a name being worked over is refused without a password check and a
+        // refusal says nothing about whether the name exists. The wait a
+        // caller is in is its own address's or the name's, never another
+        // address's. A login with an API key never touches either count.
+        let now = Utc::now();
+        let name = name.to_owned();
+        if let Some(wait) = held(&st.lockouts, &name, from, now) {
+            subject.principal = Some(name);
+            tracing::info!("sign-in refused: the name is in a wait after failed attempts");
+            return Err(too_many(wait));
+        }
+        let p = store.collection::<Principal>().try_get_by_name(&name)?;
+        let hash = p
+            .as_ref()
+            .filter(|p| p.spec.kind == PrincipalKind::User)
+            .and_then(|p| p.spec.password_hash.as_deref());
+        // A principal with no password of its own has nothing to sign in with
+        // on any server, and is refused as one in a wait is.
+        if p.as_ref().is_some_and(|p| !p.spec.enabled) {
+            subject.principal = Some(name);
             return Err(invalid());
         }
-        (p, None, None)
+        // A name that is not there, a service account and a wrong password are
+        // all counted and answered the same, so the wall cannot be used to
+        // find out which names the cloud holds.
+        if !hash.is_some_and(|h| credentials::verify_password(password, h)) {
+            // The name that was tried, and nobody's id: a failure that named
+            // an id would say whether the cloud holds that name.
+            let locked = failed(&st.lockouts, &name, from, Utc::now());
+            subject.principal = Some(name);
+            tracing::info!("failed password login");
+            if locked {
+                return Err(too_many(crate::lockout::WINDOW));
+            }
+            return Err(invalid());
+        }
+        let principal = p.expect("a password was verified against it");
+        succeeded(&st.lockouts, &name, from);
+        subject.principal = Some(name);
+        (principal, None, None)
     };
 
+    // A project that was asked for, or that a key names, must be one the
+    // principal has a role in: `caller_for` refuses it otherwise. A default
+    // project it has no role in is only a stale setting, and the token is
+    // issued without a project.
     let project = match req.project.as_deref() {
         Some(p) => Some(crate::resolve_project(store, p)?.meta.id),
-        None => key_project.or_else(|| principal.spec.default_project.clone()),
+        None => match key_project {
+            Some(p) => Some(p),
+            None => match principal.spec.default_project.clone() {
+                Some(p) if has_role_in(store, &principal, &p)? => Some(p),
+                _ => None,
+            },
+        },
     };
     let ttl = match req.ttl_secs {
         Some(s) if s <= 0 => return Err(ApiError::bad_request("ttl_secs must be positive")),
@@ -256,6 +321,42 @@ fn issue_login(
     subject.principal_id = Some(principal.meta.id.clone());
     subject.project = project.clone();
     issue_token(st, &principal, project, key, ttl)
+}
+
+/// How long this name must be waited on, `None` when it may be tried now from
+/// `from`. The lockout tables are this process's own; a poisoned one is
+/// treated as empty rather than taking sign-ins down with it.
+fn held(lockouts: &Lockouts, name: &str, from: IpAddr, now: DateTime<Utc>) -> Option<Duration> {
+    let guard = lockouts.as_ref().lock().unwrap_or_else(|e| e.into_inner());
+    match guard.attempt(name, from, now) {
+        lockout::Attempt::Try => None,
+        lockout::Attempt::Locked(left) => Some(left),
+    }
+}
+
+/// Count a failed password attempt against the name and the address it came
+/// from. Says whether this one brought a wait down.
+fn failed(lockouts: &Lockouts, name: &str, from: IpAddr, now: DateTime<Utc>) -> bool {
+    let mut guard = lockouts.as_ref().lock().unwrap_or_else(|e| e.into_inner());
+    guard.failed(name, from, now)
+}
+
+/// A sign-in that worked clears what was counted for the name from the
+/// address that signed in, and that address alone.
+fn succeeded(lockouts: &Lockouts, name: &str, from: IpAddr) {
+    let mut guard = lockouts.as_ref().lock().unwrap_or_else(|e| e.into_inner());
+    guard.succeeded(name, from);
+}
+
+/// The refusal for a name in a wait. Nothing about the password is known or
+/// said: the attempt was refused before it was looked at. Whether the wait is
+/// the caller's address's or the name's is not said either — that would tell
+/// a caller which address it arrived from.
+fn too_many(left: Duration) -> ApiError {
+    ApiError::rate_limited(
+        "too many failed sign-ins for this name; try again later",
+        left,
+    )
 }
 
 /// Resolve roles from bindings and sign a token. Library entry point so
@@ -280,8 +381,26 @@ pub fn issue_token(
     })
 }
 
+/// Whether a principal may hold a token for `project`: it has a role
+/// bound in that project, or a role at system scope.
+pub fn has_role_in(store: &Store, principal: &Principal, project: &Id) -> ApiResult<bool> {
+    Ok(store
+        .collection::<RoleBinding>()
+        .list(None)?
+        .iter()
+        .filter(|b| b.spec.principal == principal.meta.id)
+        .any(|b| match &b.spec.scope {
+            Scope::System => true,
+            Scope::Project { project: p } => p == project,
+        }))
+}
+
 /// Build the `Caller` for a principal: system roles always apply; project
 /// roles apply when the token is scoped to that project.
+///
+/// A project the principal has no role in is refused. A caller with no
+/// role may still read what its project holds, so a token for such a
+/// project would let anyone with a password read any project.
 pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> ApiResult<Caller> {
     if let Some(p) = &project {
         let proj = store.collection::<Project>().get(p)?;
@@ -295,6 +414,7 @@ pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> 
     let bindings = store.collection::<RoleBinding>().list(None)?;
     let mut roles: Vec<String> = Vec::new();
     let mut system = false;
+    let mut bound = false;
     for b in bindings
         .iter()
         .filter(|b| b.spec.principal == principal.meta.id)
@@ -308,9 +428,20 @@ pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> 
             }
             Scope::Project { project: p } => project.as_ref() == Some(p),
         };
+        bound |= applies;
         if applies && !roles.contains(&b.spec.role) {
             roles.push(b.spec.role.clone());
         }
+    }
+    if let (Some(p), false) = (&project, bound) {
+        let name = store
+            .collection::<Project>()
+            .try_get(p)?
+            .map_or_else(|| p.to_string(), |proj| proj.meta.name);
+        return Err(ApiError::forbidden(format!(
+            "'{}' has no role in project '{name}'",
+            principal.meta.name
+        )));
     }
     roles.sort();
     Ok(Caller {
@@ -324,6 +455,123 @@ pub fn caller_for(store: &Store, principal: &Principal, project: Option<Id>) -> 
 
 async fn whoami(AuthCaller(caller): AuthCaller) -> Json<Caller> {
     Json(caller)
+}
+
+/// A project the caller can hold a token for.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MyProject {
+    pub id: Id,
+    pub name: String,
+    /// The project this one sits under, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    /// The roles the caller would have there.
+    pub roles: Vec<String>,
+    /// The project of the token that asked.
+    pub current: bool,
+}
+
+/// The projects the caller can work in: those it has a role bound in, or
+/// every project for a caller with a role at system scope. Disabled
+/// projects are left out. Any caller may ask; it is how a user finds out
+/// where they can go without being able to list every project.
+async fn my_projects(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<Vec<MyProject>>> {
+    let bindings: Vec<RoleBinding> = st
+        .store
+        .collection::<RoleBinding>()
+        .list(None)?
+        .into_iter()
+        .filter(|b| b.spec.principal == caller.principal)
+        .collect();
+    let everywhere: Vec<String> = bindings
+        .iter()
+        .filter(|b| matches!(b.spec.scope, Scope::System))
+        .map(|b| b.spec.role.clone())
+        .collect();
+    let projects = st.store.collection::<Project>().list(None)?;
+    let names: BTreeMap<Id, String> = projects
+        .iter()
+        .map(|p| (p.meta.id.clone(), p.meta.name.clone()))
+        .collect();
+    let mut out: Vec<MyProject> = projects
+        .into_iter()
+        .filter(|p| p.spec.enabled)
+        .filter_map(|p| {
+            let mut roles = everywhere.clone();
+            for b in &bindings {
+                if matches!(&b.spec.scope, Scope::Project { project } if *project == p.meta.id) {
+                    roles.push(b.spec.role.clone());
+                }
+            }
+            if roles.is_empty() {
+                return None;
+            }
+            roles.sort();
+            roles.dedup();
+            Some(MyProject {
+                current: caller.project.as_ref() == Some(&p.meta.id),
+                parent_name: p.spec.parent.as_ref().and_then(|id| names.get(id).cloned()),
+                parent: p.spec.parent.clone(),
+                id: p.meta.id,
+                name: p.meta.name,
+                roles,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.parent_name, &a.name).cmp(&(&b.parent_name, &b.name)));
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwitchRequest {
+    /// Project name or id to move to.
+    pub project: String,
+}
+
+/// Trade the caller's token for one in another project, without the
+/// password. The new token ends when the old one would have: switching is
+/// not a way to stay signed in. `issue_token` refuses a project the
+/// principal has no role in. The old token goes on working until it
+/// expires.
+///
+/// A token from an API key cannot move: the key names its project.
+async fn switch_project(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    headers: HeaderMap,
+    Body(req): Body<SwitchRequest>,
+) -> ApiResult<Json<TokenResponse>> {
+    let claims = st
+        .keys
+        .verifier()
+        .claims(crate::token::bearer_in(&headers)?)?;
+    if claims.key.is_some() {
+        return Err(ApiError::forbidden(
+            "a token from an API key stays in the key's project",
+        ));
+    }
+    let left = claims.expires_at() - Utc::now();
+    if left <= Duration::zero() {
+        return Err(ApiError::unauthorized("token expired"));
+    }
+    let principal = st
+        .store
+        .collection::<Principal>()
+        .try_get(&caller.principal)?
+        .ok_or_else(|| ApiError::unauthorized("token revoked"))?;
+    let project = crate::resolve_project(&st.store, &req.project)?.meta.id;
+    Ok(Json(issue_token(
+        &st,
+        &principal,
+        Some(project),
+        None,
+        left,
+    )?))
 }
 
 // ---- projects --------------------------------------------------------------
@@ -633,8 +881,13 @@ async fn create_principal(
         Some(p) => Some(crate::resolve_project(&st.store, p)?.meta.id),
         None => None,
     };
+    // The rule is asked of the name the principal will be called, and only
+    // here: a password already stored is verified as it was stored.
     let password_hash = match req.password.as_deref() {
-        Some(pw) => Some(credentials::hash_password(pw)?),
+        Some(pw) => {
+            credentials::check_password(pw, &req.name)?;
+            Some(credentials::hash_password(pw)?)
+        }
         None => None,
     };
     let mut meta = Meta::new(kind::PRINCIPAL, req.name, None);
@@ -694,6 +947,7 @@ async fn update_principal(
         p.spec.email = Some(e);
     }
     if let Some(pw) = req.password.as_deref() {
+        credentials::check_password(pw, &p.meta.name)?;
         p.spec.password_hash = Some(credentials::hash_password(pw)?);
     }
     if let Some(e) = req.enabled {
@@ -741,6 +995,91 @@ async fn delete_principal(
     }
     st.store.collection::<Principal>().delete(&p.meta.id)?;
     Ok(no_content())
+}
+
+/// Refuse every token this principal was issued up to now. A token cannot
+/// be revoked one at a time: it is not stored anywhere to mark.
+async fn revoke_tokens(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Principal>> {
+    let p = resolve_principal(&st.store, &id)?;
+    if p.meta.id != caller.principal {
+        policy::authorize(&caller, "principals.update", None)?;
+    }
+    let now = Utc::now();
+    let p = st.store.collection::<Principal>().modify(&p.meta.id, |p| {
+        p.status.tokens_not_before = Some(now);
+        Ok(())
+    })?;
+    tracing::info!(principal = %p.meta.name, by = %caller.principal_name, "tokens revoked");
+    Ok(Json(p.redacted()))
+}
+
+// ---- signing keys ----------------------------------------------------------
+
+/// The signing keys as the API shows them: never a secret.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SigningKeys {
+    pub keys: Vec<crate::token::SigningKeyInfo>,
+    /// Ids dropped by this call (`retire` only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<String>,
+}
+
+fn internal(e: anyhow::Error) -> ApiError {
+    ApiError::internal(e.to_string())
+}
+
+async fn list_signing_keys(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<SigningKeys>> {
+    policy::authorize(&caller, "signing_keys.list", None)?;
+    let set = crate::token::KeySet::load(&st.store)
+        .map_err(internal)?
+        .unwrap_or_default();
+    Ok(Json(SigningKeys {
+        keys: set.describe(),
+        retired: Vec::new(),
+    }))
+}
+
+async fn rotate_signing_key(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<SigningKeys>> {
+    policy::authorize(&caller, "signing_keys.rotate", None)?;
+    let set = crate::token::rotate(&st.store, Utc::now()).map_err(internal)?;
+    tracing::info!(
+        current = set.current_kid(),
+        keys = set.describe().len(),
+        by = %caller.principal_name,
+        "token signing key rotated"
+    );
+    Ok(Json(SigningKeys {
+        keys: set.describe(),
+        retired: Vec::new(),
+    }))
+}
+
+async fn retire_signing_keys(
+    State(st): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+) -> ApiResult<Json<SigningKeys>> {
+    policy::authorize(&caller, "signing_keys.retire", None)?;
+    let (set, retired) = crate::token::retire(&st.store).map_err(internal)?;
+    tracing::info!(
+        current = set.current_kid(),
+        retired = ?retired,
+        by = %caller.principal_name,
+        "token signing keys retired"
+    );
+    Ok(Json(SigningKeys {
+        keys: set.describe(),
+        retired,
+    }))
 }
 
 // ---- roles -----------------------------------------------------------------

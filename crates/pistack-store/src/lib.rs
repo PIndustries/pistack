@@ -12,14 +12,15 @@
 //! changes to what is stored are a serde default. One that older code would
 //! misread raises [`SCHEMA_VERSION`] and adds a step to `MIGRATIONS`.
 
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use pistack_types::{ApiError, Event, EventAction, Id, Kind, Meta};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
 const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");
@@ -138,6 +139,13 @@ pub trait Backend: Send + Sync + 'static {
     fn read_log(&self, after: u64, limit: usize) -> Result<Vec<LogEntry>>;
     /// Current record flag. `apply_entries` turns recording off, then restores this.
     fn record_log(&self) -> bool;
+    /// The store as it stands, read once, for a follower checking a whole page
+    /// of the leader's rows before it writes any of them. A backend built on a
+    /// redb file hands back its read transaction; any other is asked row by row
+    /// through [`Backend::get`] instead.
+    fn whole_store_read(&self) -> Option<redb::ReadTransaction> {
+        None
+    }
     /// Write a consistent copy of the whole store to `dst`. `src` is the
     /// file this backend was opened from. The default copies the file; the
     /// redb backend writes a fresh, compact database from one read
@@ -223,6 +231,142 @@ fn allowed_when_fenced(op: &Op) -> bool {
     is_bookkeeping(op) || is_follower_meta(op)
 }
 
+/// The store as it stands, read one page of the leader's rows against it.
+enum Read<'a> {
+    /// One consistent read of the whole store, opened once for the page.
+    Tx(&'a redb::ReadTransaction),
+    /// No whole-store read to hand out: the backend is asked a row at a time.
+    Rows(&'a Arc<dyn Backend>),
+}
+
+impl Read<'_> {
+    /// Whether one row is in the store, and carried out as an action because
+    /// that is all [`known`] can report before the page says what stood.
+    fn stands(&self, table: &str, key: &str) -> Result<bool> {
+        match self {
+            Read::Tx(tx) => {
+                if table == "names" {
+                    let names = tx.open_table(NAMES)?;
+                    return Ok(names.get(key)?.is_some());
+                }
+                let res = tx.open_table(RESOURCES)?;
+                Ok(res.get(key)?.is_some())
+            }
+            Read::Rows(backend) => backend.get(table, key).map(|v| v.is_some()),
+        }
+    }
+}
+
+/// What one logged row write names, and whether the row it writes stood before
+/// it — or `None` when the write is not of a row anybody watches: a `meta` row
+/// (the log's own, a counter, cluster bookkeeping), the gateway's audit trail, a
+/// name index entry, or a row this binary cannot read as one.
+fn known(read: &Read<'_>, op: &LogOp) -> Result<Option<Change>> {
+    let (table, key, value) = (op.table.as_str(), op.key.as_str(), op.value.as_deref());
+    // Only a `resources` row names something a watcher watches. A `meta` row is
+    // the log's own, a counter's, or cluster bookkeeping; a `names` row is the
+    // name index, which points at a resource row that is announced in its own
+    // right. Neither is worth a read of the store to answer `None`, so none is
+    // read before this returns.
+    if table != "resources" {
+        return Ok(None);
+    }
+    let stood = read.stands(table, key)?;
+    // The row key is `{kind}/{id}`: the head names the kind, the tail is the
+    // row's address. Reading the kind off the key rather than out of the row is
+    // what keeps a row whose name looks like an id of another kind from being
+    // announced under the wrong one.
+    let Some((kind_, rest)) = key.split_once('/') else {
+        return Ok(None);
+    };
+    let Some(id) = Id::parse(intern(kind_), rest) else {
+        return Ok(None);
+    };
+    // The audit trail is a row like any other, but it is bookkeeping: the
+    // gateway writes one for every call that changes something, and a follower
+    // that announced each would flood every watcher on this node.
+    if kind_ == AUDIT_KIND {
+        return Ok(None);
+    }
+    let Some(bytes) = value else {
+        // A row that is gone says nothing about itself: what it was is not
+        // needed, since a watcher is told to look again, not what to look at.
+        return Ok(Some(Change {
+            key: key.to_owned(),
+            kind: kind_.to_owned(),
+            id,
+            project: None,
+            revision: 0,
+            at: None,
+            stood,
+            action: EventAction::Updated,
+        }));
+    };
+    // A row of a shape this binary cannot parse still lands in the store; it
+    // simply has no metadata to name itself with, so nothing is said about it.
+    let Ok(meta) = serde_json::from_slice::<Meta>(bytes) else {
+        return Ok(None);
+    };
+    Ok(Some(Change {
+        key: key.to_owned(),
+        kind: kind_.to_owned(),
+        id,
+        project: meta.project,
+        revision: meta.revision,
+        at: Some(meta.updated_at),
+        stood,
+        action: EventAction::Updated,
+    }))
+}
+
+/// One row change a follower applied, and what to announce once it is on disk.
+/// `action` is settled by [`Store::plan`], which is the only thing that knows
+/// what stood before the write; `known` leaves it a placeholder.
+#[derive(Clone)]
+struct Change {
+    /// The row's key, `{kind}/{id}`: how a second write of the row in the same
+    /// page finds the name the first write read out of it.
+    key: String,
+    kind: String,
+    id: Id,
+    project: Option<Id>,
+    revision: u64,
+    at: Option<DateTime<Utc>>,
+    /// Whether the row stood in the store when this write reached it. Only the
+    /// page's first write of a row can be asked of the store; `plan` settles the
+    /// rest from what its own earlier writes left.
+    stood: bool,
+    action: EventAction,
+}
+
+impl Change {
+    fn into_event(self) -> Event {
+        Event {
+            kind: self.kind,
+            id: self.id,
+            project: self.project,
+            // The row's own stamp when the row still says what it is; this
+            // moment when it does not, which is the case of a row just removed.
+            at: self.at.unwrap_or_else(Utc::now),
+            action: self.action,
+            revision: self.revision,
+        }
+    }
+}
+
+/// What a write to a row that stood, or did not, amounts to.
+fn action_for(stood: bool, puts: bool) -> EventAction {
+    match (stood, puts) {
+        (false, true) => EventAction::Created,
+        (true, true) => EventAction::Updated,
+        (true, false) => EventAction::Deleted,
+        // A delete of a row that was not there is never announced: it changed
+        // nothing, and a watcher told about it would look and find what was
+        // already there.
+        (false, false) => EventAction::Deleted,
+    }
+}
+
 fn log_key(index: u64) -> String {
     format!("cluster_log/{index:020}")
 }
@@ -230,6 +374,15 @@ fn log_key(index: u64) -> String {
 /// First log row this store still keeps. Rows below it were trimmed by
 /// [`Store::compact_log`]; the state they produced is in the tables.
 const LOG_START_KEY: &str = "cluster_log_start";
+
+/// The kind the gateway files its audit trail under. The store does not know
+/// the resource kinds — modules name their own — so this is the one exception
+/// it names.
+const AUDIT_KIND: &str = "audit";
+
+/// Events sent to overflow the bus. The server's own channel is this wide and
+/// the store never grows it; see [`Store::announce_all_changed`].
+const ANNOUNCE_ALL_FILL: usize = 4096 + 1;
 
 /// Rows per write transaction when copying a store or trimming its log, so
 /// neither holds one huge transaction in memory.
@@ -551,6 +704,10 @@ impl Backend for RedbBackend {
 
     fn record_log(&self) -> bool {
         self.record.load(Ordering::Acquire)
+    }
+
+    fn whole_store_read(&self) -> Option<redb::ReadTransaction> {
+        self.db.begin_read().ok()
     }
 
     fn snapshot_to(&self, _src: &Path, dst: &Path) -> Result<()> {
@@ -878,7 +1035,26 @@ impl Store {
     /// that later leads can serve it and votes compare real terms. The
     /// entries are committed together: a gap applies none of them and
     /// returns `StoreError::Conflict`.
+    ///
+    /// A committed page is announced on the event bus: one event per logged
+    /// entry and per resource row it changed, in log order, in the shape a
+    /// write through a `Collection` sends. A follower applies the leader's
+    /// rows straight to the backend, so without this nothing on this node
+    /// ever hears that a row appeared or went away — a watcher keeps whatever
+    /// it read the first time and is never told to look again.
+    ///
+    /// An event says what the entry was: a `Created` when the row was not
+    /// there before it, an `Updated` when it was, a `Deleted` when the entry
+    /// removed the row. Entries are not folded together, so a leader that
+    /// created a row and changed it a moment later is heard as two events,
+    /// exactly as it was on the node that led.
     pub fn apply_entries(&self, entries: &[LogEntry]) -> Result<()> {
+        // Whether a put created a row or changed one is settled here, before
+        // anything is written: the page lands as one transaction, so once it
+        // commits every row holds what the leader wrote and none of them says
+        // what was there first. One read transaction answers for the whole page
+        // — every page of a catch-up would otherwise pay for its own.
+        let changes = self.plan(entries)?;
         let prev = self.backend.record_log();
         self.set_record_log(false);
         self.backend.set_applying(true);
@@ -915,7 +1091,149 @@ impl Store {
         })();
         self.backend.set_applying(false);
         self.set_record_log(prev);
-        result
+        result?;
+        // The batch is on disk. A page that was refused announced nothing above
+        // and announces nothing here: a watcher left holding what it already had
+        // is still holding the truth.
+        for change in changes {
+            let _ = self.events.send(change.into_event());
+        }
+        Ok(())
+    }
+
+    /// What a page of the leader's entries announces: one event per write to a
+    /// resource row, in log order, with the action the write was. A put of a row
+    /// that was not there before it is a create, of a row that was, an update; a
+    /// delete of a row that was there is a delete. A delete of a row that was
+    /// already gone changed nothing and tells nobody anything.
+    ///
+    /// The page is walked in order with a row's state held as it goes, so a row
+    /// written twice by one entry is the two writes it was — made, then changed
+    /// — and a row a later entry touches is judged by what the entries before it
+    /// left, not by the store the page began against.
+    ///
+    /// A row is asked of the store only when the page cannot answer for it, and
+    /// every row of the page out of one consistent read, so a page of a
+    /// catch-up is one read rather than one per row. A backend that cannot hand
+    /// one out is asked a row at a time through [`Backend::get`].
+    fn plan(&self, entries: &[LogEntry]) -> Result<Vec<Change>> {
+        let tx = self.backend.whole_store_read();
+        let read = match &tx {
+            Some(tx) => Read::Tx(tx),
+            None => Read::Rows(&self.backend),
+        };
+        // Whether each row this page writes stands, after the writes of it read
+        // so far. A row answered from here needs no read of the store: what an
+        // earlier write of this page left is what the next write of it lands on,
+        // and the store cannot say that, because the page lands as one
+        // transaction and holds only the last word by the time it is readable.
+        // A row is named by its table and key together: the same key can be a
+        // `names` entry and a `resources` row, and those are different rows.
+        let mut stands: Vec<(&str, &str, bool)> = Vec::new();
+        let mut out: Vec<Change> = Vec::new();
+        for entry in entries {
+            for op in &entry.ops {
+                let (table, key) = (op.table.as_str(), op.key.as_str());
+                let puts = op.value.is_some();
+                let seen = stands.iter().position(|(t, k, _)| *t == table && *k == key);
+                // What stood before this write.
+                let was_there = match seen {
+                    Some(at) => stands[at].2,
+                    None => match known(&read, op)? {
+                        Some(found) => {
+                            let stood = found.stood;
+                            stands.push((table, key, puts));
+                            out.push(found);
+                            stood
+                        }
+                        // Not a row anybody watches: the log's own rows, counters,
+                        // name index entries, the audit trail.
+                        None => {
+                            stands.push((table, key, puts));
+                            continue;
+                        }
+                    },
+                };
+                if let Some((_, _, state)) =
+                    stands.iter_mut().find(|(t, k, _)| *t == table && *k == key)
+                {
+                    *state = puts;
+                }
+                // Removed by a write that found nothing there: nothing changed,
+                // and nobody is told it did.
+                if !was_there && !puts {
+                    continue;
+                }
+                match seen {
+                    // The page's first write of the row, announced by the read
+                    // above: the store's answer settles what that write was.
+                    None => {
+                        if let Some(last) = out.last_mut() {
+                            last.action = action_for(was_there, puts);
+                        }
+                    }
+                    // A later write of a row this page already wrote. The name
+                    // comes from the page's own change for it, since a row just
+                    // deleted has nothing left to be read from.
+                    Some(_) => {
+                        let mut change = match out.iter().rev().find(|c| c.key == key) {
+                            Some(c) => c.clone(),
+                            None => continue,
+                        };
+                        change.action = action_for(was_there, puts);
+                        if !puts {
+                            change.at = None;
+                            change.revision = 0;
+                        }
+                        out.push(change);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Tell every watcher on this node that everything it derived from the
+    /// store may be wrong: the rows behind it were replaced wholesale, most
+    /// recently by a snapshot from another server, and one change per row
+    /// would be a page of history this node has no copy of.
+    ///
+    /// A per-kind event cannot do it. A watcher waiting for zones sleeps
+    /// straight through an event about volumes, and a watcher cannot be told
+    /// every kind: modules name their own and the store does not know them.
+    /// Every subscriber already has one path that means "you missed
+    /// something, start again" — the bus overflowing, [`Lagged`] — so this
+    /// fills the bus past its capacity and leaves every receiver on that
+    /// path. The fillers are sent, not held: what a watcher acts on is the
+    /// gap they open, not their contents.
+    ///
+    /// [`Lagged`]: tokio::sync::broadcast::error::RecvError::Lagged
+    pub fn announce_all_changed(&self) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        // The bus holds at most this many events before it starts dropping,
+        // and is never grown. One more than the biggest channel in the process
+        // reaches every receiver, whoever subscribed late and whoever was
+        // already behind.
+        let fill = ANNOUNCE_ALL_FILL;
+        let filler = Event {
+            kind: String::new(),
+            // Names no kind: a filler is there to open a gap in the bus, not to
+            // be read as a row of something.
+            id: Id::new(""),
+            project: None,
+            action: EventAction::Updated,
+            revision: 0,
+            at: Utc::now(),
+        };
+        for _ in 0..fill {
+            let _ = self.events.send(filler.clone());
+        }
+        tracing::debug!(
+            filled = fill,
+            "store: every watcher told the whole store may have changed"
+        );
     }
 
     /// Copy the store while this process holds it open. Does not open `src`;
@@ -960,6 +1278,60 @@ impl Store {
             Some(p) => format!("{kind_}/{p}/{name}"),
             None => format!("{kind_}/-/{name}"),
         }
+    }
+
+    fn name_entry(kind_: &str, meta: &Meta) -> Op {
+        Op::Put {
+            table: "names".into(),
+            key: Self::name_key(kind_, meta.project.as_ref(), &meta.name),
+            value: meta.id.to_string().into_bytes(),
+        }
+    }
+
+    /// Move one row to another project and take its name index entry with it.
+    /// The resource row and both index keys land in one batch, so a name is
+    /// never in two projects or in none — a name lookup reads the index and a
+    /// list reads the row, and one of them would otherwise still answer for
+    /// the project that gave the row away. A name already taken in the project
+    /// asked for refuses the move and leaves the row where it was.
+    pub fn reproject<K: Kind>(&self, id: &Id, project: Option<&Id>) -> Result<K> {
+        let _g = self.write_lock.write();
+        let col = self.collection::<K>();
+        let cur = col.get(id)?;
+        if cur.meta().project.as_ref() == project {
+            return Ok(cur);
+        }
+        let wanted = Store::name_key(K::KIND, project, &cur.meta().name);
+        if self.backend.get("names", &wanted)?.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "{} named '{}' already exists",
+                K::KIND,
+                cur.meta().name
+            )));
+        }
+        let old = cur.meta().clone();
+        let moved_meta = {
+            let mut m = old.clone();
+            m.project = project.cloned();
+            m.touch();
+            m
+        };
+        let mut item = cur;
+        *item.meta_mut() = moved_meta.clone();
+        self.backend.batch(vec![
+            Op::Delete {
+                table: "names".into(),
+                key: Store::name_key(K::KIND, old.project.as_ref(), &old.name),
+            },
+            Op::Put {
+                table: "resources".into(),
+                key: Store::res_key(K::KIND, &moved_meta.id),
+                value: serde_json::to_vec(&item)?,
+            },
+            Store::name_entry(K::KIND, &moved_meta),
+        ])?;
+        col.emit(&moved_meta, EventAction::Updated);
+        Ok(item)
     }
 }
 
@@ -1009,10 +1381,73 @@ impl<K: Kind> Collection<K> {
 
     /// Resolve `name-or-id` the way the CLI does.
     pub fn resolve(&self, project: Option<&Id>, name_or_id: &str) -> Result<K> {
-        if let Some(id) = Id::parse(leak(K::KIND), name_or_id) {
+        if let Some(id) = Id::parse(intern(K::KIND), name_or_id) {
             return self.get(&id);
         }
         self.get_by_name(project, name_or_id)
+    }
+
+    /// Resolve `name-or-id` for a caller who may reach the whole cloud.
+    ///
+    /// An id — whole, or the short tail a table prints — is the row's own
+    /// address and is answered whole. A name is looked up in `project` and then
+    /// in the cloud scope: a row created through a token holding no project is
+    /// filed under the bare name, and the caller listing it usually holds one.
+    /// A caller of no project therefore resolves the same row its own list
+    /// printed, rather than being handed a name it cannot use. What the caller
+    /// may then touch is the caller's own rule; this is only where the row is
+    /// found.
+    ///
+    /// The name order is deliberately not reversed. A name is unique inside a
+    /// project and separately unique in the cloud scope, so the two can hold
+    /// different rows of the same name; the caller's own project wins, exactly
+    /// as it does for [`Self::resolve`].
+    pub fn resolve_scoped(&self, project: Option<&Id>, name_or_id: &str) -> Result<K> {
+        if let Some(id) = self.addressed(name_or_id)? {
+            return self.get(&id);
+        }
+        match self.find_by_name(project, name_or_id)? {
+            Some(k) => Ok(k),
+            None if project.is_some() => self.get_by_name(None, name_or_id),
+            None => Err(StoreError::NotFound(format!(
+                "{} '{name_or_id}' not found",
+                K::KIND
+            ))),
+        }
+    }
+
+    /// The id of the row this collection holds that `text` is the address of, if
+    /// any: a whole id of this kind, or the short form a table prints.
+    ///
+    /// A whole id is answered straight from the row key — the resources table is
+    /// keyed `{kind}/{id}`, so a lookup by a valid id cannot be beaten by a name
+    /// that looks the same way. This matters more than it looks: names may
+    /// contain hyphens and hex, so a long hyphenated name is indistinguishable
+    /// from an id to a parser that only reads text, and a service that generates
+    /// a resource name out of another resource's full id — a restored volume is
+    /// named after the backup it came from — then produces rows whose names are
+    /// id-shaped. Resolving those names before the row's own address lets a
+    /// project own the name and quietly answer a different row than the caller
+    /// pointed at, or answer `not found` for a row it can see in its own list.
+    ///
+    /// A whole id that names no row is not an answer: it falls through to the
+    /// name lookup, because an id that was deleted is a name nobody has taken.
+    fn addressed(&self, text: &str) -> Result<Option<Id>> {
+        if let Some(id) = Id::parse(intern(K::KIND), text) {
+            if self.try_get(&id)?.is_some() {
+                return Ok(Some(id));
+            }
+        }
+        displayed_id(self, K::KIND, text)
+    }
+
+    /// [`Self::get_by_name`] as `None` rather than an error.
+    fn find_by_name(&self, project: Option<&Id>, name: &str) -> Result<Option<K>> {
+        match self.get_by_name(project, name) {
+            Ok(k) => Ok(Some(k)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// All resources of this kind, optionally one project's.
@@ -1093,8 +1528,14 @@ impl<K: Kind> Collection<K> {
             }
         }
         let mut ops = Vec::new();
-        // Rename support: move the name index entry.
-        if current.meta().name != item.meta().name {
+        // The name index is keyed by project as well as name, so a write that
+        // changes either has to move the entry and drop the old key: a rename,
+        // and a move to another project, which keeps the name and changes the
+        // project. Left in place, the row answers to its former name or its
+        // former project forever.
+        let renamed = current.meta().name != item.meta().name
+            || current.meta().project != item.meta().project;
+        if renamed {
             let old = Store::name_key(
                 K::KIND,
                 current.meta().project.as_ref(),
@@ -1186,9 +1627,97 @@ impl<K: Kind> Collection<K> {
     }
 }
 
-fn leak(s: &str) -> &'static str {
-    // KIND constants are already 'static; this only runs for them.
-    Box::leak(s.to_owned().into_boxed_str())
+/// Interns `s` into a `&'static str`, for an `Id`'s kind, which the type keeps
+/// by reference rather than by copy.
+///
+/// A kind is one of a handful of `KIND` constants, but a caller that reaches an
+/// id through a key or a name does not hold one of those — it holds a slice of
+/// a key read off disk. Handing that to `Id::parse` needs a `'static` string.
+/// Leaking one per call would grow the heap on every lookup and, when a
+/// follower applies a page, on every replicated row. So the set of kinds ever
+/// seen is kept once, process-wide, and each is leaked at most once: a repeat
+/// returns the string the first call stored, so equal text is ever the same
+/// pointer.
+fn intern(s: &str) -> &'static str {
+    static KINDS: OnceLock<parking_lot::Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let seen = KINDS.get_or_init(|| parking_lot::Mutex::new(HashSet::new()));
+    let mut kinds = seen.lock();
+    if let Some(&held) = kinds.get(s) {
+        return held;
+    }
+    let fresh: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    kinds.insert(fresh);
+    fresh
+}
+
+/// How many hex digits of an id a display keeps, and the shortest run that
+/// is read back as an id rather than a name.
+const SHORT_ID_HEX: usize = 8;
+const SHORT_ID_MIN: usize = 4;
+
+/// The id as a table column prints it: the kind prefix and the last
+/// [`SHORT_ID_HEX`] hex digits of the uuid.
+pub fn short_id(id: &Id) -> String {
+    let hex = id.uuid.simple().to_string();
+    format!("{}-{}", id.kind, &hex[hex.len() - SHORT_ID_HEX..])
+}
+
+/// Read back what [`short_id`] wrote as the id of `prefix`, or a full id,
+/// against the rows of `col`.
+///
+/// The short form is what a table shows, so it is what an operator copies
+/// back. The tail is not unique on its own — see [`find_by_short_id`] — and
+/// a run shorter than [`SHORT_ID_MIN`] is taken for what it most likely is:
+/// a name, so this answers `None` and the caller looks the name up.
+pub fn displayed_id<K: Kind>(col: &Collection<K>, prefix: &str, text: &str) -> Result<Option<Id>> {
+    if let Some(id) = Id::parse(intern(prefix), text) {
+        return Ok(Some(id));
+    }
+    // The prefix is what the tool that printed the id calls the kind, which is
+    // not always the kind itself: a table's ID column prints a backup as
+    // `bak-1a2b3c4d` while the row's kind is `backup`. An id read back has to
+    // be tried under the name it was written with as well as under the kind,
+    // or every short id from that table is a word the service cannot find.
+    for kind in [K::KIND, prefix] {
+        if let Some(tail) = short_tail_of(kind, text) {
+            return find_by_short_id(col, &tail);
+        }
+    }
+    Ok(None)
+}
+
+/// The tail [`short_id`] keeps, when `text` is that form of an id of
+/// `prefix`. `None` when `text` is neither a full id of `prefix` nor
+/// `prefix-<tail>`.
+pub fn short_tail_of(prefix: &str, text: &str) -> Option<String> {
+    if Id::parse(intern(prefix), text).is_some() {
+        return None;
+    }
+    text.strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('-'))
+        .filter(|t| t.len() >= SHORT_ID_MIN && t.len() < 32)
+        .filter(|t| t.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|t| t.to_ascii_lowercase())
+}
+
+/// The row of `col` whose id ends in `tail`. A v7 uuid leads with a
+/// millisecond clock, so a tail is unique while rows are made apart; a tail
+/// two rows do share is refused rather than guessed.
+pub fn find_by_short_id<K: Kind>(col: &Collection<K>, tail: &str) -> Result<Option<Id>> {
+    let hits: Vec<Id> = col
+        .list(None)?
+        .into_iter()
+        .map(|item| item.meta().id.clone())
+        .filter(|id| id.uuid.simple().to_string().ends_with(tail))
+        .collect();
+    match hits.len() {
+        0 => Ok(None),
+        1 => Ok(hits.into_iter().next()),
+        _ => Err(StoreError::Conflict(format!(
+            "short id '{tail}' is ambiguous: {} rows end in it",
+            hits.len()
+        ))),
+    }
 }
 
 /// What [`check_file`] read from a store file.
@@ -1708,6 +2237,44 @@ mod tests {
     }
 
     #[test]
+    fn a_row_moved_to_another_project_answers_to_its_name_there() {
+        let store = Store::in_memory().unwrap();
+        let col = store.collection::<Widget>();
+        let from = Id::new(kind::PROJECT);
+        let to = Id::new(kind::PROJECT);
+        let w = col.create(widget("a", Some(from.clone()))).unwrap();
+
+        let moved = store.reproject::<Widget>(&w.meta.id, Some(&to)).unwrap();
+        assert_eq!(moved.meta.project.as_ref(), Some(&to));
+        assert_eq!(moved.meta.name, "a");
+        assert_eq!(moved.meta.revision, w.meta.revision + 1);
+        assert_eq!(col.get_by_name(Some(&to), "a").unwrap().meta.id, w.meta.id);
+        assert!(matches!(
+            col.get_by_name(Some(&from), "a"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(col.list(Some(&from)).unwrap().is_empty());
+        assert_eq!(col.list(Some(&to)).unwrap().len(), 1);
+        // The name sits under one project, not both.
+        assert_eq!(store.raw_scan("names", "widget/").unwrap().len(), 1);
+
+        // A move that comes back, and a move nowhere at all, both hold.
+        let back = store.reproject::<Widget>(&w.meta.id, Some(&from)).unwrap();
+        assert_eq!(back.meta.project.as_ref(), Some(&from));
+        let same = store.reproject::<Widget>(&w.meta.id, Some(&from)).unwrap();
+        assert_eq!(same.meta.revision, back.meta.revision);
+
+        // A name already taken in the project asked for refuses the move,
+        // and the row stays where it was.
+        col.create(widget("a", Some(to.clone()))).unwrap();
+        assert!(matches!(
+            store.reproject::<Widget>(&w.meta.id, Some(&to)),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(col.get(&w.meta.id).unwrap().meta.project, Some(from));
+    }
+
+    #[test]
     fn events_fire() {
         let store = Store::in_memory().unwrap();
         let mut rx = store.events().subscribe();
@@ -1877,6 +2444,334 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("gap"), "{err}");
         assert!(store.get_meta::<String>("cluster_id").unwrap().is_none());
+    }
+
+    /// A leader's write, as the follower receives it: one entry per logged
+    /// batch, in log order.
+    fn page(leader: &Store) -> Vec<LogEntry> {
+        leader.read_log(0, 64).unwrap()
+    }
+
+    fn drained(rx: &mut broadcast::Receiver<Event>) -> Vec<(String, Id, EventAction)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push((ev.kind, ev.id, ev.action));
+        }
+        out
+    }
+
+    #[test]
+    fn a_follower_announces_the_rows_it_applies() {
+        let leader = Store::in_memory().unwrap();
+        leader.set_record_log(true);
+        let col = leader.collection::<Widget>();
+        let w = col.create(widget("a", None)).unwrap();
+        let updated = col.update(w.clone(), None).unwrap();
+        col.delete(&w.meta.id).unwrap();
+
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        follower.apply_entries(&page(&leader)).unwrap();
+
+        let got = drained(&mut rx);
+        assert_eq!(
+            got,
+            vec![
+                ("widget".to_owned(), w.meta.id.clone(), EventAction::Created),
+                ("widget".to_owned(), w.meta.id.clone(), EventAction::Updated),
+                ("widget".to_owned(), w.meta.id, EventAction::Deleted),
+            ],
+            "one event per logged entry, in the order the leader made them"
+        );
+        assert_eq!(follower.commit_index().unwrap(), 3);
+        assert_eq!(updated.meta.revision, 2);
+    }
+
+    #[test]
+    fn an_applied_row_carries_the_shape_a_local_write_sends() {
+        let leader = Store::in_memory().unwrap();
+        leader.set_record_log(true);
+        let project = Id::new(kind::PROJECT);
+        let w = leader
+            .collection::<Widget>()
+            .create(widget("a", Some(project.clone())))
+            .unwrap();
+
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        follower.apply_entries(&page(&leader)).unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.kind, "widget");
+        assert_eq!(ev.id, w.meta.id);
+        assert_eq!(ev.project.as_ref(), Some(&project));
+        assert_eq!(ev.action, EventAction::Created);
+        assert_eq!(ev.revision, w.meta.revision);
+        // A row applied just now, stamped with the row's own time.
+        assert!(ev.at >= w.meta.updated_at);
+    }
+
+    #[test]
+    fn bookkeeping_rows_are_not_announced() {
+        let leader = Store::in_memory().unwrap();
+        leader.set_record_log(true);
+        leader.put_meta("cluster_id", &"abc").unwrap();
+        leader
+            .collection::<gate_kind::Audit>()
+            .create(gate_kind::audit_row())
+            .unwrap();
+
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        follower.apply_entries(&page(&leader)).unwrap();
+        assert!(
+            drained(&mut rx).is_empty(),
+            "the log's own rows and the audit trail are not a change anybody watches"
+        );
+        assert_eq!(follower.commit_index().unwrap(), 2);
+    }
+
+    /// A name index entry is written beside the resource row it points at, and
+    /// its key has a name where an id would be. Moving one — a rename, which
+    /// deletes the old key and puts a new one — is nothing a watcher watches:
+    /// the row it names is announced by its own write, and nothing in a
+    /// `names/...` key is a valid id.
+    #[test]
+    fn a_moved_name_index_sends_nothing_of_its_own() {
+        let leader = Store::in_memory().unwrap();
+        leader.set_record_log(true);
+        let col = leader.collection::<Widget>();
+        let w = col.create(widget("first", None)).unwrap();
+        let mut renamed = w.clone();
+        renamed.meta_mut().name = "second".to_owned();
+        col.update(renamed, None).unwrap();
+
+        let entry = LogEntry {
+            index: 1,
+            term: 1,
+            ops: leader
+                .read_log(0, 64)
+                .unwrap()
+                .iter()
+                .flat_map(|e| e.ops.iter())
+                .filter(|op| op.table == "names")
+                .cloned()
+                .collect(),
+        };
+        assert_eq!(
+            entry.ops.len(),
+            3,
+            "the name added at creation, then the old one removed and the new one added"
+        );
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        follower
+            .apply_entries(std::slice::from_ref(&entry))
+            .unwrap();
+        assert!(
+            drained(&mut rx).is_empty(),
+            "a name entry is not a resource row: nothing names itself with it"
+        );
+    }
+
+    #[test]
+    fn a_rejected_page_announces_nothing() {
+        let leader = Store::in_memory().unwrap();
+        leader.set_record_log(true);
+        let w = leader
+            .collection::<Widget>()
+            .create(widget("a", None))
+            .unwrap();
+
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        // Index 2 with nothing at 1: the page is refused and no row lands.
+        let mut holed = page(&leader);
+        holed[0].index = 2;
+        let err = follower.apply_entries(&holed).unwrap_err();
+        assert!(err.to_string().contains("gap"), "{err}");
+        assert!(drained(&mut rx).is_empty());
+        assert!(follower
+            .collection::<Widget>()
+            .try_get(&w.meta.id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// One entry that writes the same row twice — a leader folding two of its
+    /// own writes into one logged batch — is heard as the two writes it was:
+    /// the row made, then changed. The second write is not told as a second
+    /// creation, because the entry's own first write is what it landed on.
+    #[test]
+    fn an_entry_that_writes_a_row_twice_is_a_create() {
+        let leader = Store::in_memory().unwrap();
+        let col = leader.collection::<Widget>();
+        let w = col.create(widget("a", None)).unwrap();
+        // One entry, one row, written twice: what was there before the page
+        // began is what says whether the follower saw a new row or an old one.
+        let entry = LogEntry {
+            index: 1,
+            term: 1,
+            ops: vec![
+                LogOp {
+                    table: "resources".into(),
+                    key: format!("widget/{}", w.meta.id),
+                    value: Some(serde_json::to_vec(&w).unwrap()),
+                },
+                LogOp {
+                    table: "resources".into(),
+                    key: format!("widget/{}", w.meta.id),
+                    value: Some(serde_json::to_vec(&w).unwrap()),
+                },
+            ],
+        };
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        follower
+            .apply_entries(std::slice::from_ref(&entry))
+            .unwrap();
+        assert_eq!(
+            drained(&mut rx),
+            vec![
+                ("widget".to_owned(), w.meta.id.clone(), EventAction::Created),
+                ("widget".to_owned(), w.meta.id, EventAction::Updated),
+            ],
+            "the row was made by the first write, and changed by the second"
+        );
+    }
+
+    /// The same entry, one step further: a row the entry rewrote after it
+    /// existed is an update, and a row the entry then removed is a delete.
+    #[test]
+    fn an_entry_writes_then_removes_a_row_in_order() {
+        let leader = Store::in_memory().unwrap();
+        let col = leader.collection::<Widget>();
+        let w = col.create(widget("a", None)).unwrap();
+        let entry = LogEntry {
+            index: 1,
+            term: 1,
+            ops: vec![
+                LogOp {
+                    table: "resources".into(),
+                    key: format!("widget/{}", w.meta.id),
+                    value: Some(serde_json::to_vec(&w).unwrap()),
+                },
+                LogOp {
+                    table: "resources".into(),
+                    key: format!("widget/{}", w.meta.id),
+                    value: None,
+                },
+            ],
+        };
+        let follower = Store::in_memory().unwrap();
+        let mut rx = follower.events().subscribe();
+        follower
+            .apply_entries(std::slice::from_ref(&entry))
+            .unwrap();
+        assert_eq!(
+            drained(&mut rx),
+            vec![
+                ("widget".to_owned(), w.meta.id.clone(), EventAction::Created),
+                ("widget".to_owned(), w.meta.id.clone(), EventAction::Deleted),
+            ]
+        );
+        assert!(follower
+            .collection::<Widget>()
+            .try_get(&w.meta.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_replaced_store_is_announced_as_everything_having_changed() {
+        let store = Store::in_memory().unwrap();
+        let mut zones = store.events().subscribe();
+        let mut other = store.events().subscribe();
+        // A subscriber that never reads is behind, and is still told.
+        store.announce_all_changed();
+        for rx in [&mut zones, &mut other] {
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(broadcast::error::TryRecvError::Lagged(_))
+                ),
+                "every receiver lands on the path that means start again"
+            );
+        }
+    }
+
+    /// The fill is a fixed count, so it has to be enough for the widest
+    /// channel any subscriber can hold — not merely wider than the one this
+    /// test happens to use. A receiver that keeps up and drains every event
+    /// would otherwise sit out the announcement and go on serving a store that
+    /// is no longer there, which is the whole fault this is meant to close.
+    #[test]
+    fn the_fill_overflows_the_widest_channel_a_subscriber_can_have() {
+        // The server's own bus, as `pistack serve` builds it.
+        let (events, _) = broadcast::channel::<Event>(4096);
+        let store = Store::new(Arc::new(RedbBackend::in_memory().unwrap()), events);
+        let mut quick = store.events().subscribe();
+        let mut slow = store.events().subscribe();
+        store.announce_all_changed();
+        for rx in [&mut quick, &mut slow] {
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(broadcast::error::TryRecvError::Lagged(_))
+                ),
+                "a receiver on the widest channel is told to start again"
+            );
+        }
+    }
+
+    /// The filler names nothing, so a watcher that reads what the bus kept
+    /// rather than reacting to the gap cannot act on a row that does not exist.
+    #[test]
+    fn the_filler_names_no_row_a_watcher_could_act_on() {
+        let (events, _) = broadcast::channel::<Event>(2);
+        let store = Store::new(Arc::new(RedbBackend::in_memory().unwrap()), events);
+        let mut rx = store.events().subscribe();
+        store.announce_all_changed();
+        // Most of the fill is already gone, which is the point: what a receiver
+        // gets is the gap they open plus the last few fillers.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(ev.kind);
+        }
+        assert!(!kinds.is_empty(), "the fill does reach a receiver");
+        assert!(
+            kinds.iter().all(|k| k.is_empty()),
+            "no filler claims a kind a watcher would act on"
+        );
+    }
+
+    mod gate_kind {
+        use super::*;
+
+        /// The gateway's audit row, close enough for the store to apply: the
+        /// store knows this kind only as the one it keeps quiet about.
+        #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+        pub struct Audit {
+            #[serde(flatten)]
+            pub meta: Meta,
+        }
+        impl Kind for Audit {
+            const KIND: &'static str = "audit";
+            fn meta(&self) -> &Meta {
+                &self.meta
+            }
+            fn meta_mut(&mut self) -> &mut Meta {
+                &mut self.meta
+            }
+        }
+        pub fn audit_row() -> Audit {
+            Audit {
+                meta: Meta::new("audit", "audit", None),
+            }
+        }
     }
 
     #[test]
@@ -2152,5 +3047,18 @@ mod tests {
         store.set_write_fence(false);
         store.put_meta("x", &1u64).unwrap();
         assert_eq!(store.get_meta::<u64>("x").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn an_interned_kind_is_the_same_pointer_twice() {
+        // Equal text handed in as two distinct strings — as it arrives when read
+        // off a key — must come back as one stored string, not a fresh leak.
+        let owned = String::from("backup");
+        let again = String::from("backup");
+        let first = intern(&owned);
+        let second = intern(&again);
+        assert!(std::ptr::eq(first, second));
+        // A different kind is a different string.
+        assert!(!std::ptr::eq(intern("backup"), intern("volume")));
     }
 }

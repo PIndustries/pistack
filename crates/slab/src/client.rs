@@ -6,6 +6,7 @@
 //! volumes through it). It is the only writer of `status`.
 
 use bytes::Bytes;
+use chrono::Utc;
 use mold::ImageStore;
 use pistack_rpc::{
     CommandKind, CommandQueue, DiskTarget, VolumeAttach, VolumeAttached, VolumeDetach,
@@ -20,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
 
 use crate::backend::{
@@ -27,6 +29,7 @@ use crate::backend::{
 };
 use crate::place;
 use crate::quota::{ProjectQuota, QuotaCheck, QuotaRequest};
+use crate::transfer;
 use crate::types::*;
 
 /// Body of `POST /volumes`, `POST /snapshots`, `POST /backups`,
@@ -83,6 +86,15 @@ impl UpdateMeta {
             m.annotations = a.clone();
         }
     }
+}
+
+/// What [`Client::offer_volume`] hands back. The secret is in this struct
+/// and nowhere else: the record keeps only its hash, so an offer that was
+/// not written down here cannot be repeated.
+#[derive(Clone, Debug)]
+pub struct Offered {
+    pub transfer: Transfer,
+    pub secret: String,
 }
 
 #[derive(Clone)]
@@ -430,6 +442,9 @@ impl Client {
     pub fn backups(&self) -> Collection<Backup> {
         self.store.collection()
     }
+    pub fn transfers(&self) -> Collection<Transfer> {
+        self.store.collection()
+    }
 
     /// Create the `standard` volume type on the configured backend if no
     /// volume type exists yet. Idempotent.
@@ -586,8 +601,12 @@ impl Client {
         Ok(vol)
     }
 
+    /// One volume by name, full id or the short id a table prints. Goes through
+    /// [`Collection::resolve_scoped`] so an admin whose token carries no project
+    /// gets back the row its own list printed; whose reach is then decided by
+    /// `check_visible`, exactly as a list decides it.
     pub fn get_volume(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Volume> {
-        Ok(self.volumes().resolve(project, name_or_id)?)
+        Ok(self.volumes().resolve_scoped(project, name_or_id)?)
     }
 
     pub fn list_volumes(&self, project: Option<&Id>) -> ApiResult<Vec<Volume>> {
@@ -611,6 +630,11 @@ impl Client {
     /// Mark a volume for deletion; the reconciler frees storage and removes
     /// the record. Attached volumes are refused.
     pub fn request_delete_volume(&self, id: &Id) -> ApiResult<Volume> {
+        if !self.open_offers_for_volume(id)?.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "volume {id} is offered to another project; cancel the transfer first"
+            )));
+        }
         let snaps = self.snapshots().list(None)?;
         if snaps
             .iter()
@@ -668,11 +692,17 @@ impl Client {
         if let Some(node) = &node {
             self.check_attach_node(&self.volumes().get(id)?, node)?;
         }
+        let offered_here = !self.open_offers_for_volume(id)?.is_empty();
         Ok(self.volumes().modify(id, |v| {
             if v.status.phase != Phase::Ready {
                 return Err(StoreError::Conflict(format!(
                     "volume {id} is {:?}, not ready",
                     v.status.phase
+                )));
+            }
+            if offered_here {
+                return Err(StoreError::Conflict(format!(
+                    "volume {id} is offered to another project; cancel the transfer first"
                 )));
             }
             if let Some(cur) = &v.status.attached_to {
@@ -1020,7 +1050,8 @@ impl Client {
         match self.home_node(vol)? {
             Some(home) if home != node => Err(ApiError::unprocessable(format!(
                 "volume {} is held on node {home} and cannot attach on node {node}; \
-                 only an rbd volume attaches on any host",
+                 only an rbd volume attaches on any host. A machine created with \
+                 --near-volume is placed on that node",
                 vol.meta.id
             ))
             .with_detail("home_node", home)),
@@ -1096,7 +1127,7 @@ impl Client {
     }
 
     pub fn get_snapshot(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Snapshot> {
-        Ok(self.snapshots().resolve(project, name_or_id)?)
+        Ok(self.snapshots().resolve_scoped(project, name_or_id)?)
     }
 
     pub fn list_snapshots(&self, project: Option<&Id>) -> ApiResult<Vec<Snapshot>> {
@@ -1149,8 +1180,20 @@ impl Client {
         Ok(backup)
     }
 
+    /// The backup `name_or_id` names: resolved by whole id first of all, then by
+    /// name in `project` and then in the cloud scope.
+    ///
+    /// The id-first order is the point of this method. `Collection::resolve_scoped`
+    /// recognises a whole id and a short id — `bak-1a2b3c4d`, the form a table
+    /// prints and an operator copies back — and takes a long hyphenated string for
+    /// a name, because a name is allowed to look exactly like that. A restore's
+    /// default volume is named after the full id of the backup, so a caller who
+    /// copied a row's name out of a listing of restored volumes and then asked for
+    /// a backup by full id was answered with the *volume*'s namesake two scopes
+    /// away, or with `not found`. The row's own address is not a name and is
+    /// answered before the name index is consulted.
     pub fn get_backup(&self, project: Option<&Id>, name_or_id: &str) -> ApiResult<Backup> {
-        Ok(self.backups().resolve(project, name_or_id)?)
+        Ok(self.backups().resolve_scoped(project, name_or_id)?)
     }
 
     pub fn list_backups(&self, project: Option<&Id>) -> ApiResult<Vec<Backup>> {
@@ -1164,6 +1207,357 @@ impl Client {
         })?;
         crate::usage::refresh(self.store(), backup.meta.project.as_ref());
         Ok(backup)
+    }
+
+    // ---- transfers --------------------------------------------------------
+
+    /// Offer `volume` to another project and return the offer with the
+    /// secret that opens it.
+    ///
+    /// The volume must be available: detached, settled, with nothing
+    /// reading from it and no backup of it under way. The secret is shown
+    /// once, here; only its hash is stored. A cloud-scoped volume has no
+    /// project to release, so no project can be offered it either.
+    pub fn offer_volume(&self, id: &Id) -> ApiResult<Offered> {
+        let vol = self.volumes().get(id)?;
+        if let Some(machine) = &vol.status.attached_to {
+            return Err(ApiError::conflict(format!(
+                "volume {id} is attached to {machine}; detach it first"
+            )));
+        }
+        if attaching(&vol) {
+            return Err(ApiError::conflict(format!(
+                "volume {id} has an attach under way"
+            )));
+        }
+        if !matches!(vol.status.phase, Phase::Ready | Phase::Pending) {
+            return Err(ApiError::conflict(format!(
+                "volume {id} is {:?}, not available",
+                vol.status.phase
+            )));
+        }
+        // A backup still reading the volume's bytes is the one thing besides
+        // an attach that says the volume is not simply sitting there. A
+        // finished one is an object in a bucket and no obstacle.
+        let in_flight = self
+            .backups()
+            .list(None)?
+            .into_iter()
+            .find(|b| {
+                &b.spec.volume == id && matches!(b.status.phase, Phase::Pending | Phase::Creating)
+            })
+            .map(|b| b.meta.id);
+        if let Some(bak) = in_flight {
+            return Err(ApiError::conflict(format!(
+                "backup {bak} of volume {id} has not finished"
+            )));
+        }
+        let giver = vol.meta.project.clone().ok_or_else(|| {
+            ApiError::unprocessable(format!("volume {id} belongs to no project to move it from"))
+        })?;
+        // One open offer per volume. The secret is what decides who may take
+        // an offer, so a second one buys nothing and would leave two secrets
+        // able to move the same volume against each other.
+        if !self.open_offers_for_volume(id)?.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "volume {id} is already offered to another project"
+            )));
+        }
+
+        let (secret, hash) = transfer::new_secret();
+        let tid = Id::new(KIND_TRANSFER);
+        let mut meta = Meta::new(
+            KIND_TRANSFER,
+            transfer::record_name(&tid),
+            Some(giver.clone()),
+        );
+        meta.annotations
+            .insert(transfer::SECRET_HASH.to_owned(), hash);
+        let offered = self.transfers().create(Transfer {
+            meta,
+            spec: TransferSpec {
+                kind: KIND_VOLUME.to_owned(),
+                resource: vol.meta.id.to_string(),
+                destination: None,
+            },
+            status: TransferStatus {
+                phase: TransferPhase::Pending,
+                expires_at: Some(Utc::now() + transfer::TRANSFER_LIFETIME),
+                ..Default::default()
+            },
+        })?;
+        crate::usage::refresh(self.store(), Some(&giver));
+        Ok(Offered {
+            transfer: offered,
+            secret,
+        })
+    }
+
+    /// The offers on `volume` that could still move it. A volume with one of
+    /// these out is promised to nobody yet, but it cannot be deleted or
+    /// attached while someone may be holding a secret for it.
+    pub fn open_offers_for_volume(&self, volume: &Id) -> ApiResult<Vec<Transfer>> {
+        let now = Utc::now();
+        Ok(self
+            .list_offers_for_volume(volume)?
+            .into_iter()
+            .filter(|t| transfer::open_offer(t, now).is_some())
+            .collect())
+    }
+
+    /// The transfers of `volume`, newest first. Secrets are never in them.
+    pub fn list_offers_for_volume(&self, volume: &Id) -> ApiResult<Vec<Transfer>> {
+        let mut mine: Vec<Transfer> = self
+            .list_transfers(None)?
+            .into_iter()
+            .filter(|t| {
+                t.spec.kind == KIND_VOLUME
+                    && Id::parse(KIND_VOLUME, &t.spec.resource).as_ref() == Some(volume)
+            })
+            .collect();
+        mine.sort_by_key(|t| std::cmp::Reverse(t.meta.created_at));
+        Ok(mine)
+    }
+
+    pub fn get_transfer(&self, name_or_id: &str) -> ApiResult<Transfer> {
+        Ok(self.transfers().resolve(None, name_or_id)?)
+    }
+
+    pub fn list_transfers(&self, project: Option<&Id>) -> ApiResult<Vec<Transfer>> {
+        Ok(self.transfers().list(project)?)
+    }
+
+    /// Take an open offer into `taker`, moving the volume and the snapshots
+    /// taken from it.
+    ///
+    /// The transfer is taken under a lock before anything else is read, so
+    /// one offer cannot be accepted twice or cancelled while being taken,
+    /// and whoever holds it is the only caller left who can finish or put it
+    /// back. Every answer about the offer itself says `not found`, whether
+    /// the id is unknown, the secret is wrong, or the offer is closed: an
+    /// attacker poking at ids learns nothing about which exist.
+    ///
+    /// The receiving project is asked for the volume and its snapshots as one
+    /// set and either takes all of it or none of it. A move that cannot be
+    /// finished leaves every record where it was and reopens the offer, so
+    /// the same secret can be tried again or handed to a project with room.
+    pub fn accept_transfer(&self, id: &Id, secret: &str, taker: &Id) -> ApiResult<Volume> {
+        // Held from the claim to the end of the move. `modify` retries a
+        // revision clash rather than losing it, so with nothing around this
+        // two callers could each find the same offer open and each write
+        // itself in as the taker. Nothing here awaits, so it is a short hold.
+        let _claim = crate::transfer::claim_lock();
+        let col = self.transfers();
+        let claimed = col
+            .modify(id, |t| {
+                if transfer::is_closed(t, Utc::now())
+                    || t.spec.destination.is_some()
+                    || !secret_matches(secret, t)
+                {
+                    return Err(StoreError::NotFound(not_found(id)));
+                }
+                t.spec.destination = Some(taker.clone());
+                Ok(())
+            })
+            .map_err(|e| match e {
+                StoreError::NotFound(_) => ApiError::not_found(not_found(id)),
+                other => other.into(),
+            })?;
+        if claimed.spec.destination.as_ref() != Some(taker) {
+            return Err(ApiError::not_found(not_found(id)));
+        }
+        // The offer was open when it was claimed. A volume taken by another
+        // offer in the meantime is a different answer from a bad secret: the
+        // transfer was real and the caller holds its secret.
+        if let Err(e) = self.finish_move(id, taker) {
+            self.reopen(id, taker);
+            return Err(e);
+        }
+        Ok(self.volumes().get(&offer_volume_id(&claimed)?)?)
+    }
+
+    /// Put back an offer whose move did not happen, after a failure the
+    /// volume itself took no part in. The offer may be past its window by
+    /// now, in which case it stays closed and says so.
+    fn reopen(&self, id: &Id, taker: &Id) {
+        match self.transfers().modify(id, |t| {
+            if transfer::is_expired(t, Utc::now()) {
+                return Err(StoreError::Conflict("past its window".to_owned()));
+            }
+            t.spec.destination = None;
+            Ok(())
+        }) {
+            Ok(t) => {
+                crate::usage::mirror(self.store(), Some(taker));
+                crate::usage::mirror(self.store(), t.meta.project.as_ref());
+            }
+            Err(e) => tracing::warn!(
+                transfer = %id,
+                error = %e,
+                "slab: a transfer that did not move was not reopened"
+            ),
+        }
+    }
+
+    /// Move the volume and its snapshots of a transfer this caller claimed.
+    ///
+    /// Quota is counted from the rows and a count has no transaction around
+    /// it, so the question is asked while gate's admission lock is held and
+    /// before the volume is carried over: the receiving project is measured
+    /// without the incoming volume, exactly as it would be measured for a
+    /// volume of the same size created there. A refusal therefore moves
+    /// nothing, and nothing else can take the last unit in between.
+    fn finish_move(&self, id: &Id, taker: &Id) -> ApiResult<()> {
+        let offer = self.transfers().get(id)?;
+        let volume = offer_volume_id(&offer)?;
+        let from = offer.meta.project.clone();
+        let snaps: Vec<Id> = self
+            .snapshots()
+            .list(from.as_ref())?
+            .into_iter()
+            .filter(|s| s.spec.volume == volume && s.status.phase != Phase::Deleting)
+            .map(|s| s.meta.id)
+            .collect();
+
+        let _admission = gate::quota::admission();
+        let vol = self.volumes().get(&volume)?;
+        self.quota.check(
+            self.store(),
+            Some(taker),
+            &transfer::move_demand(vol.spec.size_gib, snaps.len() as u64),
+        )?;
+        // Carry the volume first: what moves with it follows a thing that is
+        // already placed. A row that cannot be carried back, or a snapshot
+        // that will not move, puts everything already moved where it was
+        // before the answer goes back to the caller.
+        if let Err(e) = self.carry(&volume, from.as_ref(), Some(taker)) {
+            self.undo(&volume, &[], from.as_ref());
+            return Err(e);
+        }
+        let mut moved = Vec::new();
+        for snap in &snaps {
+            match self.store().reproject::<Snapshot>(snap, Some(taker)) {
+                Ok(_) => moved.push(snap.clone()),
+                Err(e) => {
+                    self.undo(&volume, moved.as_slice(), from.as_ref());
+                    return Err(e.into());
+                }
+            }
+        }
+        let closed = self.transfers().modify(id, |t| {
+            t.status.phase = TransferPhase::Accepted;
+            t.status.accepted_by = Some(taker.clone());
+            Ok(())
+        });
+        if let Err(e) = closed {
+            self.undo(&volume, &moved, from.as_ref());
+            return Err(e.into());
+        }
+        crate::usage::mirror(self.store(), Some(taker));
+        crate::usage::mirror(self.store(), from.as_ref());
+        Ok(())
+    }
+
+    /// Put a volume and the snapshots named in `snaps` back into `to`, after
+    /// a move that had started and could not be finished. What cannot be put
+    /// back is logged: the records are the truth either way, and leaving them
+    /// where they are lets an operator see what half of this did.
+    fn undo(&self, volume: &Id, snaps: &[Id], to: Option<&Id>) {
+        if !snaps.is_empty() {
+            let back: Vec<Id> = snaps.to_vec();
+            let Some(project) = to else {
+                tracing::error!(
+                    volume = %volume,
+                    "slab: a half-finished transfer has snapshots with no project to return to"
+                );
+                return;
+            };
+            for snap in back {
+                if let Err(e) = self.store().reproject::<Snapshot>(&snap, Some(project)) {
+                    tracing::error!(
+                        snapshot = %snap,
+                        error = %e,
+                        "slab: a snapshot left by a half-finished transfer was not returned"
+                    );
+                }
+            }
+        }
+        let here = self.volumes().get(volume).ok().and_then(|v| v.meta.project);
+        if here.as_ref() != to {
+            if let Err(e) = self.carry(volume, here.as_ref(), to) {
+                tracing::error!(
+                    volume = %volume,
+                    error = %e,
+                    "slab: a volume left by a half-finished transfer was not returned"
+                );
+            }
+        }
+    }
+
+    /// Re-project `volume` from one project to another. The row is the only
+    /// place a volume counts, so this is what moves it as far as quota goes,
+    /// and the name index moves with it so the volume answers to its name in
+    /// the project that now holds it and not in the one that gave it. A volume
+    /// that has left its giver in the meantime is refused rather than moved
+    /// twice, and so is one whose name the project asked for has taken.
+    fn carry(&self, id: &Id, from: Option<&Id>, to: Option<&Id>) -> ApiResult<Volume> {
+        let vol = self.volumes().get(id)?;
+        if vol.meta.project.as_ref() != from {
+            return Err(ApiError::conflict(format!(
+                "volume {id} has left the project that offered it"
+            )));
+        }
+        if vol.meta.project.as_ref() == to {
+            return Ok(vol);
+        }
+        Ok(self.store().reproject::<Volume>(id, to)?)
+    }
+
+    /// Cancel an offer, so it can no longer be taken. The volume does not
+    /// move and stays with whoever offered it.
+    pub fn cancel_transfer(&self, id: &Id) -> ApiResult<Transfer> {
+        let _admission = gate::quota::admission();
+        let before = self.transfers().get(id)?;
+        let cancel = self.transfers().modify(id, |t| {
+            if transfer::is_closed(t, Utc::now()) {
+                return Err(StoreError::Conflict(format!(
+                    "transfer {id} is {:?} and cannot be cancelled",
+                    t.status.phase
+                )));
+            }
+            t.status.phase = TransferPhase::Closed;
+            t.status.message = "cancelled by the owner".to_owned();
+            Ok(())
+        })?;
+        crate::usage::mirror(self.store(), before.meta.project.as_ref());
+        crate::usage::mirror(self.store(), before.spec.destination.as_ref());
+        Ok(cancel)
+    }
+
+    /// Mark the offers whose window has passed closed. A record is written
+    /// only once per expiry, so repeating this per reconciler tick is cheap.
+    /// The giver keeps carrying an expired volume: nothing was given to
+    /// anyone, and the quota should say so.
+    pub fn reap_expired_transfers(&self) -> ApiResult<usize> {
+        let col = self.transfers();
+        let now = Utc::now();
+        let mut closed = 0;
+        for t in col.list(None)? {
+            if !transfer::is_expired(&t, now) || t.status.phase == TransferPhase::Closed {
+                continue;
+            }
+            col.modify(&t.meta.id, |t| {
+                if !transfer::is_expired(t, Utc::now()) || t.status.phase == TransferPhase::Closed {
+                    return Err(StoreError::Conflict("still open".to_owned()));
+                }
+                t.status.phase = TransferPhase::Closed;
+                t.status.message = "expired".to_owned();
+                Ok(())
+            })
+            .ok();
+            closed += 1;
+        }
+        Ok(closed)
     }
 
     /// Copy a ready backup out of silo into a new volume.
@@ -1289,6 +1683,10 @@ impl Client {
             v.status.phase = Phase::Creating;
             Ok(())
         })?;
+        // From here the bytes are the restored volume's. A write that fails
+        // half-way leaves them partially written, so the restore is over:
+        // `fail_volume` moves the record to `error` and the delete that follows
+        // takes the file with it. The object is read once, straight through.
         if let Err(e) = self
             .write_backup_bytes(&dest, &bucket.meta.id, &key, &expect_sha, need)
             .await
@@ -1678,6 +2076,9 @@ impl Client {
     /// Reconcile everything once. Used at start-up and after a lagged event
     /// stream.
     pub async fn reconcile_all(&self) -> ApiResult<()> {
+        if let Err(e) = self.reap_expired_transfers() {
+            tracing::warn!(error = %e, "slab: expired transfers were not closed");
+        }
         if let Err(e) = self.reconcile_stale_attaches().await {
             tracing::warn!(error = %e, "slab: stale attach reconcile failed");
         }
@@ -2230,6 +2631,18 @@ impl Client {
         Ok(None)
     }
 
+    /// The bucket a backup's bytes go to. `spec.target` names a row — the id
+    /// the CLI resolved before it created the record — so the bucket is read
+    /// the way every other name in this service is: whole id, then the short
+    /// id a table prints, then the name in the backup's project and then the
+    /// cloud scope.
+    ///
+    /// The name order matters. A bucket made inside a project is filed under
+    /// `{kind}/{project}/{name}`, and a backup inherits its volume's project,
+    /// so a project-scoped backup finds its own bucket first; a cloud-scope
+    /// token, which holds no project of its own, still finds a row filed under
+    /// the bare name. A target naming nothing is refused with the word the
+    /// record holds, because that is the word the operator typed.
     fn backup_bucket(&self, backup: &Backup) -> ApiResult<silo::Bucket> {
         let target = backup.spec.target.trim();
         if target.is_empty() {
@@ -2238,24 +2651,16 @@ impl Client {
             ));
         }
         let silo = self.silo();
-        if let Ok(bucket) = silo.get_bucket(backup.meta.project.as_ref(), target) {
-            return Ok(bucket);
-        }
-        if backup.meta.project.is_some() {
-            if let Ok(bucket) = silo.get_bucket(None, target) {
-                return Ok(bucket);
-            }
-        }
-        if let Some(bucket) = silo
-            .list_buckets(None)?
-            .into_iter()
-            .find(|bucket| bucket.meta.name == target || bucket.meta.id.to_string() == target)
-        {
-            return Ok(bucket);
-        }
-        Err(ApiError::not_found(format!(
-            "silo bucket '{target}' not found"
-        )))
+        let project = backup.meta.project.as_ref();
+        let found = match silo.get_bucket(project, target) {
+            Ok(bucket) => Some(bucket),
+            Err(e) if e.code == ErrorCode::NotFound => match silo.get_bucket(None, target) {
+                Ok(bucket) => Some(bucket),
+                Err(_) => find_short_bucket(&self.store, target)?,
+            },
+            Err(e) => return Err(e),
+        };
+        found.ok_or_else(|| ApiError::not_found(format!("silo bucket '{target}' not found")))
     }
 
     /// Record a failed upload. Ready is never set here. Unavailable is
@@ -2351,6 +2756,8 @@ struct UploadedBackup {
 /// Preferred part size is 64 MiB, raised to silo's minimum when that still
 /// fits in `max_object_bytes`. Otherwise the part size is the cap itself so
 /// a volume larger than the single-object limit can be split.
+const BACKUP_PART_BYTES: usize = 64 * 1024 * 1024;
+
 fn backup_part_size(min_part: usize, max_object: usize) -> ApiResult<usize> {
     if max_object == 0 {
         return Err(ApiError::unavailable("silo max_object_bytes is 0"));
@@ -2362,8 +2769,6 @@ fn backup_part_size(min_part: usize, max_object: usize) -> ApiResult<usize> {
         Ok(max_object)
     }
 }
-
-const BACKUP_PART_BYTES: usize = 64 * 1024 * 1024;
 
 async fn read_part(
     reader: &mut crate::backend::BackupStream,
@@ -2414,6 +2819,44 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0xf) as usize] as char);
     }
     s
+}
+
+/// The only answer a caller gets about an offer they cannot use. Whether the
+/// id was never issued, the secret was wrong, or the offer is closed, the
+/// reply is the same and says nothing about which it was.
+fn not_found(id: &Id) -> String {
+    format!("transfer {id} not found")
+}
+
+/// The volume a transfer moves. `None` when the record names nothing this
+/// build can move.
+fn offer_volume_id(offer: &Transfer) -> ApiResult<Id> {
+    Id::parse(KIND_VOLUME, &offer.spec.resource)
+        .ok_or_else(|| ApiError::not_found(not_found(&offer.meta.id)))
+}
+
+/// Does `secret` hash to what the record holds? Compared in constant time.
+/// A record with no hash is one this build did not write and matches nothing.
+fn secret_matches(secret: &str, offer: &Transfer) -> bool {
+    let Some(stored) = offer.meta.annotations.get(transfer::SECRET_HASH) else {
+        return false;
+    };
+    let given = transfer::hash_secret(secret);
+    bool::from(given.as_bytes().ct_eq(stored.as_bytes()))
+}
+
+/// The bucket whose id ends in `tail`. A short id is what `pi` prints, so it is
+/// what an operator types back; it is not unique on its own, and a tail two
+/// buckets share is refused rather than guessed.
+fn find_short_bucket(store: &Store, tail: &str) -> ApiResult<Option<silo::Bucket>> {
+    let col = store.collection::<silo::Bucket>();
+    Ok(
+        match pistack_store::find_by_short_id(&col, tail)?.map(|id| col.get(&id)) {
+            None => None,
+            Some(Ok(bucket)) => Some(bucket),
+            Some(Err(_)) => None,
+        },
+    )
 }
 
 #[cfg(test)]

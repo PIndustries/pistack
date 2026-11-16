@@ -372,7 +372,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
     );
     let cluster = std::sync::Arc::new(
         crate::cluster::handle_from(
-            node_id,
+            node_id.clone(),
             public_url.clone(),
             cluster_id,
             store.clone(),
@@ -427,6 +427,14 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
         tracing::debug!(module = name, "started");
     }
 
+    // Modules are watching now. If the last boot of this server ended by
+    // replacing its store with a snapshot from the leader, everything they
+    // would derive from that store is news to them and they have not derived
+    // any of it yet: say so before the first query arrives.
+    if crate::cluster::resync::awaiting_announce(&store)? {
+        crate::cluster::resync::announce_replaced(&store)?;
+    }
+
     let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
     let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster.clone()));
 
@@ -438,6 +446,8 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
             data_dir: opts.data_dir.clone(),
             store: store.clone(),
             names: agent_api.as_deref().and_then(host_of).into_iter().collect(),
+            leadership: leadership.clone(),
+            node_id: node_id.clone(),
         });
     let bound = crate::listen::bind_listeners(app, &opts.listen, tls).await?;
     tracing::info!(

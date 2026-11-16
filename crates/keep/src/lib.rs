@@ -8,6 +8,8 @@
 //!   verify client certificates, read secret payloads.
 //! * [`tls::server_config`] / [`tls::client_config`] — rustls configs built
 //!   from `keep` material, so the gateway and agents can speak (m)TLS.
+//! * [`files`] — a certificate, key and CA bundle as files in a directory,
+//!   replaced as a set. [`Client::renew_certificate`] issues the next one.
 //! * [`redeem_join_token`] — turn a join token into a grant and mark one use.
 //! * [`Client::lookup_access_key`] — the secret, project, principal and
 //!   project-scoped `Caller` of a live access key, for request signing
@@ -27,6 +29,10 @@
 //!   yet run in the lab against a production Vault.
 //! * `pkcs11`: **parked**. Refused with an error; nothing pretends to work.
 //!
+//! `pistack keep rotate-root-key` (`rekey.rs`) seals everything again under
+//! a new root key, for the software backend, with the server stopped. It
+//! can be interrupted and run again. Nothing rotates the key by itself.
+//!
 //! Every path that needs the key, including [`read_payload`], goes through
 //! the configured backend; there is no fallback between backends.
 //!
@@ -38,7 +44,9 @@
 //! leadership split.
 //!
 //! Background work (`sweep.rs`): the leader deletes join tokens that have
-//! been expired or used up for `join_token_grace_secs` (default 7 days).
+//! been expired or used up for `join_token_grace_secs` (default 7 days),
+//! and warns about an agent or server certificate that is past its renewal
+//! point and has not been renewed.
 //!
 //! HTTP lives under the `secrets` prefix; see `api.rs`.
 
@@ -49,9 +57,11 @@ pub mod ca;
 pub mod client;
 pub mod crypto;
 pub mod error;
+pub mod files;
 pub mod join;
 pub mod peer;
 pub mod quota;
+pub mod rekey;
 pub mod sweep;
 pub mod tls;
 pub mod types;
@@ -66,7 +76,7 @@ use std::sync::OnceLock;
 pub use access_key::{AccessKey, AccessKeyCredential, CreatedAccessKey};
 pub use backend::KeyBackend;
 pub use ca::{Ca, Issued};
-pub use client::Client;
+pub use client::{agent_cert_expiry, managed_cert_role, Client};
 pub use crypto::{RootKey, Sealed};
 pub use error::{KeepError, Result};
 pub use join::{
@@ -139,12 +149,13 @@ impl Module for Keep {
         let client = self.init(&ctx)?;
         let store = (*ctx.store::<Store>()).clone();
         let grace = client.limits().join_token_grace();
+        let root_key_days = client.limits().root_key_rotate_after_days;
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
         tokio::spawn(async move {
             leadership
                 .run_while_leader(shutdown, move |active| {
-                    sweep::run(store.clone(), grace, active)
+                    sweep::run(store.clone(), grace, root_key_days, active)
                 })
                 .await;
         });

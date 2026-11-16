@@ -36,6 +36,8 @@ pi user list
 
 Only an admin can create, list or delete principals. A principal can change its own password and email. Passwords are stored as argon2id hashes.
 
+A password being set is measured then, not later: at least 12 characters, and not the principal's name in any case. A password already stored is verified as it was stored, so a password set before the rule keeps working at sign-in. A refusal says which of the two the password failed. `PISTACK_ADMIN_PASSWORD` is measured the same way, and a server told to found itself with a password too short to keep says so and does not start.
+
 A service account is a principal for a program. It is meant to authenticate with an API key instead of a password.
 
 ## Projects and scope
@@ -54,7 +56,20 @@ Every token is scoped to one project, fixed when the token is issued. The projec
 2. the project of the API key, when logging in with one,
 3. the principal's default project.
 
-The scope decides which resources the token sees and where new resources go. There is no header or path segment to switch project on a single request. To work in another project, log in again with `--scope-project`, usually into a second profile:
+A token is only issued for a project the principal has a role in, or to a principal with a role at system scope. Asking for any other project is refused with `403`: a token with no role can still read, so one for a project you are not in would show you what it holds. A default project the principal has no role in is skipped, and the token has no project. A token for a project stops working when the principal's last role in it is removed.
+
+The scope decides which resources the token sees and where new resources go. There is no header or path segment to switch project on a single request.
+
+A caller can ask which projects they may work in and trade their token for one in another of them, without the password:
+
+```sh
+pi api GET /identity/tokens/self/projects
+pi api POST /identity/tokens/self/switch -d '{"project": "research"}'
+```
+
+The first lists each project with the project it sits under and the roles the caller has there. Any caller may ask; listing every project is still for a cloud admin. The second returns a new token. It ends when the old one would have, so switching does not keep a session alive, and the old token goes on working until then. A token that came from an API key cannot be moved: the key names its project. The web console uses these two calls for the project box in its header.
+
+With `pi`, log in again with `--scope-project`, usually into a second profile:
 
 ```sh
 pi --profile research login http://10.0.0.11:8443 --name alice --scope-project research
@@ -75,11 +90,11 @@ A binding gives one principal one role, in one project or system-wide.
 
 ```sh
 pi binding create --principal alice --role member --in-project research
-pi binding create --principal alice --role admin
+pi binding create --principal alice --role admin --system
 pi binding list
 ```
 
-Leaving out `--in-project` makes the binding system-wide.
+A binding says where it applies: `--in-project` for one project, `--system` for the whole cloud.
 
 When a token is issued, the server works out its roles:
 
@@ -119,13 +134,64 @@ pi login http://10.0.0.11:8443 --name alice
 
 `pi login` posts the name and password to `/identity/tokens` and stores the token in a profile. `--ttl` sets the lifetime in seconds.
 
-- Tokens are signed JSON Web Tokens (HS256). The signing key is generated on first start and kept in the store.
+- Tokens are signed JSON Web Tokens (HS256). The signing keys are kept in the store. The newest one signs, and a token names the key it was signed with in its `kid` header.
 - The default lifetime is 12 hours. The maximum is 7 days.
 - A token carries the principal and project. On every request the server checks that the principal still exists and is enabled, and reads its roles.
 
-Disabling or deleting a principal refuses its tokens from the next request, with `401 token revoked`. There is no way to cancel a single token; it lasts until it expires.
+Disabling or deleting a principal refuses its tokens from the next request, with `401 token revoked`.
+
+### Failing a password too often
+
+Two counts are kept, and either one brings a refusal down.
+
+Ten failed password sign-ins for one name from one client address inside 15 minutes stop that name being tried *from that address* for the rest of the window. Another address can still sign in to that name with the right password. This is the point: the wall counts the guesser, not the name, so nobody who merely knows the admin's name can hold the admin out of the admin's own account by failing at it ten times every quarter hour.
+
+The address counted is the one the audit log records for the request — the address of the connection the gateway accepted, or, where a server of the cluster carried the request, the client behind it. A sign-in that works clears the count for its own address and that address alone; other addresses keep what they have accumulated, because one address getting in says nothing about another.
+
+Two hundred failures for one name from any address inside 15 minutes stop that name being tried from everywhere for the rest of the window. This is the ceiling for a caller spreading its guesses over many addresses, one or a few from each: no single address ever reaches its own ten, and the name's total still fills. It is deliberately far above what one user signing in badly can reach, so the cost of the wider wall falls on a distributed guesser and not on a person who mistypes.
+
+What is counted is the name in the request, so a name no principal holds is counted too and answered the same way: the wall cannot be read as a list of the names the cloud holds. While a count says no, the attempt is refused with `429` and the code `rate_limited`, with a `Retry-After` header naming the seconds left, before the store is read and before any password is checked, and the reply says nothing about whether the name exists and nothing about which of the two counts refused.
+
+Both counts are in one server's memory, not in the store: every server keeps its own, and a restart starts clean. A caller who can reach every server gets those ceilings per server, not per cloud. A refusal is written to the audit log like any other refusal, with the name that was tried and no id. Logging in with an API key is not counted and is never held out: a key is not a guessable secret.
+
+Both counts are bounded in memory, so a caller inventing names or addresses cannot grow a server's tables past `MAX_NAMES` and `MAX_COUNTS`; a name or address that is tried again after its table has been walked past is simply counted afresh.
+
+A single token cannot be cancelled. The server keeps no list of the tokens it has issued, so there is nothing to mark. What you can do is refuse every token one user holds:
+
+```sh
+pi user revoke-tokens alice
+```
+
+This stamps the user with the current time, and any token of theirs issued at or before it gets `401 token revoked` from the next request on, on every server. The user logs in again for a new one. A login in the same second as the stamp is still refused; one second later it works. An admin can do this for anyone and a user can do it for themselves. API keys are not touched: delete the key to stop logins with it.
 
 `pi` reads its connection from a profile file: `~/.config/pistack/config.toml` on Linux, `~/Library/Application Support/pistack/config.toml` on macOS, or the file named by `--config` or `PI_CONFIG`. `--url` and `--token` (or `PI_URL` and `PI_TOKEN`) override the profile for one command.
+
+### Rotating the signing key
+
+```sh
+pi signing-key list
+pi signing-key rotate
+pi signing-key retire
+```
+
+`rotate` makes a new key and signs with it from then on. The key it replaces keeps verifying for 7 days and 5 seconds, which is the longest a token can live plus the clock skew allowed, and then stops by itself. Nobody is logged out and there is nothing more to run. `list` shows each key's id, its age and the time it stops verifying.
+
+`retire` drops every key but the current one at once. Every token signed with a dropped key fails with `401 invalid token` from the next request, so everyone logs in again. Use it after `rotate` when the old key may have leaked. It asks for confirmation; `--yes` skips the question.
+
+Nothing rotates the key on a schedule. Each rotation is an admin's command, and it is written to the audit log like any other change. A rotation made on the leader reaches the other servers with the store, and each server uses the new set from its next request. No restart is needed.
+
+Only the key ids and dates are ever returned. The key material stays in the store, so a copy of `state.redb` is still enough to sign tokens for that cloud.
+
+### Upgrading from a build without key ids
+
+A cloud started before signing keys had ids holds one secret. After the upgrade that secret is the first key of the set, under an id computed from it, so every server names it the same way. Tokens issued before the upgrade carry no `kid` and are checked against the oldest key, so they keep working.
+
+During a rolling upgrade both builds sign with the same secret. The old build ignores `kid`, so each accepts the other's tokens.
+
+Upgrade every server before the first `pi signing-key rotate`:
+
+- After a rotation, a server still on the old build refuses tokens signed with the new key (`401 invalid token`), because it only knows the old secret. It still accepts the old ones.
+- When the first key is retired, by `retire` or by a later `rotate` after its 7 days, the old secret is deleted from the store. A server on the old build then cannot recognise the other servers or be recognised by them, and if it is restarted it writes a new secret into its own copy of the store. Do not run the old build after that.
 
 ## API keys
 
@@ -196,6 +262,31 @@ A join token lets a host agent enroll. It starts with `pij_`, is created by an a
 
 `keep` also stores secrets and issues certificates from the cloud CA (a root, `pistack-root`, and an issuing CA, `pistack-issuing`). There are no `pi` commands for these yet; the API is under `/secrets`.
 
+### How long the cloud CA lasts
+
+Both CAs are made the first time a server starts on a new store, with ECDSA P-256 keys:
+
+| CA | Signed by | Valid for |
+| --- | --- | --- |
+| `pistack-root` | itself | 3650 days (10 years) |
+| `pistack-issuing` | `pistack-root` | 1826 days (5 years) |
+
+`pi api GET /secrets/cas` shows the exact dates in `status.not_after`.
+
+Every other certificate is signed by `pistack-issuing` and never outlives it. A certificate asked for 365 days when the issuing CA has 200 days left is cut to those 200 days. So in the fifth year the agent and server certificates get shorter with every renewal, and on the issuing CA's last day they all expire together. The server does not warn about the CA's own date.
+
+Neither CA can be rotated. There is no command for it and no procedure that works with the commands that exist:
+
+- The server finds the issuing CA by its name and makes one only when no CA called `pistack-issuing` exists. It cannot hold an old and a new issuing CA side by side, and nothing deletes the old one.
+- A new issuing CA signed by the same root would be trusted by the agents, because their `ca.pem` holds the root too. Every server would still need its `tls/` directory removed and a restart to get a certificate from it, and every agent certificate would be reissued at its next renewal or by enrolling again.
+- A new root is trusted by nobody. Every server's `tls/` and every agent's `<data_dir>/agent/` would have to be removed, and every agent enrolled again with a join token.
+
+Until rotation is built, the date of `pistack-issuing` is the date by which a build that can rotate it has to be running. Note it when you found a cloud.
+
+Agent and server certificates are renewed without anyone's help well before that. See [Agents and hosts](Agents-and-hosts#certificate-renewal) and [Running a cluster](Running-a-cluster#tls).
+
+### Where the root key is kept
+
 Secret payloads and CA keys are encrypted with one root key. By default the root key is kept in the store itself, which means the store file alone is enough to read every secret. `PISTACK_KEEP_BACKEND=vault` keeps the root key wrapped by a HashiCorp Vault Transit key instead, so the store holds only ciphertext and the server asks Vault to unwrap it at start. The Vault settings are in the [Configuration reference](Configuration-reference). The source notes that the Vault backend has not been run against a production Vault.
 
 Moving between the two is an offline operation on a stopped server, run on every control-plane node:
@@ -207,7 +298,42 @@ pistack keep migrate-to-software --allow-plaintext-key
 pistack keep rewrap
 ```
 
-`rewrap` re-encrypts the root key under the newest version of the Transit key after you rotate it.
+`rewrap` re-encrypts the root key under the newest version of the Transit key after you rotate it. It changes how the root key is wrapped, not the root key, and no secret is touched.
+
+### Rotating the root key
+
+With the `software` backend the root key itself can be replaced. Every secret payload and private key in the store is decrypted with the old key and encrypted again with a new one:
+
+```sh
+# on a single server, stopped
+pistack keep rotate-root-key
+```
+
+A cluster keeps one copy of the store per server and the command changes only the copy it runs on, so every server must be given the same new key. Stop all the servers first:
+
+```sh
+# on the first server: makes a new key and writes it to the file
+pistack keep rotate-root-key --key-file /root/new-root.key
+# copy the file to each other server, then on each of them:
+pistack keep rotate-root-key --key-file /root/new-root.key
+# when every server is done, delete the file everywhere and start the servers
+```
+
+The command refuses to run without `--key-file` on a server that has other members.
+
+It is safe to interrupt. The new key is saved next to the old one before any secret is touched, each secret is rewritten on its own, and the old key is only dropped after every payload has been opened once with the new one. Run the same command again to carry on from where it stopped. While a rotation is unfinished the server refuses to start on that store and says so, and `pistack keep status` shows it.
+
+What it does not do:
+
+- It never runs by itself. Nothing rotates the root key on a schedule.
+- It does not work with `PISTACK_KEEP_BACKEND=vault`. There the root key is wrapped by Transit; rotate the Transit key and run `rewrap`. Replacing the root key itself under Vault is not built.
+- It does not reach backups. A backup taken before the rotation holds the old key and everything sealed with it.
+
+### Secrets that ask to be rotated
+
+A secret can carry `rotate_after_days`. The server never rotates a secret. Once the payload is older than that many days, counted from the last time it was put or from creation, the leader logs a warning naming the secret, and repeats it every six hours until a new payload is put with `PUT /secrets/secrets/{id}/payload`.
+
+The root key has the same kind of reminder. Set `root_key_rotate_after_days` under `[modules.keep]` and the leader warns once the key is older than that, with the command to run. The age counts from the last `rotate-root-key`, or from the day the cloud was founded for a key never rotated. With the Vault backend it counts from the last `rewrap`. It is off by default and it only warns.
 
 ## Audit
 
@@ -231,7 +357,8 @@ Each record holds:
 | `principal`, `principal_id` | Who made the request. For a failed password login, the name that was tried and no id. |
 | `api_key` | The API key behind the token, when the token came from a key. |
 | `project` | The project the caller's token is scoped to. |
-| `client` | The address the connection came from, as the server saw it. Behind a proxy or load balancer this is the proxy; forwarding headers are not read. |
+| `client` | The address the connection came from, as the server saw it. Behind a proxy or load balancer this is the proxy; forwarding headers are not read. Of a request another server of the cluster carried, it is the client's address, the one the carrier saw. |
+| `carried_by` | The node id of the server that carried the request here, when another server of the cluster brought it. See [Running a cluster](Running-a-cluster). |
 | `method`, `path` | The request line, without the query string. |
 | `action` | What it did: `create`, `update`, `delete`, `login`, `enroll`, the name of an action route such as `drain`, `evacuate`, `start` or `revoke`, or a verb and the part it touched, such as `update_quotas`, `update_labels` or `read_payload`. |
 | `kind`, `resource` | The collection in the path (`machines`, `bindings`, `hosts`) and the resource as the request named it, by id or by name. For a create, the id of what was made. |
@@ -253,9 +380,9 @@ pi audit list --action login --principal alice
 pi audit list --kind hosts --resource rack1 -o json
 ```
 
-`pi audit list` prints the newest hundred records. `--since` and `--until` take an RFC 3339 time or an age such as `30m`, `2h` or `7d`. `--outcome` is `success` (a status below 400), `failure`, or one status code. When there are more records than `--limit`, `pi` prints the `--after` value that continues the list. `-o wide` adds the project, the API key, the method, the path and the record id.
+`pi audit list` prints the newest hundred records. `--since` and `--until` take an RFC 3339 time or an age such as `30m`, `2h` or `7d`. `--outcome` is `success` (a status below 400), `failure`, or one status code. `--carried-by <NODE>` keeps the records a server of the cluster carried to the leader, by its node id. When there are more records than `--limit`, `pi` prints the `--after` value that continues the list. `-o wide` adds the project, the API key, the server that carried the request, the method, the path and the record id.
 
-The API is `GET /identity/audit` with the query parameters `since`, `until`, `principal`, `project`, `action`, `kind`, `resource`, `outcome`, `order` (`asc`, the default, or `desc`), `limit` (100 by default, at most 1000) and `after`. It answers like every other list: `items`, `total`, and `next` when there is another page.
+The API is `GET /identity/audit` with the query parameters `since`, `until`, `principal`, `project`, `action`, `kind`, `resource`, `outcome`, `carried_by`, `order` (`asc`, the default, or `desc`), `limit` (100 by default, at most 1000) and `after`. It answers like every other list: `items`, `total`, and `next` when there is another page.
 
 A secret read is answered by the leader only. A follower cannot write the record, so it refuses the read with `409` and the leader's address, as it does for a write; `pi` follows that.
 

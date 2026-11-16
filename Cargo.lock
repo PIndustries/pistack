@@ -119,6 +119,7 @@ dependencies = [
  "pistack-rpc",
  "pistack-store",
  "pistack-types",
+ "power",
  "reqwest",
  "rustls",
  "serde",
@@ -336,6 +337,7 @@ dependencies = [
  "parking_lot",
  "pistack-store",
  "pistack-types",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "thiserror",
@@ -353,19 +355,28 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
+ "beacon",
  "chrono",
  "clap",
  "clap_complete",
  "comfy-table",
  "dirs",
+ "fabric",
  "futures",
+ "gauge",
+ "pistack-slab",
  "pistack-store",
  "pistack-types",
+ "relay",
  "reqwest",
  "rpassword",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
+ "shelf",
+ "silo",
  "tempfile",
  "thiserror",
  "tokio",
@@ -822,6 +833,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "fabric",
  "futures",
@@ -829,13 +841,19 @@ dependencies = [
  "gauge",
  "http-body-util",
  "keep",
+ "mold",
  "parking_lot",
  "pistack-rpc",
  "pistack-store",
  "pistack-types",
+ "power",
+ "rand 0.8.8",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -957,6 +975,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "hmac",
  "http",
  "jsonwebtoken",
  "pistack-store",
@@ -1524,6 +1543,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1873,6 +1893,7 @@ dependencies = [
  "http",
  "keep",
  "loom",
+ "md-5",
  "mold",
  "pistack-cluster",
  "pistack-config",
@@ -1966,10 +1987,12 @@ dependencies = [
  "pistack-rpc",
  "pistack-store",
  "pistack-types",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "sha2",
  "silo",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1983,6 +2006,7 @@ dependencies = [
 name = "pistack-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "parking_lot",
  "pistack-types",
  "redb",
@@ -2046,6 +2070,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "power"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pistack-types",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2443,9 +2479,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2832,7 +2868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

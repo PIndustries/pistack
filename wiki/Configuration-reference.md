@@ -60,6 +60,7 @@ Root-key operations on the local store. Stop the server first.
 | `pistack keep migrate-to-vault` | Wrap the root key with Vault Transit and drop the plaintext copy. |
 | `pistack keep migrate-to-software --allow-plaintext-key` | The reverse. |
 | `pistack keep rewrap` | Re-encrypt the root key under the latest Transit key version. |
+| `pistack keep rotate-root-key [--key-file PATH]` | Encrypt every secret and private key again under a new root key. Software backend only. Can be interrupted and run again. In a cluster, give every server the same key file. |
 
 ## Config file
 
@@ -82,6 +83,7 @@ max_access_keys_per_project = 100
 max_live_join_tokens = 100        # unexpired, unspent join tokens at once
 max_join_token_uses = 100         # most uses a multi-use join token may have
 join_token_grace_secs = 604800    # expired or spent join tokens are deleted after this
+root_key_rotate_after_days = 0    # warn when the root key is older than this; 0 never warns
 ```
 
 The file format also defines `data_dir`, `node_name`, `[server]`, `[tls]` and `[log]`. The server does not apply them. Use the flags and variables on this page for those. Unknown top-level keys are an error, so a typo stops the server at start.
@@ -224,6 +226,13 @@ Setting any `PISTACK_KEEP_VAULT_*` variable without `PISTACK_KEEP_BACKEND=vault`
 | `PISTACK_YOUKI_TIMEOUT_MS` | `30000` | Timeout for one youki command. |
 | `PISTACK_IP_BIN` | `ip` | `ip` binary for pod networking. |
 | `PISTACK_OVS_VSCTL_BIN` | `ovs-vsctl` | `ovs-vsctl` binary for plugging pods into OVN. |
+
+### Images
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_IMAGE_KEEP_DAYS` | `7` | Days an image nothing on the host uses is kept in the cache before a sweep deletes it. `0` is valid and means an unused image is kept for nothing beyond the sweep that finds it unused. A value that is not a whole number of days stops the agent at startup with an error. |
+| `PISTACK_IMAGE_SWEEP_SECONDS` | `21600` | How often the agent sweeps the image cache, from the moment the agent starts. `0` or a value that is not a number of seconds stops the agent at startup with an error. A sweep never deletes an image a machine uses, a machine disk is built on, one a machine's record names while its disk is still being provisioned, or one a download is filling in, and never deletes a file on the sweep that first finds it. A sweep that cannot read whether an image is in use — a machine disk it cannot open, a machine directory it cannot list, `qemu-img` missing — deletes nothing at all, warns once about what it could not read, and asks again next sweep. |
 
 ### Volumes
 

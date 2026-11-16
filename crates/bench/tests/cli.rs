@@ -19,6 +19,8 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 const TOKEN: &str = "tok-secret-123";
+const SWITCHED_TOKEN: &str = "tok-secret-456";
+const BACK_TOKEN: &str = "tok-secret-789";
 
 #[derive(Clone, Default)]
 struct Mock {
@@ -30,6 +32,18 @@ struct Mock {
     removals: Arc<Mutex<Vec<(String, bool)>>>,
     quotas: Arc<Mutex<BTreeMap<String, u64>>>,
     networks: Arc<Mutex<BTreeMap<String, Value>>>,
+    /// Paths of the identity writes that take no body.
+    identity_posts: Arc<Mutex<Vec<String>>>,
+    /// Bodies of the project switches asked for.
+    switches: Arc<Mutex<Vec<Value>>>,
+    /// Reads answered with a 404 before the row appears: a server whose copy
+    /// has not caught up with the one that took the write. Counts are per
+    /// path, so the caller's word and the id are hidden apart.
+    hiding: Arc<Mutex<BTreeMap<String, u32>>>,
+    /// Paths every read of this server has seen.
+    reads: Arc<Mutex<Vec<String>>>,
+    /// Bodies of machine rebuilds asked for.
+    rebuilds: Arc<Mutex<Vec<Value>>>,
 }
 
 fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
@@ -40,10 +54,36 @@ fn err(status: StatusCode, code: &str, msg: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Spend one of the misses owed to `path`, if any are left.
+fn hiding(m: &Mock, path: &str) -> bool {
+    let mut hiding = m.hiding.lock().unwrap();
+    let Some(n) = hiding.get_mut(path) else {
+        return false;
+    };
+    if *n == 0 {
+        return false;
+    }
+    *n -= 1;
+    true
+}
+
+/// The 404 of a server that does not have the row.
+fn gone(what: &str) -> axum::response::Response {
+    err(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        &format!("mach '{what}' not found"),
+    )
+}
+
 fn authed(h: &HeaderMap) -> bool {
+    bearer(h) == Some(TOKEN)
+}
+
+fn bearer(h: &HeaderMap) -> Option<&str> {
     h.get("authorization")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {TOKEN}"))
+        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 async fn login(Json(body): Json<Value>) -> axum::response::Response {
@@ -82,6 +122,28 @@ async fn whoami(h: HeaderMap) -> axum::response::Response {
         "system": true
     }))
     .into_response()
+}
+
+/// Only a token a switch handed out is good here.
+async fn needs_switched(h: HeaderMap) -> axum::response::Response {
+    let who = match bearer(&h) {
+        Some(SWITCHED_TOKEN) => json!({
+            "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+            "principal_name": "admin",
+            "project": "proj-0199a5e0-4444-7000-8000-000000000004",
+            "roles": ["reader"],
+            "system": false
+        }),
+        Some(BACK_TOKEN) => json!({
+            "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+            "principal_name": "admin",
+            "project": null,
+            "roles": ["admin"],
+            "system": true
+        }),
+        _ => return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials"),
+    };
+    Json(who).into_response()
 }
 
 async fn list(State(m): State<Mock>, h: HeaderMap) -> axum::response::Response {
@@ -149,13 +211,14 @@ async fn show(
     if !authed(&h) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
     }
+    let path = format!("/compute/machines/{id}");
+    m.reads.lock().unwrap().push(path.clone());
+    if hiding(&m, &path) {
+        return gone(&id);
+    }
     let mut machines = m.machines.lock().unwrap();
     let Some(mut v) = find(&machines, &id) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("mach '{id}' not found"),
-        );
+        return gone(&id);
     };
     *m.polls.lock().unwrap() += 1;
     let name = v["name"].as_str().unwrap_or("").to_owned();
@@ -173,6 +236,27 @@ async fn show(
     Json(v).into_response()
 }
 
+/// The action endpoints for the power verbs: the machine as it is, with the
+/// power the action asks for.
+async fn power_action(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path((id, action)): Path<(String, String)>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let mut machines = m.machines.lock().unwrap();
+    let Some(mut v) = find(&machines, &id) else {
+        return err(StatusCode::NOT_FOUND, "not_found", "no such machine");
+    };
+    let want = if action == "stop" { "off" } else { "on" };
+    v["status"]["power"] = json!(want);
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    machines.insert(name, v.clone());
+    Json(v).into_response()
+}
+
 async fn delete(
     State(m): State<Mock>,
     h: HeaderMap,
@@ -183,22 +267,68 @@ async fn delete(
     }
     let mut machines = m.machines.lock().unwrap();
     let Some(v) = find(&machines, &id) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("mach '{id}' not found"),
-        );
+        return gone(&id);
     };
-    machines.remove(v["name"].as_str().unwrap_or(""));
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    machines.remove(&name);
     (StatusCode::ACCEPTED, Json(v)).into_response()
 }
 
-async fn start(State(m): State<Mock>, Path(id): Path<String>) -> axum::response::Response {
+async fn rebuild(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    m.rebuilds.lock().unwrap().push(match body {
+        Some(Json(b)) => b,
+        None => json!(null),
+    });
     let machines = m.machines.lock().unwrap();
     match find(&machines, &id) {
-        Some(v) => Json(v).into_response(),
+        Some(v) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&v).unwrap()))
+            .unwrap(),
         None => err(StatusCode::NOT_FOUND, "not_found", "no such machine"),
     }
+}
+
+/// A resize takes the new size, refuses one it has never heard of, and
+/// writes it to the machine so a later show reports it.
+async fn resize(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let size = body["size"].as_str().unwrap_or("");
+    if size.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "bad_request", "size is required");
+    }
+    if size == "huge" {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "size 'huge' not found",
+        );
+    }
+    let mut machines = m.machines.lock().unwrap();
+    let Some(mut v) = find(&machines, &id) else {
+        return gone(&id);
+    };
+    v["spec"]["size"] = json!(size);
+    v["status"]["message"] = json!("resize requested");
+    let name = v["name"].as_str().unwrap_or("").to_owned();
+    machines.insert(name, v.clone());
+    Json(v).into_response()
 }
 
 fn find_pod(pods: &BTreeMap<String, Value>, id: &str) -> Option<Value> {
@@ -271,6 +401,109 @@ async fn remove_server(
     }
     m.removals.lock().unwrap().push((id, force));
     Json(json!({"members": []})).into_response()
+}
+
+fn signing_keys(m: &Mock) -> Value {
+    let posts = m.identity_posts.lock().unwrap();
+    let rotated = posts.iter().any(|p| p.ends_with("/rotate"));
+    let retired = posts.iter().any(|p| p.ends_with("/retire"));
+    let old = json!({"kid": "aaaa1111", "current": !rotated, "created_at": "2026-01-01T00:00:00Z",
+        "retire_at": if rotated { json!("2026-11-20T00:00:05Z") } else { Value::Null }});
+    let new = json!({"kid": "bbbb2222", "current": true, "created_at": "2026-11-13T00:00:00Z"});
+    match (rotated, retired) {
+        (false, _) => json!({"keys": [old]}),
+        (true, false) => json!({"keys": [old, new]}),
+        (true, true) => json!({"keys": [new], "retired": ["aaaa1111"]}),
+    }
+}
+
+async fn list_signing_keys(State(m): State<Mock>, h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    Json(signing_keys(&m)).into_response()
+}
+
+async fn identity_post(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let path = uri.path().to_owned();
+    m.identity_posts.lock().unwrap().push(path.clone());
+    if path.ends_with("/revoke-tokens") {
+        return Json(json!({"id": "prin-0000", "name": "bob", "kind": "prin",
+            "status": {"tokens_not_before": "2026-11-13T10:00:00Z"}}))
+        .into_response();
+    }
+    Json(signing_keys(&m)).into_response()
+}
+
+async fn my_projects(h: HeaderMap) -> axum::response::Response {
+    if !authed(&h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    Json(json!([
+        {"id": "proj-0199a5e0-2222-7000-8000-000000000002", "name": "acme-web",
+         "parent": "proj-0199a5e0-3333-7000-8000-000000000003", "parent_name": "acme",
+         "roles": ["member"], "current": true},
+        {"id": "proj-0199a5e0-4444-7000-8000-000000000004", "name": "acme-data",
+         "parent": "proj-0199a5e0-3333-7000-8000-000000000003", "parent_name": "acme",
+         "roles": ["reader"], "current": false}
+    ]))
+    .into_response()
+}
+
+async fn switch_project(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    // A token from a switch keeps working until it expires, so either can
+    // ask to move again.
+    if !matches!(bearer(&h), Some(TOKEN) | Some(SWITCHED_TOKEN)) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized", "no credentials");
+    }
+    let project = body["project"].as_str().unwrap_or("").to_owned();
+    m.switches.lock().unwrap().push(body);
+    if project == "system" {
+        return Json(json!({
+            "token": BACK_TOKEN,
+            "token_type": "Bearer",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "caller": {
+                "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+                "principal_name": "admin",
+                "project": null,
+                "roles": ["admin"],
+                "system": true
+            }
+        }))
+        .into_response();
+    }
+    if project != "acme-data" {
+        return err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            &format!("'alice' has no role in project '{project}'"),
+        );
+    }
+    Json(json!({
+        "token": SWITCHED_TOKEN,
+        "token_type": "Bearer",
+        "expires_at": "2030-01-01T00:00:00Z",
+        "caller": {
+            "principal": "prin-0199a5e0-1111-7000-8000-000000000001",
+            "principal_name": "admin",
+            "project": "acme-data",
+            "roles": ["reader"],
+            "system": false
+        }
+    }))
+    .into_response()
 }
 
 async fn discovery() -> Json<Value> {
@@ -486,10 +719,18 @@ async fn automatic_floating_ips_are_set_on_create_and_changed_later() {
 
 async fn serve() -> (String, Mock) {
     let mock = Mock::default();
+    let url = serve_with(mock.clone()).await;
+    (url, mock)
+}
+
+async fn serve_with(mock: Mock) -> String {
     let app = Router::new()
         .route("/", get(discovery))
         .route("/identity/tokens", post(login))
         .route("/identity/tokens/self", get(whoami))
+        .route("/identity/tokens/self/projects", get(my_projects))
+        .route("/identity/tokens/self/switch", post(switch_project))
+        .route("/identity/switched-only", get(needs_switched))
         .route("/cluster", get(cluster_status))
         .route(
             "/identity/projects/{id}/quotas",
@@ -500,9 +741,18 @@ async fn serve() -> (String, Mock) {
             "/network/networks/{id}",
             get(show_network).put(update_network),
         )
+        .route("/identity/signing-keys", get(list_signing_keys))
+        .route("/identity/signing-keys/rotate", post(identity_post))
+        .route("/identity/signing-keys/retire", post(identity_post))
+        .route(
+            "/identity/principals/{id}/revoke-tokens",
+            post(identity_post),
+        )
         .route("/compute/machines", get(list).post(create))
         .route("/compute/machines/{id}", get(show).delete(delete))
-        .route("/compute/machines/{id}/start", post(start))
+        .route("/compute/machines/{id}/rebuild", post(rebuild))
+        .route("/compute/machines/{id}/resize", post(resize))
+        .route("/compute/machines/{id}/{action}", post(power_action))
         .route("/loom/pods/{id}", get(show_pod))
         .route("/loom/pods/{id}/exec", post(exec_pod))
         .route(
@@ -513,7 +763,7 @@ async fn serve() -> (String, Mock) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), mock)
+    format!("http://{addr}")
 }
 
 #[derive(Debug)]
@@ -701,6 +951,54 @@ async fn login_then_machines_end_to_end() {
         r.out
     );
 
+    // Rebuild without --yes and no tty refuses; with --yes the request goes,
+    // with the image only when one is named.
+    let r = pi(&cfg, "", &["machine", "rebuild", "web"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("--yes"), "{}", r.err);
+    assert!(mock.rebuilds.lock().unwrap().is_empty());
+    let r = pi(&cfg, "", &["machine", "rebuild", "web", "--yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        r.out.trim(),
+        "machine \"web\" rebuild requested (mach-00000001)"
+    );
+    let r = pi(
+        &cfg,
+        "",
+        &["machine", "rebuild", "web", "--image", "noble", "--yes"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    {
+        let got = mock.rebuilds.lock().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], json!({}), "no body without --image");
+        assert_eq!(got[1], json!({"image": "noble"}));
+    }
+
+    // Resize sends the new size and the server records it.
+    let r = pi(&cfg, "", &["machine", "resize", "web", "--size", "m.4x8"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.starts_with("machine \"web\" resize requested"),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        mock.machines.lock().unwrap()["web"]["spec"]["size"],
+        "m.4x8"
+    );
+    // A size the server does not know is its error, printed once.
+    let r = pi(&cfg, "", &["machine", "resize", "web", "--size", "huge"]).await;
+    assert_eq!(r.code, 1);
+    assert_eq!(r.err.trim(), "error: size 'huge' not found");
+    assert!(r.out.is_empty());
+    // The size is required.
+    let r = pi(&cfg, "", &["machine", "resize", "web"]).await;
+    assert_eq!(r.code, 2);
+    assert!(r.err.contains("--size"), "{}", r.err);
+
     // Delete without --yes and no tty refuses; with --yes it goes.
     let r = pi(&cfg, "", &["machine", "delete", "web"]).await;
     assert_eq!(r.code, 1);
@@ -843,16 +1141,30 @@ async fn cluster_status_lists_the_servers_and_marks_the_leader() {
     assert_eq!(v["members"].as_array().unwrap().len(), 4);
 }
 
-/// A server that refuses every write the way a follower does, naming
-/// `leader`, and counts what it was sent.
-async fn follower(leader: String) -> (String, Arc<Mutex<u32>>) {
-    let refused = Arc::new(Mutex::new(0));
-    let count = refused.clone();
-    let app = Router::new().fallback(move || {
+/// A server that answers reads from its own copy, which does not have `row`,
+/// and refuses every write the way a follower does, naming `leader`. Counts
+/// what it was sent.
+async fn follower(leader: String, row: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let count = seen.clone();
+    let missing = row.to_owned();
+    let app = Router::new().fallback(move |r: axum::extract::Request| {
         let leader = leader.clone();
         let count = count.clone();
+        let missing = missing.clone();
         async move {
-            *count.lock().unwrap() += 1;
+            let path = r.uri().path().to_owned();
+            count.lock().unwrap().push(path.clone());
+            if r.method() == axum::http::Method::GET {
+                if path == format!("/compute/machines/{missing}") {
+                    return gone(&missing);
+                }
+                return err(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("mach '{missing}' not found"),
+                );
+            }
             (
                 StatusCode::CONFLICT,
                 Json(
@@ -860,18 +1172,20 @@ async fn follower(leader: String) -> (String, Arc<Mutex<u32>>) {
                     "details": {"leader": leader}}}),
                 ),
             )
+                .into_response()
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), refused)
+    (format!("http://{addr}"), seen)
 }
 
 #[tokio::test]
 async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     let (leader, mock) = serve().await;
-    let (url, refused) = follower(leader.clone()).await;
+    let (url, seen) = follower(leader.clone(), "").await;
+    let refused = Arc::clone(&seen);
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
     let create = [
@@ -883,7 +1197,7 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
     assert_eq!(r.code, 0, "{r:?}");
     assert!(mock.machines.lock().unwrap().contains_key("web"));
-    assert_eq!(*refused.lock().unwrap(), 1);
+    assert_eq!(*refused.lock().unwrap(), ["/compute/machines".to_owned()]);
     assert_eq!(
         r.err,
         format!("{url} is not the leader; sending the request to {leader}\n")
@@ -899,7 +1213,7 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     // Two followers that name each other: one retry, then the refusal.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let other = format!("http://{}", listener.local_addr().unwrap());
-    let (lost, lost_refused) = follower(other.clone()).await;
+    let (lost, lost_seen) = follower(other.clone(), "").await;
     let back = lost.clone();
     let app = Router::new().fallback(move || {
         let back = back.clone();
@@ -917,7 +1231,7 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     let on = ["--url", lost.as_str(), "--token", TOKEN];
     let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
     assert_eq!(r.code, 1, "{r:?}");
-    assert_eq!(*lost_refused.lock().unwrap(), 1);
+    assert_eq!(*lost_seen.lock().unwrap(), ["/compute/machines".to_owned()]);
     assert!(r.err.contains("error: not the leader"), "{}", r.err);
     assert!(
         r.err.contains(&format!("\"leader\":\"{lost}\"")),
@@ -926,11 +1240,12 @@ async fn a_write_refused_by_a_follower_is_sent_to_the_leader_once() {
     );
 
     // A leader on another scheme is not followed: the token stays put.
-    let (url, refused) = follower("https://127.0.0.1:1".into()).await;
+    let (url, seen) = follower("https://127.0.0.1:1".into(), "").await;
+    let refused = Arc::clone(&seen);
     let on = ["--url", url.as_str(), "--token", TOKEN];
     let r = pi(&cfg, "", &[&on[..], &create[..]].concat()).await;
     assert_eq!(r.code, 1, "{r:?}");
-    assert_eq!(*refused.lock().unwrap(), 1);
+    assert_eq!(*refused.lock().unwrap(), ["/compute/machines".to_owned()]);
     assert!(r.err.starts_with("error: not the leader"), "{}", r.err);
     assert!(r.err.contains("https://127.0.0.1:1"), "{}", r.err);
 }
@@ -1276,4 +1591,324 @@ async fn quota_set_then_show() {
     assert!(r.err.contains("not a number"), "{}", r.err);
     let r = pi(&cfg, "", &["quota", "set", "web"]).await;
     assert_eq!(r.code, 2, "{r:?}");
+}
+
+#[tokio::test]
+async fn signing_keys_are_listed_rotated_and_retired() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let admin = ["--url", url.as_str(), "--token", TOKEN];
+    let run = |rest: &[&'static str]| {
+        let args = [&admin[..], rest].concat();
+        let cfg = cfg.clone();
+        async move { pi(&cfg, "", &args).await }
+    };
+
+    let r = run(&["signing-key", "list"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", r.out);
+    assert!(lines[0].starts_with("KEY"), "{}", r.out);
+    assert!(lines[0].contains("VERIFIES-UNTIL"), "{}", r.out);
+    assert!(lines[1].starts_with("aaaa1111"), "{}", r.out);
+    assert!(lines[1].contains("yes"), "{}", r.out);
+
+    let r = run(&["signing-key", "rotate"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", r.out);
+    assert!(lines[1].contains("2026-11-20T00:00:05Z"), "{}", r.out);
+    assert!(!lines[1].contains("yes"), "{}", r.out);
+    assert!(lines[2].starts_with("bbbb2222"), "{}", r.out);
+
+    // No terminal to confirm on, and nothing is sent.
+    let r = run(&["signing-key", "retire"]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("--yes"), "{}", r.err);
+    assert_eq!(mock.identity_posts.lock().unwrap().len(), 1);
+
+    let r = run(&["signing-key", "retire", "--yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("bbbb2222"), "{}", r.out);
+    assert!(r.out.ends_with("retired aaaa1111\n"), "{}", r.out);
+
+    let r = run(&["user", "revoke-tokens", "bob"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("user \"bob\" tokens revoked"), "{}", r.out);
+    assert_eq!(
+        mock.identity_posts.lock().unwrap().last().unwrap(),
+        "/identity/principals/bob/revoke-tokens"
+    );
+}
+
+#[tokio::test]
+async fn a_token_lists_its_projects_and_moves_between_them() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", &url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    let r = pi(&cfg, "", &["project", "mine"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("acme-web"), "{}", r.out);
+    assert!(r.out.contains("acme-data"), "{}", r.out);
+    let r = pi(&cfg, "", &["project", "mine", "-o", "json"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+
+    // The switch trades the token and the profile keeps the rest.
+    let r = pi(&cfg, "", &["project", "switch", "acme-data"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out, "now in project acme-data\n");
+    let saved = cli::Config::load(&cfg).unwrap();
+    assert_eq!(
+        saved.current().unwrap().token.as_deref(),
+        Some(SWITCHED_TOKEN)
+    );
+    assert_eq!(
+        saved.current().unwrap().project.as_deref(),
+        Some("acme-data")
+    );
+    assert_eq!(saved.current().unwrap().url, url);
+    assert_eq!(saved.current().unwrap().principal.as_deref(), Some("admin"));
+
+    // What comes next is sent with the new token.
+    let r = pi(&cfg, "", &["api", "GET", "/identity/switched-only"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(v["project"], "proj-0199a5e0-4444-7000-8000-000000000004");
+
+    // A refused switch: the server's message, and the old token stays.
+    let refused = pi(&cfg, "", &["project", "switch", "secret"]).await;
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(
+        refused.err.contains("has no role in project 'secret'"),
+        "{}",
+        refused.err
+    );
+    let still = cli::Config::load(&cfg).unwrap();
+    assert_eq!(
+        still.current().unwrap().token.as_deref(),
+        Some(SWITCHED_TOKEN)
+    );
+
+    // A switch to system scope drops the project from the profile. The
+    // route behind it answers to the old token too, the way a real server
+    // lets a token work until it expires.
+    let r = pi(&cfg, "", &["project", "switch", "system"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.out, "now in project system scope\n");
+    let saved = cli::Config::load(&cfg).unwrap();
+    assert_eq!(saved.current().unwrap().token.as_deref(), Some(BACK_TOKEN));
+    assert!(saved.current().unwrap().project.is_none());
+
+    assert_eq!(
+        mock.switches.lock().unwrap().len(),
+        3,
+        "{:?}",
+        mock.switches.lock().unwrap()
+    );
+}
+
+// ---- waiting on a server whose copy lags -----------------------------------------
+
+/// Log in against `url` and return the config path.
+async fn signed_in(url: &str, dir: &std::path::Path) -> std::path::PathBuf {
+    let cfg = dir.join("config.toml");
+    let r = pi(
+        &cfg,
+        "x\n",
+        &["login", url, "--name", "admin", "--password-stdin"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    cfg
+}
+
+const WEB_ID: &str = "mach-0199a5e0-aaaa-7000-8000-000000000001";
+
+#[tokio::test]
+async fn create_wait_retries_a_row_the_reads_do_not_have_yet() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+
+    // The first two reads answer as if the machine was never made.
+    mock.hiding
+        .lock()
+        .unwrap()
+        .insert(format!("/compute/machines/{WEB_ID}"), 2);
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a", "--wait",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert!(
+        lines[0].starts_with("machine \"web\" created (mach-00000001)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(lines[1], "machine \"web\": creating");
+    assert_eq!(lines[2], "machine \"web\": ready");
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        mock.reads.lock().unwrap().len(),
+        4,
+        "{:?}",
+        mock.reads.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_wait_that_never_finds_the_row_reports_the_404() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+    mock.hiding
+        .lock()
+        .unwrap()
+        .insert(format!("/compute/machines/{WEB_ID}"), u32::MAX);
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a", "--wait",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(
+        r.err.contains(&format!("mach '{WEB_ID}' not found")),
+        "{}",
+        r.err
+    );
+    // The grace is bounded: a few reads, not a wait that never ends.
+    let reads = mock.reads.lock().unwrap().len();
+    assert!(
+        // About one read a second over the grace, and no more.
+        (10..20).contains(&reads),
+        "the grace should cost about ten reads, got {reads}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_wait_reads_from_the_leader_the_write_reached() {
+    let (leader, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    // The follower took the write for the leader, and its own copy does not
+    // have the row yet.
+    let (url, seen) = follower(leader.clone(), WEB_ID).await;
+    let admin = ["--url", url.as_str(), "--token", TOKEN];
+    let r = pi(
+        &dir.path().join("config.toml"),
+        "",
+        &[
+            &admin[..],
+            &[
+                "machine", "create", "web", "--size", "s.1x1", "--image", "a", "--wait",
+            ],
+        ]
+        .concat(),
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("machine \"web\": ready"), "{}", r.out);
+    // The follower saw the write and nothing else: the retry and every read
+    // of the wait went to the leader it named.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["/compute/machines".to_owned()],
+        "the follower was asked again"
+    );
+    let reads = mock.reads.lock().unwrap().clone();
+    assert_eq!(
+        reads,
+        [
+            format!("/compute/machines/{WEB_ID}"),
+            format!("/compute/machines/{WEB_ID}"),
+        ],
+        "the wait must read from the leader the write reached"
+    );
+}
+
+#[tokio::test]
+async fn delete_wait_believes_the_server_it_asked() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // The first read after the delete is answered as if the row was never
+    // here. The wait asks by the name the user gave, so this is the machine
+    // gone and the server that says so is the one that is believed.
+    mock.hiding
+        .lock()
+        .unwrap()
+        .insert("/compute/machines/web".into(), 1);
+    let r = pi(&cfg, "", &["machine", "delete", "web", "--yes", "--wait"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(
+        r.out,
+        "machine \"web\" deletion requested\nmachine \"web\": gone\n"
+    );
+    assert_eq!(
+        *mock.reads.lock().unwrap(),
+        ["/compute/machines/web".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn power_wait_reads_the_row_the_action_handed_back() {
+    let (url, mock) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = signed_in(&url, dir.path()).await;
+    let r = pi(
+        &cfg,
+        "",
+        &[
+            "machine", "create", "web", "--size", "s.1x1", "--image", "a",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // The action answers with the machine's id, and the wait reads that row.
+    // One read answers the machine as the action left it, and that is the
+    // power asked for, so there is no second one.
+    let r = pi(&cfg, "", &["machine", "stop", "web", "--wait"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("power off"), "{}", r.out);
+    // The row the action handed back is what the reads asked for.
+    let reads = mock.reads.lock().unwrap().clone();
+    assert!(
+        reads
+            .iter()
+            .all(|p| p == &format!("/compute/machines/{WEB_ID}")),
+        "{reads:?}"
+    );
+    assert_eq!(
+        mock.machines.lock().unwrap()["web"]["status"]["power"],
+        "off"
+    );
 }

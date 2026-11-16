@@ -11,10 +11,12 @@
 //! per listen address from [`listen_addrs`].
 //!
 //! Queries and AXFR (TCP only) are served for primary zones and for secondary
-//! zones that have completed an AXFR pull. Updates, notifies and IXFR get
-//! NOTIMP. Secondaries live in a side cache filled by [`crate::xfer`].
+//! zones that have completed an AXFR pull. Updates and IXFR get NOTIMP;
+//! NOTIFY is decided by [`crate::notify`]. Secondaries live in a side cache
+//! filled by [`crate::xfer`].
 
 use crate::client::Client;
+use crate::notify;
 use crate::types::{in_zone, RecordType as Rt, Zone, KINDS};
 use async_trait::async_trait;
 use hickory_proto::op::{Metadata, OpCode, ResponseCode};
@@ -25,7 +27,7 @@ use hickory_server::net::xfer::Protocol;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pistack_types::module::CancellationToken;
 use pistack_types::Event;
 use std::collections::HashMap;
@@ -33,7 +35,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// Environment variable naming the listen address(es).
 ///
@@ -48,7 +50,7 @@ pub const DEFAULT_PORT: u16 = 5353;
 /// private cluster address is known. Never the all-interfaces surprise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:5353";
 /// How long an idle TCP client may hold a connection.
-const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest CNAME chain followed inside one zone.
 const MAX_CNAME_DEPTH: usize = 8;
 
@@ -361,12 +363,18 @@ fn synth_owner(mut r: Record, owner: &Name) -> Record {
     r
 }
 
+/// What an accepted NOTIFY hands the pull loop: the apex, and the address the
+/// NOTIFY came from, when the caller knew one.
+type Pulled = (String, Option<IpAddr>);
+
 /// Store-backed [`RequestHandler`] with an invalidating cache.
 #[derive(Clone)]
 pub struct Handler {
     client: Client,
     cache: Arc<RwLock<Option<Arc<Catalog>>>>,
     secondaries: SecondaryCache,
+    /// Apices an accepted NOTIFY asked for, handed to the pull loop.
+    refresh: Arc<Mutex<Option<mpsc::UnboundedSender<Pulled>>>>,
 }
 
 impl Handler {
@@ -375,7 +383,15 @@ impl Handler {
             client,
             cache: Arc::new(RwLock::new(None)),
             secondaries,
+            refresh: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Where an accepted NOTIFY leaves its zone. Set once at start; a handler
+    /// without one still answers, it simply has nobody to wake.
+    pub fn with_refresh(self, tx: mpsc::UnboundedSender<(String, Option<IpAddr>)>) -> Self {
+        *self.refresh.lock() = Some(tx);
+        self
     }
 
     /// Drop the compiled catalog; the next query rebuilds it.
@@ -454,6 +470,11 @@ impl RequestHandler for Handler {
         request: &Request,
         mut response_handle: R,
     ) -> ResponseInfo {
+        // hickory has no notion of NOTIFY and would answer NOTIMP to every
+        // one, so it is settled here, before the query path.
+        if request.metadata.op_code == OpCode::Notify {
+            return self.handle_notify(request, &mut response_handle).await;
+        }
         let (code, answers, authorities, authoritative) = match self.classify(request) {
             Ok(a) => (a.code, a.answers, a.authorities, true),
             Err(code) => (code, Vec::new(), Vec::new(), false),
@@ -493,6 +514,39 @@ impl RequestHandler for Handler {
 }
 
 impl Handler {
+    /// Accept or refuse a NOTIFY, and hand an accepted one to the pull loop.
+    async fn handle_notify<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: &mut R,
+    ) -> ResponseInfo {
+        let src = request.src();
+        let message = match hickory_proto::op::Message::from_vec(request.as_slice()) {
+            Ok(m) => m,
+            Err(_) => {
+                return notify::answer_notify(request, ResponseCode::FormErr, response_handle)
+                    .await;
+            }
+        };
+        let allowed = match notify::notify_allowed(&self.client, &message, src) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "beacon: notify lookup failed");
+                false
+            }
+        };
+        if !allowed {
+            tracing::debug!(from = %src, "beacon: notify refused");
+            return notify::answer_notify(request, ResponseCode::Refused, response_handle).await;
+        }
+        let apex = notify::asked_apex(&message).unwrap_or_default();
+        if let Some(tx) = self.refresh.lock().as_ref() {
+            let _ = tx.send((apex.clone(), Some(src.ip())));
+        }
+        tracing::debug!(zone = %apex, from = %src, "beacon: notify accepted");
+        notify::answer_notify(request, ResponseCode::NoError, response_handle).await
+    }
+
     /// Decide what to answer, or which error code to return.
     fn classify(&self, request: &Request) -> Result<Answer, ResponseCode> {
         if request.metadata.op_code != OpCode::Query {
@@ -628,17 +682,22 @@ fn host_from_hint(raw: &str) -> Option<&str> {
 /// Bind UDP and TCP on each address in `listens` and serve until `shutdown`
 /// fires. Returns the bound addresses (useful when an entry has port 0).
 /// The handler is invalidated on every zone/record event from `events`.
+/// `refresh`, when given, is where an accepted NOTIFY leaves its zone.
 pub async fn serve(
     client: Client,
     listens: &[SocketAddr],
     events: broadcast::Sender<Event>,
     shutdown: CancellationToken,
     secondaries: SecondaryCache,
+    refresh: Option<mpsc::UnboundedSender<(String, Option<IpAddr>)>>,
 ) -> anyhow::Result<Vec<SocketAddr>> {
     if listens.is_empty() {
         anyhow::bail!("beacon: no DNS listen addresses");
     }
-    let handler = Handler::new(client, secondaries);
+    let mut handler = Handler::new(client, secondaries);
+    if let Some(tx) = refresh {
+        handler = handler.with_refresh(tx);
+    }
     handler.watch(events.subscribe(), shutdown.clone());
 
     let mut server = Server::new(handler);

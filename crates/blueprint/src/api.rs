@@ -7,13 +7,14 @@
 //! `POST /stacks/{id}/apply`, `POST /stacks/{id}/rollback`, and `GET|POST`,
 //! `GET|DELETE /{id}`, `POST /{id}/apply` for `/kits` and `/workflows`.
 //!
-//! `PUT` stores a new spec (honouring `If-Match`); apply realizes it. Apply
-//! re-validates the stored document, creates missing network, subnet,
-//! machine, router, pod, listener, and record set rows, updates the rows
-//! an earlier apply of the same stack created, and deletes managed rows
-//! the document no longer names. `status.phase` is `applying` while it
-//! runs, then `ready` or `failed`. Each successful stack apply of a new
-//! spec is kept in `status.history`; rollback puts an earlier revision's
+//! `PUT` stores a new spec (honouring `If-Match`); apply realizes it,
+//! substituting the values given for the document's `"{{ param.NAME }}"`
+//! references first. Apply re-validates the stored document, creates missing
+//! network, subnet, machine, router, pod, listener, and record set rows,
+//! updates the rows an earlier apply of the same stack created, and deletes
+//! managed rows the document no longer names. `status.phase` is `applying`
+//! while it runs, then `ready` or `failed`. Each successful stack apply of a
+//! new spec is kept in `status.history`; rollback puts an earlier revision's
 //! spec back and applies it. A kit is that same document without history.
 //! A workflow applies named stacks in order and stops on the first error.
 //! Unknown kinds are skipped.

@@ -590,6 +590,149 @@ pub fn parse_complete_xml(body: &str) -> ApiResult<Vec<CompletedPart>> {
     Ok(parts)
 }
 
+/// One `<Object>` of a DeleteObjects request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteRequest {
+    pub key: String,
+    /// `<Quiet>` inside the object overrides the request-level flag.
+    pub quiet: Option<bool>,
+}
+
+/// A parsed DeleteObjects request body.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteObjectsBody {
+    pub objects: Vec<DeleteRequest>,
+    /// `<Quiet>` outside `<Object>`, which applies to every one without its own.
+    pub quiet: bool,
+}
+
+/// Parse a DeleteObjects body. The tag walk is deliberately shallow — the
+/// same shape [`parse_complete_xml`] accepts and nothing else. A body with no
+/// `<Object>` is `MalformedXML`, as it is on S3.
+pub fn parse_delete_xml(body: &str) -> ApiResult<DeleteObjectsBody> {
+    let mut out = DeleteObjectsBody {
+        objects: Vec::new(),
+        quiet: top_level_quiet(body),
+    };
+    let mut rest = body;
+    while let Some(idx) = find_object_open(rest) {
+        let after = &rest[idx..];
+        let Some(gt) = after.find('>') else {
+            return Err(s3_err("MalformedXML", "unclosed <Object>"));
+        };
+        let tag = after[..gt].trim();
+        let (block, consumed) = if tag.ends_with('/') {
+            // `<Object/>` carries its key as an attribute.
+            (None, gt + 1)
+        } else {
+            let Some(close) = after[gt..].find("</Object>") else {
+                return Err(s3_err("MalformedXML", "unclosed <Object>"));
+            };
+            (Some(&after[gt + 1..gt + close]), gt + close + 9)
+        };
+        let raw_key = match block {
+            Some(block) => xml_text(block, "Key")?,
+            None => attribute(tag, "Key")
+                .ok_or_else(|| s3_err("MalformedXML", "missing <Key> in DeleteObjects"))?
+                .to_owned(),
+        };
+        let raw_quiet = match block {
+            Some(block) => xml_text_opt(block, "Quiet"),
+            None => attribute(tag, "Quiet").map(str::to_owned),
+        };
+        out.objects.push(DeleteRequest {
+            key: normalize_key(&raw_key),
+            quiet: raw_quiet.as_deref().map(parse_bool_text).transpose()?,
+        });
+        rest = &after[consumed..];
+    }
+    if out.objects.is_empty() {
+        return Err(s3_err("MalformedXML", "no <Object> in DeleteObjects"));
+    }
+    Ok(out)
+}
+
+/// `<Quiet>` that appears before the first `<Object>`, so an object's own
+/// flag is not mistaken for the request-level one.
+fn top_level_quiet(body: &str) -> bool {
+    let head = match find_object_open(body) {
+        Some(idx) => &body[..idx],
+        None => body,
+    };
+    match xml_text_opt(head, "Quiet") {
+        Some(v) => parse_bool_text(&v).unwrap_or(false),
+        None => false,
+    }
+}
+
+fn find_object_open(s: &str) -> Option<usize> {
+    for pat in ["<Object>", "<Object "] {
+        if let Some(i) = s.find(pat) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn parse_bool_text(raw: &str) -> ApiResult<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(s3_err("MalformedXML", "Quiet must be true or false")),
+    }
+}
+
+fn xml_text_opt(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let s = block.find(&open)?;
+    let after = &block[s + open.len()..];
+    let e = after.find(&close)?;
+    Some(after[..e].trim().to_owned())
+}
+
+/// Value of `name="…"` inside a start tag.
+fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("{name}=\"");
+    let s = tag.find(&open)? + open.len();
+    let rest = &tag[s..];
+    let e = rest.find('"')?;
+    Some(&rest[..e])
+}
+
+fn normalize_key(raw: &str) -> String {
+    xml_unescape(raw.trim())
+}
+
+/// Undo the XML entities a client puts in a key. A `%20` stays as written: a
+/// DeleteObjects body carries a key, not a URL.
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let (text, used) = match tail.find(';') {
+            Some(end) => match &tail[..=end] {
+                "&amp;" => ("&", end + 1),
+                "&lt;" => ("<", end + 1),
+                "&gt;" => (">", end + 1),
+                "&quot;" => ("\"", end + 1),
+                "&apos;" => ("'", end + 1),
+                _ => ("&", 1),
+            },
+            None => ("&", 1),
+        };
+        out.push_str(text);
+        rest = &tail[used..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn xml_text(block: &str, tag: &str) -> ApiResult<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -641,6 +784,7 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         | "AuthorizationHeaderMalformed"
         | "IncompleteBody"
         | "BadDigest"
+        | "InvalidDigest"
         | "XAmzContentSHA256Mismatch"
         | "XAmzContentChecksumMismatch" => ApiError::bad_request(message),
         "InvalidAccessKeyId"
@@ -826,6 +970,51 @@ mod tests {
         assert_eq!(parts[0].part_number, 1);
         assert_eq!(normalize_etag(&parts[0].etag), "aabb");
         assert_eq!(parts[1].part_number, 2);
+    }
+
+    #[test]
+    fn parse_delete_objects_keys_and_quiet() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete><Quiet>true</Quiet>
+  <Object><Key>a.txt</Key></Object>
+  <Object><Key>dir/b &amp; c</Key><Quiet>false</Quiet></Object>
+</Delete>"#;
+        let got = parse_delete_xml(xml).unwrap();
+        assert!(got.quiet);
+        assert_eq!(
+            got.objects,
+            vec![
+                DeleteRequest {
+                    key: "a.txt".into(),
+                    quiet: None
+                },
+                DeleteRequest {
+                    key: "dir/b & c".into(),
+                    quiet: Some(false)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_delete_objects_takes_no_object_as_malformed() {
+        for body in [
+            "<Delete></Delete>",
+            "<Delete><Quiet>true</Quiet></Delete>",
+            "<Delete><Object><Key>a</Key></Delete>",
+            "<Delete><Object><Quiet>true</Quiet></Object></Delete>",
+            "<Delete><Object><Key>a</Key><Quiet>yes</Quiet></Object></Delete>",
+        ] {
+            let err = parse_delete_xml(body).unwrap_err();
+            assert_eq!(s3_code_of(&err), Some("MalformedXML"), "{body}");
+        }
+    }
+
+    #[test]
+    fn parse_delete_objects_keeps_a_key_that_looks_like_markup() {
+        // Only the entities are undone; a body carries a key, not a URL.
+        let xml = "<Delete><Object><Key>a%20b&lt;c&gt;</Key></Object></Delete>";
+        assert_eq!(parse_delete_xml(xml).unwrap().objects[0].key, "a%20b<c>");
     }
 
     #[test]

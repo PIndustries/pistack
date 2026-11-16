@@ -3,7 +3,7 @@
 
 //! Resource kinds owned by `slab`: volume types, volumes, snapshots, backups.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pistack_types::{kind, Condition, Id, Kind, Meta, Phase, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -15,6 +15,7 @@ pub const KIND_VOLUME_TYPE: &str = "voltype";
 pub const KIND_VOLUME: &str = kind::VOLUME;
 pub const KIND_SNAPSHOT: &str = kind::SNAPSHOT;
 pub const KIND_BACKUP: &str = "bak";
+pub const KIND_TRANSFER: &str = "xfer";
 
 /// Name of the volume type seeded on first boot.
 pub const DEFAULT_VOLUME_TYPE: &str = "standard";
@@ -232,6 +233,63 @@ pub struct BackupStatus {
 }
 
 resource_kind!(Backup, BackupSpec, BackupStatus, KIND_BACKUP);
+
+// ---- Transfer -------------------------------------------------------------
+
+/// One resource offered to another project. A transfer moves a volume, and
+/// the snapshots taken from it, to `destination`; the record is cloud-scoped
+/// so the giving and the receiving project can both read it. Its name is its
+/// id: nothing else identifies an offer, and a name would be one more thing
+/// to guess.
+///
+/// The one-time secret is not here. Only its SHA-256 is, under the
+/// annotation named in [`crate::transfer`], and the secret itself is
+/// returned once, with the offer that created the record.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TransferSpec {
+    /// Kind of what is moved, today `vol`.
+    pub kind: String,
+    /// Id of what is moved, rendered so a record of a kind this crate does
+    /// not own could still be stored.
+    #[serde(default)]
+    pub resource: String,
+    /// Project that may take the offer. `None` until the taker names itself,
+    /// which is when the transfer stops being open to anyone else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Id>,
+}
+
+/// How far a transfer has got. Not a [`Phase`]: an offer is not something
+/// being built, and its states say who may still act on it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPhase {
+    /// Open: the owner may cancel, a member of another project may accept.
+    #[default]
+    Pending,
+    /// Taken. The volume and its snapshots are the taker's.
+    Accepted,
+    /// Closed and not to be taken: cancelled, or past its window.
+    Closed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TransferStatus {
+    #[serde(default)]
+    pub phase: TransferPhase,
+    /// End of the open window. `None` on a record written before transfers
+    /// expired, which none does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Project that took it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_by: Option<Id>,
+    /// Why an offer was closed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+resource_kind!(Transfer, TransferSpec, TransferStatus, KIND_TRANSFER);
 
 // ---- helpers --------------------------------------------------------------
 

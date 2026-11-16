@@ -10,7 +10,7 @@
 
 pub mod cloud;
 pub mod libvirt;
-mod metal;
+pub(crate) mod metal;
 pub mod mock;
 pub(crate) mod ovsplug;
 mod podnet;
@@ -49,6 +49,19 @@ pub trait MachineRuntime: Send + Sync + 'static {
     async fn stop(&self, id: &Id) -> ApiResult<()>;
     async fn delete(&self, id: &Id) -> ApiResult<()>;
     async fn list(&self) -> ApiResult<Vec<RunningMachine>>;
+
+    /// Replace the root disk of `req.id` with a fresh copy of the request's
+    /// image, then start the machine again. First-boot setup is written
+    /// again, so the guest runs it as it did on a new machine. A machine
+    /// this runtime does not hold is `not_found`. Default: this runtime has
+    /// no root disk to replace.
+    async fn rebuild(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
+        let _ = req;
+        Err(ApiError::not_implemented(format!(
+            "{} does not rebuild root disks",
+            self.name()
+        )))
+    }
 
     /// Hotplug `req` into a machine this runtime holds. The returned string
     /// is the guest device name (`vdb`). Default: this runtime has no disks.
@@ -178,6 +191,26 @@ impl Runtimes {
             ApiError::unprocessable(format!("this host has no runtime for {:?}", req.kind))
         })?;
         rt.start(req).await
+    }
+
+    /// Rebuild on whichever runtime holds the machine. A runtime that does
+    /// not hold it (`not_found`) or has no root disk to replace
+    /// (`not_implemented`) moves on to the next, as with [`Runtimes::stop`].
+    pub async fn rebuild(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
+        let mut last = ApiError::not_found(format!("machine {} is not on this host", req.id));
+        for rt in self.distinct() {
+            match rt.rebuild(req).await {
+                Ok(r) => return Ok(r),
+                Err(e)
+                    if e.code == pistack_types::error::ErrorCode::NotFound
+                        || e.code == pistack_types::error::ErrorCode::NotImplemented =>
+                {
+                    last = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
     }
 
     /// Stop on whichever runtime holds `id`; `not_found` when none does.

@@ -16,6 +16,7 @@
 //!   whose driver is `edge` and starts no process.
 //! * `reconcile` — turns spec into provider state and writes status.
 //! * [`health`] — active TCP/HTTP checks driving `Member.operating_status`.
+//! * [`picker`] — member selection under the pool's algorithm.
 //! * `api` — HTTP, mounted at `/balancers`.
 
 pub mod api;
@@ -23,6 +24,7 @@ pub mod bind;
 pub mod client;
 pub mod door;
 pub mod health;
+pub mod picker;
 pub mod provider;
 mod reconcile;
 mod tls;
@@ -31,6 +33,7 @@ mod udp;
 
 pub use client::Client;
 pub use door::{DoorKind, DoorPlan};
+pub use picker::{Backend, Picker};
 pub use provider::{
     Call, ForwardProvider, LbProvider, MockProvider, OvnProvider, Providers, RelayL7Provider,
     RouteView,

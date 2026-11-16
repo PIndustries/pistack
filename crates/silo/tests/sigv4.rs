@@ -2072,3 +2072,429 @@ async fn replace_content_type_flipped_after_sign_rejected() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+async fn put_signed(w: &World, key: &str, payload: &[u8]) {
+    let path = format!("/{}/{}", w.bucket, key);
+    let hash = sha256_hex(payload);
+    let (status, body, _) = signed_call(
+        &w.app,
+        "PUT",
+        &path,
+        "",
+        payload,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &hash,
+        "silo.test",
+        &[("content-type", "application/octet-stream")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
+#[tokio::test]
+async fn signed_range_get_answers_206_and_416() {
+    let w = world().await;
+    let payload: Vec<u8> = (0..=255u8).cycle().take(500).collect();
+    put_signed(&w, "ranged.bin", &payload).await;
+    let path = format!("/{}/ranged.bin", w.bucket);
+
+    for (range, expect) in [
+        ("bytes=0-9", &payload[0..10]),
+        ("bytes=200-", &payload[200..]),
+        ("bytes=-16", &payload[484..]),
+    ] {
+        let (status, body, headers) = signed_call(
+            &w.app,
+            "GET",
+            &path,
+            "",
+            b"",
+            &w.access_key_id,
+            &w.secret,
+            &w.region,
+            &amz_now(),
+            EMPTY_PAYLOAD_SHA256,
+            "silo.test",
+            &[("range", range)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(body, expect, "{range}");
+        let lo = expect.as_ptr() as usize - payload.as_ptr() as usize;
+        assert_eq!(
+            headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("bytes {}-{}/500", lo, lo + expect.len() - 1).as_str()),
+            "{range}"
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes"),
+            "{range}"
+        );
+    }
+
+    let (status, body, headers) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[("range", "bytes=500-")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes */500")
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&body)),
+        "InvalidRange"
+    );
+
+    // A reader's key may still ask for a range of an object it can see.
+    let (status, body, _) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        "",
+        b"",
+        &w.reader_access_key_id,
+        &w.reader_secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[("range", "bytes=10-19")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, &payload[10..20]);
+}
+
+#[tokio::test]
+async fn signed_head_reports_accept_ranges() {
+    let w = world().await;
+    put_signed(&w, "head-ranged.bin", b"0123456789").await;
+    let path = format!("/{}/head-ranged.bin", w.bucket);
+    let (status, body, headers) = signed_call(
+        &w.app,
+        "HEAD",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+    assert_eq!(
+        headers
+            .get(header::ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes")
+    );
+    assert_eq!(
+        headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("10")
+    );
+}
+
+fn delete_body(keys: &[&str]) -> Vec<u8> {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Delete>");
+    for key in keys {
+        xml.push_str(&format!("<Object><Key>{key}</Key></Object>"));
+    }
+    xml.push_str("</Delete>");
+    xml.into_bytes()
+}
+
+#[tokio::test]
+async fn signed_delete_objects_round_trip() {
+    let w = world().await;
+    put_signed(&w, "gone-a", b"a").await;
+    put_signed(&w, "gone-b", b"b").await;
+    let body = delete_body(&["gone-a", "never-there", "gone-b"]);
+    let hash = sha256_hex(&body);
+    let (status, resp, _) = signed_call(
+        &w.app,
+        "POST",
+        &format!("/{}", w.bucket),
+        "delete",
+        &body,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &hash,
+        "silo.test",
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+    let xml = String::from_utf8_lossy(&resp).into_owned();
+    for key in ["gone-a", "never-there", "gone-b"] {
+        assert!(xml.contains(&format!("<Key>{key}</Key>")), "{xml}");
+    }
+    assert!(!xml.contains("<Error>"), "{xml}");
+
+    let path = format!("/{}/gone-a", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn signed_delete_objects_wrong_body_hash_rejected() {
+    let w = world().await;
+    put_signed(&w, "kept.txt", b"keep me").await;
+    let body = delete_body(&["kept.txt"]);
+    // The signature covers the body the client declared; the bytes sent are
+    // not those, so nothing is deleted.
+    let (status, resp, _) = signed_call(
+        &w.app,
+        "POST",
+        &format!("/{}", w.bucket),
+        "delete",
+        &body,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        &sha256_hex(b"<Delete><Object><Key>other.txt</Key></Object></Delete>"),
+        "silo.test",
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&resp)),
+        "XAmzContentSHA256Mismatch"
+    );
+
+    let path = format!("/{}/kept.txt", w.bucket);
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &path,
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn signed_delete_objects_query_is_signed_too() {
+    let w = world().await;
+    put_signed(&w, "signed-del.txt", b"x").await;
+    let body = delete_body(&["signed-del.txt"]);
+    // A `?delete` that was never signed does not verify.
+    let date = amz_now();
+    let hash = sha256_hex(&body);
+    let path = format!("/{}", w.bucket);
+    let headers = vec![
+        ("content-length".to_string(), body.len().to_string()),
+        ("host".to_string(), "silo.test".to_string()),
+        ("x-amz-content-sha256".to_string(), hash.clone()),
+        ("x-amz-date".to_string(), date.clone()),
+    ];
+    let sig = sigv4::sign_request(
+        "POST",
+        &path,
+        // signed with the wrong query
+        "list-type=2",
+        &headers,
+        &hash,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+    );
+    let date_stamp: String = date.chars().take(8).collect();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{date_stamp}/{}/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date, Signature={sig}",
+        w.access_key_id, w.region
+    );
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{path}?delete"))
+                .header("host", "silo.test")
+                .header("content-length", body.len().to_string())
+                .header("x-amz-content-sha256", &hash)
+                .header("x-amz-date", &date)
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let out = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&out)),
+        "SignatureDoesNotMatch"
+    );
+
+    // And the key is still there.
+    let (status, _, _) = signed_call(
+        &w.app,
+        "GET",
+        &format!("/{}/signed-del.txt", w.bucket),
+        "",
+        b"",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reader_key_may_range_read_but_not_batch_delete() {
+    let w = world().await;
+    put_signed(&w, "reader-ranged.bin", b"0123456789").await;
+    let (status, body, _) = signed_call(
+        &w.app,
+        "GET",
+        &format!("/{}/reader-ranged.bin", w.bucket),
+        "",
+        b"",
+        &w.reader_access_key_id,
+        &w.reader_secret,
+        &w.region,
+        &amz_now(),
+        EMPTY_PAYLOAD_SHA256,
+        "silo.test",
+        &[("range", "bytes=2-4")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, b"234");
+
+    let body = delete_body(&["reader-ranged.bin"]);
+    let hash = sha256_hex(&body);
+    let (status, resp, _) = signed_call(
+        &w.app,
+        "POST",
+        &format!("/{}", w.bucket),
+        "delete",
+        &body,
+        &w.reader_access_key_id,
+        &w.reader_secret,
+        &w.region,
+        &amz_now(),
+        &hash,
+        "silo.test",
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        extract_error_code(&String::from_utf8_lossy(&resp)),
+        "AccessDenied"
+    );
+}
+
+#[tokio::test]
+async fn presigned_get_serves_a_range() {
+    let w = world().await;
+    put_signed(&w, "presign-range.bin", b"abcdefghij").await;
+    let path = format!("/{}/presign-range.bin", w.bucket);
+    let qs = sigv4::presign_query(
+        "GET",
+        &path,
+        "silo.test",
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &amz_now(),
+        900,
+        "",
+    );
+    let resp = w
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{path}?{qs}"))
+                .header("host", "silo.test")
+                .header("range", "bytes=3-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 3-5/10")
+    );
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(&body[..], b"def");
+}

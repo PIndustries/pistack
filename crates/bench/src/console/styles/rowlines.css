@@ -1,0 +1,16 @@
+  .rowlines { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .rowlines .empty { padding: 1.6rem 1rem; margin: 0; text-align: center; color: var(--muted); }
+  .rowlines .line { display: flex; align-items: center; border-bottom: 1px solid var(--line); min-height: 2.7rem; }
+  .rowlines button.line-open {
+    display: flex; flex: 1; gap: 1rem; align-items: center; min-width: 0;
+    padding: 0.6rem 1rem; background: transparent; border: 0; border-radius: 0;
+    text-align: left;
+  }
+  .rowlines .line:hover { background: var(--hover); }
+  .rowlines button.line-open > b { flex: 0 0 12rem; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .rowlines .line-actions { flex: 0 0 auto; padding-right: 1rem; }
+  .rowlines .line-actions button { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
+  .rowlines button.line-open > span { flex: 1; min-width: 0; color: var(--muted); font-size: 0.86rem; }
+  .rowlines button.line-open::after { content: "▾"; color: var(--muted); }
+  .rowlines button.line-open[aria-expanded="true"]::after { content: "▴"; }
+  .rowlines .panel { border: 0; border-radius: 0; background: none; padding: 0; }

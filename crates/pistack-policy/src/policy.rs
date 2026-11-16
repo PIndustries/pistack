@@ -430,6 +430,7 @@ impl Policy {
             "cronjob",
             "configmap",
             // fabric
+            "vpc",
             "network",
             "subnet",
             "port",

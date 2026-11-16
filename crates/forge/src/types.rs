@@ -8,7 +8,9 @@
 //! the transport delivers); `status` is written only by the reconciler.
 
 use chrono::{DateTime, Utc};
-use pistack_types::{kind, Condition, Id, Kind, Meta, Phase, Resource, Resources};
+use pistack_types::{
+    kind, ApiError, ApiResult, Condition, Id, Kind, Meta, Phase, Resource, Resources,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -83,6 +85,11 @@ pub const NODE_PIN_ANNOTATION: &str = "loom.pistack.io/node";
 /// to plug shared volumes back in.
 pub const EVACUATED_FROM_ANNOTATION: &str = "pistack.io/evacuated-from";
 
+/// A root disk rebuild the reconciler owes the machine, written by
+/// `POST /machines/{id}/rebuild`. The value is the image the new disk is a
+/// copy of. While it is set, `Updating` means rebuild, not migration.
+pub const REBUILD_ANNOTATION: &str = "pistack.io/rebuild";
+
 /// Host label that names the availability zone. `MachineSpec::zone` is a
 /// hard selector on it.
 pub const ZONE_LABEL: &str = "zone";
@@ -91,7 +98,74 @@ pub const ZONE_LABEL: &str = "zone";
 /// cannot set them, and replacing a host's labels keeps them.
 pub const SYSTEM_LABEL_PREFIX: &str = "pistack.io/";
 
+/// Host label saying where the agent keeps machine root disks: `local`
+/// when the directory is on this host's own filesystem, `shared` when it is
+/// on a filesystem the other hosts mount too. The agent reports it and it
+/// defaults to `local`, because that is what a host that never said is.
+pub const DISK_LABEL: &str = "pistack.io/disk";
+
+/// The [`DISK_LABEL`] value for a host whose machine disks are elsewhere.
+pub const DISK_SHARED: &str = "shared";
+
+/// Whether this host's machine root disks are on storage every host can see.
+/// A host that did not report the label is treated as local.
+pub fn machine_disks_are_shared(host: &Host) -> bool {
+    host.meta
+        .labels
+        .get(DISK_LABEL)
+        .is_some_and(|v| v == DISK_SHARED)
+}
+
 // ---- Host ------------------------------------------------------------------
+
+/// How the server can cut a host's power from outside it. Set by a cloud
+/// admin when a host is worth fencing: without it, evacuating a host that
+/// stopped reporting relies on an operator's word that it is dead.
+///
+/// The password is never here. `secret` is the *name* of a secret in the
+/// secrets service that holds it; the payload stays there and is read only
+/// at the moment of a power-off, and is never returned or logged.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PowerControl {
+    /// `ipmi` or `redfish`.
+    pub kind: String,
+    /// The BMC address: a `host[:port]` for IPMI, a URL or host for Redfish.
+    pub address: String,
+    /// The BMC user.
+    pub user: String,
+    /// Name (or id) of the secret holding the BMC password. Never the
+    /// password itself.
+    pub secret: String,
+}
+
+impl PowerControl {
+    /// A control with its fields trimmed and checked. The kind must be one
+    /// the power transport understands; the address, user and secret name
+    /// must be non-empty.
+    pub fn checked(kind: &str, address: &str, user: &str, secret: &str) -> ApiResult<PowerControl> {
+        let kind = power::Kind::parse(kind)?.as_str().to_owned();
+        let address = address.trim();
+        let user = user.trim();
+        let secret = secret.trim();
+        if address.is_empty() {
+            return Err(ApiError::bad_request("power control needs a bmc address"));
+        }
+        if user.is_empty() {
+            return Err(ApiError::bad_request("power control needs a bmc user"));
+        }
+        if secret.is_empty() {
+            return Err(ApiError::bad_request(
+                "power control needs the name of a secret holding the bmc password",
+            ));
+        }
+        Ok(PowerControl {
+            kind,
+            address: address.to_owned(),
+            user: user.to_owned(),
+            secret: secret.to_owned(),
+        })
+    }
+}
 
 /// What a host *is*: reported by the agent at hello time and on change.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -115,6 +189,10 @@ pub struct HostSpec {
     /// Why the host is disabled, in the operator's words.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub disabled_reason: String,
+    /// Out-of-band power control, set by a cloud admin. When present, an
+    /// evacuation powers the host off and confirms it before anything moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_control: Option<PowerControl>,
 }
 
 /// What is true about a host right now. Written by the reconciler.
@@ -137,6 +215,11 @@ pub struct HostStatus {
     /// network only where this says ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ovn: Option<pistack_rpc::OvnReport>,
+    /// When the agent's client certificate expires. Not stored: the host
+    /// routes fill it in from keep's certificate records on every read.
+    /// None for a host that never enrolled (the dev-mode local host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_expires: Option<DateTime<Utc>>,
 }
 
 impl HostStatus {
@@ -257,6 +340,50 @@ pub fn default_sizes() -> Vec<Size> {
     ]
 }
 
+// ---- Keypair ---------------------------------------------------------------
+
+/// Id prefix / store table for key pairs.
+pub const KEYPAIR_KIND: &str = "keypair";
+
+/// An SSH public key a machine can be given. Only the public half is ever
+/// stored; a pair generated here hands its private half to the caller once.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KeypairSpec {
+    /// The key as one OpenSSH line, what a guest is given verbatim.
+    pub public_key: String,
+    /// Wire name: `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256`.
+    pub key_type: String,
+    /// `SHA256:...`, as `ssh-keygen -l` prints it.
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KeypairStatus {}
+
+resource_kind!(
+    /// A named SSH public key in a project.
+    Keypair,
+    KeypairSpec,
+    KeypairStatus,
+    KEYPAIR_KIND
+);
+
+pub fn new_keypair(
+    name: impl Into<String>,
+    project: Option<Id>,
+    key: crate::keypair::PublicKey,
+) -> Keypair {
+    Keypair(Resource {
+        meta: Meta::new(KEYPAIR_KIND, name, project),
+        spec: KeypairSpec {
+            public_key: key.line,
+            key_type: key.key_type,
+            fingerprint: key.fingerprint,
+        },
+        status: KeypairStatus {},
+    })
+}
+
 // ---- Machine ---------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -314,10 +441,21 @@ pub struct MachineSpec {
     pub security_groups: Vec<String>,
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Volumes this machine will have attached later. Nothing is attached
+    /// at start. Hard constraint: a volume held on one node (a local file
+    /// or LVM) keeps the machine on that node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub near_volumes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+    /// Key pair name whose public key was added to `ssh_keys` at create.
+    /// Resolved in the caller's project and stored as given; read-only after
+    /// create. The machine carries the key itself, so deleting the pair
+    /// changes nothing about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keypair: Option<String>,
     /// Soft hint: prefer hosts that already run machines with these names.
     #[serde(default)]
     pub affinity: Vec<String>,
@@ -437,4 +575,13 @@ fn underlay_ip_ok(ip: Ipv4Addr) -> bool {
 /// Whether a delete has been requested (see `DELETE_ANNOTATION`).
 pub fn delete_requested(m: &Machine) -> bool {
     m.meta.annotations.contains_key(DELETE_ANNOTATION) || m.status.phase == Phase::Deleting
+}
+
+/// Whether a root disk rebuild is owed to this machine (see
+/// `REBUILD_ANNOTATION`).
+pub fn rebuild_requested(m: &Machine) -> bool {
+    m.meta
+        .annotations
+        .get(REBUILD_ANNOTATION)
+        .is_some_and(|v| !v.is_empty())
 }

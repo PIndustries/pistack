@@ -1,6 +1,29 @@
 # Install
 
-Today PiStack is installed by building it from source.
+PiStack is installed from a release tarball, or built from source.
+
+## Release binaries
+
+Releases for Linux x86_64 and aarch64 are on the [releases page](https://github.com/PIndustries/pistack/releases). Each tarball is `pistack-VERSION-linux-ARCH.tar.gz` and holds:
+
+| Path | What it is |
+| --- | --- |
+| `bin/pistack` | The server and the host agent. |
+| `bin/pi` | The command-line client. |
+| `scripts/` | The host helpers: `pistack-overlay`, `pistack-fip`, `pistack-shelf-helper`, `pistack-youki-cleanup`. |
+| `systemd/` | `pistack-server.service` and `pistack-agent.service`. |
+| `env/` | `server.env` and `agent.env`, the settings the units read. |
+| `install.sh` | Installs all of the above. |
+
+Every release carries `SHA256SUMS`. Check the download against it before you run anything; [docs/RELEASING.md](../docs/RELEASING.md) shows how.
+
+The binaries are built on Ubuntu 22.04 and need glibc 2.35 or newer, so they run on Linux only. To install from an unpacked tarball:
+
+```sh
+sudo ./install.sh
+```
+
+It puts the binaries in `/usr/local/bin`, the helpers in `/usr/local/sbin`, the units in `/etc/systemd/system` and the settings in `/etc/pistack`. It starts nothing and enables nothing. Both units run as root, and the helpers need `python3` and `sudo`. [Quick start](Quick-start) and [Running a cluster](Running-a-cluster) cover the settings and starting the services.
 
 ## From source
 
@@ -19,17 +42,13 @@ This produces two binaries:
 | `target/release/pistack` | The server and the host agent. |
 | `target/release/pi` | The command-line client. |
 
-Copy both somewhere on your `PATH`. Nothing else is installed: there is no service unit, no package and no default config file.
+Copy both somewhere on your `PATH`. `sudo packaging/install.sh` from a checkout installs the binaries, the helpers and the units the same way the tarball does. A build from source needs no settings file: pass flags or set the environment.
 
 The server and `pi` build and run on Linux and macOS. On macOS the server is only useful in `--dev` mode. The host agent is Linux only in practice: it reads memory from `/proc/meminfo`, so on other systems it reports a host with no memory and nothing is scheduled on it.
 
-## Release binaries
-
-Not available yet. The release pipeline is being built. This section will list download locations, checksums and supported platforms once the first release exists.
-
 ## Container images
 
-Not available yet. This section will name the image and tags once they are published.
+Not published yet. A release builds a server image (`pistack server`) and an agent image (`pistack agent`) for `linux/amd64` and `linux/arm64`, but no image is published until the first release that pushes them. [docs/RELEASING.md](../docs/RELEASING.md) describes the images and their limits; this section will name the repository and tags once they exist.
 
 ## What a host needs
 

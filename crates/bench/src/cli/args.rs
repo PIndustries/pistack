@@ -99,6 +99,12 @@ pub enum Cmd {
         cmd: UserCmd,
     },
     /// Roles.
+    /// Token signing keys (admin).
+    #[command(alias = "signing-keys")]
+    SigningKey {
+        #[command(subcommand)]
+        cmd: SigningKeyCmd,
+    },
     Role {
         #[command(subcommand)]
         cmd: RoleCmd,
@@ -135,6 +141,12 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: PodCmd,
     },
+    /// SSH key pairs.
+    #[command(alias = "keypairs", alias = "kp")]
+    Keypair {
+        #[command(subcommand)]
+        cmd: KeypairCmd,
+    },
     /// Sizes (flavors).
     Size {
         #[command(subcommand)]
@@ -159,6 +171,11 @@ pub enum Cmd {
     Network {
         #[command(subcommand)]
         cmd: NetworkCmd,
+    },
+    /// VPCs and the subnets cut from them.
+    Vpc {
+        #[command(subcommand)]
+        cmd: crate::cli::vpc::VpcCmd,
     },
     /// Subnets.
     Subnet {
@@ -245,6 +262,56 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: StackCmd,
     },
+    /// Load balancers, and their listeners, pools and members (relay).
+    Lb {
+        #[command(subcommand)]
+        cmd: super::lb::LbCmd,
+    },
+    /// Volume backups.
+    Backup {
+        #[command(subcommand)]
+        cmd: crate::cli::backup::BackupCmd,
+    },
+    /// Object storage buckets.
+    Bucket {
+        #[command(subcommand)]
+        cmd: BucketCmd,
+    },
+    /// Objects in a bucket.
+    Object {
+        #[command(subcommand)]
+        cmd: ObjectCmd,
+    },
+    /// Shared filesystems (shelf).
+    Share {
+        #[command(subcommand)]
+        cmd: super::share::ShareCmd,
+    },
+    /// Secrets (keep). The payload is never an argument.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
+    /// Certificates issued by the cloud CA (keep).
+    Cert {
+        #[command(subcommand)]
+        cmd: CertCmd,
+    },
+    /// DNS zones and records.
+    Dns {
+        #[command(subcommand)]
+        cmd: crate::cli::dns::DnsCmd,
+    },
+    /// Threshold alarms on metrics (gauge).
+    Alarm {
+        #[command(subcommand)]
+        cmd: super::alarm::AlarmCmd,
+    },
+    /// Metric series a server holds points for (gauge).
+    Metric {
+        #[command(subcommand)]
+        cmd: super::alarm::MetricCmd,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -328,6 +395,16 @@ pub struct ListArgs {
     pub selector: Vec<String>,
 }
 
+/// A bucket whose keys are being listed.
+#[derive(Args, Debug, Default)]
+pub struct ObjectListArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Only keys starting with this.
+    #[arg(long)]
+    pub prefix: Option<String>,
+}
+
 #[derive(Args, Debug)]
 pub struct NameArg {
     /// Name or id.
@@ -357,7 +434,7 @@ pub struct MetaArgs {
 }
 
 macro_rules! crud {
-    ($name:ident, $create:ty $(, $(#[$m:meta])* $var:ident($args:ty))* $(,)?) => {
+    ($name:ident, $create:ty $(, $(#[$m:meta])* $var:ident ($($args:ty)?))* $(,)?) => {
         #[derive(Subcommand, Debug)]
         #[allow(clippy::large_enum_variant)]
         pub enum $name {
@@ -372,12 +449,18 @@ macro_rules! crud {
             /// Delete by name or id.
             #[command(alias = "rm")]
             Delete(DeleteArgs),
-            $( $(#[$m])* $var($args), )*
+            $($(#[$m])* $var $(($args))?, )*
         }
     };
 }
 
 // ---- identity ----------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct ProjectSwitchArgs {
+    /// Project name or id to move to.
+    pub project: String,
+}
 
 #[derive(Args, Debug)]
 pub struct ProjectCreate {
@@ -393,7 +476,14 @@ pub struct ProjectCreate {
     #[arg(long)]
     pub disabled: bool,
 }
-crud!(ProjectCmd, ProjectCreate);
+crud!(
+    ProjectCmd,
+    ProjectCreate,
+    /// List the projects this token can work in
+    Mine(),
+    /// Move to another project: trade the token for one scoped to it
+    Switch(ProjectSwitchArgs),
+);
 
 #[derive(Subcommand, Debug)]
 pub enum QuotaCmd {
@@ -447,7 +537,33 @@ pub struct UserCreate {
     #[arg(long)]
     pub disabled: bool,
 }
-crud!(UserCmd, UserCreate);
+crud!(
+    UserCmd,
+    UserCreate,
+    /// Refuse every token the user holds now. They log in again to get a
+    /// new one. One token cannot be revoked on its own.
+    RevokeTokens(NameArg)
+);
+
+#[derive(Subcommand, Debug)]
+pub enum SigningKeyCmd {
+    /// List the token signing keys: id, age and when each stops verifying.
+    #[command(alias = "ls")]
+    List,
+    /// Sign new tokens with a new key. The key before it keeps verifying
+    /// until every token it signed has expired (7 days), then stops.
+    Rotate,
+    /// Drop every key but the current one now. Tokens signed with a
+    /// dropped key stop working at once.
+    Retire(SigningKeyRetire),
+}
+
+#[derive(Args, Debug)]
+pub struct SigningKeyRetire {
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct RoleCreate {
@@ -465,9 +581,12 @@ pub struct BindingCreate {
     /// Role name.
     #[arg(long)]
     pub role: String,
-    /// Project (name or id); omit for system scope.
-    #[arg(long = "in-project", value_name = "PROJECT")]
+    /// Project (name or id).
+    #[arg(long = "in-project", value_name = "PROJECT", conflicts_with = "system")]
     pub in_project: Option<String>,
+    /// Bind across the whole cloud, not one project.
+    #[arg(long)]
+    pub system: bool,
 }
 crud!(BindingCmd, BindingCreate);
 
@@ -543,11 +662,18 @@ pub struct MachineCreate {
     /// Volume (repeatable).
     #[arg(long = "volume", value_name = "VOLUME")]
     pub volumes: Vec<String>,
+    /// Place the machine where this volume can attach (repeatable).
+    /// Nothing is attached; use `pi volume attach` once it runs.
+    #[arg(long = "near-volume", value_name = "VOLUME")]
+    pub near_volumes: Vec<String>,
     #[arg(long, value_enum, default_value_t = MachineKind::Vm)]
     pub kind: MachineKind,
     /// SSH public key (repeatable); `@file` reads a file.
     #[arg(long = "ssh-key", value_name = "KEY")]
     pub ssh_keys: Vec<String>,
+    /// Key pair (name or id) whose public key the machine also gets.
+    #[arg(long, value_name = "KEYPAIR")]
+    pub keypair: Option<String>,
     /// cloud-init user data; `@file` reads a file.
     #[arg(long)]
     pub user_data: Option<String>,
@@ -569,6 +695,32 @@ pub struct PowerArgs {
     pub wait: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct KeypairCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Import this public key file instead of making a key.
+    #[arg(long = "public-key-file", value_name = "FILE")]
+    pub public_key_file: Option<String>,
+    /// Write a generated private key here, mode 0600, never overwritten.
+    /// Without it a key is printed, and only when the output is not a
+    /// terminal.
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<String>,
+}
+
+crud!(KeypairCmd, KeypairCreate);
+
+#[derive(Args, Debug)]
+pub struct MachineResizeArgs {
+    /// Machine name or id. Must be stopped.
+    pub name: String,
+    /// New size name or id.
+    #[arg(long)]
+    pub size: String,
+}
+
 crud!(
     MachineCmd,
     MachineCreate,
@@ -578,9 +730,31 @@ crud!(
     Stop(PowerArgs),
     /// Reboot.
     Reboot(PowerArgs),
+    /// Replace the machine's root disk with a fresh copy of an image and
+    /// start it again. Its id, name, host, network and keys are kept; what
+    /// was on the root disk is gone.
+    Rebuild(MachineRebuildArgs),
+    /// Change the machine's size. Stop it first.
+    Resize(MachineResizeArgs),
     /// What the machine is using now: CPU, memory, disk and network.
     Stats(NameArg),
 );
+
+#[derive(Args, Debug)]
+pub struct MachineRebuildArgs {
+    /// Name or id.
+    pub name: String,
+    /// Image the new root disk is a copy of (name or id). Default: the
+    /// image the machine has.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Wait until the machine is ready again (or failed).
+    #[arg(long)]
+    pub wait: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct PodCreate {
@@ -664,6 +838,45 @@ pub enum HostCmd {
     /// dead. The machines' root disks were on that host and are NOT moved:
     /// each machine starts again from its image.
     Evacuate(HostEvacuateArgs),
+    /// Set, clear or show how the server powers this host off.
+    ///
+    /// With power control set, an evacuation powers the host off and
+    /// confirms it before any machine is started elsewhere. Without it, an
+    /// evacuation needs --confirm-dead every time.
+    Power {
+        #[command(subcommand)]
+        cmd: HostPowerCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HostPowerCmd {
+    /// Set the host's power control. The password is not given here: it
+    /// lives in a secret and only its name is stored.
+    Set(HostPowerSetArgs),
+    /// Remove the host's power control.
+    Clear(NameArg),
+    /// Show the host's power control, without the password.
+    Show(NameArg),
+}
+
+#[derive(Args, Debug)]
+pub struct HostPowerSetArgs {
+    /// Name or id.
+    pub name: String,
+    /// The transport: ipmi or redfish.
+    #[arg(long)]
+    pub kind: String,
+    /// BMC address: a host[:port] for IPMI, a URL or host for Redfish.
+    #[arg(long)]
+    pub address: String,
+    /// BMC user.
+    #[arg(long)]
+    pub user: String,
+    /// Name of the secret holding the BMC password. The password itself is
+    /// never stored, shown or logged.
+    #[arg(long)]
+    pub secret: String,
 }
 
 #[derive(Args, Debug)]
@@ -737,6 +950,9 @@ pub struct AuditListArgs {
     /// `success`, `failure`, or one status code such as 403.
     #[arg(long)]
     pub outcome: Option<String>,
+    /// Node id of the server that carried the request to the leader.
+    #[arg(long = "carried-by", value_name = "NODE")]
+    pub carried_by: Option<String>,
     /// Most records to print.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
@@ -1373,6 +1589,199 @@ crud!(
     /// Re-apply an earlier revision.
     Rollback(StackRollback),
 );
+
+// ---- object storage ----------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct BucketCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Keep the previous bytes when a key is written again.
+    #[arg(long)]
+    pub versioning: bool,
+}
+
+crud!(BucketCmd, BucketCreate);
+
+#[derive(Subcommand, Debug)]
+pub enum ObjectCmd {
+    /// List keys (or keys under a prefix).
+    #[command(alias = "ls")]
+    List(ObjectListArgs),
+    /// Upload a file under a key.
+    Put(ObjectPutArgs),
+    /// Read an object.
+    #[command(alias = "fetch")]
+    Get(ObjectGetArgs),
+    /// Delete an object.
+    #[command(alias = "rm")]
+    Delete(ObjectDeleteArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ObjectPutArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// File to upload.
+    pub file: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct ObjectGetArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// Write to this file instead of stdout (`-` is stdout).
+    #[arg(long = "out", value_name = "FILE")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ObjectDeleteArgs {
+    /// Bucket (name or id).
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+// ---- secrets and certificates (keep) -------------------------------------------
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum SecretKindArg {
+    #[default]
+    Opaque,
+    Password,
+    SshKey,
+    Token,
+    Certificate,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum CertUsageArg {
+    #[default]
+    Server,
+    Client,
+    Both,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretCreate {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// The value: a file, or `-` for stdin. Default: stdin.
+    #[arg(long = "value-file", value_name = "PATH")]
+    pub value_file: Option<String>,
+    #[arg(long, value_enum, default_value_t = SecretKindArg::Opaque)]
+    pub kind: SecretKindArg,
+    /// MIME type of the value. Default depends on the kind.
+    #[arg(long)]
+    pub content_type: Option<String>,
+    /// When the value stops being valid, RFC 3339.
+    #[arg(long)]
+    pub expires_at: Option<String>,
+    /// Warn once the value is this many days old.
+    #[arg(long, value_name = "DAYS")]
+    pub rotate_after_days: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretGet {
+    /// Name or id.
+    pub name: String,
+    /// The version to print. Only the current payload is kept, so this
+    /// checks the version that comes back and fails if it is another one.
+    #[arg(long = "version", value_name = "N")]
+    pub version: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretPut {
+    /// Name or id.
+    pub name: String,
+    /// The new value: a file, or `-` for stdin. Default: stdin.
+    #[arg(long = "value-file", value_name = "PATH")]
+    pub value_file: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SecretCmd {
+    /// List. The payload is never listed.
+    #[command(alias = "ls")]
+    List(ListArgs),
+    /// Show one record by name or id. The payload is not in it.
+    Show(NameArg),
+    /// Create with a value from a file or stdin.
+    Create(SecretCreate),
+    /// Delete by name or id.
+    #[command(alias = "rm")]
+    Delete(DeleteArgs),
+    /// Print the value. The only command that does.
+    // `--version` here names the payload's version, so this command does not
+    // carry the version flag the rest of the tree gets.
+    #[command(disable_version_flag = true)]
+    Get(SecretGet),
+    /// Replace the value: the next version of the secret.
+    Put(SecretPut),
+}
+
+#[derive(Args, Debug)]
+pub struct CertIssue {
+    pub name: String,
+    #[command(flatten)]
+    pub meta: MetaArgs,
+    /// Subject of the certificate. Defaults to the name.
+    #[arg(long)]
+    pub common_name: Option<String>,
+    /// DNS name or address (repeatable). The subject is not added to it.
+    #[arg(long = "san", value_name = "NAME")]
+    pub sans: Vec<String>,
+    #[arg(long, value_enum, default_value_t = CertUsageArg::Server)]
+    pub usage: CertUsageArg,
+    /// Days until it expires. The issuing CA can cut this short.
+    #[arg(long, value_name = "DAYS")]
+    pub ttl_days: Option<u32>,
+    /// Certificate authority to sign with (id); default: the issuing CA.
+    /// Naming one needs admin.
+    #[arg(long)]
+    pub issuer: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct CertRevoke {
+    /// Name or id.
+    pub name: String,
+    /// Do not ask for confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum CertCmd {
+    /// List.
+    #[command(alias = "ls")]
+    List(ListArgs),
+    /// Show one, its PEM included.
+    Show(NameArg),
+    /// Issue one now from the cloud CA.
+    Issue(CertIssue),
+    /// Delete by name or id, with its key. A revoked certificate is kept.
+    #[command(alias = "rm")]
+    Delete(DeleteArgs),
+    /// Revoke it. The record stays so its serial stays in the CRL.
+    Revoke(CertRevoke),
+    /// Print the certificate, its private key and the chain (admin).
+    Key(NameArg),
+}
 
 #[cfg(test)]
 mod tests {

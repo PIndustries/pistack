@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The `compute` API: `/machines`, `/hosts`, `/sizes`.
+//! The `compute` API: `/machines`, `/hosts`, `/sizes`, `/keypairs`.
 //!
 //! Handlers write `spec` and `meta` only. Anything that must happen on a
 //! host (start, stop, reboot, delete) is recorded as desired state and the
@@ -17,9 +17,10 @@
 //! is treated as cloud admin in dev mode and rejected otherwise.
 
 use crate::driver::DriverRegistry;
+use crate::keypair;
 use crate::types::{
-    new_machine, new_size, Host, Machine, MachineSpec, Size, DELETE_ANNOTATION,
-    SYSTEM_LABEL_PREFIX, ZONE_LABEL,
+    new_keypair, new_machine, new_size, Host, Keypair, Machine, MachineSpec, Size,
+    DELETE_ANNOTATION, REBUILD_ANNOTATION, SYSTEM_LABEL_PREFIX, ZONE_LABEL,
 };
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Request, State},
@@ -46,6 +47,10 @@ pub struct AppState {
     pub queue: Option<CommandQueue>,
     /// How a drain picks destinations. The reconciler's own strategy.
     pub strategy: crate::scheduler::Strategy,
+    /// The window host reports land in, which stats are read from.
+    pub samples: Arc<gauge::SampleRing>,
+    /// Powers a host off and confirms it before its machines are evacuated.
+    pub fencer: Arc<dyn crate::maintain::Fencer>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -59,6 +64,8 @@ pub fn router(state: AppState) -> Router {
         .route("/machines/{id}/start", post(start_machine))
         .route("/machines/{id}/stop", post(stop_machine))
         .route("/machines/{id}/reboot", post(reboot_machine))
+        .route("/machines/{id}/rebuild", post(rebuild_machine))
+        .route("/machines/{id}/resize", post(resize_machine))
         .route("/machines/{id}/migrate", post(migrate_machine))
         .route("/machines/{id}/stats", get(machine_stats))
         .route("/machines/{id}/console", get(console))
@@ -71,11 +78,19 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/{id}/enable", post(enable_host))
         .route("/hosts/{id}/drain", post(drain_host))
         .route("/hosts/{id}/evacuate", post(evacuate_host))
+        .route(
+            "/hosts/{id}/power",
+            get(get_host_power)
+                .put(set_host_power)
+                .delete(clear_host_power),
+        )
         .route("/sizes", get(list_sizes).post(create_size))
         .route(
             "/sizes/{id}",
             get(get_size).put(update_size).delete(delete_size),
         )
+        .route("/keypairs", get(list_keypairs).post(create_keypair))
+        .route("/keypairs/{id}", get(get_keypair).delete(delete_keypair))
         .with_state(state)
 }
 
@@ -268,7 +283,7 @@ fn created<T: Serialize>(v: T) -> Response {
 async fn index() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "module": "forge",
-        "resources": ["machines", "hosts", "sizes"],
+        "resources": ["machines", "hosts", "sizes", "keypairs"],
     }))
 }
 
@@ -303,6 +318,9 @@ fn sizes(s: &AppState) -> Collection<Size> {
 fn hosts(s: &AppState) -> Collection<Host> {
     s.store.collection::<Host>()
 }
+fn keypairs(s: &AppState) -> Collection<Keypair> {
+    s.store.collection::<Keypair>()
+}
 
 fn load_machine(s: &AppState, scope: &Scope, id: &str) -> ApiResult<Machine> {
     let m = machines(s).resolve(scope.filter(), id)?;
@@ -327,7 +345,8 @@ fn refuse_volumes(volumes: &[String]) -> ApiResult<()> {
     }
     Err(ApiError::unprocessable(
         "spec.volumes is not supported: a machine does not attach volumes when it starts. \
-         Create the machine without them, then attach each one with \
+         Create the machine without them (`--near-volume` places it where a \
+         volume can attach), then attach each one with \
          `pi volume attach <volume> --machine <machine>`",
     ))
 }
@@ -374,6 +393,17 @@ async fn create_machine(
     check_zone(&body.spec)?;
     let size = resolve_size(&s, &body.spec.size)?;
     let mut spec = body.spec;
+    // The pair is resolved to its key for the host, but the name stays on the
+    // machine: it is what `pi machine show` prints and what update refuses to
+    // change. The host is given keys, never the name.
+    if let Some(name) = &spec.keypair {
+        if !name.trim().is_empty() {
+            let key = keypair_public_key(&s, &scope, name)?;
+            if !spec.ssh_keys.iter().any(|k| k == &key) {
+                spec.ssh_keys.push(key);
+            }
+        }
+    }
     // Store the canonical size name so renames of the request form do not
     // change what the scheduler looks up.
     spec.size = size.meta.name.clone();
@@ -401,7 +431,7 @@ async fn machine_stats(
     Path(id): Path<String>,
 ) -> ApiResult<Json<crate::stats::Stats>> {
     let machine = load_machine(&s, &scope, &id)?;
-    let gauge = gauge::Gauge.client(s.store.clone());
+    let gauge = gauge::Client::new(s.store.clone(), s.samples.clone());
     Ok(Json(crate::stats::machine_stats(&gauge, &machine)))
 }
 
@@ -421,6 +451,23 @@ async fn update_machine(
         m.meta.labels = l;
     }
     if let Some(mut spec) = body.spec {
+        // A key pair is a create-time name; an update carries the keys a
+        // machine has, so asking to change the pair is refused rather than
+        // quietly ignored. The name is compared to the stored name and to its
+        // id, since `pi apply` sends back whatever a read returned and an
+        // id is a legal way to name the pair.
+        if let Some(want) = spec.keypair.as_deref() {
+            let held = m.spec.keypair.as_deref();
+            // An id is a legal way to name the pair, so name and id both
+            // count as the same pair.
+            let same = held.is_some_and(|h| keypair_same(&s, &scope, want, h));
+            if !same {
+                return Err(ApiError::unprocessable(
+                    "spec.keypair is set when the machine is created and cannot change after it",
+                ));
+            }
+        }
+        spec.keypair = m.spec.keypair.clone();
         if m.status.phase != Phase::Pending
             && (spec.kind != m.spec.kind || spec.image != m.spec.image || spec.size != m.spec.size)
         {
@@ -531,6 +578,172 @@ async fn reboot_machine(
     .await
 }
 
+/// Body of `POST /machines/{id}/rebuild`.
+#[derive(Debug, Deserialize, Default)]
+struct RebuildBody {
+    /// Image the new root disk is a copy of: name or id. Default: the
+    /// machine's current image.
+    #[serde(default)]
+    image: Option<String>,
+}
+
+/// Replace the machine's root disk with a fresh copy of an image and start
+/// it again. Everything the machine is stays: id, name, host, ports,
+/// addresses, volumes and keys. The call is accepted for a machine that is
+/// ready or stopped and returns as it enters the `updating` phase; see
+/// [`crate::reconcile::Reconciler::rebuild`] for what the host does.
+async fn rebuild_machine(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<RebuildBody>,
+) -> ApiResult<Json<Machine>> {
+    let m = load_machine(&s, &scope, &id)?;
+    if m.meta.annotations.contains_key(DELETE_ANNOTATION) {
+        return Err(ApiError::conflict("machine is being deleted"));
+    }
+    if m.status.phase != Phase::Ready && m.status.phase != Phase::Pending {
+        return Err(ApiError::conflict(format!(
+            "a {} machine cannot be rebuilt; stop it or wait for it to finish",
+            crate::maintain::phase_word(m.status.phase)
+        )));
+    }
+    let mut m = m;
+    if let Some(image) = body.image.map(|i| i.trim().to_owned()) {
+        if image.is_empty() {
+            return Err(ApiError::bad_request("image must not be empty"));
+        }
+        m.spec.image = image;
+    }
+    if let Some(why) =
+        crate::agent_driver::boot_image_problem(&s.store, m.meta.project.as_ref(), &m.spec.image)
+    {
+        return Err(ApiError::unprocessable(why));
+    }
+    let size = resolve_size(&s, &m.spec.size)?;
+    if let Some(why) = crate::agent_driver::boot_image_size_problem(
+        &s.store,
+        m.meta.project.as_ref(),
+        &m.spec.image,
+        size.spec.resources.disk_gib,
+    ) {
+        return Err(ApiError::unprocessable(why));
+    }
+    let image = m.spec.image.clone();
+    let phase = match m.status.phase {
+        // Nothing runs yet: the request rides along to the placement and
+        // the reconciler rebuilds the machine once it has a host.
+        Phase::Pending => Phase::Pending,
+        // Placed: the reconciler turns `Updating` into the rebuild.
+        _ => Phase::Updating,
+    };
+    let m = machines(&s).modify(&m.meta.id, |x| {
+        x.spec = m.spec.clone();
+        x.meta
+            .annotations
+            .insert(REBUILD_ANNOTATION.into(), image.clone());
+        if x.status.phase != phase {
+            x.status.phase = phase;
+        }
+        x.status.message = if phase == Phase::Pending {
+            format!("will rebuild from image {image}")
+        } else {
+            format!("rebuilding from image {image}")
+        };
+        Ok(())
+    })?;
+    Ok(Json(m))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResizeBody {
+    size: String,
+}
+
+/// The resources a machine is counted for: its size, or nothing when that
+/// size is gone.
+fn resources_of(s: &AppState, name_or_id: &str) -> pistack_types::Resources {
+    resolve_size(s, name_or_id)
+        .map(|sz| sz.spec.resources)
+        .unwrap_or_default()
+}
+
+/// `2 vcpus, 4096 MiB, 20 GiB disk`.
+fn room(r: &pistack_types::Resources) -> String {
+    format!(
+        "{} vcpus, {} MiB, {} GiB disk",
+        r.vcpus, r.memory_mib, r.disk_gib
+    )
+}
+
+/// Change a stopped machine's size. The machine stays on its host: the host
+/// must have room for what the new size adds. A larger root disk grows on
+/// the next start; a smaller one than the disk already has is refused.
+async fn resize_machine(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Body(body): Body<ResizeBody>,
+) -> ApiResult<Json<Machine>> {
+    let m = load_machine(&s, &scope, &id)?;
+    if m.meta.annotations.contains_key(DELETE_ANNOTATION) {
+        return Err(ApiError::conflict("machine is being deleted"));
+    }
+    if m.spec.power != crate::types::DesiredPower::Off
+        || m.status.power != crate::types::PowerState::Off
+    {
+        return Err(ApiError::conflict(
+            "the machine must be powered off; stop it first with `pi machine stop`",
+        ));
+    }
+    if body.size.trim().is_empty() {
+        return Err(ApiError::bad_request("size is required"));
+    }
+    let to = resolve_size(&s, &body.size)?;
+    // The spec may hold the size's name or its id. Either way, the same size
+    // is nothing to do.
+    if m.spec.size == to.meta.name || m.spec.size == to.meta.id.to_string() {
+        return Ok(Json(m));
+    }
+    let from = resources_of(&s, &m.spec.size);
+    let to_res = to.spec.resources;
+    if to_res.disk_gib < from.disk_gib {
+        return Err(ApiError::unprocessable(format!(
+            "size '{}' has a {} GiB root disk, smaller than the {} GiB disk the machine has",
+            to.meta.name, to_res.disk_gib, from.disk_gib
+        )));
+    }
+    if let Some(host) = m.status.host.as_ref() {
+        let h = hosts(&s).get(host)?;
+        let more = |to: u64, from: u64| to.saturating_sub(from);
+        let need = pistack_types::Resources {
+            vcpus: to_res.vcpus.saturating_sub(from.vcpus),
+            memory_mib: more(to_res.memory_mib, from.memory_mib),
+            disk_gib: more(to_res.disk_gib, from.disk_gib),
+            gpus: to_res.gpus.saturating_sub(from.gpus),
+        };
+        if !need.fits_in(&h.status.free) {
+            return Err(ApiError::conflict(format!(
+                "host '{}' has no room for the resize: {} free, {} more needed; the machine is not moved to another host",
+                h.meta.name,
+                room(&h.status.free),
+                room(&need)
+            )));
+        }
+    }
+    let expected = m.meta.revision;
+    let project = m.meta.project.clone();
+    let mut updated = m;
+    updated.spec.size = to.meta.name.clone();
+    let write = || {
+        machines(&s)
+            .update(updated.clone(), Some(expected))
+            .map_err(Into::into)
+    };
+    let m = crate::usage::resize(&s.store, project.as_ref(), &from, &to_res, write)?;
+    Ok(Json(m))
+}
+
 #[derive(Debug, Deserialize)]
 struct MigrateBody {
     host: String,
@@ -606,7 +819,27 @@ async fn list_hosts(
     List(q): List,
 ) -> ApiResult<Json<Page<Host>>> {
     scope.require_admin()?;
-    Ok(Json(paginate(hosts(&s).list(None)?, &q)))
+    let mut all = hosts(&s).list(None)?;
+    let certs = agent_certs(&s);
+    for h in &mut all {
+        h.status.cert_expires = keep::agent_cert_expiry(&certs, &h.spec.node_name);
+    }
+    Ok(Json(paginate(all, &q)))
+}
+
+/// The certificates a host's expiry is read from. A list that cannot be
+/// read leaves the column empty and does not fail the request.
+fn agent_certs(s: &AppState) -> Vec<keep::Certificate> {
+    s.store
+        .collection::<keep::Certificate>()
+        .list(None)
+        .unwrap_or_default()
+}
+
+/// `host` as the API shows it: with its certificate's expiry.
+fn shown(s: &AppState, mut host: Host) -> Host {
+    host.status.cert_expires = keep::agent_cert_expiry(&agent_certs(s), &host.spec.node_name);
+    host
 }
 
 async fn get_host(
@@ -615,7 +848,7 @@ async fn get_host(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Host>> {
     scope.require_admin()?;
-    Ok(Json(hosts(&s).resolve(None, &id)?))
+    Ok(Json(shown(&s, hosts(&s).resolve(None, &id)?)))
 }
 
 /// What the host is using now, as its agent last reported it.
@@ -626,7 +859,7 @@ async fn host_stats(
 ) -> ApiResult<Json<crate::stats::Stats>> {
     scope.require_admin()?;
     let host = hosts(&s).resolve(None, &id)?;
-    let gauge = gauge::Gauge.client(s.store.clone());
+    let gauge = gauge::Client::new(s.store.clone(), s.samples.clone());
     Ok(Json(crate::stats::host_stats(&gauge, &host)))
 }
 
@@ -780,7 +1013,7 @@ async fn evacuate_host(
     scope.require_admin()?;
     let opts: crate::maintain::EvacuateOptions = optional_body(&body)?;
     let host = hosts(&s).resolve(None, &id)?;
-    let (evacuated, skipped) = crate::maintain::evacuate(&s.store, &host, opts)?;
+    let out = crate::maintain::evacuate(&s.store, &host, opts, Some(s.fencer.as_ref())).await?;
     // What was asked of the host no longer applies. If it comes back it
     // must not be handed a start or an attach from before.
     if let Some(queue) = &s.queue {
@@ -791,9 +1024,79 @@ async fn evacuate_host(
     }
     Ok(Json(crate::maintain::EvacuateReport {
         host,
-        evacuated,
-        skipped,
+        proof: out.proof,
+        power_off_failed: out.power_off_failed,
+        evacuated: out.evacuated,
+        skipped: out.skipped,
     }))
+}
+
+// ---- host power control --------------------------------------------------------
+
+/// Body of `PUT /hosts/{id}/power`. The password is never here: `secret`
+/// names a secret in the secrets service that holds it.
+#[derive(Debug, Deserialize)]
+pub struct SetHostPower {
+    pub kind: String,
+    pub address: String,
+    pub user: String,
+    pub secret: String,
+}
+
+/// Out-of-band power control is set and cleared by a cloud admin, and read
+/// back without the password. All three return the control (or null) under
+/// `power_control`, never a password.
+fn power_view(host: &Host) -> serde_json::Value {
+    let power = host.spec.power_control.as_ref().map(|pc| {
+        serde_json::json!({
+            "kind": pc.kind,
+            "address": pc.address,
+            "user": pc.user,
+            "secret": pc.secret,
+        })
+    });
+    serde_json::json!({ "power_control": power })
+}
+
+async fn get_host_power(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    Ok(Json(power_view(&host)))
+}
+
+async fn set_host_power(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+    Json(body): Json<SetHostPower>,
+) -> ApiResult<Json<serde_json::Value>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let pc =
+        crate::types::PowerControl::checked(&body.kind, &body.address, &body.user, &body.secret)?;
+    let host = hosts(&s).modify(&host.meta.id, |h| {
+        h.spec.power_control = Some(pc.clone());
+        Ok(())
+    })?;
+    Ok(Json(power_view(&host)))
+}
+
+async fn clear_host_power(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    scope.require_admin()?;
+    let host = hosts(&s).resolve(None, &id)?;
+    let host = hosts(&s).modify(&host.meta.id, |h| {
+        h.spec.power_control = None;
+        Ok(())
+    })?;
+    Ok(Json(power_view(&host)))
 }
 
 // ---- sizes -------------------------------------------------------------------
@@ -880,6 +1183,116 @@ async fn delete_size(
     }
     sizes(&s).delete(&sz.meta.id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- keypairs ----------------------------------------------------------------
+
+/// What a create takes. With `public_key` the key is imported; without one
+/// an `ed25519` pair is made and its private half returned once.
+#[derive(Debug, Deserialize)]
+pub struct CreateKeypair {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
+}
+
+/// The create response: the stored resource, and for a generated pair the
+/// private key, which is never stored.
+#[derive(Debug, Serialize)]
+pub struct KeypairCreated {
+    #[serde(flatten)]
+    pub keypair: Keypair,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+}
+
+fn load_keypair(s: &AppState, scope: &Scope, id: &str) -> ApiResult<Keypair> {
+    let k = keypairs(s).resolve(scope.filter(), id)?;
+    if !scope.can_see(k.meta.project.as_ref()) {
+        return Err(ApiError::not_found(format!("keypair '{id}' not found")));
+    }
+    Ok(k)
+}
+
+async fn list_keypairs(
+    State(s): State<AppState>,
+    scope: Scope,
+    List(q): List,
+) -> ApiResult<Json<Page<Keypair>>> {
+    Ok(Json(paginate(keypairs(&s).list(scope.filter())?, &q)))
+}
+
+async fn get_keypair(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Keypair>> {
+    Ok(Json(load_keypair(&s, &scope, &id)?))
+}
+
+async fn create_keypair(
+    State(s): State<AppState>,
+    scope: Scope,
+    Body(body): Body<CreateKeypair>,
+) -> ApiResult<Response> {
+    let project = scope
+        .project
+        .clone()
+        .ok_or_else(|| ApiError::forbidden("a project is required to hold a key pair"))?;
+    validate_name(&body.name)?;
+    let (key, private_key) = match &body.public_key {
+        Some(line) => (keypair::parse(line)?, None),
+        None => {
+            let made = keypair::generate_ed25519(&body.name);
+            (made.public, Some(made.private_openssh))
+        }
+    };
+    let mut kp = new_keypair(body.name, Some(project), key);
+    kp.meta.description = body.description;
+    kp.meta.labels = body.labels;
+    let kp = keypairs(&s).create(kp)?;
+    Ok(created(KeypairCreated {
+        keypair: kp,
+        private_key,
+    }))
+}
+
+/// Forget the pair. A machine made with it keeps the public key it was given
+/// at create, so nothing about a running machine changes.
+async fn delete_keypair(
+    State(s): State<AppState>,
+    scope: Scope,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let kp = load_keypair(&s, &scope, &id)?;
+    keypairs(&s).delete(&kp.meta.id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The public key of a pair named in the request, in the caller's project.
+/// A machine holds the key itself from here on; the name is not kept.
+/// Whether two spellings name the same key pair of this project. Equal
+/// strings are enough; otherwise both must resolve, to one resource.
+fn keypair_same(s: &AppState, scope: &Scope, a: &str, b: &str) -> bool {
+    a == b
+        || match (load_keypair(s, scope, a), load_keypair(s, scope, b)) {
+            (Ok(x), Ok(y)) => x.meta.id == y.meta.id,
+            _ => false,
+        }
+}
+
+fn keypair_public_key(s: &AppState, scope: &Scope, name_or_id: &str) -> ApiResult<String> {
+    let kp = load_keypair(s, scope, name_or_id).map_err(|_| {
+        ApiError::unprocessable(format!(
+            "keypair '{name_or_id}' not found in this project; create it with \
+             `pi keypair create {name_or_id}`"
+        ))
+    })?;
+    Ok(kp.spec.public_key.clone())
 }
 
 #[cfg(test)]
@@ -969,7 +1382,12 @@ mod tests {
             disk_gib: 20,
             gpus: 0,
         };
-        let labels = BTreeMap::new();
+        // Both hosts keep machine disks on storage the other can see.
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            crate::types::DISK_LABEL.to_owned(),
+            crate::types::DISK_SHARED.to_owned(),
+        );
         let src = store
             .collection::<Host>()
             .create(new_host(
@@ -1006,6 +1424,8 @@ mod tests {
             dev_admin: true,
             queue: Some(queue.clone()),
             strategy: Default::default(),
+            samples: Arc::new(gauge::SampleRing::memory()),
+            fencer: Arc::new(crate::maintain::BmcFencer::new(store.clone())),
         });
 
         async fn post(app: &axum::Router, path: &str, host: &str) -> (StatusCode, Vec<u8>) {

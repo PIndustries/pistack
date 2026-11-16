@@ -5,6 +5,13 @@
 //!
 //! Handlers validate, resolve the caller's project scope and call `Client`.
 //! They never touch `status` themselves.
+//!
+//! Transfers sit beside the volume routes. An offer is made on the volume it
+//! moves — `POST /volumes/{id}/transfer`, answered once with the secret, and
+//! `GET /volumes/{id}/transfers` to list what is open on it — because that is
+//! the resource the caller has to be allowed to touch. Taking and cancelling
+//! an offer work on the offer by id under `/transfers`, since the taker has
+//! no rights on the volume yet and must not need any.
 
 use axum::{
     extract::{Path, Query, Request, State},
@@ -16,8 +23,10 @@ use axum::{
 };
 use pistack_types::{ApiError, ApiResult, Caller, Id, Kind, ListQuery, Page};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::client::{Client, Create, RestoreRequest, UpdateMeta};
+use crate::redact::without_secret_hash;
 use crate::types::*;
 
 pub fn router(client: Client) -> Router {
@@ -40,6 +49,11 @@ pub fn router(client: Client) -> Router {
         .route("/volumes/{id}/attach", post(attach_volume))
         .route("/volumes/{id}/detach", post(detach_volume))
         .route("/volumes/{id}/extend", post(extend_volume))
+        .route("/volumes/{id}/transfer", post(offer_volume))
+        .route("/volumes/{id}/transfers", get(list_volume_transfers))
+        .route("/transfers", get(list_transfers))
+        .route("/transfers/{id}", get(get_transfer).delete(cancel_transfer))
+        .route("/transfers/{id}/accept", post(accept_transfer))
         .route("/snapshots", get(list_snapshots).post(create_snapshot))
         .route("/snapshots/{id}", get(get_snapshot).delete(delete_snapshot))
         .route("/backups", get(list_backups).post(create_backup))
@@ -319,8 +333,148 @@ async fn extend_volume(
     ))
 }
 
-// ---- snapshots ------------------------------------------------------------
+// ---- transfers ------------------------------------------------------------
 
+/// Body of `POST /transfers/{id}/accept`. The secret is the one the offer
+/// was answered with; it is never read back out of anything.
+#[derive(Deserialize)]
+struct AcceptBody {
+    secret: String,
+}
+
+/// The project an accept lands the volume in: the caller's own. Admins may
+/// name another, which is how an operator moves a volume on someone's behalf.
+fn accepting_project(c: &Caller, requested: Option<Id>) -> ApiResult<Id> {
+    match (requested, &c.project) {
+        (Some(p), _) if c.is_admin() => Ok(p),
+        (Some(p), Some(own)) if &p == own => Ok(p),
+        (Some(_), _) => Err(ApiError::forbidden(
+            "cannot accept a transfer into another project",
+        )),
+        (None, Some(own)) => Ok(own.clone()),
+        (None, None) => Err(ApiError::bad_request(
+            "the token has no project to accept the volume into",
+        )),
+    }
+}
+
+/// Whether `c` may read `t`. A transfer record is cloud-scoped so both sides
+/// of it can find it; that is not an open door. A cloud admin sees every one;
+/// anyone else sees the ones their project offered, and the ones it was
+/// offered once it has taken them.
+///
+/// A prospective taker is deliberately not in that set. Nothing in a read
+/// identifies a receiver — the only thing that does is the secret, and the
+/// secret is in no read — so until the taker accepts, the offer is the
+/// giver's to show. Afterward both sides read the same closed record.
+fn transfer_visible(c: &Caller, t: &Transfer) -> bool {
+    if c.is_admin() {
+        return true;
+    }
+    let Some(own) = c.project.as_ref() else {
+        return false;
+    };
+    t.meta.project.as_ref() == Some(own) || t.status.accepted_by.as_ref() == Some(own)
+}
+
+async fn offer_volume(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let caller = caller(ext)?;
+    caller.require_write()?;
+    let v = load_volume(&c, &caller, &id)?;
+    // The secret goes out once, here, and is not in the record afterwards.
+    let offered = c.offer_volume(&v.meta.id)?;
+    Ok(created(json!({
+        "transfer": without_secret_hash(offered.transfer),
+        "secret": offered.secret,
+    })))
+}
+
+async fn list_volume_transfers(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Page<Transfer>>> {
+    let caller = caller(ext)?;
+    let v = load_volume(&c, &caller, &id)?;
+    let offers = c
+        .list_offers_for_volume(&v.meta.id)?
+        .into_iter()
+        .map(without_secret_hash)
+        .collect();
+    Ok(Json(page(offers, &ListQuery::default())))
+}
+
+async fn list_transfers(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Page<Transfer>>> {
+    let caller = caller(ext)?;
+    // Transfer records are cloud-scoped, so a project's page is not what the
+    // store would return for its scope: it is the offers the project made and
+    // the offers made to it. One predicate, the same one a single read uses.
+    let mine: Vec<Transfer> = c
+        .list_transfers(None)?
+        .into_iter()
+        .filter(|t| transfer_visible(&caller, t))
+        .map(without_secret_hash)
+        .collect();
+    Ok(Json(page(mine, &q)))
+}
+
+async fn get_transfer(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Transfer>> {
+    let caller = caller(ext)?;
+    let t = c.get_transfer(&id)?;
+    if !transfer_visible(&caller, &t) {
+        return Err(ApiError::not_found(format!(
+            "transfer {} not found",
+            t.meta.id
+        )));
+    }
+    Ok(Json(without_secret_hash(t)))
+}
+
+async fn accept_transfer(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(id): Path<String>,
+    Json(body): Json<AcceptBody>,
+) -> ApiResult<Json<Volume>> {
+    let caller = caller(ext)?;
+    caller.require_write()?;
+    let taker = accepting_project(&caller, scope(&caller))?;
+    let id = Id::parse(crate::transfer::KIND_TRANSFER, &id)
+        .ok_or_else(|| ApiError::bad_request("transfer id must be an xfer-… id"))?;
+    Ok(Json(c.accept_transfer(&id, &body.secret, &taker)?))
+}
+
+async fn cancel_transfer(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Transfer>> {
+    let caller = caller(ext)?;
+    caller.require_write()?;
+    let t = c.get_transfer(&id)?;
+    // Only the project that offered a volume may take the offer back.
+    if !caller.is_admin() && t.meta.project != caller.project {
+        return Err(ApiError::not_found(format!(
+            "transfer {} not found",
+            t.meta.id
+        )));
+    }
+    Ok(Json(without_secret_hash(c.cancel_transfer(&t.meta.id)?)))
+}
+
+// ---- snapshots ------------------------------------------------------------
 async fn list_snapshots(
     State(c): State<Client>,
     ext: Option<Extension<Caller>>,

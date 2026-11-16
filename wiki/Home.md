@@ -15,7 +15,8 @@ Running real workloads across several hosts is still being built. Images and loc
 ## Pages
 
 - [Quick start](Quick-start): one node in dev mode, first machine with `pi`.
-- [Install](Install): build from source.
+- [Install](Install): release tarball or build from source.
+- [Upgrading](Upgrading): moving to the next build and what changes with it.
 - [Concepts](Concepts): resources, projects, roles, modules.
 - [Running a cluster](Running-a-cluster): servers, leader, failover, backup.
 - [Agents and hosts](Agents-and-hosts): joining a host, runtimes.

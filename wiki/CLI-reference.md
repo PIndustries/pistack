@@ -91,6 +91,8 @@ pi project list
 pi project show <NAME>
 pi project create <NAME>
 pi project delete <NAME>
+pi project mine
+pi project switch <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -100,6 +102,7 @@ pi project delete <NAME>
 | `project create` | `--parent <PARENT>` | Parent project (name or id) |
 | `project create` | `--quota <RES=N>` | Quota `resource=limit` (repeatable) |
 | `project create` | `--disabled` |  |
+| `project switch` | `<NAME>` | Project name or id to move to |
 
 ## pi quota
 
@@ -115,6 +118,53 @@ pi quota set <PROJECT> <RES=N>...
 | `quota show` | `[PROJECT]` | Project (name or id); default: the current scope |
 | `quota set` | `<PROJECT>` | Project (name or id) |
 | `quota set` | `<RES=N>...` | Limit `resource=N`; `resource=unlimited` removes it (repeatable) |
+
+## pi alarm
+
+Threshold alarms on metrics (gauge). See [Metrics and alarms](Metrics-and-alarms).
+
+```text
+pi alarm list
+pi alarm show <NAME>
+pi alarm create --metric <SERIES> --comparison <COMPARISON> --threshold <VALUE> <NAME>
+pi alarm update <NAME>
+pi alarm delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `alarm create` | `--description <DESCRIPTION>` |  |
+| `alarm create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `alarm create` | `--metric <SERIES>` | Series to watch: a name, or a name and labels such as `pistack_host_load1{host="h1"}`. With labels the alarm watches every series that has them; with none, every series of that name |
+| `alarm create` | `--comparison <COMPARISON>` | Which side of the threshold fires [possible values: gt, lt, eq] |
+| `alarm create` | `--threshold <VALUE>` |  |
+| `alarm create` | `--for-seconds <SECONDS>` | How long the value must keep crossing before it fires, in seconds. The wait is measured on the stamps of the samples themselves [default: 0] |
+| `alarm show` | `--samples` | Also print the points the deciding series has now |
+| `alarm update` | `--description <DESCRIPTION>` |  |
+| `alarm update` | `--label <K=V>` | Set a label `key=value` (repeatable) |
+| `alarm update` | `--metric <SERIES>` | Series to watch |
+| `alarm update` | `--comparison <COMPARISON>` | [possible values: gt, lt, eq] |
+| `alarm update` | `--threshold <VALUE>` |  |
+| `alarm update` | `--for-seconds <SECONDS>` | How long the value must keep crossing before it fires, in seconds |
+
+`show` prints the record with its `status`: the phase, the latest value the phase was decided from, and the series that decided it. With `--samples` the points held for that series follow; for `-o json|yaml` they ride inside the record under `samples`. `update` changes what you name and keeps the rest; a new spec is decided again at once from the window, so a new threshold shows without waiting for the next sample, and its hold begins from the stamps there.
+
+## pi metric
+
+The series one server holds points for (gauge). There is no history: what a server holds is the last minutes of each series, kept in memory. See [Metrics and alarms](Metrics-and-alarms).
+
+```text
+pi metric list
+pi metric show <SERIES>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `metric list` | `--name <NAME>` | Keep series with this metric name |
+| `metric show` | `<SERIES>` | The series, as `pi metric list` prints it: `queue.depth`, or `pistack_host_load1{host="h1"}` |
+| `metric show` | `--last <N>` | Keep the last N points |
+
+`list` prints one row per series with its newest point, and `show` the points a server holds for one series, oldest first. The window is the server answering the request: behind a load balancer, one row can come from one server and the next from another.
 
 ## pi audit
 
@@ -134,11 +184,12 @@ pi audit list
 | `audit list` | `--kind <KIND>` | Resource kind as in the path: machines, bindings, hosts, ... |
 | `audit list` | `--resource <ID>` | Resource id or name, as the request gave it |
 | `audit list` | `--outcome <OUTCOME>` | `success`, `failure`, or one status code such as 403 |
+| `audit list` | `--carried-by <NODE>` | Records a server of the cluster carried to the leader, by its node id |
 | `audit list` | `--limit <LIMIT>` | Most records to print [default: 100] |
 | `audit list` | `--after <ID>` | Continue after this record id (the last one of the page before) |
 | `audit list` | `--oldest-first` | Oldest first instead of newest first |
 
-Records print newest first. The filter is `--in-project` because `--project` is the global option that sets the scope of the request. See [Identity and access](Identity-and-access#audit) for what a record holds.
+Records print newest first. The filter is `--in-project` because `--project` is the global option that sets the scope of the request. `-o wide` adds the project, the API key, the server that carried the request, the method, the path and the record id; the carried-by column is empty when the request reached the leader itself. See [Identity and access](Identity-and-access#audit) for what a record holds.
 
 ## pi user
 
@@ -149,6 +200,7 @@ pi user list
 pi user show <NAME>
 pi user create <NAME>
 pi user delete <NAME>
+pi user revoke-tokens <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -161,6 +213,24 @@ pi user delete <NAME>
 | `user create` | `--password-stdin` | Read the password from stdin |
 | `user create` | `--default-project <DEFAULT_PROJECT>` | Default project (name or id) |
 | `user create` | `--disabled` |  |
+
+`user revoke-tokens` refuses every token the user holds at that moment. They log in again to get a new one. An admin can do it for anyone, a user for themselves. See [Identity and access](Identity-and-access#tokens).
+
+## pi signing-key
+
+The keys tokens are signed with (admin). `signing-keys` is an alias.
+
+```text
+pi signing-key list
+pi signing-key rotate
+pi signing-key retire
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `signing-key retire` | `-y, --yes` | Do not ask for confirmation |
+
+`list` prints each key's id, whether it signs new tokens, its age and when it stops verifying. `rotate` signs with a new key and lets the one before it verify for 7 more days. `retire` drops every key but the current one at once, which logs out everyone whose token was signed with an older key. See [Identity and access](Identity-and-access#rotating-the-signing-key).
 
 ## pi role
 
@@ -184,7 +254,7 @@ Role bindings.
 ```text
 pi binding list
 pi binding show <NAME>
-pi binding create --principal <PRINCIPAL> --role <ROLE>
+pi binding create --principal <PRINCIPAL> --role <ROLE> (--in-project <PROJECT> | --system)
 pi binding delete <NAME>
 ```
 
@@ -192,7 +262,8 @@ pi binding delete <NAME>
 | --- | --- | --- |
 | `binding create` | `--principal <PRINCIPAL>` | Principal (name or id) |
 | `binding create` | `--role <ROLE>` | Role name |
-| `binding create` | `--in-project <PROJECT>` | Project (name or id); omit for system scope |
+| `binding create` | `--in-project <PROJECT>` | Project (name or id) |
+| `binding create` | `--system` | Bind across the whole cloud, not one project |
 
 ## pi key
 
@@ -258,6 +329,8 @@ pi machine delete <NAME>
 pi machine start <NAME>
 pi machine stop <NAME>
 pi machine reboot <NAME>
+pi machine rebuild <NAME>
+pi machine resize <NAME> --size <SIZE>
 pi machine stats <NAME>
 ```
 
@@ -269,8 +342,10 @@ pi machine stats <NAME>
 | `machine create` | `--image <IMAGE>` | Image name |
 | `machine create` | `--network <NETWORK>` | Network (repeatable) |
 | `machine create` | `--volume <VOLUME>` | Volume (repeatable) |
+| `machine create` | `--near-volume <VOLUME>` | Place the machine where this volume can attach (repeatable). Nothing is attached; use `pi volume attach` once it runs |
 | `machine create` | `--kind <KIND>` | [default: vm] [possible values: vm, container, metal] |
 | `machine create` | `--ssh-key <KEY>` | SSH public key (repeatable); `@file` reads a file |
+| `machine create` | `--keypair <KEYPAIR>` | Key pair (name or id) whose public key the machine also gets |
 | `machine create` | `--user-data <USER_DATA>` | cloud-init user data; `@file` reads a file |
 | `machine create` | `--host-selector <K=V>` | Host selector `key=value` (repeatable) |
 | `machine create` | `--zone <ZONE>` | Availability zone: only hosts labelled `zone=<ZONE>` |
@@ -278,8 +353,16 @@ pi machine stats <NAME>
 | `machine start` | `--wait` |  |
 | `machine stop` | `--wait` |  |
 | `machine reboot` | `--wait` |  |
+| `machine rebuild` | `--image <IMAGE>` | Image the new root disk is a copy of (name or id). Default: the image the machine has |
+| `machine rebuild` | `-y, --yes` | Do not ask for confirmation |
+| `machine rebuild` | `--wait` | Wait until the machine is ready again (or failed) |
+| `machine resize` | `--size <SIZE>` | New size name or id |
+
+`machine resize` changes the size of a machine. It must be stopped first; a running one is refused. The new size must be one of the sizes the project may use. A larger root disk takes effect on the next start.
 
 `machine stats` prints the current value of each of the machine's usage series, and for a counter how fast it is rising. A machine that is off, or one whose runtime does not measure, has none. See [Metrics and alarms](Metrics-and-alarms).
+
+`machine rebuild` replaces the machine's root disk with a fresh copy of an image and starts it again. The machine keeps its id, name, host, ports, addresses, volumes, keys and size; what was on the root disk is gone, and first-boot setup runs again. It works on a machine that is ready or stopped, and the machine goes to `updating` and back to `ready` with the power state it had. It asks for confirmation unless `--yes`.
 
 ## pi pod
 
@@ -304,6 +387,28 @@ pi pod exec <POD> <COMMAND>...
 | `pod exec` | `<COMMAND>...` | Command and arguments. Flags after `--` belong to the command |
 | `pod exec` | `-c, --container <CONTAINER>` | Container name. Required when the pod has more than one |
 | `pod exec` | `--timeout <TIMEOUT>` | Seconds to wait. The server rejects values outside 1..=3600 [default: 30] |
+
+## pi keypair
+
+SSH key pairs.
+
+```text
+pi keypair list
+pi keypair show <NAME>
+pi keypair create [--public-key-file <FILE>] <NAME>
+pi keypair delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `keypair create` | `--description <DESCRIPTION>` |  |
+| `keypair create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `keypair create` | `--public-key-file <FILE>` | Import this public key file instead of making a key |
+| `keypair create` | `--out <FILE>` | Write a generated private key here, mode 0600, never overwritten |
+
+A create with `--public-key-file` imports the key in it. A create without it makes an ed25519 pair: the server keeps the public half and returns the private half once, and the CLI writes it to `--out` or sends it to a pipe. It is never printed on a terminal. The private half is not stored anywhere, so a pair made this way is lost if you do not keep the file. The name is settled before the server is asked: an existing file, or a directory that cannot be written, stops the command with nothing created. If the file still fails to be written after the pair is made, the pair is deleted again.
+
+`--keypair` on `machine create` gives the machine that pair's public key, beside any `--ssh-key`. The machine keeps the name, which `pi machine show` prints as `spec.keypair`, and it cannot be changed afterwards. The pair can be deleted afterwards; the machine keeps the key it was given.
 
 ## pi size
 
@@ -337,6 +442,9 @@ pi host disable <NAME>
 pi host enable <NAME>
 pi host drain <NAME>
 pi host evacuate <NAME>
+pi host power set <NAME> --kind <KIND> --address <ADDR> --user <USER> --secret <SECRET>
+pi host power show <NAME>
+pi host power clear <NAME>
 ```
 
 | Command | Argument or option | Meaning |
@@ -347,9 +455,15 @@ pi host evacuate <NAME>
 | `host disable` | `--reason <REASON>` | Why, shown by `pi host show` |
 | `host drain` | `--reason <REASON>` | Why, shown by `pi host show` |
 | `host evacuate` | `--rebuild-from-image` | Accept that every evacuated machine loses its root disk and starts again from its image. Without it no machine is moved |
-| `host evacuate` | `--confirm-dead` | The host is disabled but may still be reporting, and you know it is dead. If it is not, its machines will run twice until it reports |
+| `host evacuate` | `--confirm-dead` | Say the host is dead by your word. Needed for a host with no power control, every time; optional for one the server can power off |
+| `host power set` | `--kind <KIND>` | `ipmi` or `redfish` |
+| `host power set` | `--address <ADDR>` | BMC address: a `host[:port]` for IPMI, a URL or host for Redfish |
+| `host power set` | `--user <USER>` | BMC user |
+| `host power set` | `--secret <SECRET>` | Name of the secret holding the BMC password. The password itself is never stored, shown or logged |
 
 `host stats` prints what the host is using now: load, memory, its data disk and how many machines it holds. See [Metrics and alarms](Metrics-and-alarms).
+
+`host list -o wide` adds `CERT-EXPIRES`, the last day of the host's agent certificate, and `host show` prints it as `status.cert_expires`. It is empty for a host that never enrolled.
 
 `host disable` stops new placements; the machines on the host keep running. `host drain` disables the host and live-migrates what it can. `host evacuate` is for a host that is down. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 
@@ -580,6 +694,64 @@ pi voltype delete <NAME>
 | `voltype create` | `--backend <BACKEND>` | Backend: local, lvm, rbd [default: local] |
 | `voltype create` | `--param <K=V>` | Backend parameter `key=value` (repeatable) |
 
+## pi backup
+
+Volume backups. A backup is one volume's bytes stored in a bucket. The bucket has to exist already.
+
+```text
+pi backup list
+pi backup show <NAME>
+pi backup create --volume <VOLUME> --bucket <BUCKET> <NAME>
+pi backup delete <NAME>
+pi backup restore <BACKUP>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `backup create` | `--description <DESCRIPTION>` |  |
+| `backup create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `backup create` | `--volume <VOLUME>` | Volume to back up (name or id) |
+| `backup create` | `--bucket <BUCKET>` | Bucket to write the backup to (name or id) |
+| `backup create` | `--wait` | Wait until the backup is ready |
+| `backup restore` | `--volume <VOLUME>` | Write into this volume (name or id) instead of making a new one. It must be ready and at least as large as the backup |
+
+A new backup is `pending` while its bytes are uploaded and `ready` once they are stored. `pi backup create --wait` prints each phase and ends on `ready`; a failed upload ends with the reason. A restore needs a `ready` backup and returns once the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
+
+## pi bucket
+
+Object storage buckets.
+
+```text
+pi bucket list
+pi bucket show <NAME>
+pi bucket create <NAME>
+pi bucket delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `bucket create` | `--description <DESCRIPTION>` |  |
+| `bucket create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `bucket create` | `--versioning` | Keep the previous bytes when a key is written again |
+
+## pi object
+
+Objects in a bucket. A get without `--out` writes the bytes to stdout; a put streams the file up.
+
+```text
+pi object list <BUCKET> [--prefix <PREFIX>]
+pi object put <BUCKET> <KEY> <FILE>
+pi object get <BUCKET> <KEY> [--out <FILE>]
+pi object delete <BUCKET> <KEY>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `object list` | `--prefix <PREFIX>` | Only keys starting with this |
+| `object get` | `--out <FILE>` | Write to this file instead of stdout |
+| `object delete` | `-y, --yes` | Do not ask for confirmation |
+
+
 ## pi image
 
 Images.
@@ -751,6 +923,68 @@ pi autoscaler delete <NAME>
 | `autoscaler create` | `--min <MIN_REPLICAS>` | Minimum replicas [default: 1] |
 | `autoscaler create` | `--max <MAX_REPLICAS>` | Maximum replicas |
 
+## pi lb
+
+Load balancers, and the listeners, pools and members under them. A balancer owns one address (a VIP) on a network; listeners bind a protocol and port on it and point at a pool; a pool holds backends, one `address:port` each.
+
+```text
+pi lb list
+pi lb show <NAME>
+pi lb create --network <NETWORK> <NAME>
+pi lb delete <NAME>
+pi lb listener list
+pi lb listener show <NAME>
+pi lb listener create --balancer <BALANCER> --port <PORT> <NAME>
+pi lb listener delete <NAME>
+pi lb pool list
+pi lb pool show <NAME>
+pi lb pool create --balancer <BALANCER> <NAME>
+pi lb pool delete <NAME>
+pi lb member list
+pi lb member add --pool <POOL> --port <PORT> <ADDRESS>
+pi lb member remove --pool <POOL> <MEMBER>
+```
+
+Deleting a balancer deletes its listeners, pools and members with it. A pool a listener points at cannot be deleted until the listener is changed or gone.
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `lb create` | `--description <DESCRIPTION>` |  |
+| `lb create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `lb create` | `--network <NETWORK>` | Network (name or id) the VIP lives on |
+| `lb create` | `--vip <VIP>` | Explicit VIP address (default: allocated) |
+| `lb create` | `--vip-port <VIP_PORT>` | Bind this exact port on the VIP instead of an ephemeral one |
+| `lb create` | `--provider <PROVIDER>` | Data plane [default: forward] [possible values: forward, relay] |
+| `lb create` | `--down` | Bring it up administratively off |
+| `lb listener list` | `--balancer <BALANCER>` | Filter to one balancer (name or id) |
+| `lb listener create` | `--balancer <BALANCER>` | Balancer (name or id) the listener binds on |
+| `lb listener create` | `--protocol <PROTOCOL>` | [default: tcp] [possible values: tcp, udp, http, https, terminated] |
+| `lb listener create` | `--port <PORT>` |  |
+| `lb listener create` | `--pool <POOL>` | Default pool (name or id) |
+| `lb listener create` | `--cert <CERT>` | Certificate id for `--protocol terminated` |
+| `lb listener create` | `--connection-limit <CONNECTION_LIMIT>` | Max concurrent connections; 0 means unlimited [default: 0] |
+| `lb listener create` | `--down` | Bring it up administratively off |
+| `lb pool list` | `--balancer <BALANCER>` | Filter to one balancer (name or id) |
+| `lb pool create` | `--balancer <BALANCER>` | Balancer (name or id) the pool belongs to |
+| `lb pool create` | `--protocol <PROTOCOL>` | [default: tcp] [possible values: tcp, udp, http, https] |
+| `lb pool create` | `--algorithm <ALGORITHM>` | [default: round_robin] [possible values: round_robin, least_conn, source_ip] |
+| `lb pool create` | `--health-check` | Add a health monitor with these probe settings |
+| `lb pool create` | `--monitor <MONITOR>` | What the monitor speaks. Default: the pool protocol; a udp pool is probed with a bare connect [default: tcp] [possible values: tcp, http, https] |
+| `lb pool create` | `--interval <INTERVAL>` | Seconds between probes [default: 5] |
+| `lb pool create` | `--timeout <TIMEOUT>` | Seconds before a probe fails [default: 3] |
+| `lb pool create` | `--rise <RISE>` | Consecutive successes before a member is online [default: 2] |
+| `lb pool create` | `--fall <FALL>` | Consecutive failures before a member is offline [default: 3] |
+| `lb pool create` | `--down` | Bring it up administratively off |
+| `lb member list` | `--pool <POOL>` | Filter to one pool (name or id) |
+| `lb member list` | `--only <ONLY>` | Members whose name or address contains this |
+| `lb member add` | `--pool <POOL>` | Pool (name or id) to add the backend to |
+| `lb member add` | `--port <PORT>` | Backend port |
+| `lb member add` | `--weight <WEIGHT>` | Share of traffic; 0-256 [default: 1] |
+| `lb member add` | `--backup` | Take no new traffic while others are up |
+| `lb member add` | `--down` | Add it administratively off |
+| `lb member remove` | `--pool <POOL>` | Pool (name or id) |
+| `lb member remove` | `<MEMBER>` | Member name, id, `ADDRESS:PORT`, or address alone when the pool holds one member on it. A member's name is made from its pool, address and port; see `pi lb member list` |
+
 ## pi stack
 
 Stacks (blueprint).
@@ -773,21 +1007,169 @@ pi stack rollback <NAME>
 | `stack update` | `-d, --document <DOCUMENT>` | Replacement document; `@file` or `-` for stdin |
 | `stack rollback` | `--revision <REVISION>` | Revision from status.history (default: previous) |
 
+## pi share
+
+Shared filesystems (shelf). A share is exported over `nfs` or mounted as `cephfs`, and carries the list of who may mount it.
+
+```text
+pi share list
+pi share show <NAME>
+pi share create <NAME>
+pi share delete <NAME>
+pi share access list <NAME>
+pi share access allow --cidr <CIDR> <NAME>
+pi share access deny --cidr <CIDR> <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `share create` | `--description <DESCRIPTION>` |  |
+| `share create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `share create` | `--protocol <PROTOCOL>` | Protocol: nfs or cephfs [default: nfs] |
+| `share create` | `--size <GIB>` | Size in GiB [default: 10] |
+| `share create` | `--cidr <CIDR>` | Allow a client CIDR to mount (repeatable) |
+| `share create` | `--mode <MODE>` | Mode for the CIDRs given: read or write [default: write] |
+| `share access allow` | `--cidr <CIDR>` | Client CIDR, for example 10.0.0.0/24 |
+| `share access allow` | `--mode <MODE>` | Mount mode for the rule [default: write] |
+| `share access deny` | `--cidr <CIDR>` | Client CIDR, for example 10.0.0.0/24 |
+
+`access list` prints the client CIDR rules. An NFS share with no CIDR rule stays pending: there is nothing to export until a client is named. A rule naming a principal rather than a CIDR is not shown here; `pi share show` lists the whole record.
+
+The API has no endpoint for one rule, so `allow` and `deny` read the share, edit its access list and send the whole spec back with `If-Match` set to the revision they read. If the share was written in between, the command reports a revision mismatch and changes nothing; run it again.
+
+## pi secret
+
+Secrets (keep). The value of a secret never appears on the command line: it comes from a file or from stdin, and only `secret get` prints it back.
+
+```text
+pi secret list
+pi secret show <NAME>
+pi secret create <NAME>
+pi secret delete <NAME>
+pi secret get <NAME>
+pi secret put <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `secret create` | `--description <DESCRIPTION>` |  |
+| `secret create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `secret create` | `--value-file <PATH>` | The value: a file, or `-` for stdin. Default: stdin |
+| `secret create` | `--kind <KIND>` | [default: opaque] [possible values: opaque, password, ssh-key, token, certificate] |
+| `secret create` | `--content-type <CONTENT_TYPE>` | MIME type of the value. Default depends on the kind |
+| `secret create` | `--expires-at <EXPIRES_AT>` | When the value stops being valid, RFC 3339 |
+| `secret create` | `--rotate-after-days <DAYS>` | Warn once the value is this many days old |
+| `secret get` | `--version <N>` | The version to print. Only the current payload is kept, so this checks the version that comes back and fails if it is another one |
+| `secret put` | `--value-file <PATH>` | The new value: a file, or `-` for stdin. Default: stdin |
+
+A trailing newline is trimmed off whatever is read: a pipe and an editor end a file with one, and it is not part of the secret. An empty value is refused. `list`, `show` and `apply` carry the record, never the payload; a manifest that names a secret which does not exist yet prints what to run instead of creating a record with nothing in it.
+
+## pi cert
+
+Certificates issued by the cloud CA (keep).
+
+```text
+pi cert list
+pi cert show <NAME>
+pi cert issue <NAME>
+pi cert delete <NAME>
+pi cert revoke <NAME>
+pi cert key <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `cert issue` | `--description <DESCRIPTION>` |  |
+| `cert issue` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `cert issue` | `--common-name <COMMON_NAME>` | Subject of the certificate. Defaults to the name |
+| `cert issue` | `--san <NAME>` | DNS name or address (repeatable). The subject is not added to it |
+| `cert issue` | `--usage <USAGE>` | [default: server] [possible values: server, client, both] |
+| `cert issue` | `--ttl-days <DAYS>` | Days until it expires. The issuing CA can cut this short |
+| `cert issue` | `--issuer <ISSUER>` | Certificate authority to sign with (id); default: the issuing CA. Naming one needs admin |
+
+`show` includes the certificate PEM; `key` prints the certificate, its private key and the chain, and needs admin. `revoke` is not a deletion — the record stays so its serial stays in the CRL. Certificate authorities have no noun of their own; `pi api GET /secrets/cas` lists them.
+
+## pi dns zone
+
+DNS zones. A zone is an apex, such as `example.cloud.`, that this cloud is authoritative for. `show` takes the resource name, its id, or the apex itself.
+
+```text
+pi dns zone list
+pi dns zone show <NAME>
+pi dns zone create <APEX>
+pi dns zone delete <NAME>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `zone create` | `<APEX>` | Apex of the zone, e.g. example.cloud or example.cloud. A missing final dot is added |
+| `zone create` | `--name <NAME>` | Name the zone is filed under. Default: the apex without its final dot |
+| `zone create` | `--description <DESCRIPTION>` |  |
+| `zone create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `zone create` | `--ttl <TTL>` | Default TTL for records that do not set one, in seconds [default: 3600] |
+| `zone create` | `--email <EMAIL>` | Contact mailbox for the SOA, e.g. hostmaster@example.cloud |
+| `zone create` | `--nameserver <NAMESERVER>` | Authoritative nameserver (repeatable, absolute name). Default: `ns1.<apex>` |
+| `zone create` | `--also-notify <ADDR>` | Address of an outside secondary of this zone (`ip` or `ip:port`, repeatable), told when the serial moves. A primary zone only |
+| `zone create` | `--primary <ADDR>` | Primary to transfer the zone from (`ip` or `ip:port`, repeatable). Makes the zone a secondary |
+
+A zone made with `--primary` is a secondary: it is served only once a zone transfer has filled it and stays `pending` until then, and it takes no record sets — the module refuses those with `record sets belong on primary zones`. `--primary` and `--also-notify` contradict each other and clap refuses the pair. `pi dns zone list -o wide` shows the kind, the primaries a secondary pulls from, and the addresses in `also_notify`.
+
+A field you do not give is left out of the request rather than sent empty, so the module's own default applies and appears in what you read back: no `--email` gives the SOA mailbox `hostmaster`, no `--nameserver` makes the zone authoritative for `ns1.<apex>`. Both are the module's defaults, and the module does not repeat a default back to you, so those wide columns are blank until you set them explicitly.
+
+Deleting a zone deletes every record set in it; the module does not refuse a zone that still has record sets, so `--yes` is the only check on that. A zone labelled `pistack.io/auto=true` also gets machine records written for you; see [Networking](Networking).
+
+## pi dns record
+
+DNS record sets. A record set is one owner name and one type inside a zone, holding one or more records.
+
+```text
+pi dns record list
+pi dns record show <NAME> [--zone <ZONE>]
+pi dns record create <OWNER> <TYPE> --zone <ZONE> --record <DATA>
+pi dns record delete <NAME> [--zone <ZONE>]
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `record list` | `--zone <ZONE>` | Only this zone's record sets (name, id or apex) |
+| `record show` | `--zone <ZONE>` | Look for it in this zone only (name, id or apex) |
+| `record delete` | `--zone <ZONE>` | Look for it in this zone only (name, id or apex) |
+| `record create` | `<OWNER>` | Owner name, relative to the zone (`web`), absolute with a final dot, or `@` for the apex |
+| `record create` | `<TYPE>` | Record type: A, AAAA, CNAME, MX, TXT, SRV, NS or PTR |
+| `record create` | `--name <NAME>` | Name the record set is filed under. Default: `<owner>-<type>` lower-cased, with the zone after it when that name is already taken in the project |
+| `record create` | `--description <DESCRIPTION>` |  |
+| `record create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `record create` | `--zone <ZONE>` | Zone the record lives in (name, id or apex) |
+| `record create` | `--ttl <TTL>` | TTL in seconds. Default: the zone's |
+| `record create` | `--record <DATA>` | Record data (repeatable), presentation format: `10.0.0.4`, `10 mail.example.cloud.`, `"v=spf1 -all"` |
+
+```sh
+pi dns zone create example.cloud --email ops@example.cloud
+pi dns record create web A --zone example.cloud --record 10.0.0.4 --record 10.0.0.5
+pi dns record create @ TXT --zone example.cloud --record 'v=spf1 -all'
+pi dns record list --zone example.cloud
+```
+
+`show` and `delete` take `--zone` for the same thing: the set is looked up among that zone's own, so its short name — `<owner>-<type>` — finds it there even when the name it is filed under carries the zone as well. Without `--zone` a record set is read by the name it is filed under, and nothing else.
+
+A name is unique in a project, not in a zone, so two zones holding the same host cannot both be filed as `www-a`: the first takes the short name and the second gets the zone after it, `www-a.corp.cloud`. The record itself is unchanged by either; only the name it is filed under moves.
+
+One owner name holds one set per type, and a CNAME owner holds nothing else. The owner, the type and the zone of an existing set cannot be changed; delete the set and create it again. A set made without `--ttl` carries no TTL of its own and is served with its zone's; `list` and `show` print that number rather than a blank, while `-o json|yaml` pass the server's row through with the TTL still absent.
+
 ## Not in the CLI yet
 
 These parts of the API have no `pi` commands. Use `pi api` with the paths shown.
 
 | What | Path |
 | --- | --- |
-| DNS zones and records | `/dns` |
-| Load balancers | `/balancers` |
-| Secrets, certificates, certificate authorities | `/secrets` |
-| Buckets | `/silo/buckets` |
-| Shares | `/shelf` |
-| Volume backups | `/volume/backups` |
-| Alarms and posted samples | `/gauge` |
+| Certificate authorities | `/secrets/cas` |
+| Access keys | `/secrets/access-keys` |
+| Join tokens | `/secrets/join-tokens` |
+| Posted samples | `/gauge/samples` |
 
 ```sh
-pi api GET /dns/zones
+pi api GET /balancers/balancers
 pi api POST /silo/buckets -d '{"name":"backups"}'
 ```
+
+The zone export — a whole zone in master-file form — has no verb of its own either: `pi api GET /dns/zones/<NAME>/export`.

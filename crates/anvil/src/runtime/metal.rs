@@ -46,11 +46,18 @@ fn state_dir() -> PathBuf {
     }
 }
 
-fn images_dir() -> PathBuf {
+pub(crate) fn images_dir() -> PathBuf {
     match std::env::var_os("PISTACK_METAL_IMAGES") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => PathBuf::from(DEFAULT_IMAGES_DIR),
     }
+}
+
+/// The file names this runtime's machine disks are written under. Metal boots
+/// a machine from a file named by its image, so the image's own extensions
+/// are the disk names: a machine file named otherwise holds no image.
+pub(crate) fn runtime_disk_names() -> &'static [&'static str] {
+    &[".iso", ".img", ".qcow2"]
 }
 
 fn has_parent_dir(path: &Path) -> bool {
@@ -217,32 +224,6 @@ fn addresses(req: &MachineRequest) -> Vec<String> {
         .collect()
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
-fn ipmitool_bin() -> ApiResult<PathBuf> {
-    match std::env::var_os("PISTACK_IPMITOOL") {
-        Some(v) if !v.is_empty() => {
-            let path = PathBuf::from(v);
-            if path.is_file() {
-                Ok(path)
-            } else {
-                Err(ApiError::unavailable("ipmitool is not installed"))
-            }
-        }
-        Some(_) => Err(ApiError::unavailable("ipmitool is not installed")),
-        None => which("ipmitool").ok_or_else(|| ApiError::unavailable("ipmitool is not installed")),
-    }
-}
-
 fn pass_file(id: &Id) -> ApiResult<PathBuf> {
     let dir = match std::env::var_os("PISTACK_IPMI_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -270,45 +251,6 @@ fn pass_file(id: &Id) -> ApiResult<PathBuf> {
     Ok(path)
 }
 
-fn bmc_host(raw: &str) -> ApiResult<(String, Option<u16>)> {
-    let raw = raw.trim();
-    if raw.is_empty()
-        || raw.len() > 253
-        || raw.starts_with('-')
-        || raw.chars().any(|c| {
-            c.is_whitespace()
-                || c.is_control()
-                || matches!(c, '/' | ';' | '|' | '&' | '$' | '`' | '\\' | '"' | '\'')
-        })
-    {
-        return Err(ApiError::bad_request("bmc address is not a host"));
-    }
-    if let Some((host, port)) = raw.rsplit_once(':') {
-        if !host.is_empty() && !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(port) = port.parse::<u16>() {
-                if port > 0 {
-                    return Ok((host.to_owned(), Some(port)));
-                }
-            }
-        }
-    }
-    Ok((raw.to_owned(), None))
-}
-
-fn bmc_user(raw: &str) -> ApiResult<String> {
-    let raw = raw.trim();
-    if raw.is_empty()
-        || raw.len() > 32
-        || raw.starts_with('-')
-        || !raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Err(ApiError::bad_request("bmc user is not a name"));
-    }
-    Ok(raw.to_owned())
-}
-
 fn clip(s: &str) -> String {
     let flat: String = s
         .chars()
@@ -322,6 +264,8 @@ fn clip(s: &str) -> String {
     }
 }
 
+/// Whether this chassis is reached over Redfish: a URL address, or the
+/// host-wide override. Otherwise IPMI.
 fn is_redfish(address: &str) -> bool {
     let a = address.trim();
     if a.starts_with("http://") || a.starts_with("https://") {
@@ -333,250 +277,44 @@ fn is_redfish(address: &str) -> bool {
     )
 }
 
-fn curl_bin() -> ApiResult<PathBuf> {
-    match std::env::var_os("PISTACK_CURL") {
-        Some(v) if !v.is_empty() => {
-            let path = PathBuf::from(v);
-            if path.is_file() {
-                Ok(path)
-            } else {
-                Err(ApiError::unavailable("curl is not installed"))
-            }
-        }
-        Some(_) => Err(ApiError::unavailable("curl is not installed")),
-        None => which("curl").ok_or_else(|| ApiError::unavailable("curl is not installed")),
-    }
-}
-
-fn redfish_system() -> String {
-    match std::env::var("PISTACK_REDFISH_SYSTEM") {
-        Ok(v) if !v.trim().is_empty() => v.trim().trim_matches('/').to_owned(),
-        _ => "Systems/1".to_owned(),
-    }
-}
-
-fn redfish_base(address: &str) -> ApiResult<String> {
-    let raw = address.trim();
-    if raw.is_empty() || raw.len() > 512 {
-        return Err(ApiError::bad_request("bmc address is not a redfish url"));
-    }
-    if raw.chars().any(|c| {
-        c.is_control() || matches!(c, ';' | '|' | '&' | '$' | '`' | '\\' | '"' | '\'' | ' ')
-    }) {
-        return Err(ApiError::bad_request("bmc address is not a redfish url"));
-    }
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        let trimmed = raw.trim_end_matches('/');
-        if let Some(idx) = trimmed.find("/redfish/v1") {
-            return Ok(trimmed[..=idx + "/redfish/v1".len() - 1].to_owned());
-        }
-        return Ok(format!("{trimmed}/redfish/v1"));
-    }
-    let (host, port) = bmc_host(raw)?;
-    Ok(match port {
-        Some(p) => format!("https://{host}:{p}/redfish/v1"),
-        None => format!("https://{host}/redfish/v1"),
-    })
-}
-
-fn read_pass(pass: &Path) -> ApiResult<String> {
-    let bytes =
-        std::fs::read(pass).map_err(|_| ApiError::unavailable("bmc password file is missing"))?;
-    let text = String::from_utf8_lossy(&bytes);
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        return Err(ApiError::unavailable("bmc password file is missing"));
-    }
-    Ok(line.to_owned())
-}
-
-async fn redfish(
-    address: &str,
-    user: &str,
-    pass: &Path,
-    method: &str,
-    path: &str,
-    body: &str,
-    what: &str,
-) -> ApiResult<()> {
-    let bin = curl_bin()?;
-    let user = bmc_user(user)?;
-    let base = redfish_base(address)?;
-    let url = format!("{base}/{}", path.trim_start_matches('/'));
-    let password = read_pass(pass)?;
-    let cfg_dir = state_dir().join(".curl");
-    std::fs::create_dir_all(&cfg_dir).map_err(|e| {
-        ApiError::unavailable(format!("redfish curl config {}: {e}", cfg_dir.display()))
-    })?;
-    let cfg = cfg_dir.join(format!("cfg-{}", std::process::id()));
-    // curl --config: user = "name:password"
-    let escaped_user = user.replace('\\', "\\\\").replace('"', "\\\"");
-    let escaped_pass = password.replace('\\', "\\\\").replace('"', "\\\"");
-    let cfg_body = format!("user = \"{escaped_user}:{escaped_pass}\"\n");
-    std::fs::write(&cfg, cfg_body.as_bytes()).map_err(|e| {
-        ApiError::unavailable(format!("redfish curl config {}: {e}", cfg.display()))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&cfg)
-            .map_err(|e| {
-                ApiError::unavailable(format!("redfish curl config {}: {e}", cfg.display()))
-            })?
-            .permissions();
-        perms.set_mode(0o600);
-        let _ = std::fs::set_permissions(&cfg, perms);
-    }
-    let output = tokio::process::Command::new(&bin)
-        .args([
-            "-sS",
-            "-f",
-            "-k",
-            "--config",
-            cfg.to_str()
-                .ok_or_else(|| ApiError::internal("redfish curl config path"))?,
-            "-H",
-            "Content-Type: application/json",
-            "-X",
-            method,
-            &url,
-            "-d",
-            body,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
-    let _ = std::fs::remove_file(&cfg);
-    let output = output.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ApiError::unavailable("curl is not installed")
-        } else {
-            ApiError::unavailable(format!("curl failed to start: {e}"))
-        }
-    })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = clip(&String::from_utf8_lossy(&output.stderr));
-    if detail.is_empty() {
-        Err(ApiError::unavailable(format!("redfish {what} failed")))
+/// The BMC address and user of a chassis, checked, and the power control
+/// that drives it. The password is read from `$PISTACK_IPMI_DIR/<id>` and
+/// handed to the tool as a file path, never as bytes on the command line.
+fn control(address: &str, user: &str, pass: &Path) -> ApiResult<Box<dyn power::PowerControl>> {
+    let kind = if is_redfish(address) {
+        power::Kind::Redfish
     } else {
-        Err(ApiError::unavailable(format!(
-            "redfish {what} failed: {detail}"
-        )))
-    }
-}
-
-async fn redfish_power(address: &str, user: &str, pass: &Path, on: bool) -> ApiResult<()> {
-    let system = redfish_system();
-    let reset = if on { "On" } else { "ForceOff" };
-    let body = format!(r#"{{"ResetType":"{reset}"}}"#);
-    redfish(
-        address,
-        user,
-        pass,
-        "POST",
-        &format!("{system}/Actions/ComputerSystem.Reset"),
-        &body,
-        &format!("power {reset}"),
-    )
-    .await
-}
-
-async fn redfish_boot_pxe(address: &str, user: &str, pass: &Path) -> ApiResult<()> {
-    let system = redfish_system();
-    let body = r#"{"Boot":{"BootSourceOverrideEnabled":"Once","BootSourceOverrideTarget":"Pxe"}}"#;
-    redfish(
-        address,
-        user,
-        pass,
-        "PATCH",
-        &system,
-        body,
-        "boot override pxe",
-    )
-    .await
-}
-
-async fn ipmi(address: &str, user: &str, pass: &Path, words: &[&str], what: &str) -> ApiResult<()> {
-    let bin = ipmitool_bin()?;
-    let (host, port) = bmc_host(address)?;
-    let user = bmc_user(user)?;
-    let pass_s = pass.to_string_lossy().into_owned();
-    let mut args = vec![
-        "-I".to_owned(),
-        "lanplus".into(),
-        "-H".into(),
-        host,
-        "-U".into(),
-        user,
-        "-f".into(),
-        pass_s,
-    ];
-    if let Some(port) = port {
-        args.push("-p".into());
-        args.push(port.to_string());
-    }
-    for w in words {
-        args.push((*w).to_owned());
-    }
-    let output = tokio::process::Command::new(&bin)
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ApiError::unavailable("ipmitool is not installed")
-            } else {
-                ApiError::unavailable(format!("ipmitool failed to start: {e}"))
-            }
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = clip(&String::from_utf8_lossy(&output.stderr));
-    if detail.is_empty() {
-        Err(ApiError::unavailable(format!("ipmitool {what} failed")))
-    } else {
-        Err(ApiError::unavailable(format!(
-            "ipmitool {what} failed: {detail}"
-        )))
-    }
-}
-
-async fn chassis(power: &str, address: &str, user: &str, pass: &Path) -> ApiResult<()> {
-    if is_redfish(address) {
-        return redfish_power(address, user, pass, power == "on").await;
-    }
-    ipmi(
-        address,
-        user,
-        pass,
-        &["chassis", "power", power],
-        &format!("chassis power {power}"),
-    )
-    .await
+        power::Kind::Ipmi
+    };
+    let secret = power::Secret::from_file(pass)?;
+    Ok(kind.control(address, user, secret))
 }
 
 /// Next boot from the network. Does not install an image; it only points
 /// the chassis at PXE so a provisioner can take over.
 async fn bootdev_pxe(address: &str, user: &str, pass: &Path) -> ApiResult<()> {
-    if is_redfish(address) {
-        return redfish_boot_pxe(address, user, pass).await;
+    control(address, user, pass)?.boot_pxe().await
+}
+
+/// Power the chassis on or off, reached through the shared power control.
+async fn chassis(on: bool, address: &str, user: &str, pass: &Path) -> ApiResult<()> {
+    let ctl = control(address, user, pass)?;
+    if on {
+        ctl.power_on().await
+    } else {
+        ctl.power_off().await
     }
-    ipmi(
-        address,
-        user,
-        pass,
-        &["chassis", "bootdev", "pxe"],
-        "chassis bootdev pxe",
-    )
-    .await
+}
+
+/// The transport a chassis will be reached over, and its tool checked for.
+fn transport_for(address: &str) -> ApiResult<(&'static str, power::Kind)> {
+    let kind = if is_redfish(address) {
+        power::Kind::Redfish
+    } else {
+        power::Kind::Ipmi
+    };
+    kind.require_tool()?;
+    Ok((kind.as_str(), kind))
 }
 
 fn clean_bin() -> Option<PathBuf> {
@@ -667,16 +405,10 @@ impl MachineRuntime for MetalRuntime {
             return Err(ApiError::bad_request("bmc user is required"));
         };
         let image_path = resolve_image(&req.image)?;
-        let transport = if is_redfish(address) {
-            curl_bin()?;
-            "redfish"
-        } else {
-            ipmitool_bin()?;
-            "ipmi"
-        };
+        let (transport, _kind) = transport_for(address)?;
         let pass = pass_file(&req.id)?;
         bootdev_pxe(address, user, &pass).await?;
-        chassis("on", address, user, &pass).await?;
+        chassis(true, address, user, &pass).await?;
         write_state(&MetalRecord {
             machine: running.clone(),
             local: false,
@@ -704,13 +436,9 @@ impl MachineRuntime for MetalRuntime {
                     .bmc_user
                     .as_deref()
                     .ok_or_else(|| ApiError::unavailable("bmc user is missing"))?;
-                if is_redfish(address) {
-                    curl_bin()?;
-                } else {
-                    ipmitool_bin()?;
-                }
+                transport_for(address)?;
                 let pass = pass_file(id)?;
-                chassis("off", address, user, &pass).await?;
+                chassis(false, address, user, &pass).await?;
                 let mut record = record;
                 record.machine.power = PowerState::Off;
                 write_state(&record)?;
@@ -729,13 +457,9 @@ impl MachineRuntime for MetalRuntime {
                 if let (Some(address), Some(user)) =
                     (record.bmc_address.as_deref(), record.bmc_user.as_deref())
                 {
-                    if is_redfish(address) {
-                        curl_bin()?;
-                    } else {
-                        ipmitool_bin()?;
-                    }
+                    transport_for(address)?;
                     let pass = pass_file(id)?;
-                    chassis("off", address, user, &pass).await?;
+                    chassis(false, address, user, &pass).await?;
                     clean_remote(id, address, user, &pass).await?;
                 }
             }

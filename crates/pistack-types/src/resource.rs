@@ -76,6 +76,7 @@ pub mod kind {
     pub const MACHINE: &str = "mach";
     pub const POD: &str = "pod";
     pub const NETWORK: &str = "net";
+    pub const VPC: &str = "vpc";
     pub const SUBNET: &str = "subnet";
     pub const PORT: &str = "port";
     pub const ROUTER: &str = "rtr";

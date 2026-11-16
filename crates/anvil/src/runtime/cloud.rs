@@ -375,6 +375,24 @@ impl MachineRuntime for CloudRuntime {
         }
     }
 
+    async fn rebuild(&self, req: &MachineRequest) -> ApiResult<RunningMachine> {
+        let _guard = lock().lock().await;
+        let dir = machine_dir(&req.id)?;
+        if read_state(&dir).await?.is_none() {
+            return Err(ApiError::not_found(format!(
+                "cloud-hypervisor runtime: machine {} is not on this host",
+                req.id
+            )));
+        }
+        // The disk is inside the machine directory, so stopping removes
+        // nothing by itself; the delete takes the record with it and the
+        // start writes a fresh copy of the image. An unreadable state file
+        // stops the rebuild before the old disk goes.
+        self.stop(&req.id).await?;
+        self.delete(&req.id).await?;
+        self.start(req).await
+    }
+
     async fn list(&self) -> ApiResult<Vec<RunningMachine>> {
         let _guard = lock().lock().await;
         let _bin = resolve_bin()?;
@@ -431,11 +449,19 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     match std::env::var_os("PISTACK_CLOUD_STATE") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => PathBuf::from(DEFAULT_STATE),
     }
+}
+
+/// The file names this runtime's machine disks are written under: the raw
+/// disk and the part-file it is assembled in. cloud-hypervisor reads raw
+/// only, so no qcow2 is ever built here. A file named otherwise in a machine
+/// directory — a seed, a kernel, a log — is not a disk.
+pub(crate) fn runtime_disk_names() -> &'static [&'static str] {
+    &["disk.raw", "disk.raw.part"]
 }
 
 fn machine_dir(id: &Id) -> ApiResult<PathBuf> {

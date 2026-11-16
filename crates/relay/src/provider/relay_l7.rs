@@ -14,9 +14,14 @@
 //! `keep` already stored for that listener and stays unavailable when it
 //! has none. This proxy does not generate a certificate. UDP copies
 //! datagrams to an up member and is not ready when that list is empty.
+//!
+//! Members are picked under the pool's algorithm, the same as on the L4
+//! forwarder, and the connections this proxy holds count towards
+//! `least_conn`.
 
 use super::{LbProvider, ListenerView, Realized};
-use crate::types::{Balancer, ListenerProtocol, Member, PathMatch, Provider};
+use crate::picker::{Backend, Picker};
+use crate::types::{Algorithm, Balancer, ListenerProtocol, Member, PathMatch, Provider};
 use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult, Id};
 use std::collections::HashMap;
@@ -40,7 +45,8 @@ struct Slot {
     task: Option<JoinHandle<()>>,
     cancel: tokio_util::sync::CancellationToken,
     members: Arc<parking_lot::Mutex<Table>>,
-    cursor: Arc<AtomicUsize>,
+    picker: Picker,
+    conns: Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>,
     limit: Arc<AtomicUsize>,
     inflight: Arc<AtomicUsize>,
     mode: Arc<parking_lot::Mutex<Serve>>,
@@ -152,16 +158,19 @@ fn realized(bound: SocketAddr) -> Realized {
     }
 }
 
-fn live_addrs(members: &[Member]) -> Vec<SocketAddr> {
-    let primary: Vec<SocketAddr> = members
+/// The members to choose between. A backup member is only used when no
+/// primary is left; the rest of the health and weight rules are the
+/// picker's.
+fn live_backends(members: &[Member]) -> Vec<Backend> {
+    let primary: Vec<Backend> = members
         .iter()
         .filter(|m| !m.spec.backup)
-        .map(|m| m.addr())
+        .map(Backend::of)
         .collect();
     if !primary.is_empty() {
         return primary;
     }
-    members.iter().map(|m| m.addr()).collect()
+    members.iter().map(Backend::of).collect()
 }
 
 fn table_for(view: &ListenerView) -> Table {
@@ -169,7 +178,7 @@ fn table_for(view: &ListenerView) -> Table {
         return Table::default();
     }
     let default = match &view.pool {
-        Some((_, members)) => live_addrs(members),
+        Some((_, members)) => live_backends(members),
         None => Vec::new(),
     };
     let routes = view
@@ -180,7 +189,7 @@ fn table_for(view: &ListenerView) -> Table {
             path: r.route.path.clone(),
             exact: r.route.path_match == PathMatch::Exact,
             members: if r.pool.spec.admin_up {
-                live_addrs(&r.members)
+                live_backends(&r.members)
             } else {
                 Vec::new()
             },
@@ -192,7 +201,7 @@ fn table_for(view: &ListenerView) -> Table {
 /// Where requests on one listener go: routes first, then the default pool.
 #[derive(Default)]
 struct Table {
-    default: Vec<SocketAddr>,
+    default: Vec<Backend>,
     routes: Vec<RouteTarget>,
 }
 
@@ -200,7 +209,7 @@ struct RouteTarget {
     host: Option<String>,
     path: String,
     exact: bool,
-    members: Vec<SocketAddr>,
+    members: Vec<Backend>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -213,8 +222,15 @@ enum Choice {
 }
 
 impl Table {
-    fn choose(&self, host: Option<&str>, path: &str, cursor: &AtomicUsize) -> Choice {
-        let take = |members: &[SocketAddr]| match pick(members, cursor) {
+    fn choose(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        client: Option<IpAddr>,
+        picker: &Picker,
+        conns: &parking_lot::Mutex<HashMap<SocketAddr, u64>>,
+    ) -> Choice {
+        let take = |members: &[Backend]| match picker.pick(&weighed(members, conns), client) {
             Some(addr) => Choice::Member(addr),
             None => Choice::Unavailable,
         };
@@ -323,21 +339,19 @@ fn route_key(head: &[u8]) -> (Option<String>, String) {
     (host.filter(|h| !h.is_empty()), path.to_owned())
 }
 
-fn pick(members: &[SocketAddr], cursor: &AtomicUsize) -> Option<SocketAddr> {
-    if members.is_empty() {
-        return None;
-    }
-    let n = cursor.fetch_add(1, Ordering::Relaxed);
-    Some(members[n % members.len()])
+/// What one HTTP listener hands to every accepted connection.
+struct Served {
+    members: Arc<parking_lot::Mutex<Table>>,
+    picker: Picker,
+    conns: Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>,
+    limit: Arc<AtomicUsize>,
+    inflight: Arc<AtomicUsize>,
+    mode: Arc<parking_lot::Mutex<Serve>>,
 }
 
 async fn accept_loop(
     listener: TcpListener,
-    members: Arc<parking_lot::Mutex<Table>>,
-    cursor: Arc<AtomicUsize>,
-    limit: Arc<AtomicUsize>,
-    inflight: Arc<AtomicUsize>,
-    mode: Arc<parking_lot::Mutex<Serve>>,
+    served: Arc<Served>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     loop {
@@ -348,11 +362,11 @@ async fn accept_loop(
                 match accepted {
                     Ok((stream, peer)) => {
                         let _ = stream.set_nodelay(true);
-                        let cap = limit.load(Ordering::Relaxed);
-                        let now = inflight.fetch_add(1, Ordering::Relaxed);
-                        let serve = mode.lock().clone();
+                        let cap = served.limit.load(Ordering::Relaxed);
+                        let now = served.inflight.fetch_add(1, Ordering::Relaxed);
+                        let serve = served.mode.lock().clone();
                         if cap > 0 && now >= cap {
-                            inflight.fetch_sub(1, Ordering::Relaxed);
+                            served.inflight.fetch_sub(1, Ordering::Relaxed);
                             if matches!(serve, Serve::Http | Serve::Tls(_)) {
                                 tokio::spawn(async move {
                                     let _ = refuse(stream).await;
@@ -360,18 +374,20 @@ async fn accept_loop(
                             }
                             continue;
                         }
-                        let members = members.clone();
-                        let cursor = cursor.clone();
-                        let inflight = inflight.clone();
+                        let served = served.clone();
                         tokio::spawn(async move {
                             match serve {
-                                Serve::Http => proxy_http(stream, peer, members, cursor).await,
-                                Serve::Stream => splice(stream, members, cursor).await,
+                                Serve::Http => {
+                                    proxy_http(stream, peer, &served).await;
+                                }
+                                Serve::Stream => {
+                                    splice(stream, peer, &served).await;
+                                }
                                 Serve::Tls(cfg) => {
                                     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
                                     match acceptor.accept(stream).await {
                                         Ok(tls) => {
-                                            proxy_http(tls, peer, members, cursor).await;
+                                            proxy_http(tls, peer, &served).await;
                                         }
                                         Err(e) => {
                                             tracing::debug!(error = %e, "tls handshake failed");
@@ -379,7 +395,7 @@ async fn accept_loop(
                                     }
                                 }
                             }
-                            inflight.fetch_sub(1, Ordering::Relaxed);
+                            served.inflight.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(e) => {
@@ -388,6 +404,35 @@ async fn accept_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+/// One backend with the connections this proxy holds on it.
+fn weighed(
+    backends: &[Backend],
+    conns: &parking_lot::Mutex<HashMap<SocketAddr, u64>>,
+) -> Vec<Backend> {
+    let open = conns.lock();
+    backends
+        .iter()
+        .map(|b| Backend {
+            conns: open.get(&b.addr).copied().unwrap_or(0),
+            ..*b
+        })
+        .collect()
+}
+
+fn opened(conns: &parking_lot::Mutex<HashMap<SocketAddr, u64>>, addr: SocketAddr) {
+    *conns.lock().entry(addr).or_insert(0) += 1;
+}
+
+fn closed(conns: &parking_lot::Mutex<HashMap<SocketAddr, u64>>, addr: SocketAddr) {
+    let mut open = conns.lock();
+    if let Some(n) = open.get_mut(&addr) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            open.remove(&addr);
         }
     }
 }
@@ -418,34 +463,32 @@ where
     let _ = stream.write_all(body).await;
 }
 
-async fn splice(
-    mut inbound: TcpStream,
-    members: Arc<parking_lot::Mutex<Table>>,
-    cursor: Arc<AtomicUsize>,
-) {
+async fn splice(mut inbound: TcpStream, peer: SocketAddr, served: &Served) {
     let dest = {
-        let guard = members.lock();
-        pick(&guard.default, &cursor)
+        let guard = served.members.lock();
+        served
+            .picker
+            .pick(&weighed(&guard.default, &served.conns), Some(peer.ip()))
     };
     let Some(dest) = dest else {
         return;
     };
-    let mut outbound = match TcpStream::connect(dest).await {
+    opened(&served.conns, dest);
+    let outbound = TcpStream::connect(dest).await;
+    let mut outbound = match outbound {
         Ok(stream) => stream,
         Err(e) => {
+            closed(&served.conns, dest);
             tracing::debug!(%dest, error = %e, "http member is not up");
             return;
         }
     };
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    closed(&served.conns, dest);
 }
 
-async fn proxy_http<S>(
-    mut inbound: S,
-    peer: SocketAddr,
-    members: Arc<parking_lot::Mutex<Table>>,
-    cursor: Arc<AtomicUsize>,
-) where
+async fn proxy_http<S>(mut inbound: S, peer: SocketAddr, served: &Served)
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let read = read_headers(&mut inbound).await;
@@ -454,7 +497,13 @@ async fn proxy_http<S>(
     };
     let choice = {
         let (host, path) = route_key(&head);
-        members.lock().choose(host.as_deref(), &path, &cursor)
+        served.members.lock().choose(
+            host.as_deref(),
+            &path,
+            Some(peer.ip()),
+            &served.picker,
+            &served.conns,
+        )
     };
     let dest = match choice {
         Choice::Member(dest) => dest,
@@ -467,6 +516,8 @@ async fn proxy_http<S>(
             return;
         }
     };
+    opened(&served.conns, dest);
+    let guard = Held(served.conns.clone(), dest);
     if header_has(&head, "transfer-encoding") {
         let mut outbound = match TcpStream::connect(dest).await {
             Ok(stream) => stream,
@@ -518,6 +569,20 @@ async fn proxy_http<S>(
     }
     let _ = tokio::io::copy(&mut outbound, &mut inbound).await;
     let _ = tokio::io::AsyncWriteExt::shutdown(&mut inbound).await;
+    drop(guard);
+}
+
+/// One connection counted against a backend until the request holding it
+/// is over, whichever way the request ends.
+struct Held(
+    Arc<parking_lot::Mutex<HashMap<SocketAddr, u64>>>,
+    SocketAddr,
+);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        closed(&self.0, self.1);
+    }
 }
 
 async fn read_headers<R>(stream: &mut R) -> Option<(Vec<u8>, Vec<u8>)>
@@ -665,7 +730,8 @@ impl LbProvider for RelayL7Provider {
                 task: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 members: Arc::new(parking_lot::Mutex::new(Table::default())),
-                cursor: Arc::new(AtomicUsize::new(0)),
+                picker: Picker::new(Algorithm::default()),
+                conns: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 limit: Arc::new(AtomicUsize::new(0)),
                 inflight: Arc::new(AtomicUsize::new(0)),
                 mode: Arc::new(parking_lot::Mutex::new(Serve::Http)),
@@ -697,12 +763,18 @@ impl LbProvider for RelayL7Provider {
             ListenerProtocol::Tcp | ListenerProtocol::Https => Serve::Stream,
         };
         let table = table_for(view);
+        let algo = view
+            .pool
+            .as_ref()
+            .map(|(pool, _)| pool.spec.algorithm)
+            .unwrap_or_default();
         let limit = view.listener.spec.connection_limit as usize;
         let id = view.balancer.meta.id.clone();
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(&id)
             .ok_or_else(|| ApiError::bad_request("http balancer is not bound"))?;
+        slot.picker.set_algorithm(algo);
         *slot.members.lock() = table;
         slot.limit.store(limit, Ordering::Relaxed);
         *slot.mode.lock() = serve;
@@ -711,14 +783,17 @@ impl LbProvider for RelayL7Provider {
                 .listener
                 .take()
                 .ok_or_else(|| ApiError::internal("http socket is missing"))?;
-            let members = slot.members.clone();
-            let cursor = slot.cursor.clone();
-            let limit = slot.limit.clone();
-            let inflight = slot.inflight.clone();
-            let mode = slot.mode.clone();
+            let served = Arc::new(Served {
+                members: slot.members.clone(),
+                picker: slot.picker.clone(),
+                conns: slot.conns.clone(),
+                limit: slot.limit.clone(),
+                inflight: slot.inflight.clone(),
+                mode: slot.mode.clone(),
+            });
             let cancel = slot.cancel.clone();
             slot.task = Some(tokio::spawn(async move {
-                accept_loop(listener, members, cursor, limit, inflight, mode, cancel).await;
+                accept_loop(listener, served, cancel).await;
             }));
         }
         Ok(slot.bound.to_string())
@@ -754,16 +829,29 @@ mod tests {
     }
 
     fn view(lb: &Balancer, protocol: ListenerProtocol, members: Vec<SocketAddr>) -> ListenerView {
+        let weights = vec![1u16; members.len()];
+        algorithm_view(lb, protocol, members, weights, Algorithm::default())
+    }
+
+    /// A view whose pool carries `algorithm`, one weight per member.
+    fn algorithm_view(
+        lb: &Balancer,
+        protocol: ListenerProtocol,
+        members: Vec<SocketAddr>,
+        weights: Vec<u16>,
+        algorithm: Algorithm,
+    ) -> ListenerView {
         let pool_meta = Meta::new(kinds::POOL, "pool", None);
         let member_rows = members
             .into_iter()
-            .map(|addr| Member {
+            .zip(weights)
+            .map(|(addr, weight)| Member {
                 meta: Meta::new(kinds::MEMBER, "m", None),
                 spec: MemberSpec {
                     pool: pool_meta.id.clone(),
                     address: addr.ip(),
                     port: addr.port(),
-                    weight: 1,
+                    weight,
                     backup: false,
                     admin_up: true,
                 },
@@ -775,7 +863,7 @@ mod tests {
             spec: PoolSpec {
                 balancer: lb.meta.id.clone(),
                 protocol: PoolProtocol::Http,
-                algorithm: Algorithm::default(),
+                algorithm,
                 session_persistence: None,
                 health_monitor: None,
                 admin_up: true,
@@ -908,7 +996,7 @@ mod tests {
             host: host.map(str::to_owned),
             path: path.into(),
             exact,
-            members: vec![SocketAddr::from(([127, 0, 0, 1], port))],
+            members: vec![Backend::new(SocketAddr::from(([127, 0, 0, 1], port)))],
         }
     }
 
@@ -919,9 +1007,16 @@ mod tests {
         }
     }
 
+    /// No connections counted: nothing is open, so the picker's own
+    /// algorithm decides between the members a route holds.
+    fn no_conns() -> parking_lot::Mutex<HashMap<SocketAddr, u64>> {
+        parking_lot::Mutex::new(HashMap::new())
+    }
+
     #[test]
     fn table_prefers_specific_host_then_longest_path() {
-        let cursor = AtomicUsize::new(0);
+        let picker = Picker::new(Algorithm::RoundRobin);
+        let conns = no_conns();
         let table = Table {
             default: Vec::new(),
             routes: vec![
@@ -932,7 +1027,9 @@ mod tests {
                 target(Some("app.example.com"), "/api", true, 5),
             ],
         };
-        let at = |host: Option<&str>, path: &str| port_of(table.choose(host, path, &cursor));
+        let at = |host: Option<&str>, path: &str| {
+            port_of(table.choose(host, path, None, &picker, &conns))
+        };
         assert_eq!(at(Some("app.example.com"), "/"), 3);
         assert_eq!(at(Some("app.example.com"), "/api/v1"), 4);
         assert_eq!(at(Some("app.example.com"), "/api"), 5);
@@ -944,21 +1041,31 @@ mod tests {
 
     #[test]
     fn table_falls_back_then_404s() {
-        let cursor = AtomicUsize::new(0);
+        let picker = Picker::new(Algorithm::RoundRobin);
+        let conns = no_conns();
         let mut table = Table {
             default: Vec::new(),
             routes: vec![target(Some("app"), "/x", false, 1)],
         };
-        assert_eq!(table.choose(Some("app"), "/y", &cursor), Choice::NotFound);
-        table.default = vec![SocketAddr::from(([127, 0, 0, 1], 9))];
-        assert_eq!(port_of(table.choose(Some("app"), "/y", &cursor)), 9);
+        assert_eq!(
+            table.choose(Some("app"), "/y", None, &picker, &conns),
+            Choice::NotFound
+        );
+        table.default = vec![Backend::new(SocketAddr::from(([127, 0, 0, 1], 9)))];
+        assert_eq!(
+            port_of(table.choose(Some("app"), "/y", None, &picker, &conns)),
+            9
+        );
         table.routes[0].members.clear();
         assert_eq!(
-            table.choose(Some("app"), "/x/1", &cursor),
+            table.choose(Some("app"), "/x/1", None, &picker, &conns),
             Choice::Unavailable
         );
         let empty = Table::default();
-        assert_eq!(empty.choose(None, "/", &cursor), Choice::Unavailable);
+        assert_eq!(
+            empty.choose(None, "/", None, &picker, &conns),
+            Choice::Unavailable
+        );
     }
 
     #[test]
@@ -977,5 +1084,215 @@ mod tests {
             (Some("::1".into()), "/".into())
         );
         assert_eq!(key("GET / HTTP/1.0\r\n\r\n"), (None, "/".into()));
+    }
+
+    /// A member answering a request with its own name, so a response says
+    /// who served it.
+    async fn speaker(body: &'static [u8]) -> SocketAddr {
+        let member = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = member.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = member.accept().await.unwrap();
+                let mut buf = vec![0u8; 2048];
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if sock.write_all(resp.as_bytes()).await.is_err() {
+                    continue;
+                }
+                let _ = sock.write_all(body).await;
+            }
+        });
+        addr
+    }
+
+    /// One request through the proxy, answered with the body the member
+    /// returned.
+    /// One request through the proxy: the status line and, when the member
+    /// answers in time, its body.
+    async fn ask(vip: &str, path: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut client = TcpStream::connect(vip).await.unwrap();
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: app\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut buf),
+        )
+        .await
+        .is_ok();
+        let head = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(at) => buf[..at].to_vec(),
+            None => buf.clone(),
+        };
+        assert!(
+            head.starts_with(b"HTTP/1.1"),
+            "{}",
+            String::from_utf8_lossy(&buf)
+        );
+        let body = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(at) if answered => buf[at + 4..].to_vec(),
+            _ => Vec::new(),
+        };
+        (head, body)
+    }
+
+    /// One request answered with the member's body.
+    async fn served(vip: &str, path: &str) -> Vec<u8> {
+        let (head, body) = ask(vip, path).await;
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
+        body
+    }
+
+    async fn ask_n(vip: &str, n: usize) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            seen.push(served(vip, "/").await);
+        }
+        seen
+    }
+
+    fn tally(bodies: &[Vec<u8>]) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for body in bodies {
+            let name = String::from_utf8_lossy(body).to_string();
+            match out.iter_mut().find(|(k, _)| *k == name) {
+                Some((_, n)) => *n += 1,
+                None => out.push((name, 1)),
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn round_robin_honours_weight_over_http() {
+        let addrs = vec![speaker(b"one").await, speaker(b"two").await];
+        let p = RelayL7Provider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        let view = algorithm_view(
+            &lb,
+            ListenerProtocol::Http,
+            addrs,
+            vec![3, 1],
+            Algorithm::RoundRobin,
+        );
+        p.ensure_listener(&view).await.unwrap();
+        assert_eq!(
+            tally(&ask_n(&realized.provider_ref, 8).await),
+            vec![("one".into(), 6), ("two".into(), 2)],
+            "weight 3 against weight 1 takes three in four"
+        );
+        p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn least_conn_picks_the_least_loaded_member_over_http() {
+        // One member is kept busy so the other has the fewest open
+        // connections, which is what the algorithm is asked to find. Its
+        // answer is slow, so the count is still held when the next request
+        // arrives.
+        let busy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_addr = busy.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = busy.accept().await.unwrap();
+                let mut buf = vec![0u8; 2048];
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let _ = sock.write_all(b"never").await;
+            }
+        });
+        let idle = speaker(b"idle").await;
+
+        let p = RelayL7Provider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        let view = algorithm_view(
+            &lb,
+            ListenerProtocol::Http,
+            vec![busy_addr, idle],
+            vec![1, 1],
+            Algorithm::LeastConn,
+        );
+        p.ensure_listener(&view).await.unwrap();
+
+        let mut hold = TcpStream::connect(&realized.provider_ref).await.unwrap();
+        hold.write_all(b"GET / HTTP/1.1\r\nHost: app\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            served(&realized.provider_ref, "/").await,
+            b"idle",
+            "the member already holding one is not picked again"
+        );
+        drop(hold);
+        p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_ip_keeps_one_client_on_one_member_over_http() {
+        let addrs = vec![
+            speaker(b"one").await,
+            speaker(b"two").await,
+            speaker(b"thr").await,
+        ];
+        let p = RelayL7Provider::new();
+        let lb = balancer(None);
+        let realized = p.ensure_balancer(&lb).await.unwrap();
+        let view = algorithm_view(
+            &lb,
+            ListenerProtocol::Http,
+            addrs,
+            vec![1, 1, 1],
+            Algorithm::SourceIp,
+        );
+        p.ensure_listener(&view).await.unwrap();
+        // Every request here arrives from 127.0.0.1, so all of them must land
+        // on the one member that address hashes to. Against three members,
+        // plain round robin would answer `one` three times in nine.
+        let seen = ask_n(&realized.provider_ref, 9).await;
+        assert_eq!(
+            tally(&seen).len(),
+            1,
+            "one client address moved between members: {seen:?}"
+        );
+        p.delete_balancer(&lb.meta.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_member_is_never_picked_over_http() {
+        let addrs = [speaker(b"one").await, speaker(b"two").await];
+        for algo in [
+            Algorithm::RoundRobin,
+            Algorithm::LeastConn,
+            Algorithm::SourceIp,
+        ] {
+            let p = RelayL7Provider::new();
+            let lb = balancer(None);
+            let realized = p.ensure_balancer(&lb).await.unwrap();
+            // The second member answers, but is Offline, so the reconciler
+            // never hands it to the proxy at all.
+            let view = algorithm_view(&lb, ListenerProtocol::Http, vec![addrs[0]], vec![1], algo);
+            p.ensure_listener(&view).await.unwrap();
+            for body in ask_n(&realized.provider_ref, 4).await {
+                assert_eq!(body, b"one", "{algo}: the offline member took traffic");
+            }
+            p.delete_balancer(&lb.meta.id).await.unwrap();
+        }
     }
 }

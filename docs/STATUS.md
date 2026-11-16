@@ -2,7 +2,7 @@
 
 What a private cloud needs, area by area, and where PiStack stands on each.
 
-Read from the code on main at 7f39751, 2026-11-12. Each line is one of:
+Read from the code on main at 6cb7356, 2026-11-15. Each line is one of:
 
 - **Done**: in the tree and reachable through the API.
 - **Partial**: some of it works; the line says what does not.
@@ -21,12 +21,10 @@ All fixed on main:
 - #116: a machine could boot any project's image; a cloud-hypervisor guest wrote into the shared image and got no cloud-init. `pi machine create --volume` is refused with a message instead of ignored; attaching at start is still to do.
 - #117: `/cluster`, including the full store snapshot, was open by default. It now needs a member or a join token.
 
-Found by the three-server lab run, fixes in open pull requests or in progress:
+Found by the three-server lab run, in an open pull request, in progress, or since fixed:
 
 - #119: a failed network or load balancer reconcile was retried without pause, and a follower that fell behind a busy leader never caught up, after which no write was confirmed.
-- Hosts cannot follow a leader change: they are sent to the servers' plain HTTP address, where they cannot show their certificate (in progress).
-- An admin cannot read cluster status since #117 (in progress).
-- A server that led and had writes no majority confirmed has to be wiped and rejoined by hand when it returns.
+- A follower that fell behind a busy leader, or that once led and holds entries no majority confirmed, replaces its own store with a snapshot from the leader and starts again. It keeps its id and role, replaces at most once every ten minutes, and its unconfirmed entries are set aside, not merged.
 
 ## Compute
 
@@ -38,22 +36,25 @@ Done
 - Metadata service, EC2 layout, on overlay and hostnat
 - Metadata service on OVN, through a namespace per network on each host: written and unit-tested, not yet run on hosts
 - Live migration on libvirt (no CLI)
+- Rebuild a stopped or running machine from an image: id, name, host, network and keys are kept; the root disk is replaced (`pi machine rebuild`)
+- Resize a stopped machine to another size; the machine stays on its host, which must have room for what the new size adds (`pi machine resize`)
 - Scheduler: host filters, label selector, spread weights
 - Per-host resource accounting; a host that misses heartbeats is marked down
 - Volume hot-plug on libvirt
 - Host labels set by an admin; the `zone` label is the availability zone a machine can ask for
+- Host label `pistack.io/disk`, written by the agent: `shared` when its machine disk directory is on an NFS or SMB mount. Anything else is `local`
 - Disable and enable a host
 - Runtimes: libvirt/KVM, cloud-hypervisor, youki containers, bare metal power, mock
 - Pods, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, Ingress, Autoscaler (loom)
 
 Partial
-- SSH keys: raw strings per machine, no keypair resource
+- SSH keys: raw strings per machine or a key pair by name at create; a generated pair's private half is returned once and never stored
 - VNC console: only when the VM is on the API server's own host; libvirt only; no serial console
 - Console log: written on the host, no API to read it for a VM
 - Affinity: soft hints by machine name; no server groups, no hard rule
 - Host aggregates: labels and a host selector only; no aggregate resource
-- Drain: live-migrates running virtual machines on libvirt hosts; everything else is reported and left
-- Evacuate off a dead host: machines start elsewhere from their image without the root disk; RBD volumes follow, local ones do not; no fencing
+- Drain: live-migrates running virtual machines on libvirt hosts whose machine disks are shared; a machine that cannot be moved is listed with its reason and left running, and a local root disk or a volume on unshared storage is known before the host is asked
+- Evacuate off a dead host: the host is powered off through its BMC, over IPMI or Redfish, and the off state read back before anything moves; without power control, or when the power-off fails, nothing moves until the operator confirms the host is dead and the report says so. Machines then start elsewhere from their image without the root disk; RBD volumes follow, local ones do not
 - Compute quota: no GPU limit; a pod's machine is counted but a pod is not refused
 - NIC hot-plug: the agent can do it, nothing on the server asks it to
 - Boot from volume: the flag is stored, no runtime boots from one
@@ -62,9 +63,7 @@ Partial
 - Bare metal: power and PXE boot; does not write an image, no inspection or enrollment
 
 Missing
-- Resize
 - Cold migration
-- Shelve, rescue, rebuild
 - Snapshot a machine to an image
 - Pause and suspend
 - Overcommit ratios; the pack strategy exists but cannot be switched on
@@ -78,11 +77,11 @@ Done
 - qcow2 safety checks; URL import blocks internal addresses
 - Private, shared with a project, or public (sharing has no CLI)
 - sha256 checked on every host download
+- Host image cache sweep and resumed downloads: the agent deletes a cached image nothing needs, and a broken transfer keeps its bytes and asks the server for the rest
 - Quota per project on image count and stored bytes; the bytes are checked once an upload is in
 
 Partial
-- Minimum disk and RAM are stored and never checked
-- Host image cache has no cleanup and no resume
+- Minimum disk is checked against the size at machine create and rebuild; minimum RAM is stored and never checked
 - Storing images in object storage: written, not switched on (In progress, PR 110)
 
 Missing
@@ -95,6 +94,7 @@ Backends: OVN, overlay (VXLAN and namespaces), hostnat (one host), mock.
 
 Done
 - Networks, subnets, allocation pools, ports, fixed IPs, MACs
+- VPCs: a project's routed private space, the one router it owns, and the networks and subnets inside it
 - Routers, external gateway, SNAT (IPv4)
 - Floating IPs on OVN, overlay and hostnat
 - Automatic floating IPs from one marked external network, off by default, with an opt-out per machine and per project
@@ -103,7 +103,7 @@ Done
 - Provider networks, flat and VLAN
 - Geneve or VXLAN on OVN; VXLAN on overlay
 - DHCP on OVN and overlay
-- Quota per project on networks, subnets, routers, security groups, ports and floating IPs
+- Quota per project on networks, subnets, routers, security groups, ports, floating IPs and VPCs
 - OVN gateway HA across chassis; distributed floating IPs
 
 Partial
@@ -112,11 +112,11 @@ Partial
 - Static routes: OVN only; no CLI
 - Instance DNS: only through a labelled zone; guests are not pointed at it
 - Shared networks: cloud-wide or private, nothing between
+- Allowed address pairs: honoured on OVN only; the other backends store the pair and change nothing on the host
 - Overlay routers live on one host with no failover
 - CLI has no `update` for any network resource
 
 Missing
-- Allowed address pairs
 - Trunk ports
 - QoS and bandwidth limits
 - VPN, firewall policies, BGP, port mirroring
@@ -132,13 +132,13 @@ Done
 - TCP, UDP, HTTP with host and path routes
 - TLS termination from a stored certificate
 - TCP and HTTP health checks
+- Balancing by the pool's algorithm — round robin, least connections, source address — with member weights, on both data planes (`pi lb`)
 
 Partial
 - Runs inside the server process on the server's address; the VIP is never placed on a tenant network
-- Algorithm, session persistence and weights are stored and ignored
+- Session persistence is stored and ignored
 - Connection limit works on HTTP only
 - Floating IP field is unused
-- No CLI
 
 Missing
 - OVN load balancer (stub)
@@ -152,14 +152,14 @@ Done
 - A, AAAA, CNAME, MX, TXT, SRV, NS, PTR, wildcards
 - Authoritative server over UDP and TCP
 - Outbound AXFR and secondary pull
+- NOTIFY both ways: a zone change is notified to its secondaries and to the addresses a primary names in `also_notify`, and a notified secondary pulls at once
 - Automatic records for machines and floating IPs
 
 Partial
 - Reverse DNS by hand only
-- No CLI
 
 Missing
-- NOTIFY, IXFR, TSIG, DNSSEC
+- IXFR, TSIG, DNSSEC
 
 ## Block storage
 
@@ -169,23 +169,22 @@ Done
 - Volume from image
 - Volume types
 - Quota per project on volume count and gigabytes, snapshots, and backup count and gigabytes; extend is checked
-- Backup to object storage and restore (no CLI)
+- Backup to object storage and restore, local, LVM and RBD (`pi backup`)
 - Backends: local file, LVM thin, Ceph RBD
 
 Partial
 - Extend works; an attached guest is not told the disk grew
 - LVM and RBD have only been run against stand-in scripts, never real Ceph or LVM
+- Transfer between projects: the API offers, accepts and cancels; `pi` has no command for it
 
 In progress (PR 109)
 - A local or LVM volume stays on its node; machines are placed with their volume
-- RBD backup restore
 
 Missing
 - QoS
 - Encryption at rest (flag stored, never read)
 - Multi-attach
 - Migration and retype
-- Transfer between projects
 - Consistency groups
 - Placement by free capacity
 - iSCSI, NVMe, NFS backends
@@ -194,15 +193,14 @@ Missing
 
 Done
 - Buckets and objects
-- S3 path-style: get, put, head, delete, copy, list v2, multipart
+- S3 path-style: get (with range), put, head, delete, batch delete, copy, list v2, multipart
 - SigV4, presigned URLs, streaming uploads
 - Cleanup of abandoned multipart uploads
 
 Partial
-- S3 has no bucket calls, batch delete, range GET, list v1, virtual-host style or tagging
+- S3 has no bucket calls, list v1, virtual-host style or tagging
 - Versioning keeps old bytes but cannot list or fetch them
 - Quota: bucket count per project only; no limit on bytes
-- No CLI
 
 In progress (PR 110)
 - Object bytes copied between control-plane servers (full copies)
@@ -221,7 +219,6 @@ Done
 Partial
 - CephFS share is created; access rules are stored and not applied
 - NFS size is not enforced
-- No CLI
 
 Missing
 - Share snapshots, types, networks, resize
@@ -230,19 +227,24 @@ Missing
 
 Done
 - Users, service accounts, projects, roles, role bindings
+- Projects a token can work in, and a token traded for one scoped to another project (`pi project mine`, `pi project switch`)
 - JWT tokens with expiry; API keys
 - argon2id passwords
+- A password being set must be at least twelve characters and not the name it is set for; a hash stored before the rule keeps working
 - Quota framework: limits per project, set by an admin, read with usage by members (`pi quota`)
-- Audit log: every change, login, secret read and refusal, with principal, API key, client address and outcome; read by a cloud admin with filters and paging (`pi audit list`); kept 90 days and 50,000 records by default
+- Audit log: every change, login, secret read and refusal, with principal, API key, client address and the server of the cluster that carried the request, and outcome; read by a cloud admin with filters and paging, including by the carrying server (`pi audit list`); kept 90 days and 50,000 records by default
+- Token signing keys with ids, rotated and retired by an admin (`pi signing-key`); the key servers recognise each other with is separate and does not rotate with them
+- All of a user's tokens refused at once (`pi user revoke-tokens`)
 
 Partial
 - Roles: admin, member, reader only; custom roles grant nothing; the policy engine is built and unused
 - Nested projects: parent recorded, nothing inherited
 - Audit log: admin only, no per-project view; ordinary reads, object uploads and server joins are not recorded; no export or forwarding to another system
-- Password rule is "not empty"; no lockout
+- Sign-in lockout: ten failures for one name from one address hold that pair for fifteen minutes, and two hundred from anywhere hold the name for the window
 
 Missing
-- Signing-key rotation; a single token cannot be revoked, only its user disabled or its key deleted
+- A single token cannot be revoked, only all of a user's at once
+- Signing-key rotation on a schedule: it is by hand
 - Groups, domains
 - OIDC, SAML, LDAP, federation
 - MFA
@@ -253,13 +255,18 @@ Done
 - Encrypted secrets with versions
 - Cloud CA, certificates, revocation list
 - Root key in software or wrapped by Vault Transit
+- Re-encryption under a new root key, offline, software backend (`pistack keep rotate-root-key`)
+- Listener certificates renew while the server runs
 - S3 access keys; join tokens with limits
+- Secrets and certificates from the command line (`pi secret`, `pi cert`); a payload is never a command-line argument
 
 Partial
-- No re-encryption under a new root key; `rotate_after_days` is ignored
-- Agent certificates are never renewed
+- Agent certificates renew themselves, but only for an agent on HTTPS
+- `rotate_after_days` on a secret and `root_key_rotate_after_days` only warn; nothing is rotated automatically
+- No re-encryption under a new root key with the Vault backend
+- The cloud CA cannot be rotated: issuing CA 5 years, root 10
+- A host cannot be removed for good; the server of a removed control-plane server keeps its certificates, which are revoked by hand
 - Vault tested against a mock and a dev server only
-- Secrets and certificates have no CLI
 
 Missing
 - PKCS#11
@@ -269,9 +276,9 @@ Missing
 Done
 - Stacks, kits, workflows
 - Apply, update, history, rollback
+- Declared parameters substituted into the document at apply and update
 
 Partial
-- Parameters are stored and never substituted
 - Apply does not wait for resources to be ready
 - Covers network, subnet, router, listener, DNS and machine only
 
@@ -287,12 +294,13 @@ Done
 - Prometheus endpoint `/metrics` with stable names and labels, behind a scrape token or a cloud admin's token
 - Threshold alarms on any series, a machine's or a host's included
 - Pod logs
+- Alarms and metric series from the command line (`pi alarm`, `pi metric`)
 
 Partial
-- History: none; a server keeps the last 60 points per series in memory and Prometheus keeps the rest
+- History: none; a server keeps the last 240 points per series in memory and Prometheus keeps the rest
 - Host and machine series are on the leader only and start empty after a failover
 - Machine usage: libvirt only; nothing for containers, cloud-hypervisor or bare metal
-- Alarms: `for_seconds` is ignored; no CLI
+- Alarms: a `for_seconds` hold is measured on the stamps of the series' own samples, and can ask for at most the hour the window reaches
 - Events exist in-process with no API
 
 Missing
@@ -305,14 +313,17 @@ Missing
 Done
 - Three-voter consensus with majority-confirmed writes, compaction and snapshots. Lab-proven on three servers: an in-place upgrade, two joins by token, a leader killed and replaced in about two seconds, the old leader catching up
 - Servers discover and join each other
+- A server taken out of the cluster by id, leader only, refused while the servers left could not form a majority without `--force` (`pi server remove`)
+- A follower carries a client's write to the leader and returns the answer, forwarding everything the client sent but what belongs to the hop it leaves; the leader's audit record names the client and notes the carrier
+- `pi --wait` follows its own write to the server that took it, and forgives a copy that is a few seconds behind
+- Backup writes a checked copy of the store; restore puts a backup in place of a data directory's store and founds the cluster again with one server (`pistack store backup`, `pistack store restore`)
 - Agent enrollment with join tokens and client certificates
 - Paging, label filters, revision checks on update
 - CI: fmt, clippy, tests, sign-off
 
 Partial
-- Remove or replace a server: not possible; a dead one stays in the list
-- Backup works; restore is copying a file by hand
-- Upgrades: no schema version, no upgrade check
+- A server taken out of the cluster keeps its membership record in the store; its certificates are revoked by hand
+- Upgrades: the store records a schema version and each server checks its own copy on open. Servers do not compare versions with each other, so a release that raises it needs every server stopped and upgraded together. No release has needed a migration yet; what changes between builds is written in the upgrade notes
 - TLS: the main listener is plain HTTP; HTTPS is a second port
 - Command queue is in memory on the leader. Machine start, stop and delete and volume attach and detach keep their id in the store and are issued again by the next leader, and the host runs each once. A live migration in flight at a leader change is not followed up
 - Health: `/healthz` only
@@ -327,13 +338,14 @@ Missing
 ## Tooling
 
 Done
-- `pi` CLI: 29 nouns
-- Web console: 29 pages
+- `pi` CLI: 34 nouns
+- Web console: 30 pages, with a page of its own for a host and panels for a project's limits and a user's roles
+- The console is kept in small files, one per function, joined into the page at build time
 - Container images, tarball, installer, systemd units
-- Release workflow (never run; there is no build yet)
+- Release workflow: run; `26.11.13.1` published Linux x86_64 and aarch64 tarballs with `SHA256SUMS`. Container images are built by the workflow but none are published yet
 
 Partial
-- CLI has nothing for secrets, certificates, DNS, load balancers, buckets, shares, backups, alarms or metrics
+- CLI has nothing for VPCs or volume transfers
 
 Missing
 - Terraform provider
@@ -343,6 +355,6 @@ Missing
 ## Order of work
 
 1. Merge and prove PRs 109 and 110 on real Ceph and LVM. Fix what the three-server run found. Cut the first build.
-2. Operations: server-to-server TLS, certificate renewal, remove a server, restore, schema version, evacuation.
-3. What most sites expect: resize, cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
+2. Operations: server-to-server TLS, certificate renewal, schema version.
+3. What most sites expect: cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
 4. Long tail, on request: GPU and passthrough, UEFI and vTPM, bare metal deploy, trunks, QoS, VPN, BGP, DNSSEC, erasure coding, regions, billing.

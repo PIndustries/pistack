@@ -42,6 +42,7 @@ pub const SNAPSHOTS: &str = "snapshots";
 pub const BACKUPS: &str = "backups";
 pub const BACKUPS_GIB: &str = "backups_gib";
 pub const NETWORKS: &str = "networks";
+pub const VPCS: &str = "vpcs";
 pub const SUBNETS: &str = "subnets";
 pub const ROUTERS: &str = "routers";
 pub const SECURITY_GROUPS: &str = "security_groups";
@@ -66,6 +67,7 @@ pub const RESOURCES: &[&str] = &[
     BACKUPS,
     BACKUPS_GIB,
     NETWORKS,
+    VPCS,
     SUBNETS,
     ROUTERS,
     SECURITY_GROUPS,
@@ -78,6 +80,16 @@ pub const RESOURCES: &[&str] = &[
     CERTIFICATES,
     ACCESS_KEYS,
 ];
+
+/// The limit a project gets on a resource when no admin has set one. Only
+/// vpcs have one: five a project, which is more than a small cloud's owner
+/// needs on the day, and an admin can raise it or clear it.
+pub fn default_limit(resource: &str) -> Option<u64> {
+    match resource {
+        VPCS => Some(5),
+        _ => None,
+    }
+}
 
 /// `requested` more of `resource` on top of `used`, which the caller has
 /// just counted.
@@ -125,8 +137,12 @@ pub fn admit_in(project: &Project, demands: &[Demand<'_>]) -> ApiResult<()> {
                 project.meta.name
             )));
         }
-        let Some(&limit) = project.spec.quotas.get(d.resource) else {
-            continue;
+        let limit = match project.spec.quotas.get(d.resource) {
+            Some(&l) => l,
+            None => match default_limit(d.resource) {
+                Some(l) => l,
+                None => continue,
+            },
         };
         if d.used.saturating_add(d.requested) > limit {
             return Err(ApiError::quota(format!(

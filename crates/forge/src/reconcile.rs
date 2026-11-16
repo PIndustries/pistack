@@ -11,16 +11,18 @@
 //!   the machines placed on each host.
 //! * machines: `Pending` -> scheduler -> `Creating` -> driver start ->
 //!   `Ready`; delete requests -> `Deleting` -> driver stop/delete -> gone;
-//!   desired power and reboot counters are applied to `Ready` machines;
-//!   machines on an unreachable host get a `HostReachable=false` condition.
+//!   desired power and reboot counters are applied to `Ready` machines; a
+//!   machine annotated [`REBUILD_ANNOTATION`] has its root disk replaced on
+//!   its host, see [`Reconciler::rebuild`]; machines on an unreachable host
+//!   get a `HostReachable=false` condition.
 //!   A machine annotated [`WAIT_VOLUME_ANNOTATION`] is left unplaced and
 //!   unstarted. [`NODE_PIN_ANNOTATION`] limits placement to that host.
 
 use crate::driver::{DriverRegistry, HostDriver};
 use crate::scheduler::{self, Allocations, Strategy};
 use crate::types::{
-    delete_requested, DesiredPower, Host, Machine, MachineStatus, PowerState, Size,
-    NODE_PIN_ANNOTATION, WAIT_VOLUME_ANNOTATION,
+    delete_requested, rebuild_requested, DesiredPower, Host, Machine, MachineStatus, PowerState,
+    Size, NODE_PIN_ANNOTATION, REBUILD_ANNOTATION, WAIT_VOLUME_ANNOTATION,
 };
 use chrono::Utc;
 use pistack_rpc::proto::CommandKind;
@@ -421,8 +423,17 @@ impl Reconciler {
                 };
                 let pinned = pinned_hosts(&m, hosts);
                 let candidates = pinned.as_deref().unwrap_or(hosts);
-                let decided =
-                    scheduler::place_networked(&m.spec, &size, candidates, alloc, self.strategy);
+                // A local or LVM volume attaches only on the node that
+                // holds it, so the machine goes there or nowhere.
+                let held = crate::volumes::held(
+                    &self.store,
+                    m.meta.project.as_ref(),
+                    &m.spec.near_volumes,
+                );
+                let decided = crate::volumes::hosts_near(&held, candidates).and_then(|near| {
+                    let candidates = near.as_deref().unwrap_or(candidates);
+                    scheduler::place_networked(&m.spec, &size, candidates, alloc, self.strategy)
+                });
                 let host = match decided {
                     Ok(h) => h,
                     Err(e) => {
@@ -444,10 +455,40 @@ impl Reconciler {
                         s.set_condition("Scheduled", true, "Placed", &format!("placed on {host}"));
                     })
                     .await?;
+                if rebuild_requested(&m) {
+                    // A rebuild asked for while the machine was unplaced:
+                    // it has a host now, so rebuild it in place.
+                    let m = self
+                        .patch(&m.meta.id, |s| {
+                            s.phase = Phase::Updating;
+                            s.message = format!("rebuilding from image {}", m.spec.image);
+                        })
+                        .await?;
+                    return self.rebuild(m).await;
+                }
                 self.start(m).await
             }
             Phase::Creating => self.start(m).await,
-            Phase::Ready => self.apply_power(m).await,
+            Phase::Ready => {
+                if rebuild_requested(&m) {
+                    let m = self
+                        .patch(&m.meta.id, |s| {
+                            s.phase = Phase::Updating;
+                            s.message = format!("rebuilding from image {}", m.spec.image);
+                        })
+                        .await?;
+                    return self.rebuild(m).await;
+                }
+                self.apply_power(m).await
+            }
+            Phase::Updating => {
+                if rebuild_requested(&m) && m.status.host.is_some() {
+                    // The flip to `Updating` happened but the pass ended
+                    // before the host was asked.
+                    return self.rebuild(m).await;
+                }
+                Ok(())
+            }
             Phase::Error => {
                 // A reboot request is the user's "try again".
                 if m.spec.restarts > m.status.restarts && m.status.host.is_some() {
@@ -463,7 +504,7 @@ impl Reconciler {
                 }
                 Ok(())
             }
-            Phase::Updating | Phase::Deleting => Ok(()),
+            Phase::Deleting => Ok(()),
         }
     }
 
@@ -635,6 +676,96 @@ impl Reconciler {
         Ok(())
     }
 
+    /// Replace the machine's root disk on its host and start it again with
+    /// the power it wants. The old disk is gone by the time the host
+    /// answers, whether the new one was written or not, so any failure ends
+    /// the request in `Error` with the host's message and the machine left
+    /// off. The request lives on [`REBUILD_ANNOTATION`] until it ends.
+    async fn rebuild(&self, m: Machine) -> anyhow::Result<()> {
+        let Some(driver) = m.status.host.as_ref().and_then(|hid| self.drivers.get(hid)) else {
+            // Nothing to rebuild until the machine has a host again.
+            return Ok(());
+        };
+        if let Err(e) = crate::nic::ensure_ports(&self.store, &m).await {
+            tracing::warn!(machine = %m.meta.id, error = %e, "forge: port was not allocated");
+            let msg = e.message.clone();
+            self.modify(&m.meta.id, |x| {
+                x.status.phase = Phase::Error;
+                x.status.message = msg.clone();
+                x.status
+                    .set_condition("Running", false, "RebuildFailed", &msg);
+                x.meta.annotations.remove(REBUILD_ANNOTATION);
+            })
+            .await?;
+            return Ok(());
+        }
+        match driver.rebuild(&m).await {
+            Ok(rt) => {
+                tracing::info!(machine = %m.meta.id, name = %m.meta.name, addrs = ?rt.addresses, "forge: machine rebuilt");
+                let network_message = rt.message.clone();
+                let want_off = m.spec.power == DesiredPower::Off;
+                // The host answers with what it observes; until its next
+                // heartbeat says otherwise the machine keeps the addresses
+                // its ports gave it.
+                let addresses = if rt.addresses.is_empty() {
+                    m.status.addresses.clone()
+                } else {
+                    rt.addresses.clone()
+                };
+                self.modify(&m.meta.id, |x| {
+                    x.status.phase = Phase::Ready;
+                    x.status.addresses = addresses.clone();
+                    x.status.power = rt.power;
+                    x.status.message.clear();
+                    x.status
+                        .set_condition("Running", rt.power == PowerState::On, "Rebuilt", "");
+                    note_network(&mut x.status, &network_message);
+                    x.meta.annotations.remove(REBUILD_ANNOTATION);
+                })
+                .await?;
+                // A stopped machine is rebuilt to its image and left off.
+                if want_off && rt.power != PowerState::Off {
+                    match driver.stop(&m.meta.id).await {
+                        Ok(()) => {
+                            self.patch(&m.meta.id, |s| s.power = PowerState::Off)
+                                .await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(machine = %m.meta.id, error = %e, "forge: stop after rebuild failed");
+                            let msg = e.message.clone();
+                            self.patch(&m.meta.id, |s| {
+                                s.power = PowerState::Unknown;
+                                s.message = msg.clone();
+                            })
+                            .await?;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(machine = %m.meta.id, error = %e, "forge: driver rebuild failed");
+                // The host keeps the old disk when it cannot write the new
+                // one, so the machine is still what it was. Say the request
+                // failed; do not file the machine away. A rebuild may be
+                // asked for again, and the machine must stay startable.
+                let msg = e.message.clone();
+                self.modify(&m.meta.id, |x| {
+                    x.status.phase = Phase::Ready;
+                    x.status.message = msg.clone();
+                    x.status.set_condition(
+                        "Running",
+                        m.status.power == PowerState::On,
+                        "RebuildFailed",
+                        &msg,
+                    );
+                    x.meta.annotations.remove(REBUILD_ANNOTATION);
+                })
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn teardown(&self, m: Machine) -> anyhow::Result<()> {
         let m = if m.status.phase != Phase::Deleting {
             self.patch(&m.meta.id, |s| {
@@ -688,6 +819,29 @@ impl Reconciler {
             let mut next = cur.clone();
             f(&mut next.status);
             if next.status == cur.status {
+                return Ok(cur);
+            }
+            match col.update(next, Some(cur.meta.revision)) {
+                Ok(m) => return Ok(m),
+                Err(StoreError::Revision { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "machine {id}: too many concurrent writers"
+        )))
+    }
+
+    /// Apply `f` to the whole machine and write it back only if anything
+    /// changed. The rebuild request is an annotation, so ending it touches
+    /// `meta` as well as `status`.
+    async fn modify(&self, id: &Id, f: impl Fn(&mut Machine)) -> Result<Machine, StoreError> {
+        let col = self.machines();
+        for _ in 0..8 {
+            let cur = col.get(id)?;
+            let mut next = cur.clone();
+            f(&mut next);
+            if next.meta == cur.meta && next.status == cur.status {
                 return Ok(cur);
             }
             match col.update(next, Some(cur.meta.revision)) {

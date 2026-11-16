@@ -38,9 +38,43 @@ async fn boot() -> (Router, Store) {
         .layer(middleware::from_fn_with_state(
             gate.verifier().unwrap(),
             gate::attach_caller,
-        ));
+        ))
+        .layer(middleware::from_fn(note_client));
     (app, store)
 }
+
+/// What the gateway's own note says about a request: a socket carrying a
+/// [`keep::PeerIdentity`] names the address the sign-in is counted against.
+async fn note_client(
+    mut req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if let Some(addr) = req.extensions().get::<PeerAddr>().map(|peer| peer.0) {
+        req.extensions_mut().insert(audit::ClientAddr(addr));
+    }
+    next.run(req).await
+}
+
+/// The two addresses a sign-in is counted against in these tests.
+const ONE: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1));
+const TWO: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 2));
+
+/// The note a carrier of this cluster leaves on a request it carried.
+async fn note_carried(
+    mut req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(audit::Carried {
+        client: ONE,
+        by: "peer".into(),
+    });
+    next.run(req).await
+}
+
+/// The peer address of a connection, the shape `keep`'s identity carries it
+/// in on a real gateway.
+#[derive(Clone, Copy)]
+pub struct PeerAddr(pub std::net::IpAddr);
 
 async fn call(
     app: &Router,
@@ -72,7 +106,33 @@ async fn call(
 }
 
 async fn login(app: &Router, body: Value) -> (StatusCode, Value) {
-    call(app, "POST", "/identity/tokens", None, Some(body)).await
+    login_from(app, body, None).await
+}
+
+/// A login on a connection the gateway named `from`.
+async fn login_from(
+    app: &Router,
+    body: Value,
+    from: Option<std::net::IpAddr>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/identity/tokens")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    if let Some(addr) = from {
+        req.extensions_mut().insert(PeerAddr(addr));
+    }
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, json)
 }
 
 async fn admin_token(app: &Router) -> String {
@@ -109,8 +169,15 @@ fn find<'a>(page: &'a Value, action: &str, kind: &str) -> &'a Value {
 async fn identity_actions_are_recorded_with_who_and_what_and_no_secrets() {
     let (app, _store) = boot().await;
 
-    // A failed login, then a good one.
+    // A failed login and a name nobody holds, then a good one. Both are
+    // refused the same way, and neither is allowed to name a principal.
     let (s, _) = login(&app, json!({"name": "admin", "password": "hunter2-wrong"})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = login(
+        &app,
+        json!({"name": "nobody-here", "password": "hunter2-wrong"}),
+    )
+    .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let admin = admin_token(&app).await;
 
@@ -166,16 +233,22 @@ async fn identity_actions_are_recorded_with_who_and_what_and_no_secrets() {
     let page = audit_log(&app, &admin, "").await;
     let items = page["items"].as_array().unwrap();
     // Reads are not recorded: every record is one of the writes above.
-    assert_eq!(items.len(), 11, "{page}");
-    assert_eq!(page["total"], 11);
+    assert_eq!(items.len(), 12, "{page}");
+    assert_eq!(page["total"], 12);
 
-    // The failed login names who was tried, and nothing about the password.
+    // The failed login names the name that was tried and nobody's id, so the
+    // log cannot be read as a list of the names the cloud holds.
     let failed = &items[0]["spec"];
     assert_eq!(failed["action"], "login");
     assert_eq!(failed["status"], 401);
     assert_eq!(failed["principal"], "admin");
     assert!(failed.get("principal_id").is_none(), "{failed}");
-    let ok = &items[1]["spec"];
+    let missing = &items[1]["spec"];
+    assert_eq!(missing["action"], "login");
+    assert_eq!(missing["status"], 401);
+    assert_eq!(missing["principal"], "nobody-here");
+    assert!(missing.get("principal_id").is_none(), "{missing}");
+    let ok = &items[2]["spec"];
     assert_eq!(ok["action"], "login");
     assert_eq!(ok["status"], 200);
     assert_eq!(ok["principal"], "admin");
@@ -340,4 +413,111 @@ async fn only_a_cloud_admin_reads_the_log() {
     assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
     let (s, _) = call(&app, "GET", "/identity/audit", None, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_wait_brought_down_by_one_address_is_recorded_and_not_another_s() {
+    let (app, _store) = boot().await;
+    let admin = admin_token(&app).await;
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/identity/principals",
+        Some(&admin),
+        Some(json!({"name": "dora", "password": "dora-has-a-good-one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+
+    // One address fails dora's name to its ceiling; the wait it brings down
+    // refuses that address, and the right password from another address still
+    // gets in.
+    for _ in 0..gate::lockout::MAX_FAILURES {
+        let (s, _) = login_from(
+            &app,
+            json!({"name": "dora", "password": "not-it"}),
+            Some(ONE),
+        )
+        .await;
+        assert!(
+            s == StatusCode::UNAUTHORIZED || s == StatusCode::TOO_MANY_REQUESTS,
+            "{s}"
+        );
+    }
+    let (s, _) = login_from(
+        &app,
+        json!({"name": "dora", "password": "dora-has-a-good-one"}),
+        Some(ONE),
+    )
+    .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "the address is in a wait");
+    let (s, v) = login_from(
+        &app,
+        json!({"name": "dora", "password": "dora-has-a-good-one"}),
+        Some(TWO),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // The log keeps the refusal like any other login: the name that was
+    // tried, the status, and the address the attempt came from.
+    let page = audit_log(&app, &admin, "&action=login").await;
+    let items = page["items"].as_array().unwrap();
+    let refused = items
+        .iter()
+        .filter(|r| r["spec"]["status"] == 429 && r["spec"]["principal"] == "dora")
+        .collect::<Vec<_>>();
+    assert!(!refused.is_empty(), "a refusal is recorded: {page}");
+    for r in &refused {
+        assert_eq!(r["spec"]["client"], ONE.to_string(), "{r}");
+    }
+    let ok = items
+        .iter()
+        .find(|r| r["spec"]["status"] == 200 && r["spec"]["principal"] == "dora")
+        .expect("the sign-in that worked is recorded");
+    assert_eq!(ok["spec"]["client"], TWO.to_string(), "{ok}");
+}
+
+#[tokio::test]
+async fn a_wait_is_counted_against_the_address_the_record_names() {
+    // Where the request reached this server through a carrier of the cluster,
+    // the address counted against is the client behind the carrier — the one
+    // the record names — not the carrier's own connection.
+    let (app, _store) = boot().await;
+    let carried = Router::new()
+        .merge(app)
+        .layer(middleware::from_fn(note_carried));
+    let admin = admin_token(&carried).await;
+    let (s, v) = call(
+        &carried,
+        "POST",
+        "/identity/principals",
+        Some(&admin),
+        Some(json!({"name": "erin", "password": "erin-has-a-good-one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    for _ in 0..gate::lockout::MAX_FAILURES {
+        let (s, _) = login(&carried, json!({"name": "erin", "password": "not-it"})).await;
+        assert!(
+            s == StatusCode::UNAUTHORIZED || s == StatusCode::TOO_MANY_REQUESTS,
+            "{s}"
+        );
+    }
+    // Every attempt arrived as the client the carrier carried, and the wait
+    // the carrier's guesses brought down refuses the right password too.
+    let (s, _) = login(
+        &carried,
+        json!({"name": "erin", "password": "erin-has-a-good-one"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    let page = audit_log(&carried, &admin, "&action=login").await;
+    let refused = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["spec"]["status"] == 429 && r["spec"]["principal"] == "erin")
+        .expect("the refusal is recorded");
+    assert_eq!(refused["spec"]["client"], ONE.to_string(), "{refused}");
 }

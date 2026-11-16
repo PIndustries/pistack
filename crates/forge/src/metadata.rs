@@ -695,6 +695,7 @@ mod tests {
             addr: None,
             common_name: Some("node-b".into()),
             tls: true,
+            cert_serial: None,
         }));
         let query = MetadataQuery {
             node_name: "node-a".into(),

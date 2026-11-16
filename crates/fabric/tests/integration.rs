@@ -155,6 +155,7 @@ async fn network_subnet_ports_router_fip_flow() {
             h.meta(kind::ROUTER, "edge"),
             RouterSpec {
                 external_network: Some(ext.meta.id.clone()),
+                vpc: None,
                 interfaces: vec![],
                 routes: vec![],
             },
@@ -827,7 +828,11 @@ async fn call(
     let json = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap()
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            // Axum's own body errors come back as plain text.
+            Err(_) => serde_json::json!({"error": {"message": String::from_utf8_lossy(&bytes)}}),
+        }
     };
     (status, json)
 }
@@ -1204,6 +1209,273 @@ async fn only_an_admin_turns_automatic_floating_ips_on() {
     let (st, cleared) = call(&as_member, "PUT", "/networks/public", put(&off), None).await;
     assert_eq!(st, StatusCode::OK);
     assert!(cleared["spec"].get("auto_floating_ip").is_none());
+}
+
+/// A port that carries more than its own address: the pairs of virtual
+/// addresses it is allowed to move, at the API and through to the backend.
+#[tokio::test]
+async fn a_port_carries_allowed_address_pairs() {
+    let h = harness();
+    let app = api::router(h.client.clone());
+    let project = h.project.to_string();
+    let (st, net) = call(
+        &app,
+        "POST",
+        "/networks",
+        Some(serde_json::json!({"name": "vip", "project": project, "spec": {}})),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{net}");
+    let net_id = net["id"].as_str().unwrap().to_owned();
+    let (st, sub) = call(
+        &app,
+        "POST",
+        "/subnets",
+        Some(serde_json::json!({"name": "vip-v4", "project": project, "spec": {"network": net_id, "cidr": "10.60.0.0/24", "gateway": "10.60.0.1"}})),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{sub}");
+    let sub_id = sub["id"].as_str().unwrap().to_owned();
+
+    // One pair given bare, one with a mac of its own, one a whole prefix.
+    let pairs = serde_json::json!([
+        {"ip_address": "10.60.0.99/32"},
+        {"ip_address": "10.60.0.98/32", "mac_address": "fa:16:3e:00:00:98"},
+        {"ip_address": "10.60.9.0/28", "mac_address": "02:00:00:00:09:00"},
+    ]);
+    let body = |name: &str, spec: serde_json::Value| serde_json::json!({"name": name, "project": project, "spec": spec});
+    // Each refused port is named after what it gets wrong, and gets no row.
+    let bad_body = |why_name: &str, spec: serde_json::Value| serde_json::json!({"name": why_name, "project": project, "spec": spec});
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/ports",
+        Some(body(
+            "web-0",
+            serde_json::json!({"network": net_id, "allowed_address_pairs": pairs}),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{p}");
+    assert_eq!(p["spec"]["allowed_address_pairs"], pairs);
+    // A bare address is stored as that address with its host prefix.
+    let (st, bare) = call(
+        &app,
+        "POST",
+        "/ports",
+        Some(body(
+            "web-1",
+            serde_json::json!({
+                "network": net_id,
+                "allowed_address_pairs": [{"ip_address": "10.60.0.97"}],
+            }),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{bare}");
+    assert_eq!(
+        bare["spec"]["allowed_address_pairs"][0]["ip_address"],
+        "10.60.0.97/32"
+    );
+    let port_id = p["id"].as_str().unwrap().to_owned();
+    let rev = p["revision"].as_u64().unwrap();
+
+    // A bad pair is refused at create, whether it is caught by the reader or
+    // by the check over the whole spec.
+    let bad: Vec<serde_json::Value> = vec![
+        serde_json::json!([{"ip_address": "0.0.0.0/0"}]),
+        serde_json::json!([{"ip_address": "::/0"}]),
+        serde_json::json!([{"ip_address": "10.60.0.9", "mac_address": "nope"}]),
+        serde_json::json!([{"ip_address": "10.60.0.9"}, {"ip_address": "10.60.0.9"}]),
+        serde_json::json!([{"ip_address": "10.60.0.9", "mac_address": "01:00:5e:00:00:01"}]),
+    ];
+    for (n, bad) in bad.into_iter().enumerate() {
+        let (st, why) = call(
+            &app,
+            "POST",
+            "/ports",
+            Some(bad_body(
+                &format!("bad-{n}"),
+                serde_json::json!({
+                    "network": net_id, "allowed_address_pairs": bad
+                }),
+            )),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{why}");
+    }
+    // An address that is not an address at all never reaches the spec check:
+    // the body itself is refused.
+    let (st, why) = call(
+        &app,
+        "POST",
+        "/ports",
+        Some(bad_body(
+            "worse",
+            serde_json::json!({
+                "network": net_id,
+                "allowed_address_pairs": [{"ip_address": "not an address"}]
+            }),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{why}");
+    assert!(
+        why["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ip_address"),
+        "{why}"
+    );
+    let eleven: Vec<serde_json::Value> = (2..=12)
+        .map(|i| serde_json::json!({"ip_address": format!("10.60.0.{i}")}))
+        .collect();
+    let (st, why) = call(
+        &app,
+        "POST",
+        "/ports",
+        Some(bad_body(
+            "many",
+            serde_json::json!({
+                "network": net_id, "allowed_address_pairs": eleven
+            }),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{why}");
+    assert!(
+        why["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most 10"),
+        "{why}"
+    );
+
+    // An update replaces the whole spec, so each body below carries the
+    // port's own address and mac back.
+    let base = serde_json::json!({
+        "network": net_id, "subnet": sub_id,
+        "fixed_ips": p["spec"]["fixed_ips"], "mac": p["spec"]["mac"],
+    });
+    let spec_with = |extra: serde_json::Value| {
+        let mut s = base.as_object().unwrap().clone();
+        s.extend(extra.as_object().unwrap().clone());
+        serde_json::json!({"spec": s})
+    };
+
+    // A pair is dropped at update, and the whole set goes with an empty list.
+    let last_two = serde_json::Value::Array(pairs.as_array().unwrap()[1..].to_vec());
+    let (st, upd) = call(
+        &app,
+        "PUT",
+        &format!("/ports/{port_id}"),
+        Some(spec_with(
+            serde_json::json!({"allowed_address_pairs": last_two}),
+        )),
+        Some(rev),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{upd}");
+    assert_eq!(
+        upd["spec"]["allowed_address_pairs"],
+        serde_json::Value::Array(pairs.as_array().unwrap()[1..].to_vec())
+    );
+    let rev = upd["revision"].as_u64().unwrap();
+    let (st, upd) = call(
+        &app,
+        "PUT",
+        &format!("/ports/{port_id}"),
+        Some(spec_with(serde_json::json!({"allowed_address_pairs": []}))),
+        Some(rev),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{upd}");
+    assert!(upd["spec"].get("allowed_address_pairs").is_none());
+
+    // Turning port security off with a pair still on the port is refused.
+    let (st, why) = call(
+        &app,
+        "PUT",
+        &format!("/ports/{port_id}"),
+        Some(spec_with(serde_json::json!({
+            "port_security": false,
+            "allowed_address_pairs": [{"ip_address": "10.60.0.99/32"}],
+        }))),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{why}");
+    assert!(
+        why["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("needs port security"),
+        "{why}"
+    );
+
+    // Security off and the pairs gone in one write is what a caller does
+    // instead, and it is accepted.
+    let (st, upd) = call(
+        &app,
+        "PUT",
+        &format!("/ports/{port_id}"),
+        Some(spec_with(serde_json::json!({
+            "port_security": false, "allowed_address_pairs": [],
+        }))),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{upd}");
+    assert_eq!(upd["spec"]["port_security"], false);
+    let rev = upd["revision"].as_u64().unwrap();
+
+    // A port already without port security cannot be given a pair.
+    let (st, why) = call(
+        &app,
+        "PUT",
+        &format!("/ports/{port_id}"),
+        Some(spec_with(serde_json::json!({
+            "port_security": false,
+            "allowed_address_pairs": [{"ip_address": "10.60.0.99/32"}],
+        }))),
+        Some(rev),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{why}");
+
+    // And a machine's port carries the pair to the backend it is realised on.
+    let (st, upd) = call(
+        &app,
+        "PUT",
+        &format!("/ports/{port_id}"),
+        Some(spec_with(serde_json::json!({
+            "port_security": true,
+            "allowed_address_pairs": [{"ip_address": "10.60.0.99/32"}],
+        }))),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{upd}");
+    h.client.reconcile_all().await;
+    let stored = h
+        .client
+        .ports()
+        .resolve(Some(&h.project), &port_id)
+        .unwrap();
+    assert_eq!(stored.spec.allowed_address_pairs.len(), 1);
+    assert_eq!(
+        stored.spec.allowed_address_pairs[0].ip_address.to_string(),
+        "10.60.0.99/32"
+    );
+    assert_eq!(stored.status.phase, Phase::Ready);
+    assert!(h.backend.has_port(&stored.meta.id));
 }
 
 fn admin_caller() -> Caller {

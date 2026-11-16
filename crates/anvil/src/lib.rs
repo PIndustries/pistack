@@ -17,6 +17,8 @@
 //!   from a namespace per network.
 //! * [`agent`] — [`run_agent`], the entry point for `pistack agent`: hello,
 //!   heartbeats and the command loop over `pistack-rpc`.
+//! * [`renew`] — the agent's client certificate on disk, and renewing it
+//!   before it expires.
 
 pub mod agent;
 pub mod done;
@@ -26,6 +28,7 @@ mod overlay;
 mod ovnhost;
 mod ovnmeta;
 mod probe;
+pub mod renew;
 pub mod runtime;
 pub mod usage;
 

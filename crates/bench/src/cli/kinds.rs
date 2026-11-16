@@ -92,6 +92,14 @@ fn source_image(v: &Value, _: DateTime<Utc>) -> String {
     short_id(&str_at(v, "/spec/source/id"))
 }
 
+/// Serials are printed in hex, the way every other tool shows one.
+fn serial(v: &Value, _: DateTime<Utc>) -> String {
+    match v.pointer("/status/serial").and_then(Value::as_u64) {
+        Some(n) if n > 0 => format!("{n:x}"),
+        _ => String::new(),
+    }
+}
+
 /// `Attaching` until the host path is confirmed, then `Attached`.
 fn attach_state(v: &Value, _: DateTime<Utc>) -> String {
     let Some(items) = v.pointer("/status/conditions").and_then(Value::as_array) else {
@@ -134,25 +142,25 @@ fn host_path(v: &Value, _: DateTime<Utc>) -> String {
 
 macro_rules! col {
     ($h:literal, $f:ident) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
             get: $f,
         }
     };
     ($h:literal, $ptr:literal) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
-            get: |v, _| str_at(v, $ptr),
+            get: |v, _| $crate::cli::output::str_at(v, $ptr),
         }
     };
     ($h:literal, short $ptr:literal) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
-            get: |v, _| short_id(&str_at(v, $ptr)),
+            get: |v, _| $crate::cli::output::short_id(&$crate::cli::output::str_at(v, $ptr)),
         }
     };
     ($h:literal, list $ptr:literal) => {
-        Column {
+        $crate::cli::kinds::Column {
             header: $h,
             get: |v, _| {
                 v.pointer($ptr)
@@ -193,6 +201,30 @@ fn ingress_hosts(v: &Value, _: DateTime<Utc>) -> String {
             a.iter()
                 .filter_map(|r| r.get("host").and_then(Value::as_str))
                 .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
+/// `10.0.0.0/24=ro,10.1.0.0/16=rw`. A rule naming a principal rather than a
+/// CIDR shows that instead.
+fn access_rules(v: &Value, _: DateTime<Utc>) -> String {
+    v.pointer("/spec/access")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|rule| {
+                    let who = rule
+                        .get("cidr")
+                        .or_else(|| rule.get("principal"))
+                        .and_then(Value::as_str)?;
+                    match rule.get("mode").and_then(Value::as_str) {
+                        Some("read") => Some(format!("{who}=ro")),
+                        Some("write") => Some(format!("{who}=rw")),
+                        _ => Some(who.to_owned()),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         })
@@ -379,6 +411,23 @@ pub static KINDS: &[KindDef] = &[
         wide: WIDE_GLOBAL,
     },
     KindDef {
+        noun: "keypair",
+        aliases: &["keypairs", "key-pair", "key-pairs", "kp"],
+        path: "/compute/keypairs",
+        id_prefix: "keypair",
+        update: UpdateStyle::None,
+        flat_create: true,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("TYPE", "/spec/key_type"),
+            col!("FINGERPRINT", "/spec/fingerprint"),
+            col!("DESCRIPTION", description),
+            col!("AGE", created),
+        ],
+        wide: WIDE_PROJECT,
+    },
+    KindDef {
         noun: "host",
         aliases: &["hosts"],
         path: "/compute/hosts",
@@ -400,8 +449,34 @@ pub static KINDS: &[KindDef] = &[
             col!("LAST-SEEN", "/status/last_seen"),
         ],
         wide: &[
+            col!("CERT-EXPIRES", "/status/cert_expires"),
             col!("MESSAGE", "/status/message"),
             col!("FULL-ID", full_id),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "vpc",
+        aliases: &["vpcs"],
+        path: "/network/vpcs",
+        id_prefix: "vpc",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("PHASE", phase),
+            col!("CIDRS", list "/spec/cidrs"),
+            col!("EXTERNAL-NET", short "/spec/external_network"),
+            col!("SUBNETS", "/status/subnets"),
+            col!("ROUTER", short "/status/router"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("DNS-DOMAIN", "/spec/dns_domain"),
+            col!("MESSAGE", "/status/message"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
             col!("LABELS", labels),
         ],
     },
@@ -416,6 +491,7 @@ pub static KINDS: &[KindDef] = &[
             col!("NAME", name),
             col!("ID", id),
             col!("PHASE", phase),
+            col!("VPC", short "/spec/vpc"),
             col!("TYPE", "/spec/kind/type"),
             col!("VLAN", "/spec/kind/vlan"),
             col!("MTU", "/spec/mtu"),
@@ -794,18 +870,105 @@ pub static KINDS: &[KindDef] = &[
         ],
         wide: WIDE_PROJECT,
     },
+    KindDef {
+        noun: "share",
+        aliases: &["shares"],
+        path: "/shelf/shares",
+        id_prefix: "share",
+        update: UpdateStyle::Spec,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("PHASE", phase),
+            col!("PROTOCOL", "/spec/protocol"),
+            col!("SIZE-GIB", "/spec/size_gib"),
+            col!("ACCESS", access_rules),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("CLIENTS", count "/spec/access"),
+            col!("MESSAGE", "/status/message"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "secret",
+        aliases: &["secrets"],
+        path: "/secrets/secrets",
+        id_prefix: "sec",
+        update: UpdateStyle::Meta,
+        // keep takes the payload and the kind beside `name`.
+        flat_create: true,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("KIND", "/spec/kind"),
+            col!("VERSION", "/status/version"),
+            col!("ROTATED", "/status/last_rotated"),
+            col!("EXPIRES", "/spec/expires_at"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("CONTENT-TYPE", "/spec/content_type"),
+            col!("ROTATE-AFTER", "/spec/rotate_after_days"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
+    KindDef {
+        noun: "cert",
+        aliases: &["certs", "certificate", "certificates"],
+        path: "/secrets/certificates",
+        id_prefix: "cert",
+        update: UpdateStyle::None,
+        flat_create: false,
+        columns: &[
+            col!("NAME", name),
+            col!("ID", id),
+            col!("SUBJECT", "/spec/common_name"),
+            col!("SANS", list "/spec/sans"),
+            col!("USAGE", "/spec/usage"),
+            col!("SERIAL", serial),
+            col!("REVOKED", "/status/revoked"),
+            col!("EXPIRES", "/status/not_after"),
+            col!("AGE", created),
+        ],
+        wide: &[
+            col!("TTL-DAYS", "/spec/ttl_days"),
+            col!("ISSUER", short "/status/issuer"),
+            col!("FINGERPRINT", "/status/fingerprint_sha256"),
+            col!("KEY-SECRET", short "/status/key_secret"),
+            col!("FULL-ID", full_id),
+            col!("PROJECT", project),
+            col!("LABELS", labels),
+        ],
+    },
 ];
 
 pub fn by_noun(noun: &str) -> Option<&'static KindDef> {
     let n = noun.trim().to_lowercase().replace(['_', ' '], "-");
     let compact = n.replace('-', "");
-    KINDS.iter().find(|k| {
+    every().find(|k| {
         k.noun == n
             || k.noun.replace('-', "") == compact
             || k.aliases
                 .iter()
                 .any(|a| *a == n || a.replace('-', "") == compact)
     })
+}
+
+/// Nouns whose table lives with the command that uses it. Searched first, so
+/// a name given there wins over one in `KINDS`.
+fn extra() -> impl Iterator<Item = &'static KindDef> {
+    super::alarm::KINDS.iter().copied()
+}
+
+fn every() -> impl Iterator<Item = &'static KindDef> {
+    extra().chain(KINDS.iter())
 }
 
 #[cfg(test)]
@@ -829,6 +992,9 @@ mod tests {
         assert_eq!(by_noun("DaemonSet").unwrap().noun, "daemonset");
         assert_eq!(by_noun("hpa").unwrap().noun, "autoscaler");
         assert_eq!(by_noun("stack").unwrap().path, "/blueprint/stacks");
+        assert_eq!(by_noun("keypair").unwrap().path, "/compute/keypairs");
+        assert_eq!(by_noun("KeyPair").unwrap().noun, "keypair");
+        assert_eq!(by_noun("kp").unwrap().noun, "keypair");
         assert_eq!(by_noun("access-key").unwrap().path, "/secrets/access-keys");
         assert_eq!(by_noun("akey").unwrap().noun, "access-key");
         assert_eq!(by_noun("join-token").unwrap().path, "/secrets/join-tokens");

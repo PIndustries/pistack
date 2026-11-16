@@ -24,6 +24,7 @@ pub mod agent_driver;
 pub mod console;
 pub mod driver;
 pub mod http;
+pub mod keypair;
 pub mod maintain;
 mod metadata;
 mod nic;
@@ -34,6 +35,7 @@ pub mod scheduler;
 pub mod stats;
 pub mod types;
 mod usage;
+mod volumes;
 
 pub use agent_driver::{Registrar, RpcDriver};
 pub use driver::{
@@ -68,6 +70,11 @@ pub struct Forge {
     /// Treat unauthenticated requests as cloud admin.
     dev_admin: bool,
     strategy: Strategy,
+    /// Where what hosts report goes, and where the stats routes read it.
+    samples: Arc<gauge::SampleRing>,
+    /// Proof a host is off before its machines are evacuated. Defaults to a
+    /// fencer that drives each host's BMC; a test gives a fake.
+    fencer: Option<Arc<dyn maintain::Fencer>>,
 }
 
 impl Default for Forge {
@@ -79,6 +86,8 @@ impl Default for Forge {
             local_host: true,
             dev_admin: true,
             strategy: Strategy::Spread,
+            samples: gauge::samples(),
+            fencer: None,
         }
     }
 }
@@ -93,6 +102,8 @@ impl Forge {
             local_host: false,
             dev_admin: false,
             strategy: Strategy::Spread,
+            samples: gauge::samples(),
+            fencer: None,
         }
     }
 
@@ -119,6 +130,18 @@ impl Forge {
     }
     pub fn strategy(mut self, s: Strategy) -> Self {
         self.strategy = s;
+        self
+    }
+    /// Record host reports in, and answer stats from, `samples`. A test
+    /// gives its own window so it reads only what its hosts reported.
+    pub fn samples(mut self, samples: Arc<gauge::SampleRing>) -> Self {
+        self.samples = samples;
+        self
+    }
+    /// Prove hosts off with `fencer` instead of the BMC fencer built from
+    /// the store. A test gives a fake.
+    pub fn fencer(mut self, fencer: Arc<dyn maintain::Fencer>) -> Self {
+        self.fencer = Some(fencer);
         self
     }
     /// The registry the reconciler consults. Register per-host drivers here.
@@ -213,12 +236,19 @@ impl Module for Forge {
 
     fn router(&self, ctx: ModuleContext) -> Router {
         let store = ctx.store::<Store>();
+        let store = (*store).clone();
+        let fencer = self
+            .fencer
+            .clone()
+            .unwrap_or_else(|| Arc::new(maintain::BmcFencer::new(store.clone())));
         http::router(http::AppState {
-            store: (*store).clone(),
+            store,
             drivers: self.drivers.clone(),
             dev_admin: self.dev_admin,
             queue: self.queue.clone(),
             strategy: self.strategy,
+            samples: self.samples.clone(),
+            fencer,
         })
     }
 
@@ -235,6 +265,7 @@ impl Module for Forge {
         let strategy = self.strategy;
         let queue = self.queue.clone();
         let local_host = self.local_host;
+        let samples = self.samples.clone();
         let node_name = ctx.node_name.clone();
         let leadership = ctx.leadership.clone();
         let shutdown = ctx.shutdown.clone();
@@ -245,6 +276,7 @@ impl Module for Forge {
                     let drivers = drivers.clone();
                     let queue = queue.clone();
                     let node_name = node_name.clone();
+                    let samples = samples.clone();
                     async move {
                         match Forge::seed_sizes(&store) {
                             Ok(n) if n > 0 => {
@@ -265,7 +297,12 @@ impl Module for Forge {
                             }
                         }
                         let registrar = queue.as_ref().map(|q| {
-                            let r = Registrar::new(store.clone(), drivers.clone(), q.clone());
+                            let r = Registrar::with_gauge(
+                                store.clone(),
+                                drivers.clone(),
+                                q.clone(),
+                                gauge::Client::new(store.clone(), samples.clone()),
+                            );
                             tokio::spawn(r.run(active.clone()))
                         });
                         if registrar.is_some() {

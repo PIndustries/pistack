@@ -20,6 +20,10 @@ After the first start, `--init` is no longer needed. A server that finds an exis
 
 The certificate is valid for the IP address in `--tls-listen`, for the name `pistack`, and for the host in `--agent-url` when that is given. A server started with another `--tls-listen` or `--agent-url` than its certificate covers issues itself a new one. Files in `<data_dir>/tls` that the cloud CA did not issue are yours and are used as they are; the server warns that other servers and agents will not accept them.
 
+The certificate is valid for 365 days and the server renews it while it runs. It looks at it a minute after start and then every hour. Once two thirds of the lifetime have passed it makes a new key, has the cloud CA certify it, replaces the files in `<data_dir>/tls` and presents the new certificate from the next connection on. The listener is not restarted and open connections are not cut. The leader issues the certificate itself. A follower asks the leader for it and proves it is a member with the cluster key, because only the leader writes the store. The leader does not need to have seen the follower's certificate before; it goes by the cloud CA's signature on it and issues one with the same names. If the leader cannot be reached the follower keeps its certificate and asks again ten minutes later.
+
+A certificate in `<data_dir>/tls` that the cloud CA did not sign, one you installed yourself, is used as it is and never replaced. Once it is two thirds through its lifetime the server logs a warning every ten minutes, and you replace the files and restart. A server that was stopped until its certificate expired presents the expired one when it starts and renews it at the first look, a minute later.
+
 Each server writes the address of its HTTPS listener into its member record, as `agent_api`. That is the address agents on HTTPS are given for it, in the list of servers and when a follower names the leader. It is also where the other servers call it; see [TLS between servers](#tls-between-servers). So the address has to reach that one server, not a balancer in front of several. `--agent-url` overrides it. A server restarted with a different `--tls-listen` has the record corrected within a few seconds, and one restarted without it has the address removed.
 
 Until this is finished, put the API on a private network.
@@ -155,7 +159,7 @@ Only the leader:
 - serves joins and snapshots,
 - promotes learners.
 
-Any server answers reads. A write sent to a server that is not the leader is not forwarded. It is refused with `409` and the leader's address:
+Any server answers reads. A write sent to a server that is not the leader is refused with `409` and the leader's address, unless the client asks for it to be carried there (below):
 
 ```json
 {"error":{"code":"conflict","message":"not the leader","details":{"leader":"http://10.0.0.12:8443"}}}
@@ -167,7 +171,11 @@ Any server answers reads. A write sent to a server that is not the leader is not
 http://10.0.0.11:8443 is not the leader; sending the request to http://10.0.0.12:8443
 ```
 
-It does this only when the leader's address has the same scheme as the one `pi` was given, so a token sent over `https` is never repeated over `http`; otherwise it prints the refusal. It does not remember the leader. To save the extra request, point `pi` at the leader (`pi cluster status` shows which server that is). Other clients have to follow the address themselves, or go through a proxy that sends traffic to whichever server reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
+It does this only when the leader's address has the same scheme as the one `pi` was given, so a token sent over `https` is never repeated over `http`; otherwise it prints the refusal. Within one command `pi` remembers that address and sends the rest of its requests there, so a `--wait` that follows a write reads from the server that took it. It does not remember it into the next command. To save the extra request, point `pi` at the leader (`pi cluster status` shows which server that is). Other clients have to follow the address themselves, or go through a proxy that sends traffic to whichever server reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
+
+A client that cannot go to another address asks the server to do it. With the header `X-PiStack-Forward: leader`, a server that does not lead carries the request to the leader over the same link the servers use between themselves, and hands back the leader's answer. The token goes with the request and the leader checks it as usual. After a write the server waits, up to two seconds, for its own copy to reach that write, so a read sent to it next already shows the change. The console sends this header on every request, so it works the same on any server. A body over 8 MiB is not carried: the answer names the leader instead. The leader's audit record of a carried request shows the client's address, the one the carrier saw, and names the server that carried it beside it. The client's address travels in a header only the carrier's peer key makes count: a server takes these headers off anything that is not another server of the cluster, so a client cannot put an address of its own into a record.
+
+A carried request keeps the headers the client sent. Only the ones belonging to the connection it leaves are taken off — the hop-by-hop headers, and any name a `Connection` line asks to drop — and the carrier's own three. Everything else arrives as it was sent, repeats and all, because a client that signed a header checks it on the far side. `Host` follows that rule with one twist. An S3 request signed under `/silo`, by header or by presigned query, is signed over the address the client meant, and the leader is the server that checks it. A client that had that address would have gone to the leader itself, so the leader cannot work it out; the carrier passes on the one the client sent. Nothing else carries a `Host`: a bearer token says who the caller is without help from the name, and a caller must not be able to choose the address the leader answers under. So `curl --aws-sigv4` works against any server of the cluster with that header, whether the request has a body or not, while a signed request sent without it is still refused with the leader's address to try.
 
 Agents do follow. An agent that loses its server tries the other servers it knows and registers with the new leader. An agent that joined over HTTPS only ever moves to another HTTPS address: it logs and skips a plain one, so every server it should fail over to needs `--tls-listen`.
 
@@ -309,6 +317,8 @@ A `pistack` that is older than the store refuses to open it, says which version 
 
 Take a backup before replacing the binary. A migrated store cannot be opened by the old binary again; going back means restoring that backup with the old binary.
 
+The key servers recognise each other with is kept in the store on its own. It used to be derived from the token signing secret, and a cloud upgraded from such a build keeps exactly the value it had, so servers on the old and the new build go on recognising each other while they are upgraded one at a time. Rotating the token signing keys does not change it. Upgrade every server before the first rotation; [Identity and access](Identity-and-access#upgrading-from-a-build-without-key-ids) says what breaks otherwise. There is no command to change this key.
+
 Each server migrates its own copy of the store. Servers do not compare schema versions with each other, so when a release raises the version, stop every server, replace the binary on all of them, and start them again. A binary from before the version was recorded does not check it at all.
 
 ## Looking at the store
@@ -334,12 +344,12 @@ pistack --data-dir /var/lib/pistack store dump
 | `node.name` | The node name, chosen once. `PISTACK_NODE_NAME` overrides and rewrites it. |
 | `adopt.url` | The join target, present only while a join is in progress. |
 | `state.partial` | A snapshot download in progress, for a join or for a store replacement. |
-| `tls/` | Certificate, key and CA for `--tls-listen`. |
-| `agent/` | The agent's certificate, on a machine that also runs an agent. |
-| `images/`, `volumes/`, `silo/`, `shares/` | Module data. See [Storage](Storage). |
+| `tls/` | Certificate, key and CA for `--tls-listen`. `tls/next/` exists only while a renewed set is being moved into place. |
+| `agent/` | The agent's certificate, on a machine that also runs an agent. `agent/next/` is the same for the agent. |
+| `images/`, `volumes/`, `silo/`, `shares/`, `gauge/` | Module data. See [Storage](Storage). |
 
 ## Settings that must match across servers
 
 The network backend is cluster-wide. The leader saves `PISTACK_FABRIC_BACKEND` in the store and servers started without the variable use the saved value. Set it the same way on every server, or set it on the first and leave it unset on the rest.
 
-The root-key backend (`PISTACK_KEEP_BACKEND` and the Vault settings) must be the same on every server. The `pistack keep` commands change one server's store and have to be run on each.
+The root-key backend (`PISTACK_KEEP_BACKEND` and the Vault settings) must be the same on every server. The `pistack keep` commands change one server's store and have to be run on each. `pistack keep rotate-root-key` also has to be given the same key file on each; see [Identity and access](Identity-and-access#rotating-the-root-key).

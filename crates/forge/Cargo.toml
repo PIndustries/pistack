@@ -12,6 +12,7 @@ pistack-rpc.workspace = true
 fabric.workspace = true
 gate.workspace = true
 keep.workspace = true
+power.workspace = true
 gauge.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
@@ -26,9 +27,15 @@ uuid.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 futures.workspace = true
+base64.workspace = true
+sha2.workspace = true
+rand.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
 http-body-util = "0.1"
 anvil.workspace = true
+mold.workspace = true
 reqwest.workspace = true
+tempfile.workspace = true

@@ -35,7 +35,7 @@ status:
 - The `id` is the kind prefix and a UUIDv7. `pi` shows a short form (`mach-69655f47`).
 - A resource can also carry a `description`, `labels` and `annotations`.
 
-A create or update returns as soon as the spec is stored. The work happens afterwards, and `status.phase` and `status.conditions` tell you how far it got. `--wait` on `pi` commands polls until the resource settles.
+A create or update returns as soon as the spec is stored. The work happens afterwards, and `status.phase` and `status.conditions` tell you how far it got. `--wait` on `pi` commands polls until the resource settles. In a cluster the server answering a read may not have the row the write wrote yet, so a wait keeps asking for ten seconds before it calls a missing row an error.
 
 Names are unique per kind within a project. Anywhere the API or `pi` takes an id, it also takes the name.
 

@@ -301,6 +301,7 @@ mod tests {
                     external_network: Some(fleet.meta.id),
                     interfaces: vec![sub.meta.id],
                     routes: vec![],
+                    vpc: None,
                 },
             )
             .unwrap();

@@ -9,8 +9,9 @@
 
 use crate::types::{
     validate_document, validate_kit, validate_spec, validate_workflow, Kit, KitSpec, Stack,
-    StackPhase, StackRevision, StackSpec, StackStatus, Workflow, WorkflowPhase, WorkflowSpec,
-    WorkflowStatus, APPLYING_MESSAGE, KIT_KIND, REVISION_HISTORY_LIMIT, WORKFLOW_KIND,
+    StackDocument, StackPhase, StackRevision, StackSpec, StackStatus, Workflow, WorkflowPhase,
+    WorkflowSpec, WorkflowStatus, APPLYING_MESSAGE, KIT_KIND, REVISION_HISTORY_LIMIT,
+    WORKFLOW_KIND,
 };
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::error::ErrorCode;
@@ -174,11 +175,9 @@ impl Client {
     }
 
     fn apply_stack_from(&self, id: &Id, restored_from: Option<u64>) -> ApiResult<Stack> {
-        let applied = self.apply_rows::<StackSpec>(
-            id,
-            |spec| &spec.document,
-            |status, spec| record_revision(status, spec, restored_from),
-        )?;
+        let applied = self.apply_rows::<StackSpec>(id, |status, spec| {
+            record_revision(status, spec, restored_from)
+        })?;
         tracing::debug!(
             id = %applied.meta.id,
             revision = applied.status.revision,
@@ -189,35 +188,34 @@ impl Client {
         Ok(applied)
     }
 
-    /// The apply path shared by stacks and kits: mark `Applying`, realize
-    /// the document, then store `Ready` or `Failed`. `on_ready` runs on the
-    /// final status after a successful realize, with the spec that was
-    /// applied.
-    fn apply_rows<S: Spec>(
+    /// The apply path shared by stacks and kits: substitute the parameters,
+    /// mark `Applying`, realize the document, then store `Ready` or `Failed`.
+    /// `on_ready` runs on the final status after a successful realize, with
+    /// the spec that was applied. A parameter that is named without being
+    /// declared, or declared with neither a value nor a default, is refused
+    /// before the first write: the stack keeps the status it had.
+    fn apply_rows<S>(
         &self,
         id: &Id,
-        document: impl Fn(&S) -> &str,
         mut on_ready: impl FnMut(&mut StackStatus, &S),
-    ) -> ApiResult<Resource<S, StackStatus>> {
+    ) -> ApiResult<Resource<S, StackStatus>>
+    where
+        S: Spec + StackDocument,
+    {
         let col = self.store.collection::<Resource<S, StackStatus>>();
         let cur = col.get(id)?;
-        validate_document(document(&cur.spec))?;
-        let cur = col.modify(id, |r| {
+        validate_document(cur.spec.document())?;
+        let document = cur.spec.realized()?;
+        let managed = managed_ids(&cur.status);
+        let project = cur.meta.project.clone();
+        let applied = cur.spec;
+        let mut out = Applied::default();
+        let result = realize(&self.store, project.as_ref(), &document, &managed, &mut out);
+        // One write holds the whole outcome: the applying mark and the result
+        // are not two revisions of the same apply.
+        let next = col.modify(id, |r| {
             r.status.phase = StackPhase::Applying;
             r.status.message = APPLYING_MESSAGE.to_owned();
-            Ok(())
-        })?;
-        let managed = managed_ids(&cur.status);
-        let mut out = Applied::default();
-        let result = realize(
-            &self.store,
-            cur.meta.project.as_ref(),
-            document(&cur.spec),
-            &managed,
-            &mut out,
-        );
-        let applied = cur.spec;
-        let next = col.modify(id, |r| {
             finish(&mut r.status, &managed, &out, result.as_ref().err());
             if result.is_ok() {
                 on_ready(&mut r.status, &applied);
@@ -258,10 +256,11 @@ impl Client {
         self.kits().delete(id).map_err(Into::into)
     }
 
-    /// Apply a stored kit document through [`realize`]. Phases and updates
-    /// work as for a stack; a kit keeps no revision history.
+    /// Apply a stored kit document through [`realize`], substituting its
+    /// parameters first. Phases and updates work as for a stack; a kit keeps
+    /// no revision history.
     pub fn apply_kit(&self, id: &Id) -> ApiResult<Kit> {
-        let applied = self.apply_rows::<KitSpec>(id, |spec| &spec.document, |_, _| {})?;
+        let applied = self.apply_rows::<KitSpec>(id, |_, _| {})?;
         tracing::debug!(
             id = %applied.meta.id,
             created = applied.status.created.len(),
@@ -525,36 +524,47 @@ fn beacon_client(store: &Store) -> beacon::Client {
 }
 
 fn parse_document(document: &str) -> ApiResult<Vec<DocItem>> {
-    let mut items = Vec::new();
+    parse_all(document)?
+        .into_iter()
+        .filter(|value| !value.is_null())
+        .map(doc_item)
+        .collect()
+}
+
+/// The document as a stream of values, read the way apply reads it.
+fn parse_all(document: &str) -> ApiResult<Vec<Value>> {
+    let mut docs = Vec::new();
     for doc in serde_yaml_ng::Deserializer::from_str(document) {
         let value = serde_json::Value::deserialize(doc)
             .map_err(|e| ApiError::bad_request(format!("document is not valid YAML: {e}")))?;
-        if value.is_null() {
-            continue;
-        }
-        if !value.is_object() {
-            return Err(ApiError::bad_request(
-                "each document must be a resource mapping",
-            ));
-        }
-        let kind = value
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_owned();
-        if kind.is_empty() {
-            return Err(ApiError::bad_request("resource is missing kind"));
-        }
-        let name = value
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let spec = value.get("spec").cloned().unwrap_or(Value::Null);
-        items.push(DocItem { kind, name, spec });
+        docs.push(value);
     }
-    Ok(items)
+    Ok(docs)
+}
+
+/// One value of a parsed stream, as a document item.
+fn doc_item(value: Value) -> ApiResult<DocItem> {
+    if !value.is_object() {
+        return Err(ApiError::bad_request(
+            "each document must be a resource mapping",
+        ));
+    }
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if kind.is_empty() {
+        return Err(ApiError::bad_request("resource is missing kind"));
+    }
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let spec = value.get("spec").cloned().unwrap_or(Value::Null);
+    Ok(DocItem { kind, name, spec })
 }
 
 fn spec_is_empty(spec: &Value) -> bool {
@@ -751,6 +761,7 @@ fn router_spec(
     }
     Ok(fabric::RouterSpec {
         external_network,
+        vpc: None,
         interfaces,
         routes: doc.routes,
     })
@@ -1557,6 +1568,7 @@ spec:
                 StackSpec {
                     name: "web".into(),
                     document: DOC.into(),
+                    declared: Vec::new(),
                     parameters: Default::default(),
                 },
             )
@@ -1675,6 +1687,7 @@ spec: {}
                 StackSpec {
                     name: name.into(),
                     document: document.into(),
+                    declared: Vec::new(),
                     parameters: Default::default(),
                 },
             )
@@ -1923,6 +1936,7 @@ spec: {}
                 KitSpec {
                     name: "base".into(),
                     document: document.into(),
+                    declared: Vec::new(),
                     parameters: Default::default(),
                 },
             )

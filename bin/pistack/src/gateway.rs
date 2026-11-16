@@ -146,7 +146,17 @@ pub fn build(
         ctx.shutdown.clone(),
     );
 
-    app = guarded(app, store);
+    app = guarded(app, store.clone());
+
+    // The headers a server puts on a request it carries for a client are
+    // taken off anything else that sends them, above every other layer. A
+    // server with no peer key in its store yet has no member to prove,
+    // which is right: no server can carry for it, and every route checks
+    // its caller with this same store.
+    app = app.layer(middleware::from_fn_with_state(
+        store,
+        crate::cluster::strip_carrier_headers,
+    ));
 
     if let Some(handle) = cluster {
         app = app.merge(crate::cluster::router(handle.clone()));
@@ -156,8 +166,20 @@ pub fn build(
             reads_at_leader,
         ));
         app = app.layer(middleware::from_fn_with_state(
-            handle,
+            handle.clone(),
             crate::cluster::reject_follower_writes,
+        ));
+        app = app.layer(middleware::from_fn_with_state(
+            handle.clone(),
+            crate::cluster::wait_for_named_commit,
+        ));
+        // Outside both: every answer this follower gives, a refusal of its
+        // own or one carried from the leader, names the leader. `/healthz`
+        // is routed inside `app`, under this layer, so the cheap probe a
+        // client uses before a large upload is answered here too.
+        app = app.layer(middleware::from_fn_with_state(
+            handle,
+            crate::cluster::name_the_leader,
         ));
         // Over every route: object bytes for other servers are under the
         // silo module, not under /cluster.
@@ -300,10 +322,10 @@ async fn enforce_write_role(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// The role check and the audit log around every route in `app`. Both are
-/// inner to authentication, so the `Caller`, when there is one, is already
-/// attached. The role check is inner to the audit, so a refused write is
-/// recorded.
+/// The role check and the audit log around every route in `app`. All three
+/// are inner to authentication, so the `Caller`, when there is one, is
+/// already attached. The role check is inner to the audit, so a refused
+/// write is recorded.
 fn guarded(app: Router, store: pistack_store::Store) -> Router {
     app.layer(middleware::from_fn(enforce_write_role))
         .layer(middleware::from_fn_with_state(store, gate::audit::layer))
@@ -350,6 +372,11 @@ async fn reads_at_leader(
         || !(gate::audit::audited_read(path) || usage_read(path))
     {
         return next.run(req).await;
+    }
+    if crate::cluster::wants_forward(req.headers()) {
+        let mut req = req;
+        req.headers_mut().remove(crate::cluster::FORWARD_HEADER);
+        return crate::cluster::forward_to_leader(&handle, req).await;
     }
     let leader = handle
         .leader_api
@@ -706,6 +733,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_header_from_a_client_does_not_choose_the_recorded_address() {
+        let store = Store::in_memory().unwrap();
+        gate::Keys::load_or_create(&store).unwrap();
+        let key = keep::peer::peer_key(&store).unwrap();
+        let peer = keep::PeerIdentity::plain("10.0.0.9:51234".parse().unwrap());
+        let app = Router::new()
+            .fallback(|| async { "ok" })
+            .layer(middleware::from_fn_with_state(
+                store.clone(),
+                crate::cluster::strip_carrier_headers,
+            ))
+            .layer(middleware::from_fn_with_state(
+                store.clone(),
+                gate::audit::layer,
+            ))
+            .layer(middleware::from_fn(super::note_client))
+            .layer(Extension(peer));
+        // A client sending what a carrier sends: a key from another cloud,
+        // and an address it would like recorded.
+        let forged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compute/machines")
+                    .header(crate::cluster::PEER_HEADER, "0".repeat(64))
+                    .header(crate::cluster::NODE_HEADER, "sim9")
+                    .header(keep::peer::CLIENT_ADDR_HEADER, "203.0.113.99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::OK);
+        // The same from a server of this cluster, whose key checks out.
+        // This is the leader's own edge: a write answered here is audited
+        // inside the cluster layer, which is what reads the carrier's
+        // headers, so at this edge the connection's address stands and
+        // nothing is forged either way.
+        let carried = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compute/hosts/rack1/drain")
+                    .header(crate::cluster::PEER_HEADER, key)
+                    .header(crate::cluster::NODE_HEADER, "sim2")
+                    .header(keep::peer::CLIENT_ADDR_HEADER, "203.0.113.7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(carried.status(), StatusCode::OK);
+
+        let log = records(&store);
+        assert_eq!(log.len(), 2);
+        for record in &log {
+            assert_eq!(record.client.as_deref(), Some("10.0.0.9"));
+            assert_eq!(record.carried_by, None);
+        }
+    }
+
+    #[tokio::test]
     async fn a_follower_sends_an_audited_read_and_a_usage_read_to_the_leader() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
@@ -761,6 +852,125 @@ mod tests {
             status(&app, "GET", "/compute/machines/web/stats").await,
             StatusCode::OK
         );
+    }
+
+    /// A follower names the leader on `/healthz` (which the cluster layers
+    /// already let through) and on its 409; the leader names no one.
+    async fn answers_naming_leader(leader: bool) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let established = crate::cluster::Established {
+            role: pistack_cluster::Role::Voter,
+            leader,
+            leader_api: if leader {
+                "http://10.0.0.12:8443".into()
+            } else {
+                "http://10.0.0.11:8443".into()
+            },
+            term: 1,
+            members: Vec::new(),
+        };
+        let handle = std::sync::Arc::new(crate::cluster::handle_from(
+            "n2".into(),
+            "http://10.0.0.12:8443".into(),
+            "c1".into(),
+            store.clone(),
+            dir.path().join("state.redb"),
+            &established,
+            None,
+            pistack_types::Leadership::new(leader),
+        ));
+        let app = Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .fallback(|| async { "ok" })
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                crate::cluster::reject_follower_writes,
+            ))
+            .layer(middleware::from_fn_with_state(
+                handle.clone(),
+                crate::cluster::name_the_leader,
+            ));
+        let mut named = 0;
+        for (method, path) in [("GET", "/healthz"), ("POST", "/compute/machines")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let values: Vec<_> = response
+                .headers()
+                .get_all(crate::cluster::LEADER_HEADER)
+                .iter()
+                .collect();
+            assert!(values.len() <= 1, "{method} {path}: {values:?}");
+            if values
+                .first()
+                .is_some_and(|value| *value == "http://10.0.0.11:8443")
+            {
+                named += 1;
+            }
+        }
+        named
+    }
+
+    #[tokio::test]
+    async fn a_follower_names_the_leader_on_healthz_and_on_a_refusal() {
+        assert_eq!(answers_naming_leader(false).await, 2);
+        assert_eq!(answers_naming_leader(true).await, 0);
+    }
+
+    /// A server in no cluster at all names no one, on any answer.
+    #[tokio::test]
+    async fn a_server_with_no_cluster_names_no_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        gate::Keys::load_or_create(&store).unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let ctx = pistack_types::ModuleContext::for_test(
+            std::sync::Arc::new(store.clone()),
+            events,
+            tokio_util::sync::CancellationToken::new(),
+            "http://127.0.0.1:8443",
+            "solo",
+        );
+        let asm = crate::server::Assembly {
+            modules: Vec::new(),
+            forge: std::sync::Arc::new(forge::Forge::default()),
+            queue: pistack_rpc::CommandQueue::default(),
+            images: std::sync::Arc::new(mold::LocalDirStore::new(dir.path().join("images"))),
+        };
+        let verifier = gate::Verifier::from_store(&store).unwrap();
+        let app = super::build(&asm, ctx, verifier, true, None);
+        for (method, path) in [
+            ("GET", "/healthz"),
+            ("POST", "/compute/machines"),
+            ("GET", "/"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(crate::cluster::LEADER_HEADER),
+                "{method} {path}"
+            );
+        }
     }
 
     /// A server holding one ready image, with the agent transport on a real

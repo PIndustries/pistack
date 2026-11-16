@@ -17,18 +17,88 @@
 use crate::agent_driver::begin_migration;
 use crate::scheduler::{self, Allocations, Strategy};
 use crate::types::{
-    delete_requested, usable_underlay, Host, Machine, MachineKind, PowerState, Size,
-    EVACUATED_FROM_ANNOTATION, NODE_PIN_ANNOTATION,
+    delete_requested, machine_disks_are_shared, usable_underlay, Host, Machine, MachineKind,
+    PowerState, Size, EVACUATED_FROM_ANNOTATION, NODE_PIN_ANNOTATION,
 };
+use async_trait::async_trait;
 use pistack_rpc::CommandQueue;
 use pistack_store::Store;
 use pistack_types::{kind, ApiError, ApiResult, Id, Phase, Resource, Resources, Spec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// The host capability that can live-migrate a guest. The agent's migrate
-/// command is `virsh migrate`, whatever else the host runs.
-const LIVE_MIGRATION_DRIVER: &str = "libvirt";
+/// command is `virsh migrate`, whatever else the host runs, and it is
+/// reached only when the agent reports this capability.
+pub const LIVE_MIGRATION_DRIVER: &str = "libvirt";
+
+/// Volume backends whose data is not on the host that attaches it.
+const SHARED_BACKENDS: &[&str] = &["rbd"];
+
+/// Whether `host`'s agent can take part in a live migration, as source or
+/// as destination.
+pub fn can_live_migrate(host: &Host) -> bool {
+    host.spec
+        .drivers
+        .iter()
+        .any(|d| d.trim().eq_ignore_ascii_case(LIVE_MIGRATION_DRIVER))
+}
+
+/// Why `machine` is not asked off `host`: the disk that stays behind, said
+/// in the words `drain` reports and a migrate call returns. `None` when
+/// nothing on this host holds it.
+///
+/// A root disk is a file on its host, so a host that keeps its disks to
+/// itself cannot hand a machine to another. A volume that is not on shared
+/// storage holds its machine the same way; a volume whose type forge cannot
+/// see is counted as local, because nothing says its data is anywhere else.
+/// [`evacuate`] reasons about the same rows.
+pub fn disk_holds_machine(store: &Store, machine: &Machine, host: &Host) -> Option<String> {
+    if !machine_disks_are_shared(host) {
+        return Some(
+            "its root disk is a file on this host, and live migration needs storage both hosts \
+             share"
+                .to_owned(),
+        );
+    }
+    let Ok(volumes) = store.collection::<Volume>().list(None) else {
+        return None;
+    };
+    let attached: Vec<Volume> = volumes
+        .into_iter()
+        .filter(|v| v.status.attached_to.as_ref() == Some(&machine.meta.id))
+        .collect();
+    if attached.is_empty() {
+        return None;
+    }
+    let Ok(types) = store.collection::<VolumeType>().list(None) else {
+        return Some(format!(
+            "its volumes ({}) are on storage this host has not shared, which live migration \
+             cannot move",
+            volume_names(&attached)
+        ));
+    };
+    attached.iter().find_map(|v| {
+        let shared = types.iter().any(|t| {
+            (t.meta.name == v.spec.volume_type || t.meta.id.to_string() == v.spec.volume_type)
+                && SHARED_BACKENDS.contains(&t.spec.backend.trim())
+        });
+        (!shared).then(|| {
+            format!(
+                "volume {} is on storage this host has not shared, which live migration cannot \
+                 move",
+                v.meta.name
+            )
+        })
+    })
+}
+
+fn volume_names(volumes: &[Volume]) -> String {
+    let mut names: Vec<&str> = volumes.iter().map(|v| v.meta.name.as_str()).collect();
+    names.sort_unstable();
+    names.join(", ")
+}
 
 /// A machine that is on its way to another host.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,13 +179,15 @@ pub fn drain(
         .collect();
 
     // Other hosts a guest can be migrated to. The scheduler applies the
-    // rest: ready, enabled, selector, zone, room.
-    let dests: Vec<Host> = hosts
+    // rest: ready, enabled, selector, zone, room. `others` is every other
+    // host, so a report can say when none of them can take a migration at
+    // all rather than that placement found nothing.
+    let others: Vec<&Host> = hosts.iter().filter(|h| h.meta.id != host.meta.id).collect();
+    let dests: Vec<Host> = others
         .iter()
-        .filter(|h| h.meta.id != host.meta.id)
-        .filter(|h| h.spec.drivers.iter().any(|d| d == LIVE_MIGRATION_DRIVER))
+        .filter(|h| can_live_migrate(h))
         .filter(|h| usable_underlay(h.spec.underlay_ip.as_deref()).is_some())
-        .cloned()
+        .map(|h| (*h).clone())
         .collect();
 
     // Names on each host for the affinity hints, and the room in-flight
@@ -133,7 +205,7 @@ pub fn drain(
         }
     }
 
-    let can_migrate = host.spec.drivers.iter().any(|d| d == LIVE_MIGRATION_DRIVER);
+    let can_migrate = can_live_migrate(host);
     let mut moving = Vec::new();
     let mut left = Vec::new();
     let mut here: Vec<&Machine> = machines
@@ -187,6 +259,10 @@ pub fn drain(
             ));
             continue;
         }
+        if let Some(reason) = disk_holds_machine(store, m, host) {
+            leave(reason);
+            continue;
+        }
         if m.status.phase != Phase::Ready {
             let mut reason = format!(
                 "is {}; only a ready machine can be live-migrated",
@@ -212,8 +288,14 @@ pub fn drain(
         };
         let dest = match scheduler::place_networked(&m.spec, &size, &dests, &alloc, strategy) {
             Ok(id) => id,
-            Err(e) => {
-                leave(e.message);
+            Err(_) => {
+                leave(no_destination(
+                    host,
+                    &others,
+                    &dests.iter().collect::<Vec<_>>(),
+                    size,
+                    &alloc,
+                ));
                 continue;
             }
         };
@@ -236,26 +318,194 @@ pub fn drain(
     Ok((moving, left))
 }
 
-fn phase_word(phase: Phase) -> String {
+pub(crate) fn phase_word(phase: Phase) -> String {
     format!("{phase:?}").to_lowercase()
+}
+
+/// Why the drain found no destination. The scheduler saw only the hosts
+/// that can take a live migration and answers in a tally of the whole fleet;
+/// an operator needs host names, so this names one host per reason, in the
+/// order the placement checks them.
+fn no_destination(
+    host: &Host,
+    others: &[&Host],
+    tried: &[&Host],
+    size: Resources,
+    alloc: &Allocations,
+) -> String {
+    if others.is_empty() {
+        return format!(
+            "host {} is the only host here, so there is nowhere to migrate to",
+            host.meta.name
+        );
+    }
+    if tried.is_empty() {
+        return format!(
+            "none of the {} other {} here can take a live migration",
+            others.len(),
+            if others.len() == 1 { "host" } else { "hosts" }
+        );
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(h) = tried.iter().find(|h| h.status.phase != Phase::Ready) {
+        parts.push(format!("{} is not ready", h.meta.name));
+    }
+    if let Some(h) = tried.iter().find(|h| h.spec.disabled) {
+        parts.push(format!("{} is disabled", h.meta.name));
+    }
+    if let Some(h) = tried
+        .iter()
+        .find(|h| !size.fits_in(&h.status.free.saturating_sub(&alloc.used_on(&h.meta.id))))
+    {
+        parts.push(format!(
+            "{} has no room for {} vcpus and {} MiB",
+            h.meta.name, size.vcpus, size.memory_mib
+        ));
+    }
+    if parts.is_empty() {
+        return format!(
+            "none of the {} hosts that could take it fits its networks, affinity or \
+             host_selector",
+            tried.len()
+        );
+    }
+    parts.join(", ")
 }
 
 // ---- evacuate ----------------------------------------------------------------
 
-/// Volume backends whose data is not on the host that attaches it.
-const SHARED_BACKENDS: &[&str] = &["rbd"];
+/// How long to wait for a power-off to be confirmed before the evacuation
+/// is refused. A host that will not answer its BMC within this is treated
+/// as unfenceable, and nothing moves.
+pub const FENCE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a pending power-off is re-read.
+const FENCE_POLL: Duration = Duration::from_millis(500);
 
 /// Body of `POST /hosts/{id}/evacuate`.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct EvacuateOptions {
-    /// The operator says a disabled host that may still be reporting is
-    /// dead. Not needed for a host that is already down.
+    /// The operator says the host is dead. Required every time a host has
+    /// no power control, whether or not it is already marked down. Not
+    /// needed for a host the server can power off and confirm.
     #[serde(default)]
     pub confirm_dead: bool,
     /// Accept that each machine starts again from its image without the
     /// root disk it had. No machine is evacuated without it.
     #[serde(default)]
     pub rebuild_from_image: bool,
+}
+
+/// How the evacuation proved the host is off, so its machines can be
+/// started elsewhere without leaving a second copy running.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Proof {
+    /// The server cut the host's power through its BMC and read the off
+    /// state back.
+    PowerOff,
+    /// An operator said so (`confirm_dead`), for a host with no power
+    /// control the server can drive.
+    Operator,
+}
+
+impl Proof {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proof::PowerOff => "power-off",
+            Proof::Operator => "operator",
+        }
+    }
+
+    /// The proof in the shape an audit `action` takes: lowercase, words
+    /// joined with underscores.
+    fn audit_tag(self) -> &'static str {
+        match self {
+            Proof::PowerOff => "power_off",
+            Proof::Operator => "operator",
+        }
+    }
+}
+
+/// Cuts a host's power from outside and proves it is off. Reached through
+/// a trait so an evacuation can be tested against a fake; the real one
+/// drives the host's BMC over IPMI or Redfish.
+#[async_trait]
+pub trait Fencer: Send + Sync {
+    /// Power `host` off and confirm the off state. Errors if the host has
+    /// no power control, or is not confirmed off within [`FENCE_TIMEOUT`].
+    async fn fence(&self, host: &Host) -> ApiResult<()>;
+}
+
+/// The real fencer: drives a host's BMC over IPMI or Redfish with the
+/// shared `power` crate, and reads the BMC password from the secret named
+/// on the host. The password is read only here, only for one power-off,
+/// and is never returned or logged.
+pub struct BmcFencer {
+    store: Store,
+    timeout: Duration,
+    poll: Duration,
+}
+
+impl BmcFencer {
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            timeout: FENCE_TIMEOUT,
+            poll: FENCE_POLL,
+        }
+    }
+
+    /// The BMC password for `host`, read from the secret its power control
+    /// names. A host with no power control, or naming a secret that is not
+    /// there, cannot be fenced.
+    fn password(&self, pc: &crate::types::PowerControl) -> ApiResult<Vec<u8>> {
+        let client = keep::Client::open(&self.store)
+            .map_err(|_| ApiError::unavailable("the secrets service is unavailable"))?;
+        let listed = client
+            .list_secrets(None)
+            .map_err(|_| ApiError::unavailable("the secrets service is unavailable"))?;
+        let Some(secret) = listed
+            .into_iter()
+            .find(|s| s.meta.name == pc.secret || s.meta.id.to_string() == pc.secret)
+        else {
+            return Err(ApiError::unavailable(format!(
+                "host power control names a secret, {:?}, that is not there",
+                pc.secret
+            )));
+        };
+        client
+            .get_secret_payload(&secret.meta.id)
+            .map_err(|_| ApiError::unavailable("the host's BMC password could not be read"))
+    }
+}
+
+#[async_trait]
+impl Fencer for BmcFencer {
+    async fn fence(&self, host: &Host) -> ApiResult<()> {
+        let pc = host
+            .spec
+            .power_control
+            .as_ref()
+            .ok_or_else(|| ApiError::conflict("host has no power control"))?;
+        let kind = power::Kind::parse(&pc.kind)?;
+        let secret = power::Secret::Bytes(self.password(pc)?);
+        let control = kind.control(pc.address.clone(), pc.user.clone(), secret);
+        control.power_off().await?;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            match control.power_status().await {
+                Ok(power::ChassisPower::Off) => return Ok(()),
+                Ok(_) | Err(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(ApiError::unavailable(format!(
+                        "host {} was told to power off but is not confirmed off within {}s",
+                        host.meta.name,
+                        self.timeout.as_secs()
+                    )));
+                }
+                Ok(_) | Err(_) => tokio::time::sleep(self.poll).await,
+            }
+        }
+    }
 }
 
 /// A machine that was handed back to the scheduler.
@@ -274,13 +524,33 @@ pub struct Evacuated {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvacuateReport {
     pub host: Host,
+    /// How this call proved the host is off: a power-off the server
+    /// confirmed, or the operator's word.
+    pub proof: Proof,
+    /// Set when a power-off was tried and did not happen, saying why. The
+    /// proof is then `operator` and the machines moved on that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_off_failed: Option<String>,
     pub evacuated: Vec<Evacuated>,
     /// Machines left on the host's record, and why.
     pub skipped: Vec<Left>,
 }
 
+/// What an evacuation settled on: the proof it used, what it moved, what it
+/// left, and a note when a power-off was tried and failed.
+pub struct Evacuation {
+    pub proof: Proof,
+    pub power_off_failed: Option<String>,
+    pub evacuated: Vec<Evacuated>,
+    pub skipped: Vec<Left>,
+}
+
 // slab's rows, read as views so forge does not depend on slab. They ignore
-// every field they do not need and are never written back.
+// every field they do not need and are never written back. `evacuate` and
+// [`has_local_volume`] read both, so the kind is named once here.
+
+type Volume = Resource<VolumeSpecView, VolumeStatusView>;
+type VolumeType = Resource<VolumeTypeSpecView, NoStatus>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct VolumeSpecView {
@@ -305,47 +575,128 @@ struct VolumeTypeSpecView {
 }
 
 impl Spec for VolumeTypeSpecView {
+    /// slab names its volume types `voltype`; there is no `kind` entry for it.
     const KIND: &'static str = "voltype";
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct NoStatus {}
 
-/// A host may be evacuated when it has stopped reporting, or when an
-/// operator disabled it and says it is dead. Anything else risks starting
-/// a second copy of a machine that is still running.
-fn may_evacuate(host: &Host, confirm_dead: bool) -> ApiResult<()> {
-    if host.status.phase == Phase::Error {
-        return Ok(());
-    }
-    if host.spec.disabled && confirm_dead {
-        return Ok(());
-    }
+/// Why a host without power control cannot be evacuated without a
+/// confirmation, naming both ways out.
+fn needs_proof(host: &Host) -> ApiError {
     let name = &host.meta.name;
-    Err(ApiError::conflict(if host.spec.disabled {
-        format!(
-            "host {name} is disabled but still reporting. Its machines may be running, and \
-             evacuating them would start second copies. If the host is dead, confirm it \
-             (confirm_dead, `pi host evacuate --confirm-dead`)"
-        )
+    ApiError::conflict(format!(
+        "host {name} has no power control the server can drive, so it cannot prove the host is \
+         off. Its machines may be running, and evacuating them would start second copies. Either \
+         confirm the host is dead (confirm_dead, `pi host evacuate --confirm-dead`), or give the \
+         host power control so the server can power it off and check (`pi host power set`)"
+    ))
+}
+
+/// Why a host that is disabled but still reporting cannot be evacuated on the
+/// strength of a disabled flag alone. The host answers its control plane, so
+/// its machines are almost certainly running.
+fn still_reporting(host: &Host) -> ApiError {
+    let name = &host.meta.name;
+    let consequence = if host.spec.power_control.is_some() {
+        "evacuating it cuts the host's power and hard-stops every machine on it, since their root \
+         disks are here"
     } else {
-        format!(
-            "host {name} is up. Evacuate only acts on a host that is down, or on a disabled \
-             host you confirm is dead. Use drain to empty a working host"
-        )
-    }))
+        "the server cannot cut its power, so evacuating its machines risks starting second copies \
+         while these keep running"
+    };
+    ApiError::conflict(format!(
+        "host {name} is disabled but still reporting. {consequence}. Confirm the host is dead \
+         (confirm_dead, `pi host evacuate --confirm-dead`) to go ahead, or use drain to empty a \
+         working host",
+    ))
+}
+
+/// What a fence attempt that did not end in a confirmed power-off has to say,
+/// with the reason the host could not be proved off in it.
+fn fence_failed(host: &Host, transport: &str, reason: &str) -> String {
+    format!(
+        "a power-off over {transport} was tried for host {} and failed ({reason})",
+        host.meta.name
+    )
+}
+
+/// Prove `host` is off, so its machines may start elsewhere without a
+/// second copy.
+///
+/// A host that stopped reporting may be evacuated: it is gone, which is what
+/// evacuate is for. A host that still reports may not, even once disabled —
+/// that is a host that works, and a working host is emptied with drain.
+///
+/// A host that is down and has power control is fenced: the server powers it
+/// off and reads the off state back, and no confirmation is needed. A host
+/// that still reports needs `confirm_dead` before the server will touch its
+/// power at all, because disabling a host is not a statement that it is dead.
+///
+/// A power-off that fails or cannot be confirmed within [`FENCE_TIMEOUT`]
+/// refuses the evacuation and moves nothing, unless `confirm_dead` was given:
+/// a BMC that died with its host is a dead host, and an operator who has
+/// looked at it is allowed to say so. The report then says the power-off was
+/// tried and failed, and on what grounds. Without the confirmation nothing
+/// moves, and the refusal says why. Returns the proof used and, when a
+/// power-off was attempted and did not happen, the note describing it.
+async fn prove_off(
+    host: &Host,
+    opts: EvacuateOptions,
+    fencer: Option<&dyn Fencer>,
+) -> ApiResult<(Proof, Option<String>)> {
+    // A host still doing its work is emptied with drain, which copies
+    // machines off, not with an evacuation that abandons them here.
+    let down = host.status.phase == Phase::Error;
+    if !down && !host.spec.disabled {
+        return Err(ApiError::conflict(format!(
+            "host {} is up. Evacuate only acts on a host that is down, or one you have disabled. \
+             Use drain to empty a working host",
+            host.meta.name
+        )));
+    }
+    // Disabled says no new work lands here; it does not say the host is off.
+    // Only a host that stopped reporting may be powered off unasked.
+    if !down && !opts.confirm_dead {
+        return Err(still_reporting(host));
+    }
+    if let (Some(pc), Some(fencer)) = (host.spec.power_control.as_ref(), fencer) {
+        // Power control is configured but the fencer cannot reach it (no
+        // secret, no tool): that is a fault, and the operator's word only
+        // stands in for it when they have explicitly said the host is dead.
+        let transport = pc.kind.clone();
+        if let Err(e) = fencer.fence(host).await {
+            let why = fence_failed(host, &transport, &e.message);
+            if !opts.confirm_dead {
+                return Err(ApiError::conflict(format!(
+                    "{why}, so nothing was evacuated and its machines were not started a second \
+                     time. Confirm the host is dead (confirm_dead, \
+                     `pi host evacuate --confirm-dead`) to evacuate anyway"
+                )));
+            }
+            return Ok((Proof::Operator, Some(why)));
+        }
+        return Ok((Proof::PowerOff, None));
+    }
+    if opts.confirm_dead {
+        return Ok((Proof::Operator, None));
+    }
+    Err(needs_proof(host))
 }
 
 /// Hand the machines of a dead host back to the scheduler.
 ///
-/// Safe to call again: a machine that was evacuated is no longer on the
-/// host, so a second call only sees what the first one skipped.
-pub fn evacuate(
+/// Nothing moves until the host is proved off (see [`prove_off`]). Safe to
+/// call again: a machine that was evacuated is no longer on the host, so a
+/// second call only sees what the first one skipped.
+pub async fn evacuate(
     store: &Store,
     host: &Host,
     opts: EvacuateOptions,
-) -> ApiResult<(Vec<Evacuated>, Vec<Left>)> {
-    may_evacuate(host, opts.confirm_dead)?;
+    fencer: Option<&dyn Fencer>,
+) -> ApiResult<Evacuation> {
+    let (proof, power_off_failed) = prove_off(host, opts, fencer).await?;
     let col = store.collection::<Machine>();
     let mut here: Vec<Machine> = col
         .list(None)?
@@ -460,6 +811,7 @@ pub fn evacuate(
             name = %m.meta.name,
             host = %host.meta.id,
             image = %m.spec.image,
+            proof = proof.as_str(),
             "forge: machine evacuated; it starts from its image without its old root disk"
         );
         evacuated.push(Evacuated {
@@ -469,5 +821,62 @@ pub fn evacuate(
             volumes: attached.iter().map(|v| v.meta.name.clone()).collect(),
         });
     }
-    Ok((evacuated, skipped))
+    record_proof(
+        store,
+        host,
+        proof,
+        power_off_failed.as_deref(),
+        evacuated.len(),
+    );
+    Ok(Evacuation {
+        proof,
+        power_off_failed,
+        evacuated,
+        skipped,
+    })
+}
+
+/// Write an audit record naming the proof an evacuation used, alongside the
+/// `evacuate` action the gateway already records. When a power-off was tried
+/// and failed the reason rides along as an audit note, so the record says that
+/// the fence was attempted and did not happen, not only whose word was taken
+/// instead. A store error is logged, not returned: on a follower the
+/// write is refused, and the evacuation itself has already happened.
+fn record_proof(
+    store: &Store,
+    host: &Host,
+    proof: Proof,
+    power_off_failed: Option<&str>,
+    moved: usize,
+) {
+    let mut meta = pistack_types::Meta::new("audit", "audit", None);
+    meta.name = meta.id.to_string();
+    let mut notes = std::collections::BTreeMap::new();
+    if let Some(why) = power_off_failed {
+        notes.insert("power_off_failed".to_owned(), why.to_owned());
+    }
+    let event = gate::audit::AuditEvent {
+        meta,
+        spec: gate::audit::AuditSpec {
+            method: "POST".into(),
+            path: format!("/compute/hosts/{}/evacuate", host.meta.id),
+            action: format!("evacuate:proof_{}", proof.audit_tag()),
+            kind: kind::HOST.into(),
+            resource: host.meta.id.to_string(),
+            notes,
+            ..Default::default()
+        },
+        status: gate::audit::AuditStatus {},
+    };
+    if let Err(e) = store.collection::<gate::audit::AuditEvent>().create(event) {
+        tracing::debug!(host = %host.meta.id, error = %e, "forge: evacuation proof was not audited");
+        return;
+    }
+    tracing::info!(
+        host = %host.meta.id,
+        proof = proof.as_str(),
+        moved,
+        power_off_failed = power_off_failed.unwrap_or("none"),
+        "forge: host evacuated"
+    );
 }

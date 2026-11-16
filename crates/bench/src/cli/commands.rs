@@ -8,6 +8,7 @@
 use super::args::*;
 use super::client::{CliError, CliResult, Client};
 use super::config::Profile;
+use super::dns::dns;
 use super::kinds::{self, KindDef, UpdateStyle};
 use super::output::{self, print_list, print_one, print_value, short_id, str_at, Output};
 use super::{Ctx, Io};
@@ -18,6 +19,10 @@ use std::time::Duration;
 
 const POLL: Duration = Duration::from_secs(1);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a wait keeps asking for a resource the same command just
+/// created, while the server it reads from has not caught up with the
+/// server that answered the create.
+const ABSENT_GRACE: Duration = Duration::from_secs(10);
 
 pub async fn dispatch(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<i32> {
     match cmd {
@@ -47,6 +52,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Quota { cmd } => quota(ctx, cmd, io).await,
         Cmd::Audit { cmd } => audit(ctx, cmd, io).await,
         Cmd::User { cmd } => user(ctx, cmd, io).await,
+        Cmd::SigningKey { cmd } => signing_key(ctx, cmd, io).await,
         Cmd::Role { cmd } => role(ctx, cmd, io).await,
         Cmd::Binding { cmd } => binding(ctx, cmd, io).await,
         Cmd::Key { cmd } => key(ctx, cmd, io).await,
@@ -54,10 +60,12 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::JoinToken { cmd } => join_token(ctx, cmd, io).await,
         Cmd::Machine { cmd } => machine(ctx, cmd, io).await,
         Cmd::Size { cmd } => size(ctx, cmd, io).await,
+        Cmd::Keypair { cmd } => keypair(ctx, cmd, io).await,
         Cmd::Host { cmd } => host(ctx, cmd, io).await,
         Cmd::Cluster { cmd } => cluster(ctx, cmd, io).await,
         Cmd::Server { cmd } => server(ctx, cmd, io).await,
         Cmd::Network { cmd } => network(ctx, cmd, io).await,
+        Cmd::Vpc { cmd } => super::vpc::vpc(ctx, cmd, io).await,
         Cmd::Subnet { cmd } => subnet(ctx, cmd, io).await,
         Cmd::Port { cmd } => port(ctx, cmd, io).await,
         Cmd::Router { cmd } => router(ctx, cmd, io).await,
@@ -75,18 +83,28 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Daemonset { cmd } => daemonset(ctx, cmd, io).await,
         Cmd::Autoscaler { cmd } => autoscaler(ctx, cmd, io).await,
         Cmd::Stack { cmd } => stack(ctx, cmd, io).await,
+        Cmd::Lb { cmd } => super::lb::dispatch(ctx, cmd, io).await,
+        Cmd::Backup { cmd } => super::backup::backup(ctx, cmd, io).await,
+        Cmd::Bucket { cmd } => super::bucket::bucket(ctx, cmd, io).await,
+        Cmd::Object { cmd } => super::bucket::object(ctx, cmd, io).await,
+        Cmd::Share { cmd } => super::share::share(ctx, cmd, io).await,
+        Cmd::Secret { cmd } => crate::cli::secret::secret(ctx, cmd, io).await,
+        Cmd::Cert { cmd } => crate::cli::secret::cert(ctx, cmd, io).await,
+        Cmd::Dns { cmd } => dns(ctx, cmd, io).await,
+        Cmd::Alarm { cmd } => super::alarm::alarm(ctx, kind("alarm"), cmd, io).await,
+        Cmd::Metric { cmd } => super::alarm::metric(ctx, cmd, io).await,
     }
 }
 
 // ---- small helpers ------------------------------------------------------------
 
-fn kind(noun: &str) -> &'static KindDef {
+pub(crate) fn kind(noun: &str) -> &'static KindDef {
     // Every noun this file names is in the table; a miss is a programming error.
     kinds::by_noun(noun).unwrap_or(&kinds::KINDS[0])
 }
 
 /// `k=v` pairs into a JSON object of strings.
-fn parse_kv(pairs: &[String], what: &str) -> CliResult<Map<String, Value>> {
+pub(crate) fn parse_kv(pairs: &[String], what: &str) -> CliResult<Map<String, Value>> {
     let mut m = Map::new();
     for p in pairs {
         let (k, v) = p
@@ -122,12 +140,12 @@ fn at_file(s: &str) -> CliResult<String> {
     }
 }
 
-fn opt(v: Option<String>) -> Value {
+pub(crate) fn opt(v: Option<String>) -> Value {
     v.map(Value::String).unwrap_or(Value::Null)
 }
 
 /// Drop nulls so the server's `#[serde(default)]` applies.
-fn compact(v: Value) -> Value {
+pub(crate) fn compact(v: Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
             m.into_iter()
@@ -141,7 +159,7 @@ fn compact(v: Value) -> Value {
 }
 
 /// Name or id -> id, via `GET /<path>/{name}` when needed.
-async fn resolve(c: &Client, k: &KindDef, name_or_id: &str) -> CliResult<String> {
+pub(crate) async fn resolve(c: &Client, k: &KindDef, name_or_id: &str) -> CliResult<String> {
     if k.is_id(name_or_id) {
         return Ok(name_or_id.to_owned());
     }
@@ -155,7 +173,7 @@ async fn resolve(c: &Client, k: &KindDef, name_or_id: &str) -> CliResult<String>
     Ok(str_at(&v, "/id"))
 }
 
-async fn resolve_opt(c: &Client, k: &KindDef, v: &Option<String>) -> CliResult<Value> {
+pub(crate) async fn resolve_opt(c: &Client, k: &KindDef, v: &Option<String>) -> CliResult<Value> {
     match v {
         Some(s) => Ok(Value::String(resolve(c, k, s).await?)),
         None => Ok(Value::Null),
@@ -171,7 +189,12 @@ async fn resolve_all(c: &Client, k: &KindDef, names: &[String]) -> CliResult<Val
 }
 
 /// Create body in the shape the module expects.
-fn create_body(k: &KindDef, name: &str, meta: &MetaArgs, spec: Value) -> CliResult<Value> {
+pub(crate) fn create_body(
+    k: &KindDef,
+    name: &str,
+    meta: &MetaArgs,
+    spec: Value,
+) -> CliResult<Value> {
     let labels = parse_kv(&meta.labels, "--label")?;
     let mut body = Map::new();
     body.insert("name".into(), json!(name));
@@ -191,20 +214,26 @@ fn create_body(k: &KindDef, name: &str, meta: &MetaArgs, spec: Value) -> CliResu
     Ok(Value::Object(body))
 }
 
-fn confirm(io: &mut Io<'_>, what: &str) -> CliResult<bool> {
+pub(crate) fn confirm(io: &mut Io<'_>, verb: &str, what: &str) -> CliResult<bool> {
     if !io.tty {
         return Err(CliError::usage(format!(
-            "refusing to delete {what} without --yes (no terminal to confirm on)"
+            "refusing to {verb} {what} without --yes (no terminal to confirm on)"
         )));
     }
-    write!(io.stderr, "delete {what}? [y/N] ")?;
+    write!(io.stderr, "{verb} {what}? [y/N] ")?;
     io.stderr.flush()?;
     let line = io.read_line()?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
 /// Say what happened in table mode; dump the resource otherwise.
-fn report(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, v: &Value, verb: &str) -> CliResult<()> {
+pub(crate) fn report(
+    ctx: &Ctx,
+    io: &mut Io<'_>,
+    k: &KindDef,
+    v: &Value,
+    verb: &str,
+) -> CliResult<()> {
     match ctx.fmt.output {
         Output::Table | Output::Wide => {
             let id = str_at(v, "/id");
@@ -228,7 +257,18 @@ fn report(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, v: &Value, verb: &str) -> Cli
 
 // ---- generic verbs --------------------------------------------------------------
 
-async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>> {
+pub(crate) async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>> {
+    list_walk(c, k, a, &[]).await
+}
+
+/// The same walk with query pairs the noun needs and `ListArgs` has no field
+/// for — a zone to restrict a record set listing to, say.
+pub(crate) async fn list_walk(
+    c: &Client,
+    k: &KindDef,
+    a: &ListArgs,
+    extra: &[(&str, String)],
+) -> CliResult<Vec<Value>> {
     let mut query: Vec<String> = Vec::new();
     if a.all {
         query.push("all=true".into());
@@ -242,6 +282,9 @@ async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>
             }
         }
         query.push(format!("labels={}", a.selector.join(",")));
+    }
+    for (key, value) in extra {
+        query.push(format!("{key}={}", query_escape(value)));
     }
     let mut items = Vec::new();
     let mut after: Option<String> = None;
@@ -266,21 +309,21 @@ async fn list_all(c: &Client, k: &KindDef, a: &ListArgs) -> CliResult<Vec<Value>
     Ok(items)
 }
 
-async fn do_list(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: ListArgs) -> CliResult<()> {
+pub(crate) async fn do_list(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: ListArgs) -> CliResult<()> {
     let c = ctx.client()?;
     let items = list_all(&c, k, &a).await?;
     print_list(io.stdout, ctx.fmt, k, &items)?;
     Ok(())
 }
 
-async fn do_show(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: NameArg) -> CliResult<()> {
+pub(crate) async fn do_show(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: NameArg) -> CliResult<()> {
     let c = ctx.client()?;
     let v = c.get_value(&k.item_path(&a.name)).await?;
     print_one(io.stdout, ctx.fmt, &v)?;
     Ok(())
 }
 
-async fn do_create(
+pub(crate) async fn do_create(
     ctx: &Ctx,
     io: &mut Io<'_>,
     k: &KindDef,
@@ -291,19 +334,24 @@ async fn do_create(
     let v = c.post(k.path, &body).await?;
     report(ctx, io, k, &v, "created")?;
     if wait {
-        return wait_ready(&c, io, k, &str_at(&v, "/id")).await;
+        return wait_ready(&c, io, k, &Just::of(&v, "")).await;
     }
     Ok(v)
 }
 
-async fn do_delete(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: DeleteArgs) -> CliResult<()> {
+pub(crate) async fn do_delete(
+    ctx: &Ctx,
+    io: &mut Io<'_>,
+    k: &KindDef,
+    a: DeleteArgs,
+) -> CliResult<()> {
     let c = ctx.client()?;
     let path = k.item_path(&a.name);
-    if !a.yes && !confirm(io, &format!("{} \"{}\"", k.noun, a.name))? {
+    if !a.yes && !confirm(io, "delete", &format!("{} \"{}\"", k.noun, a.name))? {
         writeln!(io.stderr, "aborted")?;
         return Ok(());
     }
-    let (status, _) = c.delete(&path).await?;
+    let (status, v) = c.delete(&path).await?;
     let verb = if status == reqwest::StatusCode::ACCEPTED {
         "deletion requested"
     } else {
@@ -311,7 +359,7 @@ async fn do_delete(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, a: DeleteArgs) -> Cl
     };
     writeln!(io.stdout, "{} \"{}\" {verb}", k.noun, a.name)?;
     if a.wait && status == reqwest::StatusCode::ACCEPTED {
-        wait_gone(&c, io, k, &a.name).await?;
+        wait_gone(&c, io, k, &Just::of(&v, &a.name)).await?;
     }
     Ok(())
 }
@@ -335,12 +383,96 @@ async fn do_action(
     Ok(v)
 }
 
+/// A resource a command has just written: its id, and the name the user
+/// called it by. A server that does not lead answers reads from its own copy,
+/// which lags the one that took the write, so the row can be missing for a
+/// moment.
+#[derive(Clone)]
+struct Just {
+    id: String,
+    name: String,
+}
+
+impl Just {
+    /// The resource the create or action endpoint handed back.
+    fn of(v: &Value, name: &str) -> Just {
+        Just {
+            id: str_at(v, "/id"),
+            name: if name.is_empty() {
+                str_at(v, "/name")
+            } else {
+                name.to_owned()
+            },
+        }
+    }
+    /// How to ask for it: by id when there is one. The create and action
+    /// endpoints answer with the row they wrote, so the id in hand is that
+    /// row and reading by it cannot be answered from a name index that
+    /// reached this server earlier than the row did.
+    fn key(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        }
+    }
+    /// A 404 this command's own write arriving late could explain. A 404
+    /// about anything else is not that, and stays the error it looks like.
+    /// The server puts what it was asked for in the message, so a 404 that
+    /// names neither of this resource's two names is about a third thing.
+    fn could_be_my_row(&self, e: &CliError) -> bool {
+        let CliError::Api {
+            status: 404,
+            message,
+            details,
+            ..
+        } = e
+        else {
+            return false;
+        };
+        let key = self.key();
+        let names = [key, &self.name, &self.id];
+        names.iter().any(|n| !n.is_empty() && message.contains(*n))
+            || details
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == self.id)
+    }
+    /// What the user called this resource by.
+    fn says(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// The row of `just`, asked for again while the server's copy catches up. A
+/// 404 that could be about it is retried until the grace is up, then returned
+/// as the error it looks like. Anything else comes back at once.
+async fn read_just(c: &Client, k: &KindDef, just: &Just) -> CliResult<Value> {
+    let until = tokio::time::Instant::now() + ABSENT_GRACE;
+    loop {
+        match c.get_value(&k.item_path(just.key())).await {
+            Ok(v) => return Ok(v),
+            Err(e) if !just.could_be_my_row(&e) => return Err(e),
+            Err(e) => {
+                if tokio::time::Instant::now() >= until {
+                    return Err(e);
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        }
+    }
+}
+
 /// Poll until `status.phase` is `ready` or `error`, printing each change.
-async fn wait_ready(c: &Client, io: &mut Io<'_>, k: &KindDef, id: &str) -> CliResult<Value> {
+async fn wait_ready(c: &Client, io: &mut Io<'_>, k: &KindDef, just: &Just) -> CliResult<Value> {
     let start = tokio::time::Instant::now();
     let mut last = String::new();
     loop {
-        let v = c.get_value(&k.item_path(id)).await?;
+        let v = read_just(c, k, just).await?;
         let phase = str_at(&v, "/status/phase");
         if phase != last {
             let msg = str_at(&v, "/status/message");
@@ -379,27 +511,32 @@ async fn wait_ready(c: &Client, io: &mut Io<'_>, k: &KindDef, id: &str) -> CliRe
     }
 }
 
-async fn wait_gone(c: &Client, io: &mut Io<'_>, k: &KindDef, name: &str) -> CliResult<()> {
+/// Poll until the resource is gone. What the delete answered with is a row
+/// the server had a moment ago; a 404 naming something else is not this
+/// resource leaving but a copy that does not have it, so the row asked for is
+/// the one that answers.
+async fn wait_gone(c: &Client, io: &mut Io<'_>, k: &KindDef, just: &Just) -> CliResult<()> {
     let start = tokio::time::Instant::now();
     let mut last = String::new();
+    let says = just.says().to_owned();
     loop {
-        match c.get_value(&k.item_path(name)).await {
+        match c.get_value(&k.item_path(&just.name)).await {
             Ok(v) => {
                 let phase = str_at(&v, "/status/phase");
                 if phase != last {
-                    writeln!(io.stdout, "{} \"{name}\": {phase}", k.noun)?;
+                    writeln!(io.stdout, "{} \"{says}\": {phase}", k.noun)?;
                     last = phase;
                 }
             }
             Err(e) if e.is_not_found() => {
-                writeln!(io.stdout, "{} \"{name}\": gone", k.noun)?;
+                writeln!(io.stdout, "{} \"{says}\": gone", k.noun)?;
                 return Ok(());
             }
             Err(e) => return Err(e),
         }
         if start.elapsed() > WAIT_TIMEOUT {
             return Err(CliError::usage(format!(
-                "timed out waiting for {} \"{name}\" to go away",
+                "timed out waiting for {} \"{says}\" to go away",
                 k.noun
             )));
         }
@@ -896,6 +1033,11 @@ async fn apply(ctx: &Ctx, a: ApplyArgs, io: &mut Io<'_>) -> CliResult<()> {
                 Err(e) => return Err(e),
             }
         };
+        // A secret is its payload, so `keep` handles that noun in `secret.rs`.
+        if k.noun == "secret" {
+            super::secret::apply(ctx, io, k, &doc, existing).await?;
+            continue;
+        }
         match existing {
             None => {
                 let mut body = Map::new();
@@ -989,7 +1131,7 @@ fn merge(dst: &mut Value, src: Value) {
 
 // ---- identity nouns -------------------------------------------------------------------
 
-async fn project(ctx: &Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
+async fn project(ctx: &mut Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
     let k = kind("project");
     match cmd {
         ProjectCmd::List(a) => do_list(ctx, io, k, a).await,
@@ -1004,6 +1146,89 @@ async fn project(ctx: &Ctx, cmd: ProjectCmd, io: &mut Io<'_>) -> CliResult<()> {
             });
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, false).await.map(|_| ())
+        }
+        ProjectCmd::Mine => {
+            let c = ctx.client()?;
+            let items = c.get_value("/identity/tokens/self/projects").await?;
+            let empty = Vec::new();
+            let items = items.as_array().unwrap_or(&empty);
+            match ctx.fmt.output {
+                Output::Json | Output::Yaml => {
+                    print_value(io.stdout, ctx.fmt, &Value::Array(items.to_vec()))?;
+                }
+                Output::Name => {
+                    for it in items {
+                        writeln!(io.stdout, "{}", str_at(it, "/name"))?;
+                    }
+                }
+                _ => {
+                    let rows: Vec<Vec<String>> = items
+                        .iter()
+                        .map(|it| {
+                            let roles = it
+                                .pointer("/roles")
+                                .and_then(Value::as_array)
+                                .map(|a| output::join(a))
+                                .unwrap_or_default();
+                            let current = it["current"] == json!(true);
+                            vec![
+                                if current { "*".into() } else { String::new() },
+                                str_at(it, "/name"),
+                                roles,
+                                str_at(it, "/parent_name"),
+                            ]
+                        })
+                        .collect();
+                    write!(
+                        io.stdout,
+                        "{}",
+                        output::table(&["", "name", "roles", "parent"], &rows, ctx.fmt.no_headers)
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        ProjectCmd::Switch(a) => {
+            let c = ctx.client()?;
+            let resp = c
+                .post(
+                    "/identity/tokens/self/switch",
+                    &json!({"project": a.project}),
+                )
+                .await?;
+            let token = str_at(&resp, "/token");
+            if token.is_empty() {
+                return Err(CliError::Transport("server returned no token".into()));
+            }
+            let project = str_at(&resp, "/caller/project");
+            let expires = str_at(&resp, "/expires_at");
+            let mut profile = match ctx.config.get(&ctx.profile_name).cloned() {
+                Some(p) => p,
+                None => Profile {
+                    url: ctx.url.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+            };
+            let scoped = (!project.is_empty()).then_some(project.clone());
+            profile.token = Some(token.clone());
+            profile.project = scoped.clone();
+            profile.expires_at = Some(expires);
+            ctx.config.set(&ctx.profile_name, profile);
+            ctx.config.save(&ctx.config_path)?;
+            ctx.token = Some(token);
+            ctx.project = scoped;
+            match ctx.fmt.output {
+                Output::Json | Output::Yaml => print_one(io.stdout, ctx.fmt, &resp)?,
+                _ => {
+                    let where_now = if project.is_empty() {
+                        "system scope"
+                    } else {
+                        &project
+                    };
+                    writeln!(io.stdout, "now in project {where_now}")?;
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1107,7 +1332,7 @@ fn audit_time(raw: &str, now: chrono::DateTime<chrono::Utc>) -> CliResult<String
     Ok((now - chrono::Duration::seconds(secs)).to_rfc3339())
 }
 
-fn query_escape(v: &str) -> String {
+pub(crate) fn query_escape(v: &str) -> String {
     v.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -1141,6 +1366,7 @@ async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
         ("kind", a.kind),
         ("resource", a.resource),
         ("outcome", a.outcome),
+        ("carried_by", a.carried_by),
         ("after", a.after),
     ] {
         if let Some(value) = value {
@@ -1183,6 +1409,7 @@ async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
                         row.extend([
                             str_at(r, "/spec/project"),
                             str_at(r, "/spec/api_key"),
+                            str_at(r, "/spec/carried_by"),
                             str_at(r, "/spec/method"),
                             str_at(r, "/spec/path"),
                             str_at(r, "/id"),
@@ -1195,7 +1422,7 @@ async fn audit(ctx: &Ctx, cmd: AuditCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "when", "who", "from", "action", "kind", "resource", "status",
             ];
             if wide {
-                headers.extend(["project", "api key", "method", "path", "id"]);
+                headers.extend(["project", "api key", "carried-by", "method", "path", "id"]);
             }
             write!(
                 io.stdout,
@@ -1238,7 +1465,77 @@ async fn user(ctx: &Ctx, cmd: UserCmd, io: &mut Io<'_>) -> CliResult<()> {
             let body = create_body(k, &a.name, &a.meta, spec)?;
             do_create(ctx, io, k, body, false).await.map(|_| ())
         }
+        UserCmd::RevokeTokens(a) => {
+            let c = ctx.client()?;
+            let path = format!("{}/revoke-tokens", k.item_path(&a.name));
+            let v = c.post(&path, &json!({})).await?;
+            report(ctx, io, k, &v, "tokens revoked")
+        }
     }
+}
+
+/// `pi signing-key`: the keys tokens are signed with. Only ids and dates
+/// come back; the secrets stay in the store.
+async fn signing_key(ctx: &Ctx, cmd: SigningKeyCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let c = ctx.client()?;
+    let v = match cmd {
+        SigningKeyCmd::List => c.get_value("/identity/signing-keys").await?,
+        SigningKeyCmd::Rotate => c.post("/identity/signing-keys/rotate", &json!({})).await?,
+        SigningKeyCmd::Retire(a) => {
+            if !a.yes {
+                if !io.tty {
+                    return Err(CliError::usage(
+                        "refusing to retire signing keys without --yes (no terminal to confirm on)",
+                    ));
+                }
+                write!(
+                    io.stderr,
+                    "tokens signed with an older key stop working at once. retire? [y/N] "
+                )?;
+                io.stderr.flush()?;
+                if !matches!(io.read_line()?.trim(), "y" | "Y" | "yes") {
+                    return Ok(());
+                }
+            }
+            c.post("/identity/signing-keys/retire", &json!({})).await?
+        }
+    };
+    if !matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+        print_one(io.stdout, ctx.fmt, &v)?;
+        return Ok(());
+    }
+    let keys = v
+        .pointer("/keys")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let now = chrono::Utc::now();
+    let rows: Vec<Vec<String>> = keys
+        .iter()
+        .map(|k| {
+            vec![
+                str_at(k, "/kid"),
+                if k["current"] == true { "yes" } else { "" }.to_owned(),
+                output::age(&str_at(k, "/created_at"), now),
+                str_at(k, "/retire_at"),
+            ]
+        })
+        .collect();
+    write!(
+        io.stdout,
+        "{}",
+        output::table(
+            &["KEY", "CURRENT", "AGE", "VERIFIES-UNTIL"],
+            &rows,
+            ctx.fmt.no_headers
+        )
+    )?;
+    if let Some(retired) = v.pointer("/retired").and_then(Value::as_array) {
+        for kid in retired {
+            writeln!(io.stdout, "retired {}", kid.as_str().unwrap_or_default())?;
+        }
+    }
+    Ok(())
 }
 
 async fn role(ctx: &Ctx, cmd: RoleCmd, io: &mut Io<'_>) -> CliResult<()> {
@@ -1265,11 +1562,7 @@ async fn binding(ctx: &Ctx, cmd: BindingCmd, io: &mut Io<'_>) -> CliResult<()> {
         BindingCmd::Show(a) => do_show(ctx, io, k, a).await,
         BindingCmd::Delete(a) => do_delete(ctx, io, k, a).await,
         BindingCmd::Create(a) => {
-            let body = compact(json!({
-                "principal": a.principal,
-                "role": a.role,
-                "project": opt(a.in_project),
-            }));
+            let body = compact(super::binding::create_body(&a)?);
             do_create(ctx, io, k, body, false).await.map(|_| ())
         }
     }
@@ -1312,11 +1605,11 @@ async fn access_key(ctx: &Ctx, cmd: AccessKeyCmd, io: &mut Io<'_>) -> CliResult<
             // DELETE revokes; say so in the confirmation and result line.
             let c = ctx.client()?;
             let path = k.item_path(&a.name);
-            if !a.yes && !confirm(io, &format!("{} \"{}\"", k.noun, a.name))? {
+            if !a.yes && !confirm(io, "delete", &format!("{} \"{}\"", k.noun, a.name))? {
                 writeln!(io.stderr, "aborted")?;
                 return Ok(());
             }
-            c.delete(&path).await?;
+            let _ = c.delete(&path).await?;
             writeln!(io.stdout, "{} \"{}\" revoked", k.noun, a.name)?;
             Ok(())
         }
@@ -1397,6 +1690,188 @@ async fn join_token(ctx: &Ctx, cmd: JoinTokenCmd, io: &mut Io<'_>) -> CliResult<
 
 // ---- compute nouns -----------------------------------------------------------------------
 
+/// The resource without its private key, for output formats that dump it.
+fn strip_private(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut m = m.clone();
+            m.remove("private_key");
+            Value::Object(m)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Write a private key the server made, readable only by this user. An
+/// existing file is never replaced: a key that is already there belongs to
+/// something.
+fn write_private_key(path: &str, key: &str) -> CliResult<()> {
+    let path = std::path::Path::new(path);
+    if path.exists() {
+        return Err(CliError::usage(format!(
+            "refusing to overwrite {}: a private key there already",
+            path.display()
+        )));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| CliError::usage(format!("creating {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| CliError::usage(format!("setting mode on {}: {e}", path.display())))?;
+    }
+    use std::io::Write;
+    let mut file = file;
+    file.write_all(key.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Where a generated private key is going to land, settled before anything
+/// is asked of the server: a pair whose key cannot be written is a pair
+/// nobody can use.
+fn check_out(path: &str) -> CliResult<()> {
+    let p = std::path::Path::new(path);
+    if p.exists() {
+        return Err(CliError::usage(format!(
+            "refusing to overwrite {}: a private key there already",
+            p.display()
+        )));
+    }
+    let dir = if p.parent().map(|d| d.as_os_str().is_empty()).unwrap_or(true) {
+        std::path::Path::new(".")
+    } else {
+        p.parent().unwrap()
+    };
+    if !dir.is_dir() {
+        return Err(CliError::usage(format!(
+            "no such directory for {}: {}",
+            p.display(),
+            dir.display()
+        )));
+    }
+    // Write the key on top of an existing file. A read-only or busy directory
+    // is found out here, not after the server has made a key.
+    let probe = dir.join(format!(
+        ".{}.probe",
+        p.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(CliError::usage(format!(
+            "cannot write to {}: {e}",
+            dir.display()
+        ))),
+    }
+}
+
+async fn keypair(ctx: &Ctx, cmd: KeypairCmd, io: &mut Io<'_>) -> CliResult<()> {
+    let k = kind("keypair");
+    match cmd {
+        KeypairCmd::List(a) => do_list(ctx, io, k, a).await,
+        KeypairCmd::Show(a) => do_show(ctx, io, k, a).await,
+        KeypairCmd::Delete(a) => do_delete(ctx, io, k, a).await,
+        KeypairCmd::Create(a) => {
+            let mut body = Map::new();
+            body.insert("name".into(), json!(a.name));
+            if let Some(d) = &a.meta.description {
+                body.insert("description".into(), json!(d));
+            }
+            let labels = parse_kv(&a.meta.labels, "--label")?;
+            if !labels.is_empty() {
+                body.insert("labels".into(), Value::Object(labels));
+            }
+            if let Some(file) = &a.public_key_file {
+                if a.out.is_some() {
+                    return Err(CliError::usage(
+                        "--out writes a generated private key and is not used with --public-key-file",
+                    ));
+                }
+                let key = std::fs::read_to_string(file)
+                    .map_err(|e| CliError::usage(format!("reading {file}: {e}")))?;
+                body.insert("public_key".into(), json!(key.trim()));
+            } else if let Some(path) = &a.out {
+                // Nothing is asked of the server until the key has somewhere
+                // to go.
+                check_out(path)?;
+            }
+            let c = ctx.client()?;
+            let v = c.post(k.path, &Value::Object(body)).await?;
+            // A private key is written to a file or sent down a pipe, never
+            // shown on a terminal.
+            let private = str_at(&v, "/private_key");
+            if !private.is_empty() {
+                match &a.out {
+                    Some(path) => {
+                        // The pair exists now. If the file still cannot be
+                        // written, the pair goes back: a kept one would be a
+                        // key nobody holds.
+                        if let Err(e) = write_private_key(path, &private) {
+                            let id = str_at(&v, "/id");
+                            let name = str_at(&v, "/name");
+                            match c
+                                .delete(&k.item_path(if id.is_empty() { &name } else { &id }))
+                                .await
+                            {
+                                Ok(_) => {
+                                    return Err(CliError::usage(format!(
+                                    "{e}; keypair \"{name}\" was made and has been deleted again"
+                                )))
+                                }
+                                Err(de) => {
+                                    return Err(CliError::usage(format!(
+                                        "{e}; keypair \"{name}\" was made but could not be \
+                                         deleted ({de}) and its private key was not written"
+                                    )))
+                                }
+                            }
+                        }
+                        if matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+                            writeln!(io.stdout, "private key written to {path} (mode 0600)")?;
+                        }
+                    }
+                    None if io.tty => {
+                        return Err(CliError::usage(
+                            "a private key was made; write it with --out FILE rather than printing it",
+                        ));
+                    }
+                    None => {
+                        if matches!(ctx.fmt.output, Output::Table | Output::Wide) {
+                            writeln!(io.stdout, "keypair \"{}\" created", str_at(&v, "/name"))?;
+                        }
+                        write!(io.stdout, "{private}")?;
+                        return Ok(());
+                    }
+                }
+            } else if a.out.is_some() {
+                // An older server imported what it was given and made nothing.
+                return Err(CliError::usage(
+                    "the server returned no private key, so there is nothing to write",
+                ));
+            }
+            match ctx.fmt.output {
+                Output::Table | Output::Wide => report(ctx, io, k, &v, "created")?,
+                Output::Name => writeln!(io.stdout, "{}", str_at(&v, "/name"))?,
+                _ => print_one(io.stdout, ctx.fmt, &strip_private(&v))?,
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
     let k = kind("machine");
     match cmd {
@@ -1418,7 +1893,9 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
                 "image": a.image,
                 "networks": a.networks,
                 "volumes": a.volumes,
+                "near_volumes": a.near_volumes,
                 "ssh_keys": keys,
+                "keypair": opt(a.keypair),
                 "user_data": user_data,
                 "host_selector": Value::Object(parse_kv(&a.host_selector, "--host-selector")?),
                 "zone": opt(a.zone),
@@ -1429,8 +1906,51 @@ async fn machine(ctx: &Ctx, cmd: MachineCmd, io: &mut Io<'_>) -> CliResult<()> {
         MachineCmd::Start(a) => power(ctx, io, k, a, "start").await,
         MachineCmd::Stop(a) => power(ctx, io, k, a, "stop").await,
         MachineCmd::Reboot(a) => power(ctx, io, k, a, "reboot").await,
+        MachineCmd::Rebuild(a) => machine_rebuild(ctx, io, k, a).await,
+        MachineCmd::Resize(a) => {
+            do_action(
+                ctx,
+                io,
+                k,
+                &a.name,
+                "resize",
+                Some(json!({ "size": a.size })),
+            )
+            .await?;
+            Ok(())
+        }
         MachineCmd::Stats(a) => stats(ctx, io, k, &a.name).await,
     }
+}
+
+async fn machine_rebuild(
+    ctx: &Ctx,
+    io: &mut Io<'_>,
+    k: &KindDef,
+    a: MachineRebuildArgs,
+) -> CliResult<()> {
+    if !a.yes
+        && !confirm(
+            io,
+            "rebuild",
+            &format!("machine \"{}\" (its root disk is lost)", a.name),
+        )?
+    {
+        writeln!(io.stderr, "aborted")?;
+        return Ok(());
+    }
+    let body = match &a.image {
+        Some(image) => json!({"image": image}),
+        None => json!({}),
+    };
+    let v = do_action(ctx, io, k, &a.name, "rebuild", Some(body)).await?;
+    if a.wait {
+        let c = ctx.client()?;
+        // The rebuild ends when the machine is ready (or failed) again;
+        // `updating` is only ever the middle of it.
+        wait_ready(&c, io, k, &Just::of(&v, &a.name)).await?;
+    }
+    Ok(())
 }
 
 /// `1536` -> `1.5 KiB`. Whole bytes below 1024.
@@ -1550,14 +2070,15 @@ async fn power(
     if a.wait {
         let c = ctx.client()?;
         let want = if action == "stop" { "off" } else { "on" };
-        let id = str_at(&v, "/id");
+        let just = Just::of(&v, &a.name);
+        let says = just.says().to_owned();
         let start = tokio::time::Instant::now();
         let mut last = String::new();
         loop {
-            let cur = c.get_value(&k.item_path(&id)).await?;
+            let cur = read_just(&c, k, &just).await?;
             let p = str_at(&cur, "/status/power");
             if p != last {
-                writeln!(io.stdout, "machine \"{}\": power {p}", a.name)?;
+                writeln!(io.stdout, "machine \"{says}\": power {p}")?;
                 last = p.clone();
             }
             if p == want {
@@ -1695,6 +2216,11 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             let list = |ptr: &str| v.pointer(ptr).and_then(Value::as_array).cloned();
             let evacuated = list("/evacuated").unwrap_or_default();
             let skipped = list("/skipped").unwrap_or_default();
+            let failed = str_at(&v, "/power_off_failed");
+            if !failed.is_empty() {
+                writeln!(io.stdout, "WARNING: {failed}. The machines below moved on your \
+                                     confirmation that the host is dead, not on a confirmed power-off.")?;
+            }
             if !evacuated.is_empty() {
                 writeln!(
                     io.stdout,
@@ -1730,9 +2256,10 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             }
             writeln!(
                 io.stdout,
-                "{} evacuated, {} skipped",
+                "{} evacuated, {} skipped (proof: {})",
                 evacuated.len(),
-                skipped.len()
+                skipped.len(),
+                str_at(&v, "/proof")
             )?;
             Ok(())
         }
@@ -1741,6 +2268,61 @@ async fn host(ctx: &Ctx, cmd: HostCmd, io: &mut Io<'_>) -> CliResult<()> {
             let path = format!("{}/enable", k.item_path(&a.name));
             let v = c.post_empty(&path).await?;
             report(ctx, io, k, &v, "enabled")
+        }
+        HostCmd::Power { cmd } => host_power(ctx, io, k, cmd).await,
+    }
+}
+
+/// `pi host power set|clear|show`. The password never passes through here:
+/// only the name of the secret that holds it.
+async fn host_power(ctx: &Ctx, io: &mut Io<'_>, k: &KindDef, cmd: HostPowerCmd) -> CliResult<()> {
+    let c = ctx.client()?;
+    match cmd {
+        HostPowerCmd::Set(a) => {
+            let path = format!("{}/power", k.item_path(&a.name));
+            let body = json!({
+                "kind": a.kind,
+                "address": a.address,
+                "user": a.user,
+                "secret": a.secret,
+            });
+            let v = c.put(&path, &body).await?;
+            let pc = &v["power_control"];
+            writeln!(
+                io.stdout,
+                "host \"{}\" power control set: {} at {} as {} (password from secret \"{}\")",
+                a.name,
+                str_at(pc, "/kind"),
+                str_at(pc, "/address"),
+                str_at(pc, "/user"),
+                str_at(pc, "/secret"),
+            )?;
+            Ok(())
+        }
+        HostPowerCmd::Clear(a) => {
+            let path = format!("{}/power", k.item_path(&a.name));
+            c.delete(&path).await?;
+            writeln!(io.stdout, "host \"{}\" power control cleared", a.name)?;
+            Ok(())
+        }
+        HostPowerCmd::Show(a) => {
+            let path = format!("{}/power", k.item_path(&a.name));
+            let v = c.get_value(&path).await?;
+            match v.get("power_control") {
+                None | Some(Value::Null) => {
+                    writeln!(io.stdout, "host \"{}\" has no power control", a.name)?
+                }
+                Some(pc) => writeln!(
+                    io.stdout,
+                    "host \"{}\" power control: {} at {} as {} (password from secret \"{}\")",
+                    a.name,
+                    str_at(pc, "/kind"),
+                    str_at(pc, "/address"),
+                    str_at(pc, "/user"),
+                    str_at(pc, "/secret"),
+                )?,
+            }
+            Ok(())
         }
     }
 }
@@ -1785,7 +2367,13 @@ async fn server(ctx: &Ctx, cmd: ServerCmd, io: &mut Io<'_>) -> CliResult<()> {
         .unwrap_or_default();
     let found = pick_server(&all, &a.server)?;
     let (id, api) = (str_at(found, "/id"), str_at(found, "/api"));
-    if !a.yes && !confirm(io, &format!("server {id} ({api}) from the cluster"))? {
+    if !a.yes
+        && !confirm(
+            io,
+            "remove from the cluster",
+            &format!("server {id} ({api})"),
+        )?
+    {
         writeln!(io.stderr, "aborted")?;
         return Ok(());
     }
@@ -2600,6 +3188,46 @@ async fn stack(ctx: &Ctx, cmd: StackCmd, io: &mut Io<'_>) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_404_about_this_row_can_be_a_copy_that_lags() {
+        let gone = |msg: &str, id: Option<&str>| CliError::Api {
+            status: 404,
+            code: "not_found".into(),
+            message: msg.into(),
+            details: id.map_or_else(Default::default, |i| {
+                json!({"id": i}).as_object().unwrap().clone()
+            }),
+        };
+        let just = Just::of(&json!({"id": "mach-9", "name": "web"}), "");
+        assert_eq!(just.key(), "mach-9");
+        assert_eq!(just.says(), "web");
+        assert!(just.could_be_my_row(&gone("mach 'mach-9' not found", None)));
+        assert!(just.could_be_my_row(&gone("mach 'web' not found", None)));
+        assert!(just.could_be_my_row(&gone("mach 'x' not found", Some("mach-9"))));
+        // Some other row, or a row of another kind: not this command's doing.
+        assert!(!just.could_be_my_row(&gone("vol 'data' not found", None)));
+        assert!(!just.could_be_my_row(&gone("mach 'x' not found", Some("vol-1"))));
+        assert!(!just.could_be_my_row(&gone("no route", None)));
+        // A row with no id is asked for, and answered, by name.
+        let nameless = Just::of(&json!({"name": "web"}), "");
+        assert_eq!(nameless.key(), "web");
+        assert_eq!(nameless.says(), "web");
+        assert!(nameless.could_be_my_row(&gone("mach 'web' not found", None)));
+        assert!(!nameless.could_be_my_row(&gone("mach 'mach-9' not found", None)));
+        // Only a 404 can be a lag.
+        assert!(!just.could_be_my_row(&CliError::Api {
+            status: 410,
+            code: "gone".into(),
+            message: "mach-9 gone".into(),
+            details: Default::default(),
+        }));
+        // A delete names the resource the user asked for, whatever the
+        // server answered with.
+        let deleted = Just::of(&json!({"id": "mach-9"}), "web");
+        assert_eq!(deleted.says(), "web");
+        assert_eq!(deleted.key(), "mach-9");
+    }
 
     #[test]
     fn compact_drops_nulls_recursively() {

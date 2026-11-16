@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The network resource model: Network, Subnet, Port, Router,
+//! The network resource model: Vpc, Network, Subnet, Port, Router,
 //! SecurityGroup, FloatingIp.
 //!
 //! `spec` is the user's, `status` is the reconciler's. Every status carries
@@ -10,7 +10,7 @@
 
 use ipnet::IpNet;
 use pistack_types::{kind, Id, Kind, Meta, Phase, Resource};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use uuid::Uuid;
@@ -51,6 +51,40 @@ macro_rules! resource {
     };
 }
 
+// ---- Vpc -------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VpcSpec {
+    /// The blocks this space is made of. Subnets are cut from them. IPv4 or
+    /// IPv6, and none of them overlaps another.
+    pub cidrs: Vec<IpNet>,
+    /// Where traffic leaves and what floating IPs are drawn from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_network: Option<Id>,
+    /// Handed to a subnet on one of this VPC's networks that sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<StaticRoute>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VpcStatus {
+    #[serde(default)]
+    pub phase: Phase,
+    /// The router this VPC owns. Made with the VPC, deleted with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<Id>,
+    #[serde(default)]
+    pub subnets: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(default)]
+    pub observed_revision: u64,
+}
+
+resource!(Vpc, VpcSpec, VpcStatus, kind::VPC);
+
 // ---- Network ---------------------------------------------------------------
 
 /// How a network is realised on the wire.
@@ -85,6 +119,10 @@ pub struct NetworkSpec {
     /// carry it, and only one network in the cloud at a time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_floating_ip: bool,
+    /// The VPC this network belongs to. Set at create and never changed; a
+    /// network in a VPC is not external and not a provider network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc: Option<Id>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -103,6 +141,7 @@ impl Default for NetworkSpec {
             external: false,
             dns_domain: None,
             auto_floating_ip: false,
+            vpc: None,
         }
     }
 }
@@ -178,6 +217,37 @@ resource!(Subnet, SubnetSpec, SubnetStatus, kind::SUBNET);
 
 // ---- Port ------------------------------------------------------------------
 
+/// One accepted spelling of a pair's address: a CIDR, or a bare address
+/// meaning that one address of its family. Anything else is reported by the
+/// reader that checks the rest of the spec, not here.
+fn deserialize_ip_or_cidr<'de, D>(d: D) -> Result<IpNet, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    s.parse::<IpNet>()
+        .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
+        .map_err(|_| {
+            serde::de::Error::invalid_value(serde::de::Unexpected::Str(&s), &"an address or cidr")
+        })
+}
+
+/// An `(address, mac)` the port may also carry. Without one a port only
+/// ever moves traffic for its own MAC and its fixed IPs, so an address
+/// nobody owns can be moved onto a machine by pointing it at that machine's
+/// port: a virtual address two machines share, an address kept while a
+/// machine is replaced. The MAC is the one seen on the wire, which defaults
+/// to the port's own.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllowedAddressPair {
+    /// A single address or a CIDR. A bare address means that one address.
+    #[serde(deserialize_with = "deserialize_ip_or_cidr")]
+    pub ip_address: IpNet,
+    /// Omitted means the port's own MAC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortSpec {
     pub network: Id,
@@ -198,6 +268,10 @@ pub struct PortSpec {
     pub security_groups: Vec<Id>,
     #[serde(default = "default_true")]
     pub port_security: bool,
+    /// Addresses beyond the fixed ones the port may carry. Needs port
+    /// security: with it off the port filters nothing anyway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_address_pairs: Vec<AllowedAddressPair>,
 }
 
 impl Default for PortSpec {
@@ -210,6 +284,7 @@ impl Default for PortSpec {
             device: None,
             security_groups: Vec::new(),
             port_security: true,
+            allowed_address_pairs: Vec::new(),
         }
     }
 }
@@ -262,6 +337,10 @@ pub struct StaticRoute {
 pub struct RouterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_network: Option<Id>,
+    /// Set when the VPC with this id owns the router. Nothing may be changed
+    /// on it directly and it cannot be deleted by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc: Option<Id>,
     /// Subnets the router has an interface on. Managed with
     /// `PUT /routers/{id}/interfaces`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -438,6 +517,7 @@ resource!(
 
 /// Every kind fabric owns, for the reconciler's event filter.
 pub const KINDS: &[&str] = &[
+    kind::VPC,
     kind::NETWORK,
     kind::SUBNET,
     kind::PORT,

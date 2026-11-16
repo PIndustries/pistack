@@ -13,8 +13,14 @@
 //!   [`Client::confirm_attach`] and [`Client::mark_detached`].
 //! * [`quota`] — the `QuotaCheck` hook [`Client`] asks before it stores or
 //!   grows something. The default checks the project's limits in `gate`.
+//! * [`transfer`] — offers that move a volume, with its snapshots, to
+//!   another project. [`Client::offer_volume`] returns the one-time secret;
+//!   [`Client::accept_transfer`] takes it.
 //! * HTTP under `/volume`: `/volumes`, `/snapshots`, `/backups`,
-//!   `/volume-types`.
+//!   `/volume-types`, `/transfers`. A transfer of a volume hangs off the
+//!   volume it moves (`POST /volumes/{id}/transfer`, and
+//!   `/volumes/{id}/transfers` to list them); the offers themselves are
+//!   accepted and cancelled under `/transfers`.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -31,12 +37,15 @@ mod image;
 mod place;
 pub mod quota;
 pub mod reconcile;
+mod redact;
+pub mod transfer;
 pub mod types;
 mod usage;
 
 pub use backend::{AttachInfo, AttachTarget, BackendRef, BlockBackend, LocalFileBackend, Protocol};
-pub use client::{Client, Create, RestoreRequest, UpdateMeta};
+pub use client::{Client, Create, Offered, RestoreRequest, UpdateMeta};
 pub use quota::{AllowAll, ProjectQuota, QuotaCheck, QuotaRequest};
+pub use transfer::TRANSFER_LIFETIME;
 pub use types::*;
 
 /// The slab module. `Default` runs the local file backend under

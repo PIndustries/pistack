@@ -35,10 +35,24 @@ pi machine create web --image ubuntu-24.04 --size m.2x4 --network app
 | --- | --- |
 | Network | `--kind overlay` (default) or `--kind provider` with `--physnet` and optionally `--vlan`. `--external` marks a network that routers use as their gateway and that floating IPs come from. `--auto-floating-ip` is described below. |
 | Subnet | A CIDR on a network, with a gateway, allocation pools, DNS servers and DHCP on by default. |
-| Port | An address on a network, bound to a machine. Created for you when a machine names a network. |
+| Port | An address on a network, bound to a machine. Created for you when a machine names a network. Can be given allowed address pairs, described below. |
 | Router | Connects subnets to each other and to one external network. |
 | Security group | Rules by direction, protocol, port range and remote CIDR or group. |
 | Floating IP | An address on an external network mapped to a port. |
+
+## VPCs
+
+A VPC is a routed private address space inside one project. It holds one or more blocks, and the subnets cut from them reach each other without anyone making a router: the VPC owns one, made with it and gone when it goes. That router is shown as owned and cannot be changed or deleted on its own.
+
+The API sits beside the network routes: `POST /network/vpcs` with one or more `cidrs`, and `POST /network/vpcs/{id}/subnets` with a `name` and a `cidr` — the short road that makes a network and its one subnet together. A `cidr` of `/24` alone takes the next free `/24` from the VPC. The long road still works: make a network with `vpc` set, then a subnet on it.
+
+- A network set `vpc` on at create belongs to that VPC and never leaves it. A network in a VPC is private: it cannot be external or a provider network. Networks with no VPC work exactly as before, with routers made by hand.
+- A subnet on a VPC network sits inside one of the VPC's blocks and overlaps no other subnet in it. It gets its router interface as part of its own create and loses it with its own delete.
+- `cidrs` may grow; a block comes out only when no subnet uses it. An `external_network` may be set, changed or cleared; clearing is refused while a floating IP in the VPC reaches out through it.
+- A VPC is deleted only when it has no subnets. Its router goes with it.
+- A project gets five VPCs unless an admin sets another. The router a VPC owns is not counted against the router limit. On hostnat a VPC keeps to one subnet; a second is refused.
+
+`GET /networks` and `GET /subnets` take `?vpc=` to list what belongs to one VPC, or `?vpc=none` for what belongs to none.
 
 ## Automatic floating IPs
 
@@ -61,6 +75,39 @@ pi network set public --auto-floating-ip false
 - A floating IP you create and associate yourself is never touched, and a machine that has one is not given a second.
 
 Upgrading from a build without the setting: until then a network named `fleet`, or the only external network, handed a floating IP to every machine. Those floating IPs stay in place and keep working. No new ones are created until you mark a network. The server logs one warning when it becomes leader while such floating IPs exist and no network is marked. Run `pi fip list` and look for the label to see them.
+
+## Allowed address pairs
+
+By default a port carries traffic for its own MAC and its fixed addresses and nothing else. An allowed address pair says one more address, or one more range of addresses, that the port may carry, and optionally the MAC it arrives under. That is what a virtual address needs: one address answered by whichever of two machines currently holds it, or an address kept while its machine is replaced.
+
+```sh
+pi api PUT /ports/web-0 <<< '{"spec": {
+  "network": "app", "subnet": "app4",
+  "fixed_ips": ["10.1.0.5"], "mac": "02:70:69:11:22:33",
+  "allowed_address_pairs": [
+    {"ip_address": "10.1.0.100"},
+    {"ip_address": "10.1.0.101", "mac_address": "02:70:69:aa:bb:cc"},
+    {"ip_address": "10.1.9.0/28"}
+  ]
+}}'
+```
+
+- `ip_address` is one address (`10.1.0.100`, kept as `10.1.0.100/32`) or a prefix (`10.1.9.0/28`). The whole of an address family is refused: `0.0.0.0/0` and `::/0` would let a machine claim any address there.
+- `mac_address` is the address seen on the wire for that pair. Left out, the pair rides on the port's own MAC.
+- At most ten pairs per port. The same address under the same MAC twice is refused, and so is one MAC written two ways.
+- Pairs need port security on the port. A port with port security off filters nothing, so there is nothing to widen; turning security off with pairs still on the port is refused until both are cleared.
+- Nothing is allocated for a pair. Fabric does not check that the address belongs to a subnet of the network, does not mark it used, and will not stop two ports being given the same pair. What sits behind it is yours: keepalived, or whatever moves the address.
+
+What a backend does with a pair differs, because not every backend filters traffic at a port:
+
+| Backend | Effect |
+| --- | --- |
+| `ovn` | Every pair goes to the logical switch port's `port_security` with its mask, so it passes anti-spoofing. `addresses` takes what it can spell: a single address bare, and a wider prefix not at all — that column is a MAC followed by plain addresses — where only the prefix's MAC is listed, and only when it is not the port's own, which is all the switch needs to know where that MAC lives. Removing the pair removes it from both. |
+| `overlay` | Nothing. The host end of a port comes from the per-host plan, which knows the port's fixed addresses, and the segment's rules are built from those. Pairs are not in that plan. |
+| `hostnat` | Nothing. This backend sets no per-port filter at all: what a guest may send is decided by the libvirt network it sits on. |
+| `mock` | Nothing. It records calls only. |
+
+So a pair is honoured on `ovn` today. On the other backends the record carries it and reports `ready`, and nothing on the host changes.
 
 ## Scheduling
 
@@ -128,7 +175,7 @@ What the server creates:
 
 - a logical switch per network, with a `localnet` port for provider networks and a `localport` for metadata,
 - DHCP options per subnet, with an on-link route to the metadata address,
-- a switch port per port, with port security,
+- a switch port per port, with port security and any allowed address pairs,
 - logical routers with a gateway port, a default route and SNAT,
 - port groups and ACLs for security groups, with a default drop,
 - floating IPs as `dnat_and_snat` rules.
@@ -212,7 +259,17 @@ Unset, it follows the fabric: `forward` when the fabric is `hostnat`, `overlay` 
 
 The forwarder runs on the leader, so balancer traffic passes through the leader. Listeners bind loopback unless the balancer's address is a loopback or private address. There is no OVN load balancer.
 
-`pi` has no balancer commands yet. The API is under `/balancers`; use `pi api`. Services and ingresses in `loom` create balancers for you.
+A pool spreads new connections by its `algorithm`, on TCP and HTTP alike.
+
+| Value | Meaning |
+| --- | --- |
+| `round_robin` | Each member is visited in proportion to its weight, so weight 2 takes twice the share. The default. |
+| `least_conn` | The member with the fewest open connections. A tie goes to the heavier member, then to the earlier one. |
+| `source_ip` | One client address stays on one member while the member set is unchanged. |
+
+Anything else is refused when the pool is created or updated. A member that is down, draining or weighted zero is never picked under any algorithm. `session_persistence` is stored and ignored; `source_ip` is the algorithm, not persistence.
+
+`pi lb` covers balancers, and the listeners, pools and members under them; see the [CLI reference](CLI-reference.md#pi-lb). Services and ingresses in `loom` create balancers for you.
 
 ## DNS
 
@@ -230,8 +287,28 @@ It never binds `0.0.0.0` by default. If the port is taken the server does not st
 PISTACK_DNS_LISTEN=127.0.0.1:15353 pistack server ...
 ```
 
-The server answers only for its own zones and refuses everything else. It does not recurse or forward. Record types are A, AAAA, CNAME, MX, TXT, SRV, NS and PTR. Secondary zones are filled by zone transfer over TCP. Dynamic update and NOTIFY are not implemented.
+The server answers only for its own zones and refuses everything else. It does not recurse or forward. Record types are A, AAAA, CNAME, MX, TXT, SRV, NS and PTR. Secondary zones are filled by zone transfer over TCP.
 
-A zone labelled `pistack.io/auto=true` gets an address record for every machine in its project, named `<machine>.<zone>`, using the floating IP when the machine has one.
+When a zone's records change, the primary sends a NOTIFY to every address a secondary zone lists for that apex, and the secondary pulls at once rather than waiting for its refresh timer. A NOTIFY is acted on only when it names a zone this server holds as secondary and arrives from a host that zone lists as a primary; anything else is refused and pulls nothing.
 
-`pi` has no zone commands yet. The API is under `/dns`.
+A secondary that is an ordinary DNS server outside this cloud holds nothing here, so it cannot be discovered from the secondaries the cloud lists. A primary zone names it directly in `also_notify`: a list of addresses, each an `ip` or an `ip:port` with port 53 assumed when bare, up to sixteen, no repeats. A serial change is notified to every `also_notify` address as well as to the in-cloud secondaries, each asked once, with the same retries and backoff. The field is set at create and update through the zone routes, and only a primary zone takes it — a secondary that names `also_notify` is refused. Dynamic update is not implemented — records change through the API.
+
+A zone labelled `pistack.io/auto=true` gets an address record for every machine in its project, named `<machine>.<zone>`, using the floating IP when the machine has one. Those sets carry `pistack.io/managed-by=beacon-auto`; the next pass overwrites anything you change on them by hand, so make your own records somewhere else.
+
+Zones and record sets are managed with `pi`:
+
+```sh
+pi dns zone create example.cloud --email ops@example.cloud --ttl 3600
+pi dns zone create example.cloud --also-notify 203.0.113.53   # tell an outside secondary
+pi dns zone create copy.cloud --primary 198.51.100.9:53       # a secondary, filled by AXFR
+pi dns record create web A --zone example.cloud --record 10.0.0.4 --record 10.0.0.5
+pi dns record create @ TXT --zone example.cloud --record 'v=spf1 -all'
+pi dns record list --zone example.cloud
+pi dns record delete web-a --zone example.cloud --yes
+pi dns zone show example.cloud
+pi dns zone delete example.cloud
+```
+
+A record set is one owner name and one type: `web` plus `A`, with one record per `--record`. The owner can be relative to the zone, absolute with a final dot, or `@` for the apex. `show` and `delete` with `--zone` look inside that zone, where the set's short name `<owner>-<type>` is enough to find it; a filed name and an id work there too, and without `--zone` only the filed name does. Names are unique across a project rather than per zone, so a set takes the short name while it is free and the zone after it (`web-a.example.cloud`) when another zone already holds that name. Without `--ttl` the set takes the zone's, which is what a listing prints. The server keeps one set per owner and type, allows a CNAME owner nothing else, and refuses a CNAME or an apex NS that would fight the zone's own SOA and NS.
+
+`pi dns zone delete` takes the zone's record sets with it, and the module does not stop it to ask whether the zone is empty. What `pi` does not do yet is edit a zone in place or hand you the master file; for the latter, `pi api GET /dns/zones/<NAME>/export`.

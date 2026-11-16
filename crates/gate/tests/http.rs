@@ -9,7 +9,7 @@ use axum::{
     http::{header, Request, StatusCode},
     Router,
 };
-use gate::{Gate, ADMIN_PASSWORD_ENV};
+use gate::{self, Gate, ADMIN_PASSWORD_ENV};
 use pistack_store::Store;
 use pistack_types::module::CancellationToken;
 use pistack_types::{Module, ModuleContext};
@@ -64,14 +64,40 @@ async fn call(
 }
 
 async fn login(app: &Router, name: &str, password: &str) -> (StatusCode, Value) {
-    call(
-        app,
-        "POST",
-        "/tokens",
-        None,
-        Some(json!({"name": name, "password": password})),
-    )
-    .await
+    login_from(app, name, password, None).await
+}
+
+/// The same. A router with no socket to name counts every attempt against
+/// its stand-in address, so a test that wants two addresses counts against
+/// two routers; `audit.rs` drives the per-address wall through the gateway's
+/// own note.
+async fn login_from(
+    app: &Router,
+    name: &str,
+    password: &str,
+    from: Option<std::net::IpAddr>,
+) -> (StatusCode, Value) {
+    // With no address given the request is one the gateway could not name a
+    // socket for, which is counted against the stand-in address rather than
+    // sharing a counter with any real one.
+    let _ = from;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/tokens")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"name": name, "password": password}).to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, json)
 }
 
 #[tokio::test]
@@ -173,7 +199,7 @@ async fn admin_creates_project_and_user_and_user_is_scoped() {
         "POST",
         "/principals",
         Some(&admin_tok),
-        Some(json!({"name": "alice", "password": "pw-alice", "email": "a@example.com", "default_project": "web"})),
+        Some(json!({"name": "alice", "password": "alice-pass-phrase", "email": "a@example.com", "default_project": "web"})),
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "{user}");
@@ -196,7 +222,7 @@ async fn admin_creates_project_and_user_and_user_is_scoped() {
     assert_eq!(b["spec"]["scope"]["type"], "project");
 
     // Alice logs in; token is scoped to web with the member role.
-    let (s, v) = login(&app, "alice", "pw-alice").await;
+    let (s, v) = login(&app, "alice", "alice-pass-phrase").await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let alice_tok = v["token"].as_str().unwrap().to_owned();
     assert_eq!(v["caller"]["project"], proj_id);
@@ -242,18 +268,24 @@ async fn admin_creates_project_and_user_and_user_is_scoped() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["engine"], "builtin-rbac");
 
-    // Alice cannot log in scoped to the admin project with any role... she
-    // can, but gets no roles there.
+    // Alice has no role in the admin project, so she gets no token for it.
+    // One with no roles would still read everything that project holds.
     let (s, v) = call(
         &app,
         "POST",
         "/tokens",
         None,
-        Some(json!({"name": "alice", "password": "pw-alice", "project": "admin"})),
+        Some(json!({"name": "alice", "password": "alice-pass-phrase", "project": "admin"})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["caller"]["roles"], json!([]));
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no role in project"),
+        "{v}"
+    );
 
     // API keys: alice makes one, logs in with it, admin sees it, alice deletes it.
     let (s, k) = call(
@@ -336,7 +368,7 @@ async fn admin_creates_project_and_user_and_user_is_scoped() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _) = login(&app, "alice", "pw-alice").await;
+    let (s, _) = login(&app, "alice", "alice-pass-phrase").await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _) = call(&app, "DELETE", "/principals/admin", Some(&admin_tok), None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -519,7 +551,7 @@ async fn a_token_stops_working_when_what_it_stood_on_is_gone() {
     let (s, _) = post(
         "/principals",
         admin.clone(),
-        json!({"name": "alice", "password": "pw-alice", "default_project": "web"}),
+        json!({"name": "alice", "password": "alice-pass-phrase", "default_project": "web"}),
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
@@ -531,7 +563,7 @@ async fn a_token_stops_working_when_what_it_stood_on_is_gone() {
     .await;
     assert_eq!(s, StatusCode::CREATED);
 
-    let (_, v) = login(&app, "alice", "pw-alice").await;
+    let (_, v) = login(&app, "alice", "alice-pass-phrase").await;
     let by_password = v["token"].as_str().unwrap().to_owned();
     let (s, key) = post("/keys", by_password.clone(), json!({"name": "laptop"})).await;
     assert_eq!(s, StatusCode::CREATED, "{key}");
@@ -562,13 +594,23 @@ async fn a_token_stops_working_when_what_it_stood_on_is_gone() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["roles"], json!(["member"]));
 
-    // The binding is removed: the token says so on the next request.
+    // The binding is removed: alice has no role in web any more, and the
+    // token for web is refused on the next request.
     let path = format!("/bindings/{}", binding["id"].as_str().unwrap());
     let (s, _) = call(&app, "DELETE", &path, Some(&admin), None).await;
     assert!(s.is_success(), "{s}");
-    let (s, v) = who(by_password.clone()).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["roles"], json!([]));
+    let (s, v) = who(by_password).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["error"]["message"], "token revoked");
+
+    // She can still log in. Her default project is one she has no role in,
+    // so the new token has no project.
+    let (s, v) = login(&app, "alice", "alice-pass-phrase").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["project"], Value::Null);
+    assert_eq!(v["caller"]["roles"], json!([]));
+    let by_password = v["token"].as_str().unwrap().to_owned();
+    assert_eq!(who(by_password.clone()).await.0, StatusCode::OK);
 
     // The user is disabled: the token is refused.
     let (_, alice) = call(&app, "GET", "/principals/alice", Some(&admin), None).await;
@@ -617,7 +659,7 @@ async fn admin_sets_limits_and_a_member_reads_them_with_usage() {
         ("/projects", json!({"name": "other"})),
         (
             "/principals",
-            json!({"name": "alice", "password": "pw-alice", "default_project": "web"}),
+            json!({"name": "alice", "password": "alice-pass-phrase", "default_project": "web"}),
         ),
         (
             "/bindings",
@@ -627,7 +669,7 @@ async fn admin_sets_limits_and_a_member_reads_them_with_usage() {
         let (s, v) = call(&app, "POST", path, Some(&admin), Some(body)).await;
         assert_eq!(s, StatusCode::CREATED, "{v}");
     }
-    let (_, v) = login(&app, "alice", "pw-alice").await;
+    let (_, v) = login(&app, "alice", "alice-pass-phrase").await;
     let alice = v["token"].as_str().unwrap().to_owned();
 
     // Set two limits; the one that was there stays.
@@ -706,4 +748,571 @@ async fn admin_sets_limits_and_a_member_reads_them_with_usage() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["status"]["usage"]["vcpus"], 6);
     assert_eq!(v["spec"]["quotas"]["vcpus"], 16);
+}
+
+#[tokio::test]
+async fn signing_keys_rotate_and_retire_through_the_api() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let old = v["token"].as_str().unwrap().to_owned();
+
+    let (s, v) = call(&app, "GET", "/signing-keys", Some(&old), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(v["keys"][0]["current"], true);
+    // Ids and dates only.
+    assert!(!v.to_string().contains("secret"));
+    let first = v["keys"][0]["kid"].as_str().unwrap().to_owned();
+
+    let (s, v) = call(&app, "POST", "/signing-keys/rotate", Some(&old), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let keys = v["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0]["kid"], first.as_str());
+    assert_eq!(keys[0]["current"], false);
+    assert!(keys[0]["retire_at"].is_string());
+    assert_eq!(keys[1]["current"], true);
+
+    // The token from before still works; a new login is signed by the new key.
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&old), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let new = v["token"].as_str().unwrap().to_owned();
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&new), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, v) = call(&app, "POST", "/signing-keys/retire", Some(&new), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["retired"], json!([first]));
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&old), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&new), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Not for a plain user.
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&new),
+        Some(json!({"name": "bob", "password": "bob-pass-phrase-1"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, v) = login(&app, "bob", "bob-pass-phrase-1").await;
+    let bob = v["token"].as_str().unwrap().to_owned();
+    for (method, path) in [
+        ("GET", "/signing-keys"),
+        ("POST", "/signing-keys/rotate"),
+        ("POST", "/signing-keys/retire"),
+    ] {
+        let (s, _) = call(&app, method, path, Some(&bob), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn revoke_tokens_cuts_off_every_token_a_user_holds() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let admin = v["token"].as_str().unwrap().to_owned();
+    for name in ["bob", "eve"] {
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/principals",
+            Some(&admin),
+            Some(json!({"name": name, "password": format!("{name}-pass-phrase-1")})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+    }
+    let (_, v) = login(&app, "bob", "bob-pass-phrase-1").await;
+    let bob1 = v["token"].as_str().unwrap().to_owned();
+    let (_, v) = login(&app, "bob", "bob-pass-phrase-1").await;
+    let bob2 = v["token"].as_str().unwrap().to_owned();
+    let (_, v) = login(&app, "eve", "eve-pass-phrase-1").await;
+    let eve = v["token"].as_str().unwrap().to_owned();
+
+    // Another user may not; the admin may.
+    let path = "/principals/bob/revoke-tokens";
+    let (s, _) = call(&app, "POST", path, Some(&eve), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, v) = call(&app, "POST", path, Some(&admin), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["status"]["tokens_not_before"].is_string());
+
+    for t in [&bob1, &bob2] {
+        let (s, v) = call(&app, "GET", "/tokens/self", Some(t), None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(v["error"]["message"], "token revoked");
+    }
+    // Nobody else is touched.
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&eve), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&admin), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // A login after the stamp's second works again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, v) = login(&app, "bob", "bob-pass-phrase-1").await;
+    let bob3 = v["token"].as_str().unwrap().to_owned();
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&bob3), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // A user may revoke their own.
+    let (s, _) = call(&app, "POST", path, Some(&bob3), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&app, "GET", "/tokens/self", Some(&bob3), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_user_sees_their_projects_and_moves_between_them() {
+    let app = boot().await;
+    let (_, v) = login(&app, "admin", "correct-horse").await;
+    let admin = v["token"].as_str().unwrap().to_owned();
+    let post = |path: &'static str, tok: String, body: Value| {
+        let app = app.clone();
+        async move { call(&app, "POST", path, Some(&tok), Some(body)).await }
+    };
+    for body in [
+        json!({"name": "acme"}),
+        json!({"name": "acme-web", "parent": "acme"}),
+        json!({"name": "acme-data", "parent": "acme"}),
+        json!({"name": "other"}),
+    ] {
+        let (s, v) = post("/projects", admin.clone(), body).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+    let (s, _) = post(
+        "/principals",
+        admin.clone(),
+        json!({"name": "alice", "password": "alice-pass-phrase", "default_project": "acme-web"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    for (role, project) in [("member", "acme-web"), ("reader", "acme-data")] {
+        let (s, v) = post(
+            "/bindings",
+            admin.clone(),
+            json!({"principal": "alice", "role": role, "project": project}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+
+    let (_, v) = login(&app, "alice", "alice-pass-phrase").await;
+    let in_web = v["token"].as_str().unwrap().to_owned();
+    let web_expires = v["expires_at"].as_str().unwrap().to_owned();
+
+    // Alice cannot list every project, but she can see her own two, with
+    // the project they sit under and the role she has in each.
+    let (s, _) = call(&app, "GET", "/projects", Some(&in_web), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, v) = call(&app, "GET", "/tokens/self/projects", Some(&in_web), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mine = v.as_array().unwrap();
+    let seen: Vec<(&str, &str, bool)> = mine
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap(),
+                p["roles"][0].as_str().unwrap(),
+                p["current"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![("acme-data", "reader", false), ("acme-web", "member", true)]
+    );
+    assert!(mine.iter().all(|p| p["parent_name"] == "acme"), "{v}");
+
+    // She moves to the other one without her password. The new token ends
+    // when the old one would have.
+    let (s, v) = post(
+        "/tokens/self/switch",
+        in_web.clone(),
+        json!({"project": "acme-data"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["roles"], json!(["reader"]));
+    let in_data = v["token"].as_str().unwrap().to_owned();
+    let moved: chrono::DateTime<chrono::Utc> = v["expires_at"].as_str().unwrap().parse().unwrap();
+    let first: chrono::DateTime<chrono::Utc> = web_expires.parse().unwrap();
+    assert!(moved <= first, "{moved} is after {first}");
+    let (_, who) = call(&app, "GET", "/tokens/self", Some(&in_data), None).await;
+    assert_eq!(who["roles"], json!(["reader"]));
+    let (_, v) = call(&app, "GET", "/tokens/self/projects", Some(&in_data), None).await;
+    let current: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["current"] == true)
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(current, vec!["acme-data"]);
+
+    // Not to a project she has no role in, and not to one that is not there.
+    for (project, status) in [
+        ("other", StatusCode::FORBIDDEN),
+        ("acme", StatusCode::FORBIDDEN),
+        ("nowhere", StatusCode::NOT_FOUND),
+    ] {
+        let (s, v) = post(
+            "/tokens/self/switch",
+            in_web.clone(),
+            json!({"project": project}),
+        )
+        .await;
+        assert_eq!(s, status, "{project}: {v}");
+    }
+
+    // A token from an API key stays where the key put it.
+    let (s, key) = post("/keys", in_web.clone(), json!({"name": "laptop"})).await;
+    assert_eq!(s, StatusCode::CREATED, "{key}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/tokens",
+        None,
+        Some(json!({"api_key": key["secret"]})),
+    )
+    .await;
+    let by_key = v["token"].as_str().unwrap().to_owned();
+    let (s, v) = post(
+        "/tokens/self/switch",
+        by_key,
+        json!({"project": "acme-data"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+
+    // The cloud admin can go anywhere, and is shown every project.
+    let (s, v) = call(&app, "GET", "/tokens/self/projects", Some(&admin), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.as_array().unwrap().len() >= 5, "{v}");
+    let (s, v) = post("/tokens/self/switch", admin, json!({"project": "other"})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["system"], true);
+}
+
+#[tokio::test]
+async fn a_password_is_measured_when_it_is_set_and_not_when_it_is_used() {
+    let app = boot().await;
+    let (s, v) = login(&app, "admin", "correct-horse").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let admin = v["token"].as_str().unwrap().to_owned();
+
+    // A new user is created with a password that breaks both rules, and the
+    // refusal says both.
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "alice", "password": "alice"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must not be the same as the user name, and must be at least 12 characters"
+    );
+    // One rule broken says one rule. A password that only begins with the name
+    // is not the name, and is long enough to keep.
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "dora", "password": "short"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must be at least 12 characters"
+    );
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "ben", "password": "benjamin-2026-x"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "alice", "password": "short one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must be at least 12 characters"
+    );
+    // Setting one that passes is a create, and so is a user with no password.
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "alice", "password": "alice-has-a-new-one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "svc"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    // A service account has no password of its own and is refused at sign-in
+    // the way a wrong password is.
+    let (s, _) = login(&app, "svc", "svc-has-a-new-one!!").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Changing a password is measured like setting one: by an admin, and by
+    // the user whose password it is.
+    let (s, v) = edit(
+        &app,
+        "/principals/alice",
+        &admin,
+        json!({"password": "tiny"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must be at least 12 characters"
+    );
+    let (s, v) = edit(
+        &app,
+        "/principals/alice",
+        &admin,
+        json!({"password": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must not be the same as the user name, and must be at least 12 characters"
+    );
+    let (s, v) = login(&app, "alice", "alice-has-a-new-one").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let alice = v["token"].as_str().unwrap().to_owned();
+    let (s, v) = edit(
+        &app,
+        "/principals/alice",
+        &alice,
+        json!({"password": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must not be the same as the user name, and must be at least 12 characters"
+    );
+    // A password equal to the name apart from case is refused; one merely
+    // longer than the name is not the name, and is kept.
+    let (s, v) = edit(&app, "/principals/ben", &admin, json!({"password": "BEN"})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "password must not be the same as the user name, and must be at least 12 characters"
+    );
+    let (s, v) = edit(&app, "/principals/ben", &admin, json!({"password": "ben" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v) = edit(
+        &app,
+        "/principals/ben",
+        &admin,
+        json!({"password": "benjamin"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
+    let (s, v) = edit(
+        &app,
+        "/principals/alice",
+        &alice,
+        json!({"password": "alice-changed-again"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = login(&app, "alice", "alice-changed-again").await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ten_failed_password_sign_ins_hold_a_name_out_for_a_window() {
+    let app = boot().await;
+    let (s, v) = login(&app, "admin", "correct-horse").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let admin = v["token"].as_str().unwrap().to_owned();
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "alice", "password": "alice-has-a-new-one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+
+    // Nine wrong passwords are answered the same way one is: the name is not
+    // in a wait yet, and the answer says nothing but "invalid".
+    for _ in 0..gate::lockout::MAX_FAILURES - 1 {
+        let (s, v) = login(&app, "alice", "not-the-password").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{v}");
+        assert_eq!(v["error"]["message"], "invalid credentials");
+    }
+    // The tenth brings the wait down, and every attempt after it is refused
+    // for the rest of the window without the password being looked at.
+    let (s, v) = login(&app, "alice", "not-the-password").await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(v["error"]["code"], "rate_limited");
+    // A name the cloud does not hold is counted like one it does, so the wall
+    // cannot be used to find out who has an account.
+    for _ in 0..gate::lockout::MAX_FAILURES {
+        let (s, _) = login(&app, "no-such-name", "not-the-password").await;
+        assert!(
+            s == StatusCode::UNAUTHORIZED || s == StatusCode::TOO_MANY_REQUESTS,
+            "{s}"
+        );
+    }
+    assert_eq!(
+        login(&app, "no-such-name", "not-the-password").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Another name is untouched, and so is the key of a user who is in a wait:
+    // a key is not a guessable secret and is not counted.
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/keys",
+        Some(&admin),
+        Some(json!({"name": "ci", "principal": "alice"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let secret = v["secret"].as_str().unwrap().to_owned();
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/tokens",
+        None,
+        Some(json!({"api_key": secret})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = login(&app, "admin", "correct-horse").await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_sign_in_that_works_clears_what_was_counted() {
+    let app = boot().await;
+    let (s, v) = login(&app, "admin", "correct-horse").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let admin = v["token"].as_str().unwrap().to_owned();
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/principals",
+        Some(&admin),
+        Some(json!({"name": "carol", "password": "carol-has-a-new-one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+
+    // Nine wrong passwords and a good one: the wait is counted from the first
+    // failure of the run, not from the last, so the nine before a sign-in that
+    // worked count for nothing afterwards.
+    for _ in 0..gate::lockout::MAX_FAILURES - 1 {
+        let (s, _) = login(&app, "carol", "wrong").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+    let (s, v) = login(&app, "carol", "carol-has-a-new-one").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for _ in 0..gate::lockout::MAX_FAILURES - 1 {
+        let (s, _) = login(&app, "carol", "wrong").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+    let (s, _) = login(&app, "carol", "wrong").await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_refused_name_is_answered_with_the_time_left_to_wait() {
+    let app = boot().await;
+    for _ in 0..gate::lockout::MAX_FAILURES {
+        login(&app, "tired", "wrong").await;
+    }
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/tokens")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"name": "tired", "password": "wrong"}).to_string(),
+        ))
+        .unwrap();
+    req.headers_mut()
+        .insert(header::AUTHORIZATION, header::HeaderValue::from_static(""));
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let after = res
+        .headers()
+        .get(header::RETRY_AFTER)
+        .expect("a refusal that says wait")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let secs: u64 = after.parse().unwrap();
+    let window = gate::lockout::WINDOW.num_seconds() as u64;
+    assert!(
+        secs > window - 60 && secs <= window,
+        "Retry-After {secs} of a {window}s window"
+    );
+    let bytes = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], "rate_limited");
+    assert_eq!(v["error"]["details"]["retry_after_secs"], secs);
+}
+
+/// A `PUT` carrying the revision the store is holding, which is what
+/// `If-Match` is for here: these tests are about the body, not lost updates.
+async fn edit(app: &Router, path: &str, token: &str, body: Value) -> (StatusCode, Value) {
+    let (_, current) = call(app, "GET", path, Some(token), None).await;
+    let rev = current["revision"].as_i64().unwrap().to_string();
+    let req = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::IF_MATCH, rev)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    (
+        status,
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        },
+    )
 }

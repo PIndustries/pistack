@@ -1,0 +1,15 @@
+  .topo-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); padding: 0.5rem; }
+  .topo text { fill: var(--text); font-size: 12px; }
+  .topo text.dim { fill: var(--muted); font-size: 11px; }
+  .topo text.head { font-weight: 600; font-size: 13px; }
+  .topo rect.box { fill: var(--panel); stroke: var(--line-strong); }
+  .topo rect.outside { fill: var(--active); stroke: var(--accent); }
+  .topo rect.router { fill: var(--panel); stroke: var(--accent); }
+  .topo path.wire, .topo line.wire { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  .topo path.up { stroke: var(--accent); }
+  .topo circle.ready { fill: var(--ok); }
+  .topo circle.error { fill: var(--bad); }
+  .topo circle.other { fill: var(--wait); }
+  .topo .hit { cursor: pointer; }
+  .topo .hit:hover text.head, .topo .hit:hover text.name { text-decoration: underline; }
+  .topo-key { color: var(--muted); font-size: 0.8rem; margin: 0.6rem 0 0; }

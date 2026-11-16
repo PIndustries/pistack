@@ -91,6 +91,7 @@ impl Harness {
     ) -> (Host, Arc<MockDriver>) {
         let mut labels = BTreeMap::new();
         labels.insert("pistack.io/agent".to_owned(), "true".to_owned());
+        labels.insert("pistack.io/disk".to_owned(), "shared".to_owned());
         let mut host = new_host(
             name,
             name,
@@ -611,6 +612,76 @@ async fn drain_migrates_what_it_can_and_reports_the_rest() {
     assert_eq!(named.host.spec.disabled_reason, "kernel update");
 }
 
+/// A volume on the host's own storage holds its machine here too: it cannot
+/// be opened from the next host. A machine with only shared volumes moves.
+#[tokio::test]
+async fn drain_leaves_a_machine_with_a_local_volume() {
+    let queue = CommandQueue::new(QueueConfig {
+        command_timeout: Duration::from_secs(30),
+        ..QueueConfig::default()
+    });
+    let h = harness_on(Some(queue.clone())).await;
+    let vm_host = ["kvm", "libvirt", "youki"];
+    let (src, _) = h.add_host_with("src", &vm_host, Some("10.1.0.1"));
+    h.add_host_with("dst", &vm_host, Some("10.1.0.2"));
+    h.volume_type("standard", "local");
+    h.volume_type("ceph", "rbd");
+    // The host's root disks are shared here, so only the volume can hold it.
+    h.share_disks(&src.meta.id);
+
+    // Placed before `dst` is open, so both machines start on `src`.
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/dst/disable", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let stuck = h.machine("stuck", vm(json!({}))).await;
+    let free = h.machine("free", vm(json!({}))).await;
+    h.attach("scratch", "standard", &stuck.meta.id);
+    h.attach("blocks", "ceph", &free.meta.id);
+    for m in [&stuck, &free] {
+        assert_eq!(h.ready_on(&m.meta.id).await, src.meta.id);
+    }
+    let (st, _) = raw(&h.app, &admin(), "POST", "/hosts/dst/enable", None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, report) =
+        call::<DrainReport>(&h.app, &admin(), "POST", "/hosts/src/drain", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(report.migrating.len(), 1, "{report:?}");
+    assert_eq!(report.migrating[0].id, free.meta.id);
+    let left = names(&report.not_moved);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].0, "stuck");
+    assert!(left[0].1.contains("volume scratch"), "{left:?}");
+    let src_now = h.store.collection::<Host>().get(&src.meta.id).unwrap();
+    let (moving, left) =
+        forge::maintain::drain(&h.store, Some(&queue), Default::default(), &src_now).unwrap();
+    assert_eq!(moving.len(), 1, "{:?}", names(&left));
+    assert_eq!(moving[0].id, free.meta.id);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].name, "stuck");
+    assert!(left[0].reason.contains("volume scratch"), "{left:?}");
+
+    // A migrate call for the machine that cannot move is refused with the
+    // words the drain report used, and it is not marked as moving.
+    let (st, body) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        &format!("/machines/{}/migrate", stuck.meta.id),
+        Some(json!({"host": "dst"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{st}");
+    assert!(
+        String::from_utf8_lossy(&body).contains("volume scratch"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let stuck_now = h.store.collection::<Machine>().get(&stuck.meta.id).unwrap();
+    assert_eq!(stuck_now.status.phase, Phase::Ready);
+    assert_eq!(stuck_now.status.host.as_ref(), Some(&src.meta.id));
+    assert!(!stuck_now.status.message.starts_with("migrating "));
+}
+
 #[tokio::test]
 async fn drain_without_live_migration_moves_nothing_and_says_so() {
     // Dev mode shape: mock hosts and no agent transport.
@@ -672,6 +743,19 @@ impl Harness {
                     backend: backend.into(),
                 },
             ))
+            .unwrap();
+    }
+
+    /// Say `host` keeps machine disks on storage every other host can see.
+    fn share_disks(&self, host: &Id) {
+        self.store
+            .collection::<Host>()
+            .modify(host, |h| {
+                h.meta
+                    .labels
+                    .insert("pistack.io/disk".to_owned(), "shared".to_owned());
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -799,10 +883,39 @@ async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
 
     h.go_silent(&dead.meta.id).await;
 
-    // Without the flag nothing moves: every machine would lose its disk.
-    let (st, report) =
-        call::<EvacuateReport>(&h.app, &admin(), "POST", "/hosts/dead/evacuate", None).await;
+    // A down host with no power control still needs the operator's word:
+    // without a confirmation nothing is refused-proof and the call is
+    // refused, naming both ways out.
+    let (st, body) = raw(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(false, true),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("confirm_dead"), "{text}");
+    assert!(text.contains("power control"), "{text}");
+
+    // With the confirmation, but without the rebuild flag, nothing moves:
+    // every machine would lose its disk.
+    let (st, report) = call::<EvacuateReport>(
+        &h.app,
+        &admin(),
+        "POST",
+        "/hosts/dead/evacuate",
+        evacuate_body(true, false),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
+    assert_eq!(report.proof, forge::maintain::Proof::Operator);
     assert!(report.evacuated.is_empty(), "{report:?}");
     assert_eq!(report.skipped.len(), 5);
     let why = names(&report.skipped);
@@ -818,7 +931,7 @@ async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
         &admin(),
         "POST",
         "/hosts/dead/evacuate",
-        evacuate_body(false, true),
+        evacuate_body(true, true),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -871,7 +984,7 @@ async fn evacuate_reschedules_a_down_host_and_skips_what_cannot_follow() {
         &admin(),
         "POST",
         "/hosts/dead/evacuate",
-        evacuate_body(false, true),
+        evacuate_body(true, true),
     )
     .await;
     assert!(again.evacuated.is_empty(), "{again:?}");
@@ -954,4 +1067,47 @@ async fn a_disabled_host_is_evacuated_only_when_confirmed_dead() {
     assert_eq!(h.ready_on(&m.meta.id).await, spare.meta.id);
     let m = h.store.collection::<Machine>().get(&m.meta.id).unwrap();
     assert!(m.status.message.is_empty(), "{}", m.status.message);
+}
+
+#[tokio::test]
+async fn a_host_shows_when_its_agent_certificate_expires() {
+    let h = harness().await;
+    h.add_host("a");
+    h.add_host("b");
+    let keep = keep::Client::open(&h.store).unwrap();
+    let serial = |pki: &keep::Pki| {
+        keep::ca::serial_from_der(&keep::ca::pem_to_der(&pki.cert_pem).unwrap()).unwrap()
+    };
+    let first = serial(&keep.issue_client_cert("a").unwrap());
+    let record = keep.managed_certificate(first).unwrap().unwrap();
+
+    let (st, host) = call::<Host>(&h.app, &admin(), "GET", "/hosts/a", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(host.status.cert_expires.is_some());
+    assert_eq!(host.status.cert_expires, record.status.not_after);
+    // A host that never enrolled has none, and the field is left out.
+    let (_, body) = raw(&h.app, &admin(), "GET", "/hosts/b", None).await;
+    let body = String::from_utf8(body).unwrap();
+    assert!(!body.contains("cert_expires"), "{body}");
+
+    let (_, page) =
+        call::<pistack_types::Page<Host>>(&h.app, &admin(), "GET", "/hosts", None).await;
+    let of = |name: &str| {
+        page.items
+            .iter()
+            .find(|x| x.meta.name == name)
+            .unwrap()
+            .status
+            .cert_expires
+    };
+    assert_eq!(of("a"), record.status.not_after);
+    assert_eq!(of("b"), None);
+
+    // The date is read from keep each time and never written to the host.
+    let stored = h.store.collection::<Host>().resolve(None, "a").unwrap();
+    assert_eq!(stored.status.cert_expires, None);
+    // Revoked with nothing newer: the host has no certificate to show.
+    keep.revoke_certificate(&record.meta.id).unwrap();
+    let (_, host) = call::<Host>(&h.app, &admin(), "GET", "/hosts/a", None).await;
+    assert_eq!(host.status.cert_expires, None);
 }

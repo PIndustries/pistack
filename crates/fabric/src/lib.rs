@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! `fabric`: networks, subnets, ports, routers, security groups and
+//! `fabric`: vpcs, networks, subnets, ports, routers, security groups and
 //! floating IPs. Fabric realises networks through a backend: the overlay
 //! backend is a VXLAN segment per network and a network namespace per
 //! router; host NAT remains the single-host datapath; the mock is for tests.
@@ -9,6 +9,7 @@
 //! Layout:
 //! * [`types`] — the resource model.
 //! * [`ipam`] — deterministic IP and MAC allocation.
+//! * [`vpc`] — the vpc, the router it owns, and what its membership forbids.
 //! * [`overlay`] — the per-host VXLAN plan. It does not change the host.
 //! * [`Client`] — validation and writes; the library API other modules use.
 //! * `reconcile` — turns spec into backend state and writes status.
@@ -30,6 +31,7 @@ pub mod overlay;
 mod reconcile;
 pub mod types;
 mod usage;
+mod vpc;
 
 pub use backend::{HostNat, MockBackend, NetBackend, OverlayBackend, OvnBackend};
 pub use client::{Client, DEFAULT_SG};

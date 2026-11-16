@@ -63,9 +63,50 @@ Creating a volume from a snapshot or from another volume copies the data on the 
 
 `pi volume create --image NAME` fills a new volume from an image. It needs `qemu-img` on the server, and the image must be a disk image, not a container image.
 
-Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check. Restoring a backup works for `local` and `lvm` volumes and not for `rbd`. There are no `pi` commands for backups; the API is `/volume/backups`.
+Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check. Restoring a backup works for `local` and `lvm` volumes and not for `rbd`.
+
+```sh
+pi backup create nightly --volume data --bucket backups
+pi backup list
+pi backup show nightly
+pi backup restore nightly --volume data2
+pi backup delete nightly --yes
+```
+
+The bucket has to exist already: `pi api POST /silo/buckets -d '{"name":"backups"}'`. A new backup is `pending` while its bytes are uploaded and `ready` once they are stored; `--wait` holds until then. A restore needs a `ready` backup and returns only when the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
 
 Volumes can grow and cannot shrink. The `--encrypted` flag is stored on the volume and has no effect.
+
+### Moving a volume to another project
+
+A volume belongs to the project that created it. Handing one over is a transfer: the owner offers the volume and gets a transfer id and a secret, and someone in another project accepts with both. The volume and every snapshot taken from it arrive together, or nothing does.
+
+There are no `pi` commands for it; the API is under `/volume`.
+
+```sh
+# in the giving project
+pi api POST /volume/volumes/data/transfer
+# -> { "transfer": { "id": "xfer-..." }, "secret": "vxt_..." }
+
+# in the receiving project
+pi api POST /volume/transfers/xfer-.../accept -d '{"secret":"vxt_..."}'
+
+# until it is accepted, the giver can take the offer back
+pi api DELETE /volume/transfers/xfer-...
+```
+
+The secret is returned once, with the offer, and is not stored: the record keeps only its hash. Nothing on any later read gives it back, so an offer cannot be repeated from the transfer record and `pi api GET /volume/transfers/xfer-...` is safe to script. A wrong secret, an id that was never issued and an offer that is closed all answer the same `not found`, so guessing at ids tells an attacker nothing.
+
+Seeing a transfer follows the same line. The giving project reads its own offers; the receiving project reads one only after it has taken it, because until then nothing identifies it as the receiver except the secret. Whoever is handed the id and secret is whoever was meant to accept it.
+
+Rules that hold it together:
+
+- The volume must be sitting idle. An attached volume, one with an attach under way, or one with a backup still writing cannot be offered. A finished backup is no obstacle.
+- While an offer is open the volume is held: it cannot be attached or deleted, so the volume that is accepted is the one that was offered. Cancel the transfer first.
+- One open offer per volume. Cancelling and offering again issues a new secret; the old one then opens nothing.
+- The receiving project is checked for the volume and its snapshots against its own limits before anything moves, and the giving project is released when it does. A project with room for the volume but not for its snapshots takes neither.
+- An offer lasts 24 hours and then closes itself. Nothing moves when it does; the volume stays where it was.
+- What arrives behaves like a volume created in the receiving project: it is listed there, and answers to its name and its id there. It stops answering to its name in the project that gave it. A name already used there for another volume refuses the accept, and the volume stays where it was.
 
 ## Images
 
@@ -97,31 +138,38 @@ Objects are files on the server's disk under `<data_dir>/silo`. There is one cop
 
 Requests are authenticated with a bearer token, or with AWS Signature Version 4 using an access key from `pi access-key create`. See [Identity and access](Identity-and-access).
 
+Buckets and objects also have native API and CLI commands: `pi bucket` for the buckets, `pi object` for the keys inside one. A get without `--out` streams the bytes to stdout, and a put streams the file up.
+
 ### What is implemented
 
-- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`
+- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects`
 - `CopyObject`
 - `ListObjectsV2`, with prefix and delimiter
+- Range reads on `GetObject`: `bytes=a-b`, `bytes=a-` and `bytes=-n`, answered with 206 and `Content-Range`. A range past the end is 416 `InvalidRange`; a multi-range or malformed header is ignored and the whole object is returned.
 - Multipart upload: create, upload part, upload part copy, complete, abort, list parts, list uploads
 - SigV4 in the header, presigned URLs (up to seven days), and chunked uploads
 
 ### What is not
 
-- Bucket operations through S3. `CreateBucket`, `DeleteBucket` and `ListBuckets` are not there. Create buckets through the native API: `pi api POST /silo/buckets -d '{"name":"backups"}'`.
+- Bucket operations through S3. `CreateBucket`, `DeleteBucket` and `ListBuckets` are not there. Create buckets with `pi bucket create`, or through the native API: `pi api POST /silo/buckets -d '{"name":"backups"}'`.
 - `ListObjects` version 1.
-- Range requests on `GetObject`.
-- `DeleteObjects` (batch delete).
 - ACLs, bucket policies, lifecycle rules, tagging, CORS, server-side encryption.
 - Reading old versions. A bucket can keep earlier generations of an object, but there is no call to fetch one.
 - SigV4A.
 
-Limits: 5 GiB per single `PutObject`, parts of at least 5 MiB, 10,000 parts per upload, 1,000 keys per list page. Unfinished multipart uploads are removed after seven days. The object size limit, the multipart lifetime and the region can be changed in `[modules.silo]`; see the [Configuration reference](Configuration-reference).
+Limits: 5 GiB per single `PutObject`, parts of at least 5 MiB, 10,000 parts per upload, 1,000 keys per list page and per `DeleteObjects` request. Unfinished multipart uploads are removed after seven days. The object size limit, the multipart lifetime and the region can be changed in `[modules.silo]`; see the [Configuration reference](Configuration-reference).
 
 An S3 client has to be set to path-style addressing, given `http://<server>/silo` as its endpoint and `pistack` as its region, and must not try to create the bucket itself.
 
 ## Shared filesystems
 
-`shelf` creates shares and exports them. There are no `pi` commands for it; the API is under `/shelf`.
+`shelf` creates shares and exports them. See [pi share](CLI-reference#pi-share) for the commands; the API is under `/shelf`.
+
+```sh
+pi share create home --protocol nfs --size 200 --cidr 10.0.0.0/24 --mode read
+pi share access list home
+pi share access allow home --cidr 10.0.1.0/24 --mode write
+```
 
 | Backend | What happens | Needs |
 | --- | --- | --- |
@@ -131,6 +179,8 @@ An S3 client has to be set to path-style addressing, given `http://<server>/silo
 A server that is not root runs the export step through `sudo -n` and the helper named in `PISTACK_SHELF_HELPER`. Install `scripts/pistack-shelf-helper` as `/usr/local/sbin/pistack-shelf-helper`; its header has the sudoers line.
 
 An NFS share with no CIDR, or a CephFS share when `ceph` or `PISTACK_CEPH_FS` is missing, stays `pending`. The size of an NFS share is recorded and not enforced.
+
+`pi share access allow` and `deny` change one client rule. The API takes the whole spec, so the commands read the share, edit its list and write it back with `If-Match` on the revision they read; a share that moved in between is refused rather than overwritten.
 
 ## Where the data is
 

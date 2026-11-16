@@ -24,6 +24,7 @@ pub mod mock;
 pub mod overlay;
 pub mod ovn;
 pub mod ovsdb;
+mod spawn_retry;
 
 pub use hostnat::HostNat;
 pub use mock::{Call, MockBackend};

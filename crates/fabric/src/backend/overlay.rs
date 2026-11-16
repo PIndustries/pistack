@@ -63,6 +63,10 @@ impl NetBackend for OverlayBackend {
         _port: &Port,
         _groups: &[SecurityGroup],
     ) -> ApiResult<PortBinding> {
+        // Allowed address pairs are not carried here. The host end of a port
+        // is built from the plan the scheduler sends the agent, and that plan
+        // knows the port's fixed addresses and nothing else. This backend
+        // itself writes no host rules at all.
         require_segment(net)?;
         Ok(PortBinding {
             vif_type: "overlay".into(),

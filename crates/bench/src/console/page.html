@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiStack</title>
+<style>
+<!--erb:styles-->
+</style>
+</head>
+<body>
+<section id="login">
+  <form id="login-form" autocomplete="off" onsubmit="event.preventDefault()">
+    <h1><span class="mark" aria-hidden="true">π</span>PiStack</h1>
+    <p class="sub">Sign in to this cloud. The token stays in this tab.</p>
+    <label for="user">Name</label>
+    <input id="user" name="name" autocomplete="username" value="admin" required>
+    <label for="pass">Password</label>
+    <input id="pass" name="password" type="password" autocomplete="off" spellcheck="false" required>
+    <p id="login-err"></p>
+    <button class="primary" type="submit">Sign in</button>
+    <p class="build" hidden></p>
+  </form>
+</section>
+<div id="shell" hidden>
+  <aside id="side">
+    <div class="brand"><span class="mark" aria-hidden="true">π</span><strong>PiStack</strong></div>
+    <input id="nav-filter" type="search" placeholder="Jump to…  ( / )" aria-label="Filter the navigation" autocomplete="off">
+    <nav>
+      <button type="button" data-view="overview" aria-current="page">Overview</button>
+      <div class="group" data-group="Compute">
+        <button type="button" class="group-head" aria-expanded="true">Compute</button>
+        <div class="group-items">
+          <button type="button" data-view="machines">Machines</button>
+          <button type="button" data-view="hosts">Hosts</button>
+          <button type="button" data-view="images">Images</button>
+        </div>
+      </div>
+      <div class="group" data-group="Network">
+        <button type="button" class="group-head" aria-expanded="true">Network</button>
+        <div class="group-items">
+          <button type="button" data-view="topology">Topology</button>
+          <button type="button" data-view="networks">Networks</button>
+          <button type="button" data-view="subnets">Subnets</button>
+          <button type="button" data-view="ports">Ports</button>
+          <button type="button" data-view="routers">Routers</button>
+          <button type="button" data-view="security">Security groups</button>
+          <button type="button" data-view="fips">Floating IPs</button>
+          <button type="button" data-view="balancers">Load balancers</button>
+          <button type="button" data-view="dns">DNS</button>
+        </div>
+      </div>
+      <div class="group" data-group="Storage">
+        <button type="button" class="group-head" aria-expanded="true">Storage</button>
+        <div class="group-items">
+          <button type="button" data-view="volumes">Volumes</button>
+          <button type="button" data-view="buckets">Buckets</button>
+          <button type="button" data-view="shares">Shares</button>
+        </div>
+      </div>
+      <div class="group" data-group="Workloads">
+        <button type="button" class="group-head" aria-expanded="true">Workloads</button>
+        <div class="group-items">
+          <button type="button" data-view="pods">Pods</button>
+          <button type="button" data-view="deployments">Deployments</button>
+          <button type="button" data-view="statefulsets">StatefulSets</button>
+          <button type="button" data-view="daemonsets">DaemonSets</button>
+          <button type="button" data-view="autoscalers">Autoscalers</button>
+          <button type="button" data-view="services">Services</button>
+          <button type="button" data-view="jobs">Jobs</button>
+          <button type="button" data-view="ingresses">Ingresses</button>
+          <button type="button" data-view="stacks">Stacks</button>
+        </div>
+      </div>
+      <div class="group" data-group="Access">
+        <button type="button" class="group-head" aria-expanded="true">Access</button>
+        <div class="group-items">
+          <button type="button" data-view="projects">Projects</button>
+          <button type="button" data-view="users">Users</button>
+          <button type="button" data-view="keys">Keys</button>
+          <button type="button" data-view="secrets">Secrets</button>
+        </div>
+      </div>
+      <div class="group" data-group="Monitoring">
+        <button type="button" class="group-head" aria-expanded="true">Monitoring</button>
+        <div class="group-items">
+          <button type="button" data-view="alarms">Alarms</button>
+        </div>
+      </div>
+    </nav>
+    <p class="build" hidden></p>
+  </aside>
+  <div>
+    <header>
+      <div class="crumbs">
+        <button type="button" id="menu" class="ghost" aria-label="Open navigation">☰</button>
+        <span id="crumb-group"></span>
+        <strong id="crumb-title">Overview</strong>
+      </div>
+      <div class="head-tools">
+        <span id="scope" class="scope" hidden>
+          <label title="The top-level project your projects sit under"><span>Tenant</span><select id="tenant"></select></label>
+          <label title="The project you are working in"><span>Project</span><select id="project"></select></label>
+        </span>
+        <input id="filter" type="search" placeholder="Filter rows" aria-label="Filter the rows on this page" autocomplete="off">
+        <label class="live" title="Reload this page every few seconds"><input type="checkbox" id="live" checked><span>Live</span></label>
+        <button type="button" id="theme" class="ghost" aria-label="Switch between light and dark">◐</button>
+        <span id="who">PiStack</span>
+        <button type="button" id="logout">Sign out</button>
+      </div>
+    </header>
+    <main>
+      <div id="err" role="alert"></div>
+      <div id="view"></div>
+    </main>
+  </div>
+</div>
+<script>
+<!--erb:script-->
+</script>
+</body>
+</html>

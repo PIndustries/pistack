@@ -56,53 +56,64 @@ impl Module for Shelf {
             Ok(root) => tracing::info!(root = %root.display(), "shelf share root ready"),
             Err(e) => tracing::warn!(error = %e, "shelf share root is not ready"),
         }
-        let mut rx = ctx.events.subscribe();
         let shutdown = ctx.shutdown.clone();
         let interval = realize::retry_interval();
+        let leadership = ctx.leadership.clone();
+        let events = ctx.events.clone();
         tokio::spawn(async move {
-            // The first tick is immediate. The pass below is the restart
-            // reconcile; the next tick is one full interval later.
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await;
-            if let Err(e) = realize::reconcile_due(&store).await {
-                pistack_types::tally::reconcile_failed("shelf");
-                tracing::warn!(error = %e, "shelf: initial reconcile failed");
-            }
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!("shelf reconciler stopping");
-                        break;
-                    }
-                    ev = rx.recv() => match ev {
-                        Ok(ev) if ev.kind == kind::SHARE => {
-                            if let Err(e) = realize::reconcile_due(&store).await {
-                                pistack_types::tally::reconcile_failed("shelf");
-                                tracing::warn!(error = %e, "shelf: reconcile failed");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(missed = n, "shelf reconciler lagged");
-                            if let Err(e) = realize::reconcile_due(&store).await {
-                                pistack_types::tally::reconcile_failed("shelf");
-                                tracing::warn!(error = %e, "shelf: reconcile failed");
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    _ = tick.tick() => {
-                        if shutdown.is_cancelled() {
-                            break;
-                        }
+            leadership
+                .run_while_leader(shutdown, move |active| {
+                    let store = store.clone();
+                    let events = events.clone();
+                    async move {
+                        let mut rx = events.subscribe();
+                        // The first tick is immediate. The pass below is the
+                        // restart reconcile; the next tick is one full
+                        // interval later.
+                        let mut tick = tokio::time::interval(interval);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        tick.tick().await;
                         if let Err(e) = realize::reconcile_due(&store).await {
-                            tracing::warn!(error = %e, "shelf: retry failed");
+                            pistack_types::tally::reconcile_failed("shelf");
+                            tracing::warn!(error = %e, "shelf: initial reconcile failed");
+                        }
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = active.cancelled() => {
+                                    tracing::debug!("shelf reconciler stopping");
+                                    break;
+                                }
+                                ev = rx.recv() => match ev {
+                                    Ok(ev) if ev.kind == kind::SHARE => {
+                                        if let Err(e) = realize::reconcile_due(&store).await {
+                                            pistack_types::tally::reconcile_failed("shelf");
+                                            tracing::warn!(error = %e, "shelf: reconcile failed");
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(missed = n, "shelf reconciler lagged");
+                                        if let Err(e) = realize::reconcile_due(&store).await {
+                                            pistack_types::tally::reconcile_failed("shelf");
+                                            tracing::warn!(error = %e, "shelf: reconcile failed");
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = tick.tick() => {
+                                    if active.is_cancelled() {
+                                        break;
+                                    }
+                                    if let Err(e) = realize::reconcile_due(&store).await {
+                                        tracing::warn!(error = %e, "shelf: retry failed");
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            }
+                })
+                .await;
         });
         Ok(())
     }

@@ -54,7 +54,7 @@ Pass the token to the agent with `--token` or in `PISTACK_JOIN_TOKEN`.
 
 ## Enrollment and identity
 
-On first start the agent sends its node name and the join token to `/rpc/agents/enroll`. The server spends one use of the token and issues a client certificate whose common name is the node name. The agent saves it in `<data_dir>/agent/` as `cert.pem`, `key.pem` and `ca.pem`. The certificate is valid for 365 days. The agent does not renew it.
+On first start the agent makes a private key, and sends its node name, the join token and a certificate request for that key to `/rpc/agents/enroll`. The server spends one use of the token and issues a client certificate whose common name is the node name. The agent saves it in `<data_dir>/agent/` as `cert.pem`, `key.pem` and `ca.pem`. The private key is made on the host and never sent. The certificate is valid for 365 days, or until the cloud's issuing CA expires if that is sooner.
 
 On later starts the agent finds the certificate and needs no token.
 
@@ -67,6 +67,36 @@ The node name is the host's identity. It is chosen once, in this order, and writ
 5. a generated `node-<hex>`
 
 Because the name is kept in the file, renaming the machine does not change the host record. Setting `PISTACK_NODE_NAME` to something new does: the control plane sees a new host. A certificate speaks only for the node named in it. If the saved certificate names a different node, the agent enrolls again when it has a token and refuses to start when it does not.
+
+### Certificate renewal
+
+An agent that talks to the server over HTTPS renews its own certificate. It looks at it half a minute after start and then every hour. Once two thirds of the certificate's lifetime have passed (about eight months into a 365-day certificate) it:
+
+1. makes a new private key on the host,
+2. asks `/rpc/agents/renew` for a certificate for it, over the connection the current certificate secures,
+3. connects once more with the new certificate and checks that the server accepts it,
+4. replaces the files in `<data_dir>/agent/` and uses the new certificate for every call from then on.
+
+The agent is not restarted and its command loop is not interrupted. Until step 3 passes, the old certificate stays on disk and in use, so a renewal that fails half way costs nothing; it is tried again five minutes later. The new set is written to `<data_dir>/agent/next/` first and moved into place only after the server accepted it. An agent stopped in the middle finishes or drops that on its next start.
+
+The server renews only for the node the presenting certificate names. It refuses when:
+
+- the certificate has been revoked (`pi api POST /secrets/certificates/<id>/revoke`),
+- the certificate's record has been deleted from the cloud,
+- the certificate has expired.
+
+The old certificate is not revoked by a renewal. It stays valid until its own last day, about four months later.
+
+There is no `pi host` command that removes a host for good yet. To cut one off, revoke its certificates: find them with `pi api GET /secrets/certificates` (the name is `<node>-<serial>`) and revoke each one. The agent is refused from its next call and cannot renew.
+
+An agent whose certificate has already expired cannot renew it, because the server no longer accepts it for anything. What happens next depends on how the agent was started:
+
+- With a join token (`--token` or `PISTACK_JOIN_TOKEN`) it enrolls again with that token, at start or while running, and logs `client certificate has expired and cannot renew itself; enrolling again with the join token`. The token has to be one that is still valid.
+- Without one it refuses to start and tells you to create a join token and pass it. A running agent logs the same thing as an error every five minutes.
+
+Renewal needs HTTPS. An agent on plain HTTP never shows its certificate, so it has nothing to prove a renewal with and its certificate is not renewed. Agents joined over plain HTTP with `PISTACK_RPC_INSECURE=1`, the only way that works end to end today, are in that position.
+
+`pi host list -o wide` has a `CERT-EXPIRES` column and `pi host show` prints `status.cert_expires`: the last day of the newest certificate the cloud has issued for that node and not revoked. The leader also logs a warning for any agent or server certificate that is more than a day past its renewal point with no successor issued, and again every six hours, until it is renewed, revoked or deleted. A month after such a certificate expires the warning stops.
 
 ## What the host reports
 
@@ -164,6 +194,7 @@ Drain never stops a machine. A machine it cannot move stays where it is, running
 - containers, pods and bare metal
 - a machine that is powered off or not `ready`
 - any machine when the host has no libvirt runtime
+- a machine whose root disk is a file on this host
 - a machine no other host can take
 
 A migration takes time. The machine leaves the list when its new host reports it. Run the command again to see what is still on the host. Running it again is always safe: it does not start a second migration for a machine that is already moving.
@@ -171,6 +202,8 @@ A migration takes time. The machine leaves the list when its new host reports it
 When a migration fails, the machine goes to phase `error` with the message from libvirt. It is still running on the old host.
 
 Live migration does not copy disks. The destination host must already see the machine's disk at the same path.
+
+The agent says whether the directory it writes machine disks into is on an NFS or SMB mount, and the host keeps that answer as the label `pistack.io/disk`. A host without that label set to `shared` is read as keeping its machine disks to itself, so nothing on it is asked to move. Mount the disk directory where every host can see it and the host reports `shared` at its next hello.
 
 When the work is done, `pi host enable agent1` puts the host back.
 
@@ -200,20 +233,37 @@ What happens to volumes:
 
 These are also skipped: bare metal machines, pods that are pinned to the host by their volumes, and machines that are being deleted or live-migrated.
 
-Evacuate only acts on:
+Evacuate only acts on a host in phase `error` (it stopped reporting) or a host you have disabled. It refuses a host that is up: use drain to empty a working host.
 
-- a host in phase `error`, which means it stopped reporting, or
-- a disabled host, when you add `--confirm-dead`.
+Then it needs proof the host is really off, so it never starts a second copy of a machine that is still running:
 
-It refuses a host that is up.
+- A host that stopped reporting and has [power control](#power-control) is powered off through its BMC and the off state read back before any machine moves. You do not need `--confirm-dead`: the power-off is the proof, and the report says the proof was `power-off`.
+- A host that still reports is a host that works, however it is disabled. Its machines are running there. You must pass `--confirm-dead` before the server will touch anything, and the refusal says so: with power control an evacuation cuts the host's power and hard-stops every machine on it, without power control it risks second copies. Either way, `pi host drain` is how you empty a host that works. Once you have confirmed the host is dead, power control is used if the host has it and the proof is `power-off`.
+- A host that stopped reporting and has no power control needs `--confirm-dead` too, every time and even once it is marked down. The report says the proof was `operator`.
 
-**PiStack cannot power off a host.** Evacuate trusts you that the machines there are not running. If the host is only cut off from the control plane, its machines keep running there while new copies start elsewhere. Two copies then use the same addresses, and both write to any shared volume. Make sure the host is off before you evacuate it.
+A host that is only cut off from the control plane is the danger this guards against: its machines keep running there while new copies start elsewhere, two copies use the same addresses, and both write to any shared volume. Power control is what lets the server settle this instead of taking your word for it.
 
 When the host comes back, its agent still has the old copies. Each heartbeat reports them, and the control plane tells the agent to delete every machine that was evacuated off it. That removes the old root disks too. If you need data from an old root disk, copy it off the host before you start the agent there.
 
 A machine that was evacuated has the condition `Evacuated` and the annotation `pistack.io/evacuated-from`.
 
 Running the command again is safe. It only sees the machines that were skipped the first time.
+
+### Power control
+
+Power control is how the server can cut a host's power from outside it, so an evacuation can prove the host is off. A cloud admin sets it out of band, before the host is ever lost:
+
+```sh
+pi host power set agent1 --kind ipmi --address 10.9.1.8 --user admin --secret agent1-bmc
+pi host power show agent1
+pi host power clear agent1
+```
+
+The password is not given to this command and is not stored on the host. `--secret` is the name of a secret in the secrets service that holds it; only the name is kept, and the password is read only at the moment of a power-off. It never appears in `pi host power show`, in any API reply, or in a log line.
+
+`--kind` is `ipmi` or `redfish`. For IPMI the address is a `host[:port]`; for Redfish it is a URL or a host. The server drives the BMC with `ipmitool` or `curl`, the same path the bare-metal runtime uses.
+
+With power control set, `pi host evacuate` on a host that has stopped reporting powers the host off, confirms it, and then moves the machines; you do not need `--confirm-dead`. If the power-off fails or cannot be confirmed within 60 seconds the evacuation is refused and nothing moves. A BMC that died with its host is common enough — a failed power supply takes both — so you can pass `--confirm-dead` and the evacuation goes ahead on your word; the report and the audit record then both say a power-off was tried and failed, and why. A host that still reports is never powered off without that same `--confirm-dead` first; see [Evacuate](#evacuate-a-dead-host).
 
 ## Runtimes
 

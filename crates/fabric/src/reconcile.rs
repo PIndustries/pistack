@@ -59,6 +59,7 @@ macro_rules! observed {
         }
     };
 }
+observed!(Vpc);
 observed!(Network);
 observed!(Subnet);
 observed!(Port);
@@ -168,6 +169,9 @@ impl Client {
             return;
         }
         match k {
+            kind::VPC => {
+                self.reconcile_vpc(&ev.id).await;
+            }
             kind::NETWORK => {
                 self.reconcile_network(&ev.id).await;
             }
@@ -200,6 +204,7 @@ impl Client {
     async fn handle_deleted(&self, k: &str, id: &Id) {
         let b = self.backend();
         let res = match k {
+            kind::VPC => Ok(()),
             kind::NETWORK => b.delete_network(id).await,
             kind::SUBNET => b.delete_subnet(id).await,
             kind::PORT => {
@@ -250,6 +255,7 @@ impl Client {
                 }
             };
         }
+        each!(self.vpcs(), count_vpc_pass);
         each!(self.networks(), reconcile_network);
         each!(self.subnets(), reconcile_subnet);
         each!(self.security_groups(), reconcile_security_group);
@@ -259,6 +265,34 @@ impl Client {
     }
 
     // ---- per kind ---------------------------------------------------------
+
+    /// A vpc has nothing of its own to realise. The router it owns is
+    /// reconciled as a router; a vpc is ready when that router is, and its
+    /// subnet count is kept current on the way.
+    async fn count_vpc_pass(&self, id: &Id) {
+        self.reconcile_vpc(id).await;
+    }
+
+    pub async fn reconcile_vpc(&self, id: &Id) -> Phase {
+        let col = self.vpcs();
+        if col.get(id).is_err() {
+            return Phase::Deleting;
+        }
+        self.count_vpc_subnets(id);
+        let v = match col.get(id) {
+            Ok(v) => v,
+            Err(_) => return Phase::Deleting,
+        };
+        let outcome = match &v.status.router {
+            Some(r) => match self.reconcile_router(r).await {
+                Phase::Ready => Ok(()),
+                Phase::Error => Err(ApiError::unavailable(format!("router {r} failed"))),
+                _ => Err(ApiError::unavailable(format!("router {r} is not ready"))),
+            },
+            None => Err(ApiError::internal(format!("vpc {id} owns no router"))),
+        };
+        finish(&col, id, v.meta.revision, outcome, |_| {})
+    }
 
     pub async fn reconcile_network(&self, id: &Id) -> Phase {
         let col = self.networks();

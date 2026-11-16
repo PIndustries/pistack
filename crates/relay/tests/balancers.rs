@@ -12,6 +12,8 @@ use relay::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tower::ServiceExt;
 
 struct Harness {
@@ -83,6 +85,31 @@ impl Harness {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, v)
+    }
+
+    /// Send a body the router may refuse to even parse, and keep whatever
+    /// came back as text.
+    async fn raw_body(&self, method: &str, path: &str, body: &str) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let mut req = req;
+        req.extensions_mut().insert(admin_caller());
+        let res = self.router.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (status, Value::String(text))
+    }
+
+    /// Read a balancer's `provider_ref`: the socket its provider really bound.
+    fn provider_ref(&self, id: &Id) -> Option<String> {
+        self.client.balancers().get(id).unwrap().status.provider_ref
     }
 
     /// Wait until `pred` holds for the balancer.
@@ -813,5 +840,338 @@ async fn listener_routes_are_validated_and_hold_their_pools() {
     );
     let err = h.client.delete_pool(&api.meta.id).unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
+    h.ctx.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_pool_algorithm_is_named_or_refused() {
+    let h = harness().await;
+    let project = h.project.to_string();
+    let (st, lb) = h
+        .call(
+            "POST",
+            "/balancers",
+            Some(json!({ "name": "alg", "project": project, "spec": { "vip_network": "tenant" } })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{lb}");
+    let lb_id = id(&lb);
+
+    for name in ["round_robin", "least_conn", "source_ip"] {
+        let (st, pool) = h
+            .call(
+                "POST",
+                "/pools",
+                Some(
+                    json!({ "name": format!("p-{name}"), "project": project, "spec": {
+                        "balancer": lb_id.to_string(), "protocol": "tcp", "algorithm": name
+                    }}),
+                ),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{name}: {pool}");
+        assert_eq!(pool["spec"]["algorithm"], name);
+    }
+
+    // Anything else is refused on the way in, naming what may be used. The
+    // pool is read through its spec, so the refusal is the body's own.
+    let (st, raw) = h.raw_body(
+        "POST",
+        "/pools",
+        &format!(
+            r#"{{"name":"p-bad","project":"{project}","spec":{{"balancer":"{lb_id}","protocol":"tcp","algorithm":"weighted_rr"}}}}"#,
+        ),
+    )
+        .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{raw}");
+    let message = raw.to_string();
+    assert!(message.contains("weighted_rr"), "{message}");
+    for name in ["round_robin", "least_conn", "source_ip"] {
+        assert!(message.contains(name), "{message}");
+    }
+
+    let (st, pool) = h
+        .call(
+            "POST",
+            "/pools",
+            Some(json!({ "name": "p-upd", "project": project, "spec": {
+                "balancer": lb_id.to_string(), "protocol": "tcp", "algorithm": "least_conn"
+            }})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{pool}");
+    let pool_id = id(&pool);
+
+    // The same refusal on update, with the pool left as it was.
+    let (st, v) = h
+        .raw_body(
+            "PUT",
+            &format!("/pools/{pool_id}"),
+            &format!(r#"{{"spec":{{"balancer":"{lb_id}","protocol":"tcp","algorithm":"hash"}}}}"#),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert!(v.to_string().contains("hash"), "{v}");
+    let (_, kept) = h.call("GET", &format!("/pools/{pool_id}"), None).await;
+    assert_eq!(kept["spec"]["algorithm"], "least_conn");
+
+    let (st, v) = h
+        .call(
+            "PUT",
+            &format!("/pools/{pool_id}"),
+            Some(json!({ "spec": {
+                "balancer": lb_id.to_string(), "protocol": "tcp", "algorithm": "source_ip"
+            }})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["spec"]["algorithm"], "source_ip");
+    h.ctx.shutdown.cancel();
+}
+
+/// The pool's algorithm reaching a socket that is really forwarding, with
+/// the API, the reconciler and a member health check all in between.
+async fn data_plane(algorithm: &str, vip: std::net::IpAddr) -> (Harness, Id) {
+    data_plane_at(algorithm, vip, 9401, 9402).await
+}
+
+/// As above with the two members on the ports given. Each data-plane test
+/// picks its own pair: they run side by side, and a port is claimed by the
+/// member that answers on it.
+async fn data_plane_at(
+    algorithm: &str,
+    vip: std::net::IpAddr,
+    heavy_port: u16,
+    light_port: u16,
+) -> (Harness, Id) {
+    let store = Store::in_memory().unwrap();
+    let module = Relay::forward();
+    let ctx = ModuleContext {
+        store: Arc::new(store.clone()),
+        events: store.events(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        public_url: "http://test".into(),
+        node_name: "test".into(),
+        leadership: pistack_types::Leadership::always(),
+    };
+    module.start(ctx.clone()).await.unwrap();
+    let router = module.router(ctx.clone());
+    let client = module.client(&ctx);
+    let project = Id::new(kind::PROJECT);
+    let h = Harness {
+        ctx,
+        client,
+        provider: Arc::new(MockProvider::new()),
+        router,
+        project: project.clone(),
+    };
+    let project = project.to_string();
+    let (_, lb) = h
+        .call(
+            "POST",
+            "/balancers",
+            Some(json!({ "name": "live", "project": project, "spec": {
+                "vip_network": "tenant", "vip_address": vip.to_string()
+            }})),
+        )
+        .await;
+    let lb_id = id(&lb);
+    let (_, pool) = h
+        .call(
+            "POST",
+            "/pools",
+            Some(json!({ "name": "live-pool", "project": project, "spec": {
+                "balancer": lb_id.to_string(), "protocol": "tcp", "algorithm": algorithm
+            }})),
+        )
+        .await;
+    let pool_id = id(&pool);
+    for (n, port) in [("heavy", heavy_port), ("light", light_port)] {
+        let (st, m) = h
+            .call(
+                "POST",
+                &format!("/pools/{pool_id}/members"),
+                Some(json!({ "name": n, "address": "127.0.0.1", "port": port,
+                             "weight": if n == "heavy" { 3 } else { 1 } })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{m}");
+    }
+    let (st, lsn) = h
+        .call(
+            "POST",
+            "/listeners",
+            Some(json!({ "name": "live-9400", "project": project, "spec": {
+                "balancer": lb_id.to_string(), "protocol": { "type": "tcp" },
+                "port": 9400, "default_pool": pool_id.to_string()
+            }})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{lsn}");
+    // Nothing is monitored: both members read `no_monitor`, so the pool
+    // counts two of them online once the balancer is reconciled.
+    let listener_id = id(&lsn);
+    h.wait_listener(&listener_id, |l| l.status.phase == Phase::Ready)
+        .await;
+    h.wait_lb(&lb_id, |b| b.status.phase == Phase::Ready).await;
+    for _ in 0..25 {
+        h.client.reconcile_balancer(&lb_id).await;
+        h.client.reconcile_listener(&listener_id).await;
+        h.client.reconcile_pool(&pool_id).await;
+        let pool_row = h.client.pools().get(&pool_id).unwrap();
+        if pool_row.status.members == 2 {
+            return (h, lb_id);
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let pool_row = h.client.pools().get(&pool_id).unwrap();
+    panic!(
+        "the listener was never programmed with both members: {:?}",
+        pool_row.status
+    );
+}
+
+/// A member that answers each connection with its own name.
+async fn member(port: u16, body: &'static [u8]) -> tokio::task::JoinHandle<()> {
+    answer(member_listener(port).await, body).await
+}
+
+/// A member that names itself and then keeps the connection open. What it
+/// holds is the load `least_conn` counts.
+async fn silent_member(port: u16, keep: &'static [u8]) -> tokio::task::JoinHandle<()> {
+    let listener = member_listener(port).await;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                if sock.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                // The client sees who answered, then leaves the connection
+                // standing. That is the load `least_conn` has to count.
+                let _ = sock.write_all(keep).await;
+                let _ = sock.readable().await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            });
+        }
+    })
+}
+
+async fn member_listener(port: u16) -> tokio::net::TcpListener {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpListener::bind(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(l)) => l,
+        _ => panic!("port {port} is in use; the data-plane tests need it free"),
+    }
+}
+
+async fn answer(
+    listener: tokio::net::TcpListener,
+    body: &'static [u8],
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4];
+            if sock.read_exact(&mut buf).await.is_err() {
+                continue;
+            }
+            let _ = sock.write_all(body).await;
+        }
+    })
+}
+
+async fn through_vip(at: &str, n: usize) -> Vec<Vec<u8>> {
+    let mut seen = Vec::new();
+    for _ in 0..n {
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TcpStream::connect(at.parse::<std::net::SocketAddr>().unwrap()),
+        )
+        .await
+        .expect("timed out connecting to the vip")
+        .unwrap();
+        use tokio::io::AsyncWriteExt;
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = vec![0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for a member")
+        .unwrap();
+        seen.push(buf);
+        drop(client);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_tcp_listener_spreads_connections_by_the_pools_algorithm() {
+    let vip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let _heavy = member(9401, b"heav").await;
+    let _light = member(9402, b"ligh").await;
+    let (h, lb) = data_plane("round_robin", vip).await;
+    let at = h
+        .provider_ref(&lb)
+        .expect("the forwarder reports its socket");
+    let names: Vec<Vec<u8>> = through_vip(&at, 8).await;
+    let heavy = names.iter().filter(|b| b.as_slice() == b"heav").count();
+    assert_eq!(heavy, 6, "weight 3 against weight 1: {names:?}");
+    h.ctx.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_tcp_listener_honours_a_source_ip_pool() {
+    let vip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let _heavy = member(9413, b"heav").await;
+    let _light = member(9414, b"ligh").await;
+    let (h, lb) = data_plane_at("source_ip", vip, 9413, 9414).await;
+    let at = h
+        .provider_ref(&lb)
+        .expect("the forwarder reports its socket");
+    let seen = through_vip(&at, 6).await;
+    assert!(
+        seen.windows(2).all(|w| w[0] == w[1]),
+        "one client address moved between members: {seen:?}"
+    );
+    h.ctx.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_tcp_listener_honours_a_least_conn_pool() {
+    let vip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    // Both members carry the same weight, so only what is open on them can
+    // tell the two apart. One keeps every connection it is given, the other
+    // answers at once and lets go.
+    let _slow = silent_member(9411, b"slow").await;
+    let _fast = member(9412, b"fast").await;
+    let (h, lb) = data_plane_at("least_conn", vip, 9411, 9412).await;
+    let at = h
+        .provider_ref(&lb)
+        .expect("the forwarder reports its socket");
+
+    // Three connections arrive while the first is still standing. Whoever
+    // the first landed on, it is the busy one from then on, so the other two
+    // have to go to the other member: a balancer still walking its members
+    // in turn would hand the third connection back to the busy one.
+    let seen = through_vip(&at, 3).await;
+    let slow = seen.iter().filter(|b| b.as_slice() == b"slow").count();
+    assert_eq!(
+        slow, 1,
+        "a member holding a connection took another: {seen:?}"
+    );
+    // The held connection ends with the test; the member is only waiting
+    // on it, so nothing here has to wait for it back.
     h.ctx.shutdown.cancel();
 }

@@ -11,6 +11,8 @@
 //! GET|DELETE /certificates/{id}           get (cert_pem in status) / delete with its key
 //! GET       /certificates/{id}/key        private key PEM (project admin)
 //! POST      /certificates/{id}/revoke     revoke on its CA
+//! POST      /peer/renew-certificate       a server's listener certificate, for a
+//!                                         cluster member (peer key, no token)
 //! GET       /cas                          (admin) list CAs
 //! GET       /cas/{id}                     (admin)
 //! GET       /cas/{id}/certificate         CA certificate PEM (any caller)
@@ -79,6 +81,7 @@ pub fn router(client: Client) -> Router {
         )
         .route("/certificates/{id}/key", get(get_certificate_key))
         .route("/certificates/{id}/revoke", post(revoke_certificate))
+        .route("/peer/renew-certificate", post(peer_renew_certificate))
         .route("/cas", get(list_cas))
         .route("/cas/{id}", get(get_ca))
         .route("/cas/{id}/certificate", get(get_ca_certificate))
@@ -277,6 +280,47 @@ fn decode_payload(payload: &str, encoding: Encoding) -> ApiResult<Vec<u8>> {
             .decode(payload.trim())
             .map_err(|e| ApiError::bad_request(format!("payload is not base64: {e}"))),
     }
+}
+
+// ---- between servers ---------------------------------------------------------
+
+/// A server asking the leader to renew its listener certificate. A
+/// follower cannot issue one itself: only the leader writes the store.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerRenew {
+    /// The certificate the server holds now. The leader may have no
+    /// record of it; its signature is what it goes by.
+    pub cert_pem: String,
+    /// Request for a new key the server made.
+    pub csr_pem: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerRenewed {
+    pub cert_pem: String,
+    pub ca_pem: String,
+}
+
+/// The caller proves it is a member with the cluster peer key. Only a
+/// listener certificate is renewed here; an agent renews its own over
+/// `/rpc`, with the certificate itself as the proof.
+async fn peer_renew_certificate(
+    State(c): State<Client>,
+    headers: HeaderMap,
+    Body(req): Body<PeerRenew>,
+) -> ApiResult<Json<PeerRenewed>> {
+    let offered = headers
+        .get(crate::peer::PEER_HEADER)
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    if !crate::peer::is_member(c.store(), offered) {
+        return Err(ApiError::unauthorized("not a member of this cluster"));
+    }
+    let pki = c.renew_listener_certificate(&req.cert_pem, &req.csr_pem)?;
+    Ok(Json(PeerRenewed {
+        cert_pem: pki.cert_pem,
+        ca_pem: pki.ca_pem,
+    }))
 }
 
 // ---- secrets -----------------------------------------------------------------

@@ -199,12 +199,13 @@ async fn a_host_that_returns_after_an_evacuation_drops_its_stale_machines() {
     // Evacuate it. Both machines must come up on the second host.
     let resp = http
         .post(format!("{base}/compute/hosts/first/evacuate"))
-        .json(&serde_json::json!({"rebuild_from_image": true}))
+        .json(&serde_json::json!({"confirm_dead": true, "rebuild_from_image": true}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
     let report: EvacuateReport = resp.json().await.unwrap();
+    assert_eq!(report.proof, forge::maintain::Proof::Operator);
     assert_eq!(report.evacuated.len(), 2, "{report:?}");
     assert!(report.skipped.is_empty(), "{report:?}");
     // What was asked of the host is dropped, so it is not handed to the

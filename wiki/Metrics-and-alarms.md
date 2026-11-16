@@ -22,7 +22,7 @@ On the wire a machine with one disk and one interface is about 300 bytes of JSON
 
 ## What a server keeps
 
-- The last 60 points of each series, and nothing older than an hour.
+- The last 240 points of each series, and nothing older than an hour. Points are kept in stamp order, so a report arriving late with a reading it took earlier is a point of the series where its stamp puts it and not the point alarms read.
 - At most 50,000 series. A machine with one disk and one interface is about a dozen, so that is room for some four thousand machines. Past the limit, samples for new series are dropped and the server logs that once.
 - In memory only. Nothing is written to disk, and nothing is copied to the other servers.
 
@@ -163,11 +163,15 @@ pi api POST /gauge/samples -d '{"metric":"queue.depth","value":12}'
 pi api GET '/gauge/samples?metric=queue.depth'
 ```
 
+From the CLI, `pi metric list` and `pi metric show <SERIES>` read the same window: one row per series with its newest point, and the points held for one series. See [CLI reference](CLI-reference#pi-metric).
+
 A posted sample lives in the same window and appears in `/metrics` as a gauge, with characters that are not legal in a metric name turned into `_`. Names that start with `pistack_` cannot be posted. `GET /gauge/samples` returns the whole window to a cloud admin. Anyone else gets what was posted, plus the `pistack_` series of their own project.
 
 ## Alarms
 
 An alarm compares a metric with a threshold. It is `Firing` while the value crosses, `Ok` while it does not, and `Pending` until there is a sample.
+
+`pi alarm list`, `show`, `create`, `update` and `delete` do all of this from the CLI, including `pi alarm show <NAME> --samples`, which prints the points the deciding series has now. See [CLI reference](CLI-reference#pi-alarm).
 
 ```sh
 pi api POST /gauge/alarms -d '{
@@ -183,10 +187,14 @@ pi api POST /gauge/alarms -d '{
 pi api GET /gauge/alarms/web-busy
 ```
 
+A `PUT /gauge/alarms/{id}` takes `{description, labels, spec}` and changes only what it names; a new spec is decided again at once from the window, and its hold begins from the stamps there.
+
 `metric` is a name with or without labels. With labels, the alarm watches every series that has those labels; with none, every series of that name. It fires while any of them crosses, and `status.series` names the one that decided. `comparison` is `gt`, `lt` or `eq`.
 
 An alarm that belongs to a project sees only the `pistack_` series of that project, so it can watch the project's machines and nothing else. An alarm made by a cloud admin sees everything, hosts and the control plane included.
 
 Alarms are evaluated when a sample arrives, on the server that received it. The phase is written to the store when it changes; while it stays the same, `last_value` is refreshed at most once a minute. Only the leader can write to the store, so an alarm follows the series the leader has: hosts, machines, posted samples and the leader's own control-plane series. For a follower's control-plane series use Prometheus rules.
 
-What alarms do not do: `for_seconds` is stored and ignored, so an alarm fires on the first sample that crosses. Nothing is sent anywhere when one fires. An alarm on a series that stops reporting keeps its last phase. For paging, use Prometheus rules.
+`for_seconds` asks the alarm to hold off: the value has to cross at every sample for that long before the alarm fires, and the first sample that does not cross ends the run so the wait starts again. It is measured in seconds on the samples themselves — the stamp of the newest crossing sample minus the stamp of the first of the run — so a hold of sixty seconds is spanned by the fifth sample of a machine reporting every fifteen, and by the second of one reporting every minute, whatever moment either report reaches the server at. Leaving it out, or `0`, fires on the first sample that crosses. The longest hold an alarm may ask for is an hour, which is as far back as the window of samples reaches; an alarm asking for longer is refused, at the creation and at an update, with the longest possible hold in the message. An alarm is `Pending` until a sample decides it. An alarm with a hold is decided from the samples already there when it is made, so a value that has been crossing for a minute fires one asking for sixty seconds at once; an alarm with no hold waits for a fresh sample. Updating an alarm changes what its samples are measured against, and the phase follows from the samples there.
+
+What alarms do not do: nothing is sent anywhere when one fires. An alarm on a series that stops reporting keeps its last phase. For paging, use Prometheus rules.
