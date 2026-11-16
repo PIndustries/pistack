@@ -72,6 +72,7 @@ forms/create/routers.js
 forms/create/security.js
 forms/create/volumes.js
 forms/create/fips.js
+forms/create/vpcs.js
 forms/create/images.js
 forms/create/buckets.js
 forms/create/projects.js

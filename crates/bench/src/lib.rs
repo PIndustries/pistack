@@ -95,6 +95,17 @@ mod tests {
         assert!(text.contains(">Console<") || text.contains("\"Console\""));
         assert!(text.contains("A machine gets no floating IP on its own. If an admin has marked an external network for automatic floating IPs, the guest gets one from it when it has an address, and the auto DNS zone publishes its name."));
         assert!(text.contains("Name a network to boot on that project's bridge. A router on that network NATs the guest. The address on the port is the address the guest uses."));
+        // The VPC page: a nav button in the network group, the view that lists
+        // it, and both halves of its create form.
+        assert!(text.contains("data-view=\"vpcs\""));
+        assert!(text.contains("data-view=\"vpcs\">VPCs</button>"));
+        assert!(text.contains("A VPC is a private address space with its own router. Subnets are cut from its blocks."));
+        assert!(text.contains("/network/vpcs"));
+        assert!(text.contains("New VPC"));
+        assert!(text.contains("Create VPC"));
+        assert!(text.contains("Add subnet"));
+        assert!(text.contains("Block or prefix length"));
+        assert!(text.contains("/subnets\""));
         assert!(text.contains("security_groups"));
         assert!(text.contains(">Reboot<") || text.contains("\"Reboot\""));
         assert!(!text.contains("innerHTML"));
@@ -161,7 +172,7 @@ mod tests {
         }
         assert_eq!(
             text.matches("<button type=\"button\" data-view=\"").count(),
-            31
+            32
         );
         assert!(text.contains("Needs attention"));
         assert!(text.contains("Control plane"));
