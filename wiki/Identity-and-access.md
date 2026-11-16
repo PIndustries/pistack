@@ -90,11 +90,11 @@ A binding gives one principal one role, in one project or system-wide.
 
 ```sh
 pi binding create --principal alice --role member --in-project research
-pi binding create --principal alice --role admin
+pi binding create --principal alice --role admin --system
 pi binding list
 ```
 
-Leaving out `--in-project` makes the binding system-wide.
+A binding says where it applies: `--in-project` for one project, `--system` for the whole cloud.
 
 When a token is issued, the server works out its roles:
 
