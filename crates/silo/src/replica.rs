@@ -28,11 +28,15 @@
 //! stale and is fetched again. A file with no marker predates this module
 //! and was written by the only server there was, so it is trusted.
 //!
-//! What this does not do: a put is acknowledged before any other server
-//! has the bytes, so losing the leader within one pull interval of a put
-//! loses that object's bytes while its record survives. Reads of it then
-//! fail with `unavailable`. Multipart staging is not copied; an upload in
-//! flight when the leader changes has to start again.
+//! * **Copy before the answer.** A put is answered only after one other
+//!   server holds the bytes: the server that took it calls
+//!   `POST /silo/peer/pull/{object-id}/{sha256}` on each peer in turn and
+//!   the first one that answers has fetched and checked them. See
+//!   [`Peers::push`]. `[modules.silo] put_copies = 1` turns the wait off.
+//!
+//! What this does not do: multipart staging is not copied; an upload in
+//! flight when the leader changes has to start again. The finished object
+//! is copied like any other.
 
 use crate::client::Client;
 use crate::types::{Bucket, Object};
@@ -53,6 +57,18 @@ pub const REPLICATE_INTERVAL_SECS: u64 = 60;
 /// so a record that is still on its way through the log is not mistaken
 /// for a deleted one.
 pub const PRUNE_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// Servers that hold an object's bytes before a put is answered, when
+/// the config does not say.
+pub const PUT_COPIES: u32 = 2;
+
+/// How long a peer asked to pull waits for the object's record to reach
+/// it through the log before it gives up.
+pub const RECORD_WAIT: Duration = Duration::from_secs(5);
+
+/// A peer asked to pull is given this long, plus a second for each
+/// mebibyte, before the next one is tried.
+const PUSH_BASE: Duration = Duration::from_secs(30);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A peer that sends nothing for this long is given up on. There is no
@@ -153,6 +169,55 @@ impl Peers {
                 others.into_iter().map(|m| (m.api, m.agent_api)).collect()
             }
         }
+    }
+
+    /// Have `wanted` other servers fetch the bytes of `obj` from this one.
+    ///
+    /// Each peer is asked in turn and answers once it holds bytes that
+    /// match the checksum. Ok when there is no peer to ask: a cluster of
+    /// one server has nowhere to put a second copy. `unavailable` when
+    /// fewer than `wanted` took it and there were peers to ask.
+    pub async fn push(&self, obj: &Object, wanted: usize) -> ApiResult<()> {
+        let urls = self.targets();
+        let wanted = wanted.min(urls.len());
+        let wait = PUSH_BASE + Duration::from_secs(obj.status.size_bytes / (1024 * 1024));
+        let mut taken = 0;
+        let mut last = String::new();
+        let key = self.peer_key();
+        let path = format!("/silo/peer/pull/{}/{}", obj.meta.id, obj.status.sha256);
+        for (base, tls) in &urls {
+            if taken >= wanted {
+                break;
+            }
+            // The same way as the fetch: at the TLS listener when the
+            // server has one.
+            let sent = self
+                .net
+                .send(base, tls.as_deref(), CONNECT_TIMEOUT, |client, base| {
+                    let req = client.post(format!("{}{path}", base.trim_end_matches('/')));
+                    match &key {
+                        Some(key) => req.header(keep::peer::PEER_HEADER, key),
+                        None => req,
+                    }
+                });
+            match tokio::time::timeout(wait, sent).await {
+                Ok(Ok(resp)) if resp.status().is_success() => taken += 1,
+                Ok(Ok(resp)) => last = format!("{base}: status {}", resp.status().as_u16()),
+                Ok(Err(e)) => last = format!("{base}: {e}"),
+                Err(_) => last = format!("{base}: no answer in {}s", wait.as_secs()),
+            }
+        }
+        if taken >= wanted {
+            return Ok(());
+        }
+        tracing::warn!(object = %obj.meta.id, key = %obj.spec.key, %last, "silo: no second copy of a put");
+        Err(ApiError::unavailable(format!(
+            "object '{}' is stored on this server only: {} of {} other server(s) took a copy (last: {last}). \
+             It is copied in the background; read before retrying",
+            obj.spec.key,
+            taken,
+            urls.len()
+        )))
     }
 
     /// Download the bytes with checksum `sha256` to `dest`.
