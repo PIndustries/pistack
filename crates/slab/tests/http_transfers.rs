@@ -747,3 +747,193 @@ async fn a_moved_snapshot_answers_to_its_name_in_the_project_that_took_it() {
         0
     );
 }
+
+/// The annotation naming the stored hash of the one-time secret. The accept
+/// path needs it so the store keeps it; no answer may carry it out.
+const SECRET_HASH: &str = "pistack.io/transfer-secret";
+
+/// Walk a JSON answer and name the first object holding `key`.
+fn holder(carrying: &Value, key: &str) -> Option<Value> {
+    match carrying {
+        Value::Object(map) => {
+            if map.contains_key(key) {
+                return Some(Value::Object(map.clone()));
+            }
+            map.values().find_map(|v| holder(v, key))
+        }
+        Value::Array(items) => items.iter().find_map(|v| holder(v, key)),
+        _ => None,
+    }
+}
+
+fn assert_no_secret_hash(answer: &Value, where_: &str) {
+    if let Some(obj) = holder(answer, SECRET_HASH) {
+        panic!("{where_} carries the annotation {SECRET_HASH}: {obj}");
+    }
+}
+
+/// Offer a volume and read the offer back through every route that answers
+/// with a transfer, including the admin's.
+#[tokio::test]
+async fn no_answer_carries_the_stored_secret_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, app) = app(dir.path(), Arc::new(AllowAll));
+    let giver = tenant(c.store(), "giver", &[]);
+    let owner = caller(Some(giver.clone()), "member");
+    let admin = Caller {
+        principal: Id::new(kind::PRINCIPAL),
+        principal_name: "dev-admin".into(),
+        project: None,
+        roles: vec!["admin".into()],
+        system: true,
+    };
+
+    let id = make_volume(&app, &owner, "data", 1).await;
+    let vol = c.get_volume(None, &id).unwrap();
+    c.reconcile_volume(&vol.meta.id).await.unwrap();
+
+    // The offer answer is the one that shows the secret, so it is the one
+    // easiest to answer with the hash too.
+    let (st, offered) = send(
+        &app,
+        owner.clone(),
+        "POST",
+        &format!("/volumes/{id}/transfer"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{offered}");
+    let tid = offered["transfer"]["id"].as_str().unwrap().to_owned();
+    let secret = offered["secret"].as_str().unwrap().to_owned();
+    assert!(secret.starts_with("vxt_"), "{secret}");
+    assert_no_secret_hash(&offered, "POST /volumes/{id}/transfer");
+    // The stored record still has it, so the accept below can check the secret.
+    assert!(c
+        .get_transfer(&tid)
+        .unwrap()
+        .meta
+        .annotations
+        .contains_key(SECRET_HASH));
+
+    let (st, listed) = send(&app, owner.clone(), "GET", "/transfers", None).await;
+    assert_eq!(st, StatusCode::OK, "{listed}");
+    assert_eq!(listed["total"], 1, "{listed}");
+    assert_no_secret_hash(&listed, "GET /transfers");
+
+    let (st, read) = send(
+        &app,
+        owner.clone(),
+        "GET",
+        &format!("/transfers/{tid}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{read}");
+    assert_no_secret_hash(&read, "GET /transfers/{id}");
+
+    let (st, on_volume) = send(
+        &app,
+        owner.clone(),
+        "GET",
+        &format!("/volumes/{id}/transfers"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{on_volume}");
+    assert_eq!(on_volume["total"], 1, "{on_volume}");
+    assert_no_secret_hash(&on_volume, "GET /volumes/{id}/transfers");
+
+    // An admin with no project sees offers across projects, and gets the same
+    // stripped record.
+    let (st, admin_read) = send(
+        &app,
+        admin.clone(),
+        "GET",
+        &format!("/transfers/{tid}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{admin_read}");
+    assert_no_secret_hash(&admin_read, "admin GET /transfers/{id}");
+    let (st, admin_list) = send(&app, admin.clone(), "GET", "/transfers", None).await;
+    assert_eq!(st, StatusCode::OK, "{admin_list}");
+    assert_eq!(admin_list["total"], 1, "{admin_list}");
+    assert_no_secret_hash(&admin_list, "admin GET /transfers");
+    let (st, admin_on_volume) = send(
+        &app,
+        admin,
+        "GET",
+        &format!("/volumes/{id}/transfers"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{admin_on_volume}");
+    assert_no_secret_hash(&admin_on_volume, "admin GET /volumes/{id}/transfers");
+
+    // The cancel answer is a transfer too.
+    let (st, closed) = send(
+        &app,
+        owner.clone(),
+        "DELETE",
+        &format!("/transfers/{tid}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{closed}");
+    assert_eq!(closed["status"]["phase"], "closed");
+    assert_no_secret_hash(&closed, "DELETE /transfers/{id}");
+}
+
+/// Stripping the hash from an answer must not reach the record the accept
+/// path checks a secret against.
+#[tokio::test]
+async fn an_offer_is_still_taken_after_every_read_stripped_the_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, app) = app(dir.path(), Arc::new(AllowAll));
+    let giver = tenant(c.store(), "giver", &[]);
+    let taker = tenant(c.store(), "taker", &[]);
+    let owner = caller(Some(giver.clone()), "member");
+    let joiner = caller(Some(taker), "member");
+
+    let id = make_volume(&app, &owner, "data", 1).await;
+    let vol = c.get_volume(None, &id).unwrap();
+    c.reconcile_volume(&vol.meta.id).await.unwrap();
+    let (st, offered) = send(
+        &app,
+        owner.clone(),
+        "POST",
+        &format!("/volumes/{id}/transfer"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{offered}");
+    let tid = offered["transfer"]["id"].as_str().unwrap().to_owned();
+    let secret = offered["secret"].as_str().unwrap().to_owned();
+    assert_no_secret_hash(&offered, "offer answer");
+
+    // Read the offer out through every route, then take it with the secret
+    // the offer was answered with.
+    send(&app, owner.clone(), "GET", "/transfers", None).await;
+    send(
+        &app,
+        owner.clone(),
+        "GET",
+        &format!("/transfers/{tid}"),
+        None,
+    )
+    .await;
+    let (_, moved) = send(
+        &app,
+        joiner,
+        "POST",
+        &format!("/transfers/{tid}/accept"),
+        Some(json!({ "secret": secret })),
+    )
+    .await;
+    assert_eq!(moved["id"], id, "{moved}");
+
+    let (st, read) = send(&app, owner, "GET", &format!("/transfers/{tid}"), None).await;
+    assert_eq!(st, StatusCode::OK, "{read}");
+    assert_eq!(read["status"]["phase"], "accepted");
+    assert_no_secret_hash(&read, "GET /transfers/{id} after the accept");
+}

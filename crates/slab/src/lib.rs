@@ -37,6 +37,7 @@ mod image;
 mod place;
 pub mod quota;
 pub mod reconcile;
+mod redact;
 pub mod transfer;
 pub mod types;
 mod usage;
