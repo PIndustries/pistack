@@ -34,9 +34,7 @@
 //!   the first one that answers has fetched and checked them. See
 //!   [`Peers::push`]. `[modules.silo] put_copies = 1` turns the wait off.
 //!
-//! What this does not do: multipart staging is not copied; an upload in
-//! flight when the leader changes has to start again. The finished object
-//! is copied like any other.
+//! Multipart staging is copied by [`crate::staging`].
 
 use crate::client::Client;
 use crate::types::{Bucket, Object};
@@ -70,7 +68,7 @@ pub const RECORD_WAIT: Duration = Duration::from_secs(5);
 /// mebibyte, before the next one is tried.
 const PUSH_BASE: Duration = Duration::from_secs(30);
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A peer that sends nothing for this long is given up on. There is no
 /// limit on the whole transfer: a 5 GiB object takes as long as it takes.
 const STALL: Duration = Duration::from_secs(30);
@@ -152,6 +150,30 @@ impl Peers {
         self.targets().into_iter().map(|(api, _)| api).collect()
     }
 
+    /// The peer key to send with a call, when this server has one.
+    pub(crate) fn key(&self) -> Option<String> {
+        self.peer_key()
+    }
+
+    /// Send one request to the peer at `base`, to its TLS listener when it
+    /// has one. `request` builds it for the client and base address
+    /// `PeerNet` chose.
+    pub(crate) async fn send(
+        &self,
+        base: &str,
+        connect_timeout: Duration,
+        request: impl Fn(reqwest::Client, &str) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        let tls = self
+            .targets()
+            .into_iter()
+            .find(|(api, _)| api.trim_end_matches('/') == base.trim_end_matches('/'))
+            .and_then(|(_, tls)| tls);
+        self.net
+            .send(base, tls.as_deref(), connect_timeout, request)
+            .await
+    }
+
     /// Each server to ask, the leader first: its API address and, when it
     /// has one, its TLS address.
     fn targets(&self) -> Vec<(String, Option<String>)> {
@@ -180,7 +202,7 @@ impl Peers {
     pub async fn push(&self, obj: &Object, wanted: usize) -> ApiResult<()> {
         let urls = self.targets();
         let wanted = wanted.min(urls.len());
-        let wait = PUSH_BASE + Duration::from_secs(obj.status.size_bytes / (1024 * 1024));
+        let wait = push_wait(obj.status.size_bytes);
         let mut taken = 0;
         let mut last = String::new();
         let key = self.peer_key();
@@ -314,6 +336,11 @@ impl Peers {
         guard.disarm();
         Ok(())
     }
+}
+
+/// How long a peer asked to copy `size` bytes is given.
+pub(crate) fn push_wait(size: u64) -> Duration {
+    PUSH_BASE + Duration::from_secs(size / (1024 * 1024))
 }
 
 /// This server's member id, from `<data_dir>/node.id`.
@@ -541,6 +568,15 @@ pub async fn run(
             ),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "silo: syncing object bytes failed"),
+        }
+        match crate::staging::sync(&client).await {
+            Ok(report) if report != crate::staging::StagedReport::default() => tracing::info!(
+                fetched = report.fetched,
+                removed = report.removed,
+                "silo: multipart staging synced with the other servers"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "silo: syncing multipart staging failed"),
         }
     }
 }
