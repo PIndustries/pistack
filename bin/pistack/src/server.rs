@@ -427,6 +427,14 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
         tracing::debug!(module = name, "started");
     }
 
+    // Modules are watching now. If the last boot of this server ended by
+    // replacing its store with a snapshot from the leader, everything they
+    // would derive from that store is news to them and they have not derived
+    // any of it yet: say so before the first query arrives.
+    if crate::cluster::resync::awaiting_announce(&store)? {
+        crate::cluster::resync::announce_replaced(&store)?;
+    }
+
     let verifier = gate::Verifier::from_store(&store).context("loading token verifier")?;
     let app = gateway::build(&asm, ctx.clone(), verifier, opts.dev, Some(cluster.clone()));
 
