@@ -133,6 +133,13 @@ fn is_read(method: &Method) -> bool {
     *method == Method::GET || *method == Method::HEAD
 }
 
+/// What a follower answers when the forward header is there but the body is
+/// past what it will buffer. It names the leader in `details.leader` and
+/// asks that the client bring the body there itself.
+const MSG_NOT_LEADER: &str = "not the leader";
+const MSG_BODY_TOO_LARGE: &str =
+    "the request is too large to pass on to the leader; send it to the leader";
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -144,13 +151,14 @@ pub struct Client {
     home: Arc<Mutex<Option<String>>>,
 }
 
-/// The leader a "not the leader" answer names, if a request sent to `base`
-/// may be sent there instead: a different server on the same scheme. The
-/// token goes with the retry, so a server reached over https is never
-/// followed to an http address.
+/// The leader a refusal names, if a request sent to `base` may be sent there
+/// instead: a different server on the same scheme. The token goes with the
+/// retry, so a server reached over https is never followed to an http address.
+/// Two refusals name a leader: a follower asked to carry a write it does not
+/// lead, and a follower whose buffer cannot hold the body it was handed.
 fn named_leader(base: &str, err: &CliError) -> Option<String> {
     let CliError::Api {
-        status: 409,
+        status,
         message,
         details,
         ..
@@ -158,7 +166,12 @@ fn named_leader(base: &str, err: &CliError) -> Option<String> {
     else {
         return None;
     };
-    if message != "not the leader" {
+    let refused = match *status {
+        409 if message == MSG_NOT_LEADER => true,
+        400 if message == MSG_BODY_TOO_LARGE => true,
+        _ => false,
+    };
+    if !refused {
         return None;
     }
     let leader = details
@@ -257,9 +270,10 @@ impl Client {
     }
 
     /// Where to send `path` again after `err`, when a follower refused it
-    /// and named the leader. Says so on stderr, and the rest of this
-    /// client's requests go there too. The caller retries once: a second
-    /// refusal is returned as it is.
+    /// and named the leader — either because it does not lead, or because
+    /// the body is too large for it to carry. Says so on stderr, and the
+    /// rest of this client's requests go there too. The caller retries once:
+    /// a second refusal is returned as it is.
     fn leader_url(&self, path: &str, err: &CliError) -> Option<String> {
         if path.starts_with("http://") || path.starts_with("https://") {
             return None;
@@ -299,6 +313,7 @@ impl Client {
     }
 
     /// One JSON request, sent again at the leader when a follower refuses it.
+    /// The body is a value held in memory, so the retry builds it again.
     /// The leader a follower names takes the rest of this client's requests,
     /// so a wait after a write reads where the write happened.
     async fn call_following(
@@ -392,8 +407,9 @@ impl Client {
     }
 
     /// Stream a file as the request body (image upload). A follower's
-    /// refusal is followed to the leader like [`Client::call`], reading the
-    /// file again from the start.
+    /// refusal is followed to the leader like [`Client::call`]: the stream
+    /// the follower partly consumed is discarded and the file opened again,
+    /// so the leader is handed the whole body and not the tail of it.
     pub async fn put_file(&self, path: &str, file: &Path) -> CliResult<Value> {
         let first = self.put_file_to(self.address(path), file).await;
         let Err(err) = &first else {
@@ -660,6 +676,146 @@ mod tests {
         }
         assert_eq!(carried("GET"), Some(None), "a read does not");
         assert_eq!(carried("HEAD"), Some(None), "a head read does not");
+    }
+
+    #[test]
+    fn a_upload_too_large_to_carry_is_followed_too() {
+        let refusal = |status: u16, message: &str| {
+            let mut details = serde_json::Map::new();
+            details.insert("leader".into(), "http://10.0.0.13:8443".into());
+            CliError::Api {
+                status,
+                code: if status == 409 {
+                    "conflict"
+                } else {
+                    "bad_request"
+                }
+                .into(),
+                message: message.into(),
+                details,
+            }
+        };
+        let base = "http://10.0.0.12:8443";
+        assert_eq!(
+            named_leader(base, &refusal(400, MSG_BODY_TOO_LARGE)).as_deref(),
+            Some("http://10.0.0.13:8443")
+        );
+        // Any other 400 that happens to name a leader is a complaint about
+        // the request, not a pointer at the leader.
+        assert_eq!(
+            named_leader(base, &refusal(400, "the key is not valid")),
+            None
+        );
+        assert_eq!(
+            named_leader(base, &refusal(400, "the request is too large")),
+            None
+        );
+        // The same checks as the 409: same scheme, and a different server.
+        assert_eq!(
+            named_leader("https://10.0.0.12:8444", &refusal(400, MSG_BODY_TOO_LARGE)),
+            None
+        );
+        let mut itself = refusal(400, MSG_BODY_TOO_LARGE);
+        if let CliError::Api { details, .. } = &mut itself {
+            details.insert("leader".into(), base.into());
+        }
+        assert_eq!(named_leader(base, &itself), None);
+        // Too large for a server that does not name one.
+        let no_leader = CliError::Api {
+            status: 400,
+            code: "bad_request".into(),
+            message: MSG_BODY_TOO_LARGE.into(),
+            details: Default::default(),
+        };
+        assert_eq!(named_leader(base, &no_leader), None);
+        // A refusal of that shape at another status is nobody's redirect.
+        assert_eq!(named_leader(base, &refusal(413, MSG_BODY_TOO_LARGE)), None);
+    }
+
+    #[tokio::test]
+    async fn an_upload_a_follower_cannot_carry_is_handed_to_the_leader_whole() {
+        use axum::body::Bytes;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        // A file of several chunks, so a stream that is only partly consumed
+        // cannot pass as a whole body.
+        let mut bytes = Vec::with_capacity(600 * 1024);
+        for i in 0..(600 * 1024) {
+            bytes.push((i % 251) as u8);
+        }
+        let digest = Sha256::digest(&bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("payload");
+        std::fs::write(&file, &bytes).unwrap();
+
+        let seen_at = |bytes: Bytes| {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            hasher.finalize()
+        };
+
+        // The leader: keeps every byte it is handed.
+        let leader_got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = leader_got.clone();
+        let leader_app = axum::Router::new().fallback(move |body: Bytes| {
+            let log = log.clone();
+            async move {
+                *log.lock().unwrap() = seen_at(body).to_vec();
+                axum::Json(json!({"key": "payload"}))
+            }
+        });
+        let leader_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_addr = leader_l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(leader_l, leader_app).await.unwrap() });
+
+        // The follower: refuses a body it cannot carry, naming the leader.
+        let follower_hits = Arc::new(Mutex::new(0));
+        let count = follower_hits.clone();
+        let follower_app = axum::Router::new().fallback(move |body: Bytes| {
+            let count = count.clone();
+            let leader = format!("http://{leader_addr}");
+            async move {
+                *count.lock().unwrap() += 1;
+                // Whatever arrives is read to the end right here and then
+                // dropped: the bytes the leader receives must come from the
+                // file, not from a stream this server already swallowed.
+                let swallowed = body.len();
+                assert!(swallowed > 0, "the follower was handed a body");
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(
+                        json!({"error": {"code": "bad_request",
+                        "message": "the request is too large to pass on to the leader; send it to the leader",
+                        "details": {"leader": leader}}}),
+                    ),
+                )
+            }
+        });
+        let follower_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let follower_addr = follower_l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(follower_l, follower_app).await.unwrap() });
+
+        let notices = Notices::default();
+        let c = Client::new(&format!("http://{follower_addr}"), Some("t".into()), false)
+            .unwrap()
+            .with_notices(notices.clone());
+        let v = c.put_file("/silo/buckets/b/objects/payload", &file).await;
+        assert_eq!(v.unwrap()["key"], "payload");
+        assert_eq!(*follower_hits.lock().unwrap(), 1, "asked once");
+        assert_eq!(
+            leader_got.lock().unwrap().as_slice(),
+            digest.as_slice(),
+            "the leader received every byte"
+        );
+        let said = notices.lock().unwrap().clone();
+        assert_eq!(
+            said,
+            vec![format!(
+                "http://{follower_addr} is not the leader; sending the request to http://{leader_addr}"
+            )],
+            "said once where the upload went"
+        );
+        assert_eq!(c.settled(), format!("http://{leader_addr}/"));
     }
 
     #[test]
