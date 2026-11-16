@@ -65,6 +65,7 @@ async fn dispatch_rest(ctx: &mut Ctx, cmd: Cmd, io: &mut Io<'_>) -> CliResult<()
         Cmd::Cluster { cmd } => cluster(ctx, cmd, io).await,
         Cmd::Server { cmd } => server(ctx, cmd, io).await,
         Cmd::Network { cmd } => network(ctx, cmd, io).await,
+        Cmd::Vpc { cmd } => super::vpc::vpc(ctx, cmd, io).await,
         Cmd::Subnet { cmd } => subnet(ctx, cmd, io).await,
         Cmd::Port { cmd } => port(ctx, cmd, io).await,
         Cmd::Router { cmd } => router(ctx, cmd, io).await,
