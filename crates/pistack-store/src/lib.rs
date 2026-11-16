@@ -17,10 +17,10 @@ use parking_lot::RwLock;
 use pistack_types::{ApiError, Event, EventAction, Id, Kind, Meta};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
 const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");
@@ -263,24 +263,23 @@ impl Read<'_> {
 /// name index entry, or a row this binary cannot read as one.
 fn known(read: &Read<'_>, op: &LogOp) -> Result<Option<Change>> {
     let (table, key, value) = (op.table.as_str(), op.key.as_str(), op.value.as_deref());
-    match table {
-        "resources" => {}
-        "names" => {}
-        // A `meta` row is the log's own, a counter's, or cluster bookkeeping.
-        // Nobody watches those.
-        _ => return Ok(None),
+    // Only a `resources` row names something a watcher watches. A `meta` row is
+    // the log's own, a counter's, or cluster bookkeeping; a `names` row is the
+    // name index, which points at a resource row that is announced in its own
+    // right. Neither is worth a read of the store to answer `None`, so none is
+    // read before this returns.
+    if table != "resources" {
+        return Ok(None);
     }
     let stood = read.stands(table, key)?;
-    // The row key is `{kind}/{id}` for a resource, `{kind}/{project}/{name}`
-    // for a name. The head names the kind either way; only a resource row can
-    // have an id for a tail, so a name's key stops here and announces nothing.
-    // Reading the kind off the key rather than out of the row is also what
-    // keeps a row whose name looks like an id of another kind from being
+    // The row key is `{kind}/{id}`: the head names the kind, the tail is the
+    // row's address. Reading the kind off the key rather than out of the row is
+    // what keeps a row whose name looks like an id of another kind from being
     // announced under the wrong one.
     let Some((kind_, rest)) = key.split_once('/') else {
         return Ok(None);
     };
-    let Some(id) = Id::parse(leak(kind_), rest) else {
+    let Some(id) = Id::parse(intern(kind_), rest) else {
         return Ok(None);
     };
     // The audit trail is a row like any other, but it is bookkeeping: the
@@ -1128,32 +1127,36 @@ impl Store {
         // earlier write of this page left is what the next write of it lands on,
         // and the store cannot say that, because the page lands as one
         // transaction and holds only the last word by the time it is readable.
-        let mut stands: Vec<(&str, bool)> = Vec::new();
+        // A row is named by its table and key together: the same key can be a
+        // `names` entry and a `resources` row, and those are different rows.
+        let mut stands: Vec<(&str, &str, bool)> = Vec::new();
         let mut out: Vec<Change> = Vec::new();
         for entry in entries {
             for op in &entry.ops {
-                let key = op.key.as_str();
+                let (table, key) = (op.table.as_str(), op.key.as_str());
                 let puts = op.value.is_some();
-                let seen = stands.iter().position(|(k, _)| *k == key);
+                let seen = stands.iter().position(|(t, k, _)| *t == table && *k == key);
                 // What stood before this write.
                 let was_there = match seen {
-                    Some(at) => stands[at].1,
+                    Some(at) => stands[at].2,
                     None => match known(&read, op)? {
                         Some(found) => {
                             let stood = found.stood;
-                            stands.push((key, puts));
+                            stands.push((table, key, puts));
                             out.push(found);
                             stood
                         }
                         // Not a row anybody watches: the log's own rows, counters,
                         // name index entries, the audit trail.
                         None => {
-                            stands.push((key, puts));
+                            stands.push((table, key, puts));
                             continue;
                         }
                     },
                 };
-                if let Some((_, state)) = stands.iter_mut().find(|(k, _)| *k == key) {
+                if let Some((_, _, state)) =
+                    stands.iter_mut().find(|(t, k, _)| *t == table && *k == key)
+                {
                     *state = puts;
                 }
                 // Removed by a write that found nothing there: nothing changed,
@@ -1378,7 +1381,7 @@ impl<K: Kind> Collection<K> {
 
     /// Resolve `name-or-id` the way the CLI does.
     pub fn resolve(&self, project: Option<&Id>, name_or_id: &str) -> Result<K> {
-        if let Some(id) = Id::parse(leak(K::KIND), name_or_id) {
+        if let Some(id) = Id::parse(intern(K::KIND), name_or_id) {
             return self.get(&id);
         }
         self.get_by_name(project, name_or_id)
@@ -1430,7 +1433,7 @@ impl<K: Kind> Collection<K> {
     /// A whole id that names no row is not an answer: it falls through to the
     /// name lookup, because an id that was deleted is a name nobody has taken.
     fn addressed(&self, text: &str) -> Result<Option<Id>> {
-        if let Some(id) = Id::parse(leak(K::KIND), text) {
+        if let Some(id) = Id::parse(intern(K::KIND), text) {
             if self.try_get(&id)?.is_some() {
                 return Ok(Some(id));
             }
@@ -1624,9 +1627,27 @@ impl<K: Kind> Collection<K> {
     }
 }
 
-fn leak(s: &str) -> &'static str {
-    // KIND constants are already 'static; this only runs for them.
-    Box::leak(s.to_owned().into_boxed_str())
+/// Interns `s` into a `&'static str`, for an `Id`'s kind, which the type keeps
+/// by reference rather than by copy.
+///
+/// A kind is one of a handful of `KIND` constants, but a caller that reaches an
+/// id through a key or a name does not hold one of those — it holds a slice of
+/// a key read off disk. Handing that to `Id::parse` needs a `'static` string.
+/// Leaking one per call would grow the heap on every lookup and, when a
+/// follower applies a page, on every replicated row. So the set of kinds ever
+/// seen is kept once, process-wide, and each is leaked at most once: a repeat
+/// returns the string the first call stored, so equal text is ever the same
+/// pointer.
+fn intern(s: &str) -> &'static str {
+    static KINDS: OnceLock<parking_lot::Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let seen = KINDS.get_or_init(|| parking_lot::Mutex::new(HashSet::new()));
+    let mut kinds = seen.lock();
+    if let Some(&held) = kinds.get(s) {
+        return held;
+    }
+    let fresh: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    kinds.insert(fresh);
+    fresh
 }
 
 /// How many hex digits of an id a display keeps, and the shortest run that
@@ -1649,7 +1670,7 @@ pub fn short_id(id: &Id) -> String {
 /// a run shorter than [`SHORT_ID_MIN`] is taken for what it most likely is:
 /// a name, so this answers `None` and the caller looks the name up.
 pub fn displayed_id<K: Kind>(col: &Collection<K>, prefix: &str, text: &str) -> Result<Option<Id>> {
-    if let Some(id) = Id::parse(leak(prefix), text) {
+    if let Some(id) = Id::parse(intern(prefix), text) {
         return Ok(Some(id));
     }
     // The prefix is what the tool that printed the id calls the kind, which is
@@ -1669,7 +1690,7 @@ pub fn displayed_id<K: Kind>(col: &Collection<K>, prefix: &str, text: &str) -> R
 /// `prefix`. `None` when `text` is neither a full id of `prefix` nor
 /// `prefix-<tail>`.
 pub fn short_tail_of(prefix: &str, text: &str) -> Option<String> {
-    if Id::parse(leak(prefix), text).is_some() {
+    if Id::parse(intern(prefix), text).is_some() {
         return None;
     }
     text.strip_prefix(prefix)
@@ -3026,5 +3047,18 @@ mod tests {
         store.set_write_fence(false);
         store.put_meta("x", &1u64).unwrap();
         assert_eq!(store.get_meta::<u64>("x").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn an_interned_kind_is_the_same_pointer_twice() {
+        // Equal text handed in as two distinct strings — as it arrives when read
+        // off a key — must come back as one stored string, not a fresh leak.
+        let owned = String::from("backup");
+        let again = String::from("backup");
+        let first = intern(&owned);
+        let second = intern(&again);
+        assert!(std::ptr::eq(first, second));
+        // A different kind is a different string.
+        assert!(!std::ptr::eq(intern("backup"), intern("volume")));
     }
 }
