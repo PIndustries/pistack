@@ -24,7 +24,7 @@ use clap::{CommandFactory, Parser};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-pub use client::{CliError, CliResult, Client, Notices};
+pub use client::{CliError, CliResult, Client, Notices, PendingCommit};
 pub use config::{Config, Profile};
 pub use output::{Format, Output};
 
@@ -58,6 +58,10 @@ pub struct Ctx {
     pub fmt: Format,
     /// What the clients this command made have to say on stderr.
     pub notices: Notices,
+    /// What the clients this command made wrote to a server other than the
+    /// one `pi` was given; the command waits for that server to catch up
+    /// before it exits.
+    pub pending_commit: PendingCommit,
 }
 
 impl Ctx {
@@ -92,6 +96,7 @@ impl Ctx {
             config,
             profile_name,
             notices: Notices::default(),
+            pending_commit: PendingCommit::default(),
         })
     }
 
@@ -107,7 +112,9 @@ impl Ctx {
 
     /// A client that may be unauthenticated (login, version, modules).
     pub fn client_with(&self, url: &str) -> CliResult<Client> {
-        Ok(Client::new(url, self.token.clone(), self.insecure)?.with_notices(self.notices.clone()))
+        Ok(Client::new(url, self.token.clone(), self.insecure)?
+            .with_notices(self.notices.clone())
+            .with_pending_commit(self.pending_commit.clone()))
     }
 
     /// Print and forget what the clients had to say.
@@ -148,6 +155,16 @@ pub async fn run(args: Vec<String>, io: &mut Io<'_>) -> Result<i32> {
 
     let mut ctx = Ctx::from_cli(&cli)?;
     let done = commands::dispatch(&mut ctx, cli.cmd, io).await;
+    // Both the success and the error path end here, before the process does.
+    // The cell is shared by every client this command made (the one place
+    // they are all built), so this waits for what any of them wrote
+    // elsewhere. A command that wrote nothing elsewhere waits nothing and
+    // makes no request.
+    if let Some(url) = &ctx.url {
+        if let Ok(c) = ctx.client_with(url) {
+            c.catch_up().await;
+        }
+    }
     ctx.flush_notices(io.stderr)?;
     match done {
         Ok(code) => Ok(code),
