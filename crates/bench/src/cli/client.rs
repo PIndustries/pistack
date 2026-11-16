@@ -120,6 +120,19 @@ pub fn parse_error(status: StatusCode, body: &str) -> CliError {
 /// no handle on stderr; whoever owns one prints and empties these.
 pub type Notices = Arc<Mutex<Vec<String>>>;
 
+/// Ask the server a write arrives at to carry it to the leader itself and
+/// hold the answer until its own store has applied the write. Without this,
+/// a write answered by the leader leaves the server `pi` was configured with
+/// behind, and the next command — run milliseconds later against that same
+/// server — reads there and finds nothing. Reads (GET and HEAD) never carry
+/// it: a read belongs on the server it was asked of.
+const FORWARD_HEADER: &str = "x-pistack-forward";
+const FORWARD_LEADER: &str = "leader";
+
+fn is_read(method: &Method) -> bool {
+    *method == Method::GET || *method == Method::HEAD
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -198,10 +211,15 @@ impl Client {
         self.request_url(method, self.address(path))
     }
 
+    /// The single place a request is built. A write carries the forward
+    /// header; a read does not.
     fn request_url(&self, method: Method, url: String) -> reqwest::RequestBuilder {
-        let mut r = self.http.request(method, url);
+        let mut r = self.http.request(method.clone(), url);
         if let Some(t) = &self.token {
             r = r.bearer_auth(t);
+        }
+        if !is_read(&method) {
+            r = r.header(FORWARD_HEADER, FORWARD_LEADER);
         }
         r
     }
@@ -591,6 +609,57 @@ mod tests {
         let _ = c.get_value("/compute/machines/mach-1").await;
         assert_eq!(*leader_hits.lock().unwrap(), 2);
         assert_eq!(*refused.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_write_asks_the_server_it_reached_to_carry_it_to_the_leader() {
+        use axum::extract::Request;
+        use axum::http::HeaderMap;
+        use serde_json::json;
+        async fn echo_headers() -> (String, Arc<Mutex<Vec<(String, Option<String>)>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            let app = axum::Router::new().fallback(move |req: Request| {
+                let log = log.clone();
+                async move {
+                    let method = req.method().to_string();
+                    let header = req
+                        .headers()
+                        .get(FORWARD_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.to_owned());
+                    log.lock().unwrap().push((method, header));
+                    (HeaderMap::new(), axum::Json(json!({"ok": true})))
+                }
+            });
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            (format!("http://{addr}"), seen)
+        }
+        let (url, seen) = echo_headers().await;
+        let c = Client::new(&url, Some("t".into()), false).unwrap();
+        let body = json!({"name": "x"});
+        c.post("/alarms/alarms", &body).await.unwrap();
+        c.put("/alarms/alarms/a-1", &body).await.unwrap();
+        c.call(Method::PATCH, "/alarms/alarms/a-1", Some(&body))
+            .await
+            .unwrap();
+        c.delete("/alarms/alarms/a-1").await.unwrap();
+        let _ = c.get_value("/alarms/alarms").await.unwrap();
+        let head = c.request(Method::HEAD, "/alarms/alarms").send().await;
+        let _ = head;
+        let log = seen.lock().unwrap();
+        let carried = |method: &str| {
+            log.iter()
+                .find(|(m, _)| m == method)
+                .map(|(_, h)| h.as_deref())
+        };
+        for w in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert_eq!(carried(w), Some(Some(FORWARD_LEADER)), "{w} carries it");
+        }
+        assert_eq!(carried("GET"), Some(None), "a read does not");
+        assert_eq!(carried("HEAD"), Some(None), "a head read does not");
     }
 
     #[test]
