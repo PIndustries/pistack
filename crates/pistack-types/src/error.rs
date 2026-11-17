@@ -32,6 +32,9 @@ pub enum ErrorCode {
     Forbidden,
     NotFound,
     Conflict,
+    /// The resource is there but this method is not allowed on it. S3 answers
+    /// a read of a delete marker this way.
+    MethodNotAllowed,
     QuotaExceeded,
     /// Too many requests; the message says what to wait for.
     RateLimited,
@@ -59,6 +62,7 @@ impl ErrorCode {
             ErrorCode::Forbidden => StatusCode::FORBIDDEN,
             ErrorCode::NotFound => StatusCode::NOT_FOUND,
             ErrorCode::Conflict => StatusCode::CONFLICT,
+            ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::QuotaExceeded => StatusCode::FORBIDDEN,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,

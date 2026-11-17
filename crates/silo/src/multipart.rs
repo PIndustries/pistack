@@ -19,6 +19,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use md5::Md5;
+use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult, Id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -798,6 +799,8 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         "BucketAlreadyExists" => ApiError::conflict(message),
         // DeleteBucket on a bucket that still holds objects or uploads.
         "BucketNotEmpty" => ApiError::conflict(message),
+        // GetObject on a key whose current generation is a delete marker.
+        "MethodNotAllowed" => ApiError::new(ErrorCode::MethodNotAllowed, message),
         // S3 uses HTTP 412; pistack ErrorCode has no 412, so Conflict (409).
         "PreconditionFailed" => ApiError::conflict(message),
         "NotImplemented" => ApiError::not_implemented(message),

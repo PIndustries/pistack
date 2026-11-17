@@ -4,14 +4,15 @@
 //! S3 ListObjectVersions: `GET /{bucket}?versions`.
 //!
 //! Lists every generation the bucket holds: the current one of each key plus
-//! every older generation a versioned bucket has kept. A `<Version>` carries
-//! `Key`, `VersionId` (the record's generation number as a decimal string),
-//! `IsLatest`, `LastModified`, `ETag` and `Size`. Paging follows the S3
+//! every older generation a versioned bucket has kept, and every delete marker
+//! a plain delete left behind. A `<Version>` carries `Key`, `VersionId` (the
+//! record's generation number as a decimal string), `IsLatest`, `LastModified`,
+//! `ETag` and `Size`. A `<DeleteMarker>` carries `Key`, `VersionId`, `IsLatest`
+//! and `LastModified` — a marker has no bytes, so no ETag and no size.
+//! `IsLatest` is answered off the key's history: the newest generation of a
+//! key, whether or not that generation is a marker. Paging follows the S3
 //! shape: `prefix`, `max-keys`, and `key-marker` with `version-id-marker` to
 //! resume inside one key; the answer names where the next page starts.
-//!
-//! The store keeps no delete marker — a key with no record left is simply not
-//! listed, and no `<DeleteMarker>` element appears.
 
 use crate::client::Client;
 use crate::client::ListObjectEntry;
@@ -71,6 +72,9 @@ pub(crate) async fn list_versions(
             ListObjectEntry::CommonPrefix(_) => None,
         }),
         encode_url,
+        // `IsLatest` is the newest generation of the row's key, which the page
+        // does not always hold whole — the bucket's history does.
+        all: c.list_all_objects(&bucket.meta.id)?,
     });
     let mut resp = (
         StatusCode::OK,
@@ -97,6 +101,7 @@ struct VersionsPage<'a> {
     next_key: Option<&'a str>,
     next_version: Option<String>,
     encode_url: bool,
+    all: Vec<crate::types::Object>,
 }
 
 fn versions_xml(page: &VersionsPage<'_>) -> String {
@@ -145,12 +150,15 @@ fn versions_xml(page: &VersionsPage<'_>) -> String {
         match entry {
             ListObjectEntry::Object(obj) => {
                 let obj = obj.as_ref();
-                let etag = if !obj.status.md5.is_empty() {
-                    &obj.status.md5
+                let latest = crate::versions::is_latest(&page.all, obj);
+                // A marker leads with <DeleteMarker> and has no ETag or Size:
+                // it holds no bytes, and there is nothing to name by checksum.
+                let tag = if obj.status.delete_marker {
+                    "DeleteMarker"
                 } else {
-                    &obj.status.sha256
+                    "Version"
                 };
-                body.push_str("<Version>");
+                body.push_str(&format!("<{tag}>"));
                 body.push_str(&format!(
                     "<Key>{}</Key>",
                     xml_list_value(&obj.spec.key, enc)
@@ -158,16 +166,23 @@ fn versions_xml(page: &VersionsPage<'_>) -> String {
                 body.push_str(&format!("<VersionId>{}</VersionId>", obj.status.version));
                 body.push_str(&format!(
                     "<IsLatest>{}</IsLatest>",
-                    if obj.status.latest { "true" } else { "false" }
+                    if latest { "true" } else { "false" }
                 ));
                 body.push_str(&format!(
                     "<LastModified>{}</LastModified>",
                     obj.meta.updated_at.format("%Y-%m-%dT%H:%M:%S%.3fZ")
                 ));
-                body.push_str(&format!("<ETag>&quot;{}&quot;</ETag>", xml_escape(etag)));
-                body.push_str(&format!("<Size>{}</Size>", obj.status.size_bytes));
-                body.push_str("<StorageClass>STANDARD</StorageClass>");
-                body.push_str("</Version>");
+                if tag == "Version" {
+                    let etag = if !obj.status.md5.is_empty() {
+                        &obj.status.md5
+                    } else {
+                        &obj.status.sha256
+                    };
+                    body.push_str(&format!("<ETag>&quot;{}&quot;</ETag>", xml_escape(etag)));
+                    body.push_str(&format!("<Size>{}</Size>", obj.status.size_bytes));
+                    body.push_str("<StorageClass>STANDARD</StorageClass>");
+                }
+                body.push_str(&format!("</{tag}>"));
             }
             ListObjectEntry::CommonPrefix(cp) => {
                 body.push_str("<CommonPrefixes><Prefix>");

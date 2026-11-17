@@ -467,6 +467,8 @@ async fn delete_bucket(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let bucket = load_bucket(&c, &caller(ext)?, &id)?;
+    // The client refuses while a generation or a delete marker is left, so a
+    // key hidden from the listing still counts as holding the bucket open.
     c.delete_bucket(&bucket.meta.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

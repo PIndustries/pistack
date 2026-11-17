@@ -52,6 +52,7 @@ mod bucket_name;
 pub mod chunked;
 pub mod client;
 pub mod copy;
+mod delete_marker;
 pub mod delimiter;
 pub mod gc;
 pub mod http;

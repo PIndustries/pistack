@@ -576,6 +576,34 @@ pub async fn get_object(
     Query(q): Query<ObjectQuery>,
     headers: HeaderMap,
 ) -> Response {
+    with_object_read(c, ext, bucket, key, q, headers, true).await
+}
+
+pub async fn head_object(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<ObjectQuery>,
+    headers: HeaderMap,
+) -> Response {
+    with_object_read(c, ext, bucket, key, q, headers, false).await
+}
+
+/// GET and HEAD on an object path, and the marker headers on both.
+///
+/// A key under a delete marker is not there, and a marker named by
+/// `versionId` is not an object; either way the answer says so with
+/// `x-amz-delete-marker: true` and the marker's version, as S3 does.
+#[allow(clippy::too_many_arguments)]
+async fn with_object_read(
+    c: Client,
+    ext: Option<Extension<Caller>>,
+    bucket: String,
+    key: String,
+    q: ObjectQuery,
+    headers: HeaderMap,
+    with_body: bool,
+) -> Response {
     if let Some(upload_id) = q.upload_id.as_deref() {
         return match list_parts_inner(c, ext, bucket, key, upload_id).await {
             Ok(resp) => resp,
@@ -589,29 +617,17 @@ pub async fn get_object(
         },
         None => None,
     };
-    match get_object_inner(c, ext, bucket, key, headers, true, version).await {
+    match get_object_inner(c, ext, bucket, key, headers, with_body, version).await {
         Ok(resp) => resp,
-        Err(err) => s3_error(err),
-    }
-}
-
-pub async fn head_object(
-    State(c): State<Client>,
-    ext: Option<Extension<Caller>>,
-    Path((bucket, key)): Path<(String, String)>,
-    Query(q): Query<ObjectQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let version = match q.version_id.as_deref() {
-        Some(raw) => match crate::versions::parse_version_id(raw) {
-            Ok(v) => Some(v),
-            Err(err) => return s3_error(err),
-        },
-        None => None,
-    };
-    match get_object_inner(c, ext, bucket, key, headers, false, version).await {
-        Ok(resp) => resp,
-        Err(err) => s3_error(err),
+        Err(err) => {
+            let marker = crate::delete_marker::marker_version_of(&err);
+            let mut resp = s3_error(err);
+            if let Some(version) = marker {
+                set_delete_marker(resp.headers_mut());
+                set_version_id(resp.headers_mut(), version);
+            }
+            resp
+        }
     }
 }
 
@@ -626,6 +642,15 @@ async fn get_object_inner(
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
+    // A generation named by `versionId` that turns out to be a delete marker
+    // is refused before any file is opened: a marker has no bytes, and S3
+    // answers it 405 MethodNotAllowed rather than 404.
+    if let Some(v) = version {
+        let obj = c.head_version(&bucket.meta.id, &key, v)?;
+        if obj.status.delete_marker {
+            return Err(crate::delete_marker::not_a_readable_object(&obj));
+        }
+    }
     if !with_body {
         let obj = match version {
             Some(v) => c.head_version(&bucket.meta.id, &key, v)?,
@@ -725,10 +750,12 @@ async fn delete_object_inner(
             .await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    // A named generation is taken on its own; the key path then belongs to
-    // the newest survivor, or the key is gone. Without a `versionId` the whole
-    // key goes as it always has — the store keeps no delete marker to leave
-    // behind, so nothing is recorded in its place.
+    // A key already hidden and a key the call is about to hide both answer
+    // with a marker, so the route asks what was there before it deletes.
+    let hidden_before = c
+        .head_object(&bucket.meta.id, &key)
+        .err()
+        .is_some_and(|e| crate::delete_marker::marker_version_of(&e).is_some());
     let obj = match q.version_id.as_deref() {
         Some(raw) => {
             let version = crate::versions::parse_version_id(raw)?;
@@ -737,8 +764,17 @@ async fn delete_object_inner(
         None => c.delete_object(&bucket.meta.id, &key).await?,
     };
     let mut resp = StatusCode::NO_CONTENT.into_response();
-    // `x-amz-version-id` names the generation this call acted on.
+    // `x-amz-version-id` names the generation the call acted on: the marker it
+    // wrote, the survivor it promoted, or the generation it took.
+    // `x-amz-delete-marker` says the key is now hidden behind a marker. A
+    // delete that named a `versionId` never hides a key: it removed one
+    // generation, and the survivor is current or the key is gone. A plain
+    // delete hides a key only over bytes that were there — one that found the
+    // key already hidden takes it whole and answers no marker.
     set_version_id(resp.headers_mut(), obj.status.version);
+    if q.version_id.is_none() && !hidden_before && obj.status.delete_marker {
+        set_delete_marker(resp.headers_mut());
+    }
     Ok(resp)
 }
 
@@ -1083,26 +1119,34 @@ async fn delete_objects_inner(
         ));
     }
 
-    let mut deleted: Vec<String> = Vec::new();
+    let mut deleted: Vec<DeletedKey> = Vec::new();
     let mut failed: Vec<FailedKey> = Vec::new();
     for object in &parsed.objects {
-        let refused = match c.delete_object(&bucket.meta.id, &object.key).await {
-            Ok(_) => false,
+        let outcome = match c.delete_object(&bucket.meta.id, &object.key).await {
+            Ok(obj) => Some(DeletedKey {
+                key: object.key.clone(),
+                // A batch delete that left a marker says so per key, the way
+                // it says which generation it named.
+                marker: obj.status.delete_marker,
+            }),
             // A key that is not there is already as deleted as the caller
             // wants it, so it is not a failure.
-            Err(err) if key_not_there(&err) => false,
+            Err(err) if key_not_there(&err) => Some(DeletedKey {
+                key: object.key.clone(),
+                marker: false,
+            }),
             Err(err) => {
                 failed.push(FailedKey {
                     key: object.key.clone(),
                     code: s3_code_of(&err).unwrap_or("InternalError").to_owned(),
                     message: err.message,
                 });
-                true
+                None
             }
         };
         let quiet = object.quiet.unwrap_or(parsed.quiet);
-        if !refused && !quiet {
-            deleted.push(object.key.clone());
+        if let Some(entry) = outcome.filter(|_| !quiet) {
+            deleted.push(entry);
         }
     }
     Ok((
@@ -1111,6 +1155,13 @@ async fn delete_objects_inner(
         delete_objects_xml(&deleted, &failed),
     )
         .into_response())
+}
+
+/// One `<Deleted>` row of a DeleteObjects answer.
+struct DeletedKey {
+    key: String,
+    /// True when the key is now hidden behind a delete marker rather than gone.
+    marker: bool,
 }
 
 struct FailedKey {
@@ -1153,13 +1204,16 @@ fn key_not_there(err: &ApiError) -> bool {
             && !err.message.contains("bucket"))
 }
 
-fn delete_objects_xml(deleted: &[String], failed: &[FailedKey]) -> String {
+fn delete_objects_xml(deleted: &[DeletedKey], failed: &[FailedKey]) -> String {
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     body.push_str("<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-    for key in deleted {
+    for entry in deleted {
         body.push_str("<Deleted>");
-        body.push_str(&format!("<Key>{}</Key>", xml_escape(key)));
+        body.push_str(&format!("<Key>{}</Key>", xml_escape(&entry.key)));
+        if entry.marker {
+            body.push_str("<DeleteMarker>true</DeleteMarker>");
+        }
         body.push_str("</Deleted>");
     }
     for e in failed {
@@ -1313,7 +1367,13 @@ pub(crate) fn set_version_id(headers: &mut HeaderMap, version: u64) {
     }
 }
 
+/// `x-amz-delete-marker: true`: the call met, created or named a delete marker.
+fn set_delete_marker(headers: &mut HeaderMap) {
+    headers.insert(DELETE_MARKER, HeaderValue::from_static("true"));
+}
+
 const VERSION_ID: HeaderName = HeaderName::from_static("x-amz-version-id");
+const DELETE_MARKER: HeaderName = HeaderName::from_static("x-amz-delete-marker");
 
 pub(crate) fn etag_value(obj: &Object) -> Option<HeaderValue> {
     let hex = if !obj.status.md5.is_empty() {
@@ -1541,6 +1601,9 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
 }
 
 pub(crate) fn s3_error(err: ApiError) -> Response {
+    if err.code == ErrorCode::MethodNotAllowed {
+        return s3_method_not_allowed(&err);
+    }
     let (status, default_code) = match err.status() {
         StatusCode::NOT_FOUND => (StatusCode::NOT_FOUND, "NoSuchKey"),
         StatusCode::UNAUTHORIZED => (StatusCode::FORBIDDEN, "AccessDenied"),
@@ -1564,6 +1627,15 @@ pub(crate) fn s3_error(err: ApiError) -> Response {
         error_xml(code, &err.message),
     )
         .into_response()
+}
+
+/// S3 answers a refused method with an empty body, so the usual error document
+/// is not sent. `x-amz-delete-marker` is added by the caller, which sees the
+/// marker in the error.
+fn s3_method_not_allowed(_err: &ApiError) -> Response {
+    let mut resp = StatusCode::METHOD_NOT_ALLOWED.into_response();
+    *resp.body_mut() = Body::empty();
+    resp
 }
 
 /// The `<Error>` document every S3 route answers with. Also what a follower

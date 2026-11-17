@@ -106,6 +106,15 @@ impl Client {
         &self.store
     }
 
+    /// Store one object record as built. A delete marker has no bytes to
+    /// stream, so it is the one record written whole.
+    pub(crate) async fn insert(&self, obj: Object) -> ApiResult<Object> {
+        self.store
+            .collection::<Object>()
+            .create(obj)
+            .map_err(Into::into)
+    }
+
     /// Directory that holds `{bucket-id}/{key}`.
     pub fn root(&self) -> &Path {
         &self.root
@@ -177,8 +186,16 @@ impl Client {
     }
 
     /// Delete the bucket, its object records, and the bucket directory.
+    ///
+    /// Refused while the bucket still holds a generation or a delete marker —
+    /// including a key hidden behind one, which a listing does not show. The
+    /// bucket is empty only when nothing is left to remove.
     pub async fn delete_bucket(&self, id: &Id) -> ApiResult<Bucket> {
         let bucket = self.store.collection::<Bucket>().get(id)?;
+        let left = self.objects_for_bucket(&bucket)?.len();
+        if left > 0 {
+            return Err(crate::delete_marker::not_empty(left));
+        }
         let dir = self.bucket_dir(&bucket.meta.id);
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => {}
@@ -316,11 +333,14 @@ impl Client {
         validate_key(key)?;
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
         let path = self.key_path(&bucket.meta.id, key)?;
-        let existing = self.find_current(&bucket, key)?;
-        let version = existing
-            .as_ref()
-            .map(|o| o.status.version.saturating_add(1))
-            .unwrap_or(1);
+        let all = self.objects_for_bucket(&bucket)?;
+        // The record a put replaces is the newest one at the key that holds
+        // bytes. When a plain delete left a marker on top, the put goes under
+        // it and the key is readable again.
+        let existing = crate::versions::newest_data(&all, key);
+        // The key's newest generation, marker included: generations are
+        // numbered along the whole history of the key, not along its bytes.
+        let version = crate::versions::next_version(&all, key);
         let ctype = match content_type {
             Some(v) if !v.trim().is_empty() => v,
             _ => existing
@@ -420,9 +440,8 @@ impl Client {
     ) -> ApiResult<(Object, tokio::fs::File)> {
         validate_key(key)?;
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
-        let obj = self
-            .find_current(&bucket, key)?
-            .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))?;
+        let all = self.objects_for_bucket(&bucket)?;
+        let obj = current_to_read(&all, key)?;
         let path = self.key_path(&bucket.meta.id, key)?;
         match self.ensure_bytes(&obj).await {
             Ok(_) => {}
@@ -459,7 +478,14 @@ impl Client {
     /// The current generation of a key is the file at the key path, and
     /// is stale when its marker names another checksum. An older
     /// generation is a file under `.blobs`, named by its checksum.
+    ///
+    /// A delete marker has no bytes anywhere and no checksum to ask by, so
+    /// there is nothing to hold and nothing to fetch: the answer is no, at
+    /// once, and the background pull is not kept asking.
     pub async fn ensure_bytes(&self, obj: &Object) -> ApiResult<bool> {
+        if obj.status.delete_marker {
+            return Ok(false);
+        }
         let bucket = &obj.spec.bucket;
         let sha = &obj.status.sha256;
         if !obj.status.latest {
@@ -508,6 +534,12 @@ impl Client {
         let mut paths = Vec::new();
         let mut size = None;
         for obj in self.objects_for_bucket(&bucket)? {
+            if obj.status.delete_marker {
+                // A marker has no checksum. An empty one could match a record
+                // of some other key and be answered out of this server's path
+                // list, so it is not considered at all.
+                continue;
+            }
             if obj.status.sha256 != sha256 {
                 continue;
             }
@@ -538,17 +570,86 @@ impl Client {
     pub fn head_object(&self, bucket_id: &Id, key: &str) -> ApiResult<Object> {
         validate_key(key)?;
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
-        self.find_current(&bucket, key)?
-            .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))
+        let all = self.objects_for_bucket(&bucket)?;
+        current_to_read(&all, key)
     }
 
+    /// Open one generation of `key` for reading, named by its version number.
+    ///
+    /// A generation under a delete marker still reads. A marker itself has no
+    /// bytes and is refused as `MethodNotAllowed`, the way S3 refuses it.
+    pub async fn open_version(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+        version: u64,
+    ) -> ApiResult<(Object, tokio::fs::File)> {
+        let obj = self.head_version(bucket_id, key, version)?;
+        let path = self.generation_path(&obj).await?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| crate::versions::no_such_version(&version.to_string()))?;
+        Ok((obj, file))
+    }
+
+    /// Metadata of one generation of `key`, named by its version number.
+    ///
+    /// A delete marker is answered the same way the read path refuses it:
+    /// `MethodNotAllowed`, with the marker's version in `details` so HEAD can
+    /// answer `x-amz-delete-marker` the way S3 does.
+    pub fn head_version(&self, bucket_id: &Id, key: &str, version: u64) -> ApiResult<Object> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let obj = crate::versions::generation(&self.objects_for_bucket(&bucket)?, key, version)?;
+        if obj.status.delete_marker {
+            return Err(crate::delete_marker::not_a_readable_object(&obj));
+        }
+        Ok(obj)
+    }
+
+    /// Delete `key`, and answer with the record the call acted on: the delete
+    /// marker the key now carries, or the newest generation of a key taken
+    /// whole. `status.delete_marker` says which of the two happened.
+    ///
+    /// See [`crate::delete_marker`]: on a bucket with versioning on, nothing is
+    /// removed and a marker becomes the current generation. On a bucket without
+    /// versioning every record, the file and the key's blobs go, as before.
+    /// Whether the key was already hidden cannot be read back off the answer —
+    /// the marker the call wrote and the marker it removed are alike — so a
+    /// route that must tell them apart asks [`Self::head_object`] before it
+    /// deletes: a key under a marker answers `not_found` naming the marker.
     pub async fn delete_object(&self, bucket_id: &Id, key: &str) -> ApiResult<Object> {
         validate_key(key)?;
         let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
         let all = self.objects_for_bucket(&bucket)?;
+        let current = pick_current(all.iter().filter(|o| o.spec.key == key).cloned().collect())
+            .ok_or_else(|| crate::delete_marker::key_not_there(key))?;
+        match crate::delete_marker::action(&bucket, &current) {
+            crate::delete_marker::Action::RemoveKey => {
+                // The key's current record — the marker on top of a hidden
+                // key, or the newest generation of a key being taken whole —
+                // is what the call acted on, so that is the record it answers
+                // with. A marker taken this way leaves no `x-amz-delete-marker`
+                // behind: the key is gone, not hidden.
+                self.remove_key(bucket_id, key).await
+            }
+            crate::delete_marker::Action::AddMarker => {
+                let version = crate::versions::next_version(&all, key);
+                let marker = crate::delete_marker::new_marker(&bucket, key, version);
+                self.insert(marker).await
+            }
+        }
+    }
+
+    /// Take the key away: every record of it, the file at its key path, and
+    /// every blob no other key still names.
+    pub(crate) async fn remove_key(&self, bucket_id: &Id, key: &str) -> ApiResult<Object> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let all = self.objects_for_bucket(&bucket)?;
         let doomed: Vec<Object> = all.iter().filter(|o| o.spec.key == key).cloned().collect();
-        let current = pick_current(doomed.clone())
-            .ok_or_else(|| ApiError::not_found(format!("object '{key}' not found")))?;
+        let current =
+            pick_current(doomed.clone()).ok_or_else(|| crate::delete_marker::key_not_there(key))?;
         let keep: BTreeSet<String> = all
             .iter()
             .filter(|o| o.spec.key != key)
@@ -571,9 +672,13 @@ impl Client {
 
     /// Remove exactly one generation of `key`, named by its version number.
     ///
-    /// The key path always holds the current generation, so the file comes
-    /// away only when the named generation is the current one; an older
-    /// generation loses its `.blobs` copy. When a generation survives at the
+    /// A delete marker is removed the same way: the named record goes and the
+    /// generation under it becomes current again, so the key is readable once
+    /// more.
+    ///
+    /// The key path holds the bytes of whichever generation holds bytes, so the
+    /// file comes away only when the named generation was the key's only one;
+    /// an older generation loses its `.blobs` copy. When records survive at the
     /// key, the newest of them becomes the current one if the named row was.
     pub async fn delete_version(
         &self,
@@ -595,8 +700,14 @@ impl Client {
             .into_iter()
             .filter(|o| o.meta.id != doomed.meta.id)
             .collect();
-        if doomed.status.latest {
+        let was_current = pick_current(all.iter().filter(|o| o.spec.key == key).cloned().collect())
+            .is_some_and(|cur| cur.meta.id == doomed.meta.id);
+        if was_current {
             match survivors.iter().max_by_key(|o| o.status.version) {
+                // A marker left on top needs no bytes: the key stays hidden and
+                // its file is left alone. Otherwise the newest survivor becomes
+                // the current generation at the key path.
+                Some(newest) if newest.status.delete_marker => {}
                 Some(newest) => {
                     self.promote(&bucket, newest).await?;
                 }
@@ -607,13 +718,14 @@ impl Client {
                 }
             }
         }
-        // A checksum still named by a surviving record keeps its blob.
+        // A checksum still named by a surviving record keeps its blob. A marker
+        // names no checksum, so it takes nothing with it.
         let keep: BTreeSet<String> = all
             .iter()
             .filter(|o| o.meta.id != doomed.meta.id)
             .map(|o| o.status.sha256.clone())
             .collect();
-        if !keep.contains(&doomed.status.sha256) {
+        if !doomed.status.sha256.is_empty() && !keep.contains(&doomed.status.sha256) {
             if let Some(blob) = blob_file(&self.root, &bucket.meta.id, &doomed.status.sha256) {
                 remove_file(&blob).await?;
             }
@@ -637,30 +749,6 @@ impl Client {
         }
         same.sort_by_key(|o| std::cmp::Reverse(o.status.version));
         Ok(same)
-    }
-
-    /// Metadata of one generation of `key`, named by its version number.
-    pub fn head_version(&self, bucket_id: &Id, key: &str, version: u64) -> ApiResult<Object> {
-        validate_key(key)?;
-        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
-        crate::versions::generation(&self.objects_for_bucket(&bucket)?, key, version)
-    }
-
-    /// Open one generation of `key` for reading, named by its version number.
-    pub async fn open_version(
-        &self,
-        bucket_id: &Id,
-        key: &str,
-        version: u64,
-    ) -> ApiResult<(Object, tokio::fs::File)> {
-        validate_key(key)?;
-        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
-        let obj = crate::versions::generation(&self.objects_for_bucket(&bucket)?, key, version)?;
-        let path = self.generation_path(&obj).await?;
-        let file = tokio::fs::File::open(&path)
-            .await
-            .map_err(|_| crate::versions::no_such_version(&version.to_string()))?;
-        Ok((obj, file))
     }
 
     /// Turn versioning off, or on, for the bucket.
@@ -691,7 +779,16 @@ impl Client {
     /// The file holding `obj`'s bytes on this server, fetching them from a
     /// peer when it does not hold them. The key path when the generation is
     /// current, its `.blobs` copy otherwise.
+    ///
+    /// A delete marker has no file and no checksum: it is an error, not a path.
+    /// Callers check [`crate::types::ObjectStatus::delete_marker`] first.
     pub(crate) async fn generation_path(&self, obj: &Object) -> ApiResult<PathBuf> {
+        if obj.status.delete_marker {
+            return Err(ApiError::not_found(format!(
+                "object '{}' is a delete marker",
+                obj.spec.key
+            )));
+        }
         if !obj.status.latest {
             let Some(path) = blob_file(&self.root, &obj.spec.bucket, &obj.status.sha256) else {
                 return Err(ApiError::not_found(format!(
@@ -764,6 +861,10 @@ impl Client {
     /// Latest generation of each key, optionally filtered by `prefix` and
     /// starting after `after_key` (exclusive), capped at `limit`.
     ///
+    /// A key whose latest generation is a delete marker is not listed, and
+    /// counts for nothing toward `limit`: ListObjectsV2 shows what is readable
+    /// at the key path, and a hidden key is not.
+    ///
     /// Non-empty `delimiter` rolls keys into [`ListObjectEntry::CommonPrefix`]
     /// (each counts once toward `limit`, and toward ListObjectsV2 KeyCount).
     /// When `after_key` is a common-prefix marker (ends with the delimiter),
@@ -794,8 +895,9 @@ impl Client {
         let objects: Vec<Object> = keys
             .into_iter()
             .filter_map(|key| {
-                let matches = all.iter().filter(|o| o.spec.key == key).cloned().collect();
-                pick_current(matches)
+                let current =
+                    pick_current(all.iter().filter(|o| o.spec.key == key).cloned().collect())?;
+                (!current.status.delete_marker).then_some(current)
             })
             .collect();
         let entries: Vec<ListObjectEntry> = match delimiter {
@@ -849,6 +951,7 @@ impl Client {
             size_bytes: size,
             version,
             latest: true,
+            delete_marker: false,
         };
         self.store
             .collection::<Object>()
@@ -869,15 +972,6 @@ impl Client {
             .into_iter()
             .filter(|o| o.spec.bucket == bucket.meta.id)
             .collect())
-    }
-
-    fn find_current(&self, bucket: &Bucket, key: &str) -> ApiResult<Option<Object>> {
-        let matches = self
-            .objects_for_bucket(bucket)?
-            .into_iter()
-            .filter(|o| o.spec.key == key)
-            .collect();
-        Ok(pick_current(matches))
     }
 
     async fn preserve_previous(&self, bucket: &Id, sha: &str, src: &Path) -> ApiResult<()> {
@@ -914,15 +1008,26 @@ impl ListObjectEntry {
     }
 }
 
-fn pick_current(mut matches: Vec<Object>) -> Option<Object> {
-    matches.sort_by(|a, b| {
-        b.status
-            .latest
-            .cmp(&a.status.latest)
-            .then(b.status.version.cmp(&a.status.version))
-            .then(b.meta.revision.cmp(&a.meta.revision))
-    });
-    matches.into_iter().next()
+fn pick_current(matches: Vec<Object>) -> Option<Object> {
+    // Newest generation wins — that is the key's current record, marker
+    // included. `latest` only breaks a tie between two records written at the
+    // same generation, which a racing writer can leave behind.
+    matches
+        .into_iter()
+        .max_by_key(|o| (o.status.version, o.status.latest, o.meta.revision))
+}
+
+/// The current record of `key`, or the error a read of the key is owed.
+///
+/// A key whose current generation is a delete marker is not there: 404, with
+/// the marker's version in `details` so the S3 route can answer
+/// `x-amz-delete-marker: true` and name it.
+fn current_to_read(all: &[Object], key: &str) -> ApiResult<Object> {
+    match pick_current(all.iter().filter(|o| o.spec.key == key).cloned().collect()) {
+        None => Err(ApiError::not_found(format!("object '{key}' not found"))),
+        Some(obj) if obj.status.delete_marker => Err(crate::delete_marker::hidden(key, &obj)),
+        Some(obj) => Ok(obj),
+    }
 }
 
 fn blob_file(root: &Path, bucket: &Id, sha: &str) -> Option<PathBuf> {

@@ -193,6 +193,13 @@ async fn the_pull_copies_what_is_missing_and_a_follower_prunes() {
     );
 
     p.a.delete_object(&plain, "one").await.unwrap();
+    // A versioned bucket is emptied generation by generation: a plain delete
+    // leaves a marker, and a marker or not, every record holds the bucket.
+    for v in p.a.list_object_versions_of_key(&kept, "doc").unwrap() {
+        p.a.delete_version(&kept, "doc", v.status.version)
+            .await
+            .unwrap();
+    }
     p.a.delete_bucket(&kept).await.unwrap();
 
     // The leader does not prune: a put writes the file before the record.
@@ -211,6 +218,42 @@ async fn the_pull_copies_what_is_missing_and_a_follower_prunes() {
     assert!(!b_plain.join("one").exists());
     assert!(b_plain.join("two").exists());
     assert!(!b_kept.exists());
+}
+
+#[tokio::test]
+async fn a_delete_marker_asks_no_peer_for_bytes() {
+    // A marker is a record with no bytes anywhere. The pull walks every record
+    // it has and must not ask a peer for a marker's bytes, count it as missing,
+    // or retry it: the pass is clean and the key stays hidden here.
+    let p = pair().await;
+    let kept = bucket(&p.a, "versions", true);
+    p.a.put_object(&kept, "doc", b"body", None).await.unwrap();
+    sync_once(&p.b, true, Duration::ZERO).await.unwrap();
+    p.a.delete_object(&kept, "doc").await.unwrap();
+
+    let report = sync_once(&p.b, true, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        report,
+        SyncReport::default(),
+        "a marker has no bytes to fetch and is not missing"
+    );
+    // The marker reached the follower as a record, and the key is hidden here
+    // too rather than readable off stale bytes.
+    let err = p.b.open_object(&kept, "doc").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound, "{err}");
+    // Removing the marker on the leader brings the bytes back on the next
+    // pass; nothing was fetched twice or dropped on the floor.
+    let versions = p.a.list_object_versions_of_key(&kept, "doc").unwrap();
+    let marker = versions
+        .iter()
+        .find(|o| o.status.delete_marker)
+        .expect("the marker is listed");
+    p.a.delete_version(&kept, "doc", marker.status.version)
+        .await
+        .unwrap();
+    let report = sync_once(&p.b, true, Duration::ZERO).await.unwrap();
+    assert_eq!(report.missing, 0);
+    assert_eq!(read(&p.b, &kept, "doc").await, b"body");
 }
 
 #[tokio::test]
