@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The relay module itself: which providers it mounts, the `Client` it
+//! The module a server mounts: which providers it carries, the `Client` it
 //! hands the api, and the reconciler and health checker it starts as the
 //! leader.
 
@@ -10,16 +10,13 @@ use crate::backend::RelayBackend;
 use crate::client::Client;
 use crate::health;
 use crate::provider::{ForwardProvider, LbProvider, MockProvider, Providers, RelayL7Provider};
+use crate::relay::retry_interval::RETRY_INTERVAL;
 use crate::types::KINDS;
 use async_trait::async_trait;
 use pistack_rpc::CommandQueue;
 use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::sync::Arc;
-use std::time::Duration;
-
-/// How often the reconciler retries resources that are not `Ready`.
-const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The module. `Default` uses the mock provider so a single-node server is
 /// functional end to end. [`Relay::forward`] is the in-process L4 forwarder

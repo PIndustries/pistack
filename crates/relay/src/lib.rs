@@ -48,7 +48,3 @@ mod relay;
 
 pub use backend::RelayBackend;
 pub use relay::Relay;
-
-#[cfg(test)]
-#[path = "backend_tests.rs"]
-mod backend_tests;

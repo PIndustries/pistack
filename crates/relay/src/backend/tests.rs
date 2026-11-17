@@ -4,7 +4,10 @@
 //! Backend-selection tests: the parse and choose rules, and that the
 //! forward backend serves both planes.
 
-use super::*;
+use super::RelayBackend;
+use crate::provider::{ForwardProvider, LbProvider, OvnProvider};
+use crate::types::Provider;
+use crate::Relay;
 
 #[test]
 fn backend_choice_is_explicit() {
