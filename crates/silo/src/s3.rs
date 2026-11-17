@@ -4,11 +4,14 @@
 //! Path-style S3-compatible routes on the silo router.
 //!
 //! ```text
-//! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}
-//! GET                       /{bucket}?list-type=2&prefix=&delimiter=&continuation-token=&start-after=&max-keys=
-//! GET                       /{bucket}?uploads&prefix=&delimiter=&key-marker=&upload-id-marker=&max-uploads=
+//! PUT                         /{bucket}          CreateBucket
+//! HEAD                        /{bucket}          HeadBucket
+//! DELETE                      /{bucket}          DeleteBucket
+//! GET                         /{bucket}?list-type=2&prefix=&delimiter=&continuation-token=&start-after=&max-keys=
+//! GET                         /{bucket}?uploads&prefix=&delimiter=&key-marker=&upload-id-marker=&max-uploads=
 //!                                     ListMultipartUploads
-//! POST                      /{bucket}?delete (XML body)   DeleteObjects
+//! POST                        /{bucket}?delete (XML body)   DeleteObjects
+//! PUT|GET|HEAD|DELETE|POST    /{bucket}/{*key}
 //!
 //! Multipart (query on the object path):
 //! POST   ?uploads                         CreateMultipartUpload
@@ -81,6 +84,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use futures::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use pistack_types::error::ErrorCode;
 use pistack_types::{ApiError, ApiResult, Caller};
 use serde::Deserialize;
 use std::io::SeekFrom;
@@ -805,6 +809,30 @@ pub async fn list_or_bucket(
     }
 }
 
+/// HeadBucket: `HEAD /{bucket}`. 200 when the bucket is visible to the
+/// caller, 404 (`NoSuchBucket`) otherwise — the same visibility rule as every
+/// other bucket route, with no body.
+pub async fn head_bucket(
+    State(c): State<Client>,
+    ext: Option<Extension<Caller>>,
+    Path(bucket): Path<String>,
+) -> Response {
+    match head_bucket_inner(c, ext, bucket).await {
+        Ok(status) => status.into_response(),
+        Err(err) => s3_error(err),
+    }
+}
+
+async fn head_bucket_inner(
+    c: Client,
+    ext: Option<Extension<Caller>>,
+    bucket_name: String,
+) -> ApiResult<StatusCode> {
+    let who = caller(ext)?;
+    load_bucket(&c, &who, &bucket_name)?;
+    Ok(StatusCode::OK)
+}
+
 async fn list_or_bucket_inner(
     c: Client,
     ext: Option<Extension<Caller>>,
@@ -1241,9 +1269,28 @@ fn content_length(headers: &HeaderMap) -> ApiResult<Option<u64>> {
     }
 }
 
-fn caller(ext: Option<Extension<Caller>>) -> ApiResult<Caller> {
+pub(crate) fn caller(ext: Option<Extension<Caller>>) -> ApiResult<Caller> {
     ext.map(|Extension(c)| c)
         .ok_or_else(|| ApiError::unauthorized("no credentials"))
+}
+
+/// Read the whole body and check it against the payload hash the SigV4
+/// middleware recorded (if any). Used by handlers that take a body they do
+/// not otherwise consume, so a declared hash is still honoured.
+pub(crate) async fn ensure_body_hash(req: Request) -> ApiResult<()> {
+    let expected = req.extensions().get::<ExpectedPayloadSha256>().cloned();
+    let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("reading body: {e}")))?;
+    sigv4::verify_body_sha256(expected.as_ref(), &body)
+}
+
+/// A store conflict naming an existing bucket row. The create path is the
+/// only one that raises it, so the message (`bkt … already exists`) is enough.
+pub(crate) fn bucket_exists(err: &ApiError) -> bool {
+    err.code == ErrorCode::Conflict
+        && err.message.contains("bkt ")
+        && err.message.contains("already exists")
 }
 
 fn xml_escape(s: &str) -> String {
@@ -1401,7 +1448,7 @@ fn list_bucket_xml(page: &ListBucketPage<'_>) -> String {
     body
 }
 
-fn s3_error(err: ApiError) -> Response {
+pub(crate) fn s3_error(err: ApiError) -> Response {
     let (status, default_code) = match err.status() {
         StatusCode::NOT_FOUND => (StatusCode::NOT_FOUND, "NoSuchKey"),
         StatusCode::UNAUTHORIZED => (StatusCode::FORBIDDEN, "AccessDenied"),

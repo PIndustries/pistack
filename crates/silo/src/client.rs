@@ -160,6 +160,22 @@ impl Client {
             .map_err(Into::into)
     }
 
+    /// The bucket the name is taken by, anywhere in the store, or `None`.
+    ///
+    /// Bucket names share one namespace: `create` refuses a name already held
+    /// in any project (or the cloud scope). CreateBucket must see that row to
+    /// answer `BucketAlreadyExists`, even though it is not visible to the
+    /// caller. `get_by_name` is scoped to one project, so the whole store is
+    /// scanned by name — a bucket create is rare and the scan is one list.
+    pub(crate) fn find_bucket(&self, name: &str) -> Option<Bucket> {
+        self.store
+            .collection::<Bucket>()
+            .list(None)
+            .ok()?
+            .into_iter()
+            .find(|b| b.meta.name == name)
+    }
+
     /// Delete the bucket, its object records, and the bucket directory.
     pub async fn delete_bucket(&self, id: &Id) -> ApiResult<Bucket> {
         let bucket = self.store.collection::<Bucket>().get(id)?;
@@ -551,6 +567,14 @@ impl Client {
             }
         }
         Ok(current)
+    }
+
+    /// True when this server still stages an unfinished multipart upload in
+    /// the bucket. A `.uploads/` entry that is neither recorded done nor
+    /// complete is one; an empty or unreadable staging tree is not.
+    pub(crate) async fn has_staged_uploads(&self, bucket_id: &Id) -> ApiResult<bool> {
+        let root = self.uploads_root(bucket_id);
+        Ok(!crate::multipart::scan_staged(&root).await?.is_empty())
     }
 
     /// Latest generation of each key in the bucket, ordered by key.

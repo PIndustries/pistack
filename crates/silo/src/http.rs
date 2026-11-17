@@ -36,6 +36,8 @@
 
 use crate::client::Client;
 use crate::s3;
+use crate::s3_create_bucket;
+use crate::s3_delete_bucket;
 use crate::sigv4::{self, SigV4State};
 use crate::types::*;
 use axum::{
@@ -126,7 +128,11 @@ pub fn router_with(client: Client, keep: Option<keep::Client>, region: String) -
         .route("/buckets/{id}/objects/{*key}", object_routes)
         .route(
             "/{bucket}",
-            get(s3::list_or_bucket).post(s3::delete_objects),
+            get(s3::list_or_bucket)
+                .post(s3::delete_objects)
+                .head(s3::head_bucket)
+                .put(s3_create_bucket::create_bucket)
+                .delete(s3_delete_bucket::delete_bucket),
         )
         .route("/{bucket}/{*key}", s3_object)
         .fallback(|| async { ApiError::not_found("no such silo endpoint") })
@@ -333,7 +339,7 @@ fn caller(ext: Option<Extension<Caller>>) -> ApiResult<Caller> {
         .ok_or_else(|| ApiError::unauthorized("no credentials"))
 }
 
-fn create_project(caller: &Caller, body: &Option<Id>) -> ApiResult<Option<Id>> {
+pub(crate) fn create_project(caller: &Caller, body: &Option<Id>) -> ApiResult<Option<Id>> {
     match (caller.is_admin(), body, &caller.project) {
         (true, Some(p), _) => Ok(Some(p.clone())),
         (true, None, p) => Ok(p.clone()),

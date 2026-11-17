@@ -48,6 +48,7 @@ use pistack_store::Store;
 use pistack_types::{Module, ModuleContext, ModuleInfo};
 use std::path::PathBuf;
 
+mod bucket_name;
 pub mod chunked;
 pub mod client;
 pub mod copy;
@@ -57,6 +58,8 @@ pub mod http;
 pub mod multipart;
 pub mod replica;
 pub mod s3;
+mod s3_create_bucket;
+mod s3_delete_bucket;
 pub mod sigv4;
 pub mod staging;
 mod staging_fetch;

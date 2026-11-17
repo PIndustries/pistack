@@ -778,6 +778,7 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         | "InvalidPart"
         | "InvalidPartOrder"
         | "InvalidArgument"
+        | "InvalidBucketName"
         | "InvalidRequest"
         | "InvalidRange"
         | "MalformedXML"
@@ -791,6 +792,10 @@ pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
         | "SignatureDoesNotMatch"
         | "AccessDenied"
         | "RequestTimeTooSkewed" => ApiError::forbidden(message),
+        // CreateBucket on a name owned by another project.
+        "BucketAlreadyExists" => ApiError::conflict(message),
+        // DeleteBucket on a bucket that still holds objects or uploads.
+        "BucketNotEmpty" => ApiError::conflict(message),
         // S3 uses HTTP 412; pistack ErrorCode has no 412, so Conflict (409).
         "PreconditionFailed" => ApiError::conflict(message),
         "NotImplemented" => ApiError::not_implemented(message),
