@@ -2,11 +2,10 @@
 
 What a private cloud needs, area by area, and where PiStack stands on each.
 
-Read from the code on main at 6cb7356, 2026-11-15. Each line is one of:
+Read from the code on this branch at 71cf282, 2026-11-17. Each line is one of:
 
 - **Done**: in the tree and reachable through the API.
 - **Partial**: some of it works; the line says what does not.
-- **In progress**: in an open pull request.
 - **Missing**: no code.
 
 "No CLI" means it works over HTTP or `pi api` but `pi` has no command for it.
@@ -21,7 +20,7 @@ All fixed on main:
 - #116: a machine could boot any project's image; a cloud-hypervisor guest wrote into the shared image and got no cloud-init. `pi machine create --volume` is refused with a message instead of ignored; attaching at start is still to do.
 - #117: `/cluster`, including the full store snapshot, was open by default. It now needs a member or a join token.
 
-Found by the three-server lab run, in an open pull request, in progress, or since fixed:
+Found by the three-server lab run and since fixed:
 
 - #119: a failed network or load balancer reconcile was retried without pause, and a follower that fell behind a busy leader never caught up, after which no write was confirmed.
 - A follower that fell behind a busy leader, or that once led and holds entries no majority confirmed, replaces its own store with a snapshot from the leader and starts again. It keeps its id and role, replaces at most once every ten minutes, and its unconfirmed entries are set aside, not merged.
@@ -48,7 +47,7 @@ Done
 - Pods, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, Ingress, Autoscaler (loom)
 
 Partial
-- SSH keys: raw strings per machine or a key pair by name at create; a generated pair's private half is returned once and never stored
+- SSH keys: raw strings per machine, or a key pair kept as a resource of a project and given at create by name or id (`pi keypair`). A generated pair's private half is returned once and never stored
 - VNC console: only when the VM is on the API server's own host; libvirt only; no serial console
 - Console log: written on the host, no API to read it for a VM
 - Affinity: soft hints by machine name; no server groups, no hard rule
@@ -57,7 +56,7 @@ Partial
 - Evacuate off a dead host: the host is powered off through its BMC, over IPMI or Redfish, and the off state read back before anything moves; without power control, or when the power-off fails, nothing moves until the operator confirms the host is dead and the report says so. Machines then start elsewhere from their image without the root disk; RBD volumes follow, local ones do not
 - Compute quota: no GPU limit; a pod's machine is counted but a pod is not refused
 - NIC hot-plug: the agent can do it, nothing on the server asks it to
-- Boot from volume: the flag is stored, no runtime boots from one
+- Boot from volume: the flag is stored, no runtime boots from one. Volumes named at create are refused with a message; `--near-volume` places the machine where a volume can attach and attaches nothing
 - Root disk: one copy-on-write disk on libvirt; no extra ephemeral or swap disks
 - GPU: in sizes and the scheduler; hosts always report zero and there is no passthrough
 - Bare metal: power and PXE boot; does not write an image, no inspection or enrollment
@@ -82,7 +81,7 @@ Done
 
 Partial
 - Minimum disk is checked against the size at machine create and rebuild; minimum RAM is stored and never checked
-- Storing images in object storage: written, not switched on (In progress, PR 110)
+- Storing images in object storage: written, off by default (`[modules.mold] store = "silo"`, streamed); not run against a real cluster
 
 Missing
 - Image signing
@@ -94,7 +93,7 @@ Backends: OVN, overlay (VXLAN and namespaces), hostnat (one host), mock.
 
 Done
 - Networks, subnets, allocation pools, ports, fixed IPs, MACs
-- VPCs: a project's routed private space, the one router it owns, and the networks and subnets inside it
+- VPCs: a project's routed private space, the one router it owns, and the networks and subnets inside it (`pi vpc`, `pi vpc subnet`, and a console page)
 - Routers, external gateway, SNAT (IPv4)
 - Floating IPs on OVN, overlay and hostnat
 - Automatic floating IPs from one marked external network, off by default, with an opt-out per machine and per project
@@ -114,14 +113,13 @@ Partial
 - Shared networks: cloud-wide or private, nothing between
 - Allowed address pairs: honoured on OVN only; the other backends store the pair and change nothing on the host
 - Overlay routers live on one host with no failover
-- CLI has no `update` for any network resource
+- The CLI changes only a network's automatic-floating-IP setting (`pi network set`); no other network resource has an update command
 
 Missing
 - Trunk ports
 - QoS and bandwidth limits
 - VPN, firewall policies, BGP, port mirroring
 - Per-project network sharing (RBAC)
-- Topology and IP availability views
 
 Lab-proven on two hosts (OVN): networks, DHCP, traffic between hosts, a router with an external gateway, floating IPs in and out on both hosts, outbound NAT, security groups denying by default and allowing by rule, a flat provider network. Not yet run on hosts: VLAN provider networks, IPv6, gateway failover between hosts.
 
@@ -132,7 +130,7 @@ Done
 - TCP, UDP, HTTP with host and path routes
 - TLS termination from a stored certificate
 - TCP and HTTP health checks
-- Balancing by the pool's algorithm — round robin, least connections, source address — with member weights, on both data planes (`pi lb`)
+- Balancing by the pool's algorithm (round robin, least connections, source address) with member weights, on both data planes (`pi lb`)
 
 Partial
 - Runs inside the server process on the server's address; the VIP is never placed on a tenant network
@@ -154,9 +152,11 @@ Done
 - Outbound AXFR and secondary pull
 - NOTIFY both ways: a zone change is notified to its secondaries and to the addresses a primary names in `also_notify`, and a notified secondary pulls at once
 - Automatic records for machines and floating IPs
+- Zones and record sets from the command line (`pi dns zone`, `pi dns record`)
 
 Partial
 - Reverse DNS by hand only
+- CLI has no update for a zone or a record set
 
 Missing
 - IXFR, TSIG, DNSSEC
@@ -171,14 +171,14 @@ Done
 - Quota per project on volume count and gigabytes, snapshots, and backup count and gigabytes; extend is checked
 - Backup to object storage and restore, local, LVM and RBD (`pi backup`)
 - Backends: local file, LVM thin, Ceph RBD
+- A local file or an LVM volume stays on the node that made it (`status.home_node`) and attaches only there; a machine created with `--near-volume` is placed on that node
 
 Partial
 - Extend works; an attached guest is not told the disk grew
 - LVM and RBD have only been run against stand-in scripts, never real Ceph or LVM
+- RBD credentials come from the host's `ceph.conf` and keyring, not from keep
+- A local volume cannot be moved between nodes
 - Transfer between projects: the API offers, accepts and cancels; `pi` has no command for it
-
-In progress (PR 109)
-- A local or LVM volume stays on its node; machines are placed with their volume
 
 Missing
 - QoS
@@ -193,17 +193,17 @@ Missing
 
 Done
 - Buckets and objects
+- Bucket create, delete and head over S3 as well as the JSON API
 - S3 path-style: get (with range), put, head, delete, batch delete, copy, list v2, multipart
 - SigV4, presigned URLs, streaming uploads
 - Cleanup of abandoned multipart uploads
+- Object bytes copied between control-plane servers, in full. A put is answered once another server holds the bytes (`[modules.silo] put_copies`, default 2); multipart staging is copied the same way, so an upload in flight survives a leader change
 
 Partial
-- S3 has no bucket calls, list v1, virtual-host style or tagging
-- Versioning keeps old bytes but cannot list or fetch them
+- S3 has no list v1, virtual-host style or tagging
+- Versioning: set and read on the S3 surface, list every generation, read or delete one by versionId, and a plain delete writes a delete marker. Suspended is answered as versioning off, since the store keeps one flag. Through the S3 surface and the JSON API only: `pi bucket` sets versioning at create and cannot list or read a generation
 - Quota: bucket count per project only; no limit on bytes
-
-In progress (PR 110)
-- Object bytes copied between control-plane servers (full copies)
+- A write that reaches a follower is carried to the leader unasked; a body over the carry limit is refused in S3 form and the client must send it to the leader
 
 Missing
 - ACLs and bucket policies
@@ -215,10 +215,14 @@ Missing
 
 Done
 - NFS shares with access by client CIDR
+- A share allowed in mode write is writable: managed exports carry `all_squash` to an unprivileged uid and the share directory is owned by it
+- A ready share reports where to mount as `<address>:<path>` in its status, and `pi share show` prints it
+- Shares are reconciled by the server that leads, and from the command line (`pi share`)
 
 Partial
 - CephFS share is created; access rules are stored and not applied
 - NFS size is not enforced
+- A share is exported by one server: the exports file and the directory stay local, so they do not follow a leader change
 
 Missing
 - Share snapshots, types, networks, resize
@@ -240,13 +244,15 @@ Partial
 - Roles: admin, member, reader only; custom roles grant nothing; the policy engine is built and unused
 - Nested projects: parent recorded, nothing inherited
 - Audit log: admin only, no per-project view; ordinary reads, object uploads and server joins are not recorded; no export or forwarding to another system
+- Sign-in with an OpenID Connect identity token: a cloud admin registers a provider (issuer, client id, the claim naming a user, optionally a group claim mapped to roles and projects) and `POST /identity/oidc/login` takes a provider name and an ID token the client already holds. Keys come from the provider's discovery document over HTTPS and are cached ten minutes; RS256 and ES256 only; issuer, audience, expiry and not-before enforced. An outside identity is the provider and the token's subject, never matched to an account by name or email. This is the token check only: no browser sign-in and no CLI
 - Sign-in lockout: ten failures for one name from one address hold that pair for fifteen minutes, and two hundred from anywhere hold the name for the window
 
 Missing
 - A single token cannot be revoked, only all of a user's at once
+- Browser sign-in and CLI sign-in with OIDC: only the token check exists
 - Signing-key rotation on a schedule: it is by hand
 - Groups, domains
-- OIDC, SAML, LDAP, federation
+- SAML, LDAP, federation
 - MFA
 
 ## Secrets
@@ -297,7 +303,7 @@ Done
 - Alarms and metric series from the command line (`pi alarm`, `pi metric`)
 
 Partial
-- History: none; a server keeps the last 240 points per series in memory and Prometheus keeps the rest
+- History: none; a server keeps the last 240 points per series in memory, none older than an hour, for at most 50,000 series, and Prometheus keeps the rest
 - Host and machine series are on the leader only and start empty after a failover
 - Machine usage: libvirt only; nothing for containers, cloud-hypervisor or bare metal
 - Alarms: a `for_seconds` hold is measured on the stamps of the series' own samples, and can ask for at most the hour the window reaches
@@ -338,14 +344,15 @@ Missing
 ## Tooling
 
 Done
-- `pi` CLI: 34 nouns
-- Web console: 30 pages, with a page of its own for a host and panels for a project's limits and a user's roles
+- `pi` CLI: 54 nouns
+- Web console: 31 pages, with a page of its own for a host, pages for key pairs and VPCs, and panels for a project's limits and a user's roles
 - The console is kept in small files, one per function, joined into the page at build time
+- Rebuild, resize and key pairs have console pages, and the machine page follows the machine while Live is on
 - Container images, tarball, installer, systemd units
 - Release workflow: run; `26.11.13.1` published Linux x86_64 and aarch64 tarballs with `SHA256SUMS`. Container images are built by the workflow but none are published yet
 
 Partial
-- CLI has nothing for VPCs or volume transfers
+- CLI has nothing for volume transfers
 
 Missing
 - Terraform provider
@@ -354,7 +361,4 @@ Missing
 
 ## Order of work
 
-1. Merge and prove PRs 109 and 110 on real Ceph and LVM. Fix what the three-server run found. Cut the first build.
-2. Operations: server-to-server TLS, certificate renewal, schema version.
-3. What most sites expect: cold migration, host maintenance, availability zones, server groups, OIDC, boot from volume, machine snapshot, volume encryption, load balancer on tenant networks, IPv6 router advertisements, metrics per machine, CLI for every resource, Terraform provider.
-4. Long tail, on request: GPU and passthrough, UEFI and vTPM, bare metal deploy, trunks, QoS, VPN, BGP, DNSSEC, erasure coding, regions, billing.
+The plan is in [ROADMAP.md](ROADMAP.md).

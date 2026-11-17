@@ -2,7 +2,9 @@
 
 Each phase ends at a gate an outside tool decides.
 
-## Phase 0 — Foundation (now)
+Phase 0 is closed. Phase 1 is nearly closed. Phase 2 is the current work.
+
+## Phase 0 — Foundation (done)
 
 - [x] Cargo workspace, `pistack` binary, gateway, discovery document
 - [x] `pistack-types`: resource model, errors, Module contract
@@ -28,7 +30,7 @@ Each phase ends at a gate an outside tool decides.
 - [x] `bench`: `pi` CLI covering 18 nouns, login/profiles, apply, completions. `/console` serves the web portal (login, machines, hosts, networks, volumes, images, buckets).
 - [x] Gate reached 2026-10-02: `pistack server --init` + `pistack agent --join` in separate processes; `pi machine create --wait` reaches Ready on the agent's mock runtime; volumes attach; secrets and certs issue; a Deployment produces Running pods. 233 tests in CI.
 - [x] Decisions for the next phase are recorded in [DECISIONS.md](DECISIONS.md): libvirt/KVM first, PiStack YAML stacks, the PiStack API only in v1, loom on the same records as every other module, youki directly under anvil
-- [x] `silo`, `shelf`, `gauge`, `blueprint` are store-backed HTTP APIs. silo writes object bytes under the data dir (streaming PUT, default 5 GiB cap) and serves path-style S3 objects, ListObjectsV2 (with delimiter/CommonPrefixes, encoding-type=url, and opaque continuation tokens), multipart upload, and ListMultipartUploads (with delimiter/CommonPrefixes and encoding-type=url); PutObject/CreateMultipartUpload/CopyObject destination and native PUT `/buckets/{id}/objects/{*key}` reject XML-unsafe key characters (C0 controls, U+007F, U+FFFE, U+FFFF) while GET/HEAD/DELETE still serve legacy keys; unfinished multipart uploads are swept after `multipart_ttl_secs` (default 7 days). AWS SigV4 is verified in-process via keep access keys (header auth, presigned GET/PUT, and aws-chunked PutObject/UploadPart: `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`; UploadPartCopy and CopyObject via `x-amz-copy-source`; copy-source `versionId` is not implemented; ECDSA/SigV4A streaming is not supported). gauge keeps an in-memory sample ring and Prometheus text. shelf shares stay Pending. blueprint apply accepts a document and does not create machines.
+- [x] `silo`, `shelf`, `gauge`, `blueprint` are store-backed HTTP APIs. silo writes object bytes under the data dir (streaming PUT, default 5 GiB cap) and serves path-style S3 objects, ListObjectsV2 (with delimiter/CommonPrefixes, encoding-type=url, and opaque continuation tokens), multipart upload, and ListMultipartUploads (with delimiter/CommonPrefixes and encoding-type=url); PutObject/CreateMultipartUpload/CopyObject destination and native PUT `/buckets/{id}/objects/{*key}` reject XML-unsafe key characters (C0 controls, U+007F, U+FFFE, U+FFFF) while GET/HEAD/DELETE still serve legacy keys; unfinished multipart uploads are swept after `multipart_ttl_secs` (default 7 days). AWS SigV4 is verified in-process via keep access keys (header auth, presigned GET/PUT, and aws-chunked PutObject/UploadPart: `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`; UploadPartCopy and CopyObject via `x-amz-copy-source`; copy-source `versionId` is not implemented; ECDSA/SigV4A streaming is not supported). gauge keeps points per series in memory and Prometheus text. blueprint apply accepts a document and writes machines.
 - [x] silo object bytes reach every control-plane server: a read that misses fetches from a peer and checks size and SHA-256, and each server pulls what it lacks in the background (`[modules.silo] replicate_interval_secs`). mold can keep images in silo (`[modules.mold] store = "silo"`, streamed, off by default), and slab backups already do. A put is answered after one other server holds the bytes (`put_copies`, default 2). Multipart staging is copied the same way, so an upload in flight survives a leader change. Not done: no Ceph (RGW or RADOS) store for the bytes.
 - [x] A request with no Caller is unauthorized (`no credentials`) on fabric, beacon, relay, blueprint, gauge, slab, mold, silo, and shelf. `--dev` still injects an admin only at the gateway (except `/silo` SigV4 header/presigned requests, which keep no synthetic Caller so silo can verify the signature). `/`, `/healthz`, `POST /identity/tokens`, and `/rpc` do not require a token.
 - [x] Gateway TLS: `pistack server --tls-listen ADDR` (env `PISTACK_TLS_LISTEN`) serves the same app with rustls beside plain HTTP. Certs are `data_dir/tls/cert.pem`, `key.pem`, and `ca.pem`, reused when present and otherwise issued by keep. The address must be specific (not `0.0.0.0` or `::`). `--insecure-http` still only silences the plain-HTTP warning when TLS is not configured.
@@ -43,10 +45,27 @@ Each phase ends at a gate an outside tool decides.
 - [x] Overlay datapath when `PISTACK_FABRIC_BACKEND=overlay`: one VXLAN segment per network, one router namespace per router, static forwarding to peer underlays, DHCP and subnet routes from that router, a provider bridge for a physical link, floating-IP translation on the host that owns the port, and placement only onto a host that reported an underlay address. Host NAT stays in place for networks already realised that way.
 - [x] LVM and Ceph RBD backends in slab, chosen by the volume type; qemu-img in mold. An RBD volume attaches on any host: a VM gets a network disk, a pod gets a mapped device. A local file or an LVM volume stays on the node that made it (`status.home_node`), and attaches only there; a machine created with `--near-volume` is placed on that node. RBD backups restore through `rbd import`. Not run against a Ceph cluster yet.
 - [ ] Not done in slab: RBD credentials from keep (agents use the host's `ceph.conf` and keyring), moving a local volume between nodes, and LVM on any host but the control-plane server.
-- TLS everywhere via keep
-- Gate: a VM boots on three nodes and gets an IP, a volume and a floating IP from the CLI.
+- [x] TLS between the control-plane servers, checked against the cloud CA, with `PISTACK_CLUSTER_TLS` preferred or required, and joining over https with the CA fingerprint (`PISTACK_JOIN_CA_SHA256`).
+- [x] Listener and agent certificates renew themselves while the server or agent runs; signing keys rotate and retire through the API and `pi signing-key`; the root key can be replaced offline with the software backend. The cloud CA cannot be replaced yet.
+- [ ] Gate: a VM boots on three nodes and gets an IP, a volume and a floating IP from the CLI.
 
-## Phase 2 — Containers and platform
+## Phase 2 — Containers and platform (now)
+
+Planned work, in this order.
+
+1. Storage on a multi-server control plane: local and LVM volumes run against real hosts, LVM usable on any host, and RBD credentials taken from keep.
+2. Machines that keep their disk on the host move off it: cold migration, and a drain that empties a host whose machine disks are local.
+3. Sign-in from the browser with an OpenID Connect provider, and LDAP.
+4. Object lifecycle rules and storage quotas on bytes.
+5. Machine snapshots: a machine saved to an image, and a volume turned into an image.
+6. VPN and firewall policies.
+7. Usage metering and billing export.
+8. A Terraform provider.
+9. Testing at scale: real LVM, real Ceph, many hosts, and the checks that go with them.
+
+After these, on request: GPU passthrough, bare-metal deployment, BGP, regions.
+
+Already in the tree from this phase:
 
 - [x] youki runtime: an OCI bundle and `youki create` / `youki start` when the binary is on the host. A missing binary is unavailable.
 - [x] Command probes: an exec probe runs its argv in the container with youki exec. Exit 0 passes. A non-zero exit or a timeout fails. Other runtimes report the probe unsupported.
@@ -54,14 +73,10 @@ Each phase ends at a gate an outside tool decides.
 - [x] L4 forwarder when `PISTACK_RELAY_BACKEND=forward`: a loopback or private listener copies bytes to a pool member.
 - [x] Relay defaults to the forwarder when the fabric backend is `hostnat` or `overlay`; set `PISTACK_RELAY_BACKEND=mock` to opt out.
 - [x] HTTP reverse proxy for the same setting. It answers `GET` from an up member. TLS termination stays unavailable until a certificate is configured. UDP is refused.
-- [x] A listener door runs cloudflared or tailscale when that binary is present and stays unavailable when it is missing. WireGuard and an edge host start no process.
-- [x] A failed live migration sets the machine to `Error` and leaves it on the source host.
-- [x] Host heartbeats write memory and vcpu capacity into one process-wide gauge ring.
-- [x] An NFS share is `Ready` only after `exportfs` accepts the client CIDR. CephFS is `Ready` only after `ceph fs subvolume create`. A missing tool stays `Pending`.
+- [x] A listener door runs cloudflared, tailscale or wireguard when that binary is present and stays unavailable when it is missing. An edge door queues a publish for a host whose driver is edge.
+- [x] A failed live migration leaves the machine running on the source host, back to ready with the host's own message, and a later drain tries it again.
+- [x] Usage of the host and of its machines rides on the agent heartbeat and becomes metric series; a Prometheus endpoint, threshold alarms, and `pi metric` and `pi alarm` read them.
+- [x] An NFS share is `Ready` only after `exportfs` accepts the client CIDR. CephFS is `Ready` only after `ceph fs subvolume create`. A missing tool stays `Pending`. A share allowed in mode write is writable and a ready share says where to mount.
 - [x] A metal machine that names this host is the host and is not powered off. A different machine with a BMC address is powered with `ipmitool` when that binary and a password file are present.
 - [ ] A stack with a VM database and a pod web tier behind one relay and one DNS name, on real hosts.
-- beacon (hickory) and silo are already in the tree.
-
-## Phase 3 — Everything else
-
-- shelf, blueprint kits, Cloud Hypervisor driver, bare-metal provisioning, web console. Control-plane discovery, adopt, and leader replication are part of `pistack server`. A compatibility door waits until a migration needs it.
+- [x] The web console, `pi share`, blueprint kits, the Cloud Hypervisor driver and bare-metal power are in the tree. Control-plane discovery, adopt, and leader replication are part of `pistack server`. A compatibility door waits until a migration needs it. Bare metal has no image written to it.
