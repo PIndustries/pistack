@@ -88,6 +88,19 @@ pub fn router(state: AppState) -> Router {
         .route("/keys/{id}", get(get_key).delete(delete_key))
         .route("/policy", get(get_policy))
         .route("/audit", get(list_audit))
+        .route(
+            "/providers",
+            get(crate::oidc_providers::list).post(crate::oidc_providers::create),
+        )
+        .route(
+            "/providers/{id}",
+            get(crate::oidc_providers::get).delete(crate::oidc_providers::remove),
+        )
+        // An administrator binding an account to an external identity, and the
+        // reverse. The removal names its pair in the body, so it is a POST.
+        .route("/identities", post(crate::oidc_link::link))
+        .route("/identities/remove", post(crate::oidc_link::unlink))
+        .route("/oidc/login", post(crate::oidc_signin::login))
         .fallback(|| async { ApiError::not_found("no such identity endpoint") })
         .with_state(state)
 }
@@ -145,7 +158,7 @@ fn no_content() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn validate_name(name: &str) -> ApiResult<()> {
+pub(crate) fn validate_name(name: &str) -> ApiResult<()> {
     let ok = !name.is_empty()
         && name.len() <= 63
         && name
@@ -268,6 +281,19 @@ fn issue_login(
             return Err(too_many(wait));
         }
         let p = store.collection::<Principal>().try_get_by_name(&name)?;
+        // An account that belongs to an identity provider has no password of
+        // its own. It is refused exactly as a wrong password is — counted, and
+        // answered "invalid credentials" — so password login cannot be used to
+        // learn which names come from a provider.
+        if p.as_ref().is_some_and(|p| p.spec.auth_source.is_some()) {
+            let locked = failed(&st.lockouts, &name, from, Utc::now());
+            subject.principal = Some(name);
+            tracing::info!("failed password login for a provider-owned account");
+            if locked {
+                return Err(too_many(crate::lockout::WINDOW));
+            }
+            return Err(invalid());
+        }
         let hash = p
             .as_ref()
             .filter(|p| p.spec.kind == PrincipalKind::User)
@@ -901,6 +927,9 @@ async fn create_principal(
             password_hash,
             enabled: req.enabled.unwrap_or(true),
             default_project,
+            auth_source: None,
+            // Only a provider sign-in or an administrator's link sets this.
+            external: None,
         },
         status: PrincipalStatus::default(),
     })?;

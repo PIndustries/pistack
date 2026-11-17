@@ -15,8 +15,19 @@
 
 pub mod api;
 pub mod audit;
+mod audit_note;
 pub mod credentials;
 pub mod lockout;
+mod oidc_account;
+mod oidc_bindings;
+mod oidc_claims;
+pub mod oidc_discovery;
+mod oidc_error;
+mod oidc_identities;
+pub mod oidc_link;
+pub mod oidc_providers;
+pub mod oidc_signin;
+mod oidc_verify;
 pub mod policy;
 pub mod quota;
 pub mod token;
@@ -258,6 +269,8 @@ pub fn bootstrap_with(store: &Store, password_file: Option<&Path>) -> anyhow::Re
             password_hash: Some(password_hash),
             enabled: true,
             default_project: Some(admin_project.meta.id.clone()),
+            auth_source: None,
+            external: None,
         },
         status: PrincipalStatus::default(),
     })?;
@@ -355,6 +368,17 @@ pub fn paginate<K: Kind>(mut items: Vec<K>, q: &ListQuery) -> Page<K> {
 /// without matching on the error.
 pub(crate) trait TryGetByName<K> {
     fn try_get_by_name(&self, name: &str) -> pistack_store::Result<Option<K>>;
+}
+
+/// [`TryGetByName`] for a name in a store whose handle is at hand. Kept to
+/// `pub(crate)` like the trait it borrows its name from, so a module that
+/// already holds the `Store` can ask the same question without carrying a
+/// `Collection` around.
+pub(crate) fn principal_named(
+    store: &Store,
+    name: &str,
+) -> pistack_store::Result<Option<Principal>> {
+    store.collection::<Principal>().try_get_by_name(name)
 }
 
 impl<K: Kind> TryGetByName<K> for pistack_store::Collection<K> {

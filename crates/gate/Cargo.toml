@@ -22,10 +22,17 @@ chrono.workspace = true
 jsonwebtoken.workspace = true
 argon2.workspace = true
 rand.workspace = true
-sha2.workspace = true
 hmac.workspace = true
+sha2.workspace = true
 base64.workspace = true
+reqwest.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
+futures.workspace = true
+# Tests mint ID tokens with a locally generated RSA key and serve a JWKS from a
+# tiny in-process HTTP server. `rsa` re-exports the `sha2` and `rand_core` the
+# signing needs, so no separate crypto dev-deps are pulled in.
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }

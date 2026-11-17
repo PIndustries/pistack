@@ -157,12 +157,17 @@ async fn count(app: &Router, token: &str, query: &str) -> usize {
 }
 
 fn find<'a>(page: &'a Value, action: &str, kind: &str) -> &'a Value {
+    find_in(page, |s| s["action"] == action && s["kind"] == kind)
+}
+
+/// The first record whose `spec` satisfies `wanted`.
+fn find_in(page: &Value, wanted: impl Fn(&Value) -> bool) -> &Value {
     page["items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["spec"]["action"] == action && r["spec"]["kind"] == kind)
-        .unwrap_or_else(|| panic!("no {action} {kind} record in {page}"))
+        .find(|r| wanted(&r["spec"]))
+        .unwrap_or_else(|| panic!("no matching record in {page}"))
 }
 
 #[tokio::test]
@@ -520,4 +525,78 @@ async fn a_wait_is_counted_against_the_address_the_record_names() {
         .find(|r| r["spec"]["status"] == 429 && r["spec"]["principal"] == "erin")
         .expect("the refusal is recorded");
     assert_eq!(refused["spec"]["client"], ONE.to_string(), "{refused}");
+}
+
+#[tokio::test]
+async fn linking_an_account_to_an_external_identity_is_recorded() {
+    // A link hands outside-vouched access to an account that already has roles,
+    // so both directions of it are in the log with whose account and which
+    // identity — neither of which the caller on the request says.
+    let (app, _store) = boot().await;
+    let admin = admin_token(&app).await;
+    let (s, provider) = call(
+        &app,
+        "POST",
+        "/identity/providers",
+        Some(&admin),
+        Some(json!({
+            "name": "corp",
+            "issuer": "https://id.example",
+            "client_id": "client-1",
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{provider}");
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/identity/principals",
+        Some(&admin),
+        Some(json!({"name": "karl", "password": "karl-has-a-good-one"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/identity/identities",
+        Some(&admin),
+        Some(json!({"user": "karl", "provider": "corp", "subject": "karl-1"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let page = audit_log(&app, &admin, "").await;
+    let linked = find(&page, "create", "identities")["spec"].clone();
+    assert_eq!(linked["status"], 200);
+    assert_eq!(linked["principal"], "admin");
+    assert_eq!(
+        linked["notes"]["action"], "link external identity",
+        "{linked}"
+    );
+    assert_eq!(linked["notes"]["provider"], "corp");
+    assert_eq!(linked["notes"]["subject"], "karl-1");
+    assert_eq!(linked["notes"]["user"], "karl");
+
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/identity/identities/remove",
+        Some(&admin),
+        Some(json!({"provider": "corp", "subject": "karl-1"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let page = audit_log(&app, &admin, "").await;
+    // `describe` names a POST by its last path segment, so the removal is filed
+    // beside the link under `identities`; the note is what tells them apart.
+    let cut = find_in(&page, |s| {
+        s["kind"] == "identities" && s["notes"]["action"] == "unlink external identity"
+    })["spec"]
+        .clone();
+    assert_eq!(cut["status"], 200);
+    assert_eq!(cut["notes"]["action"], "unlink external identity", "{cut}");
+    assert_eq!(cut["notes"]["provider"], "corp");
+    assert_eq!(cut["notes"]["subject"], "karl-1");
+    assert_eq!(cut["notes"]["user"], "karl");
 }
