@@ -573,8 +573,8 @@ async fn run_program(
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
         .map_err(|e| format!("{what} {}: {e}", program.display()))?;
     if let Some(body) = stdin_body {
         if let Some(mut input) = child.stdin.take() {

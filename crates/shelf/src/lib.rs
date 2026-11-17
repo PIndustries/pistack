@@ -14,6 +14,7 @@
 
 mod http;
 mod realize;
+pub(crate) mod spawn_retry;
 mod types;
 
 pub use realize::quiesce;
