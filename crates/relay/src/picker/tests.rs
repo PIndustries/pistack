@@ -5,8 +5,9 @@
 //! algorithm pays out, and the members that never become a choice.
 
 use super::backend::*;
+use super::eligible::*;
+use super::hash_ip::hash_ip;
 use super::select::*;
-use super::source_ip::hash_ip;
 use crate::types::{kinds, Algorithm, Member, MemberSpec, MemberStatus, OperatingStatus, PoolSpec};
 use pistack_types::{Id, Meta};
 use std::net::{IpAddr, SocketAddr};

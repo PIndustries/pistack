@@ -20,16 +20,17 @@
 //! as a choice. Members that are not healthy never reach a picker at all:
 //! the caller hands over only what may take traffic.
 //!
-//! One concern per file: the [`Backend`] and the members that may become
-//! one in [`backend`], the algorithm names a pool spec may carry in
-//! [`algorithm`], the [`Picker`] and its dispatch in [`select`], the
-//! rotation behind `round_robin` in [`round_robin`], the counts read by
-//! `least_conn` in [`least_conn`], and the ring and pins behind
-//! `source_ip` in [`source_ip`]. Callers see [`Backend`] and [`Picker`],
-//! as before.
+//! One file per thing: the [`Backend`] in [`backend`], the members that
+//! may become one in [`eligible`], the algorithm names a pool spec may
+//! carry in [`algorithm`], the [`Picker`] and its dispatch in [`select`],
+//! the rotation behind `round_robin` in [`round_robin`], the counts read
+//! by `least_conn` in [`least_conn`], and the ring and pins behind
+//! `source_ip` in [`source_ip`], over the address hash in [`hash_ip`]. Callers see [`Backend`] and [`Picker`], as before.
 
 mod algorithm;
 mod backend;
+mod eligible;
+mod hash_ip;
 mod least_conn;
 mod round_robin;
 mod select;
@@ -39,5 +40,6 @@ mod source_ip;
 mod tests;
 
 pub use algorithm::wire;
-pub use backend::{dialable, eligible, Backend};
+pub use backend::Backend;
+pub use eligible::{dialable, eligible};
 pub use select::Picker;

@@ -2,10 +2,11 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! `source_ip`: one client address, one backend, for as long as the
-//! backend set holds still. The ring the hash walks, the pins remembered
-//! against it, and the hash itself.
+//! backend set holds still. The ring the hash walks and the pins remembered
+//! against it. The hash itself is in [`super::hash_ip`].
 
 use super::backend::Backend;
+use super::hash_ip::hash_ip;
 use std::net::{IpAddr, SocketAddr};
 
 /// `source_ip`'s state: the backend set the table was built for, and the
@@ -19,22 +20,6 @@ pub(super) struct Sticky {
 /// How many client addresses `source_ip` remembers. Past this, a client
 /// is placed by its hash again rather than by its history.
 const PINNED_CAP: usize = 4096;
-
-/// FNV-1a over the address bytes. Fixed so a restart, or another server
-/// in the cluster, pins the same client to the same slot.
-pub(super) fn hash_ip(ip: IpAddr) -> u64 {
-    let mut bytes: Vec<u8> = Vec::new();
-    match ip {
-        IpAddr::V4(a) => bytes.extend_from_slice(&a.octets()),
-        IpAddr::V6(a) => bytes.extend_from_slice(&a.octets()),
-    }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 impl Sticky {
     /// The client's address picks a slot in the backend set, so a set

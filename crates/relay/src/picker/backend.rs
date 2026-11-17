@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The dialable backend and the members that may become one.
+//! The dialable backend: the address to dial with the weight and open
+//! connections the picker needs.
 //!
 //! A [`Backend`] is built from a member, never by hand outside tests, so
-//! the weight and the health rules travel together. [`eligible`] and
-//! [`dialable`] are the same question asked at two heights: which members
-//! a pool may hand to a data plane.
+//! the weight and the health rules travel together. Which members may
+//! become one is the question in [`super::eligible`].
 
-use crate::types::{Member, OperatingStatus};
+use crate::types::Member;
 use std::net::SocketAddr;
 
 /// One dialable backend with what the picker needs to weigh it.
@@ -43,27 +43,4 @@ impl Backend {
             conns: 0,
         }
     }
-}
-
-/// Members that may take traffic: administratively up, weighted above
-/// zero, and `Online` or unmonitored. Under every algorithm a member
-/// outside that is never a choice, so a data plane that dials addresses
-/// rather than members starts from this list too.
-pub fn eligible(members: &[Member]) -> Vec<&Member> {
-    members
-        .iter()
-        .filter(|m| {
-            m.spec.admin_up
-                && m.spec.weight > 0
-                && matches!(
-                    m.status.operating_status,
-                    OperatingStatus::Online | OperatingStatus::NoMonitor
-                )
-        })
-        .collect()
-}
-
-/// The addresses of the members that may take traffic, in the same order.
-pub fn dialable(members: &[Member]) -> Vec<SocketAddr> {
-    eligible(members).into_iter().map(|m| m.addr()).collect()
 }
