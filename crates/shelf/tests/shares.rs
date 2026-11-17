@@ -46,10 +46,10 @@ fn install_share_tools(dir: &std::path::Path) {
 /// owner is checked against a uid this process certainly holds.
 fn euid() -> u32 {
     extern "C" {
-        fn geteuid() -> u32;
+        fn geteuid() -> std::ffi::c_int;
     }
     // SAFETY: geteuid has no preconditions and does not touch Rust memory.
-    unsafe { geteuid() }
+    unsafe { geteuid() }.try_into().unwrap_or(u32::MAX)
 }
 
 /// The share directory's owner and mode, as `(uid, mode)`.

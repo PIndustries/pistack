@@ -68,21 +68,13 @@ fn raw_chown(dir: &Path, owner: u32) -> std::io::Result<()> {
     // checks already refuse a name that would escape the shelf root.
     const EINVAL: i32 = 22;
 
-    extern "C" {
-        fn lchown(path: *const i8, owner: u32, group: u32) -> i32;
-    }
-    let c_path = CString::new(dir.as_os_str().as_bytes())
+    CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from_raw_os_error(EINVAL))?;
-    // SAFETY: `c_path` is a valid NUL-terminated path; lchown only reads it.
-    // (gid_t) -1 leaves the gid alone: on Linux a root server owns the file
+    // `None` leaves the gid alone: on Linux a root server owns the file
     // after this and the export line's anongid decides what a client sees;
     // BSDs refuse a chown into a group the process is not a member of, and
     // refusing that is what leaves the gid to the owner.
-    let rc = unsafe { lchown(c_path.as_ptr(), owner, u32::MAX) };
-    if rc == 0 {
-        return Ok(());
-    }
-    Err(std::io::Error::last_os_error())
+    std::os::unix::fs::lchown(dir, Some(owner), None)
 }
 
 #[cfg(not(unix))]
@@ -104,10 +96,10 @@ pub fn probe(dir: &Path) -> std::io::Result<(u32, u32)> {
 #[cfg(all(test, unix))]
 pub fn euid() -> u32 {
     extern "C" {
-        fn geteuid() -> u32;
+        fn geteuid() -> std::ffi::c_int;
     }
     // SAFETY: geteuid has no preconditions and does not touch Rust memory.
-    unsafe { geteuid() }
+    unsafe { geteuid() }.try_into().unwrap_or(u32::MAX)
 }
 
 /// One lock for every unit test that touches the process environment.

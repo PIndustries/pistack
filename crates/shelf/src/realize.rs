@@ -625,11 +625,11 @@ fn running_as_root() -> bool {
 
 fn process_euid() -> u32 {
     // SAFETY: geteuid has no preconditions and does not touch Rust memory.
-    unsafe { geteuid() }
+    unsafe { geteuid() }.try_into().unwrap_or(u32::MAX)
 }
 
 extern "C" {
-    fn geteuid() -> u32;
+    fn geteuid() -> std::ffi::c_int;
 }
 
 fn backoff_ms(failures: u32) -> i64 {
