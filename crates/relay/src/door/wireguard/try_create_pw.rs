@@ -2,33 +2,14 @@
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
 //! Creating the `pw` WireGuard interface before `wg set` runs against it.
-//! Only creates; never deletes, never names `wg-fleet`.
 
-use super::binary::which;
-use super::iface::is_pw;
-use std::path::PathBuf;
-
-pub(super) fn ip_bin() -> Option<PathBuf> {
-    match std::env::var_os("PISTACK_IP") {
-        Some(v) if !v.is_empty() => {
-            let path = PathBuf::from(v);
-            path.is_file().then_some(path)
-        }
-        _ => {
-            // Tests must not create a host interface. Production looks up `ip`.
-            if cfg!(test) {
-                None
-            } else {
-                which("ip")
-            }
-        }
-    }
-}
+use super::super::iface::is_pw;
+use super::ip_bin::ip_bin;
 
 /// Create only `iface`, which has already been checked as `pw` plus 12 hex
 /// digits. A missing `ip` is ignored. The command never deletes and never
 /// names `wg-fleet`.
-pub(super) async fn try_create_pw(iface: &str) {
+pub(crate) async fn try_create_pw(iface: &str) {
     if !is_pw(iface) {
         return;
     }

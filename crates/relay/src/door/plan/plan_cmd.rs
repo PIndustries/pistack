@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The command a door would run, and the argv each kind builds.
+//! The argv each publisher kind builds.
 
-use super::iface::pw_iface;
-use super::iface::refuse_wg_args;
-use super::kind::DoorKind;
-use super::listen::listen_port;
-use super::upstream::check_upstream;
-use pistack_types::ApiError;
-
-/// A command that would publish the listener. Empty `bin` means do not run
-/// anything. `note` says why, when there is no command.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DoorPlan {
-    pub bin: String,
-    pub argv: Vec<String>,
-    pub note: String,
-}
+use super::super::iface::pw_iface;
+use super::super::iface::refuse_wg_args;
+use super::super::kind::DoorKind;
+use super::super::listen::listen_port;
+use super::super::upstream::check_upstream;
+use super::door_plan::DoorPlan;
+use pistack_types::{ApiError, ApiResult};
 
 /// Argv for `kind`. `id` names the listener and is the only source of a
 /// WireGuard interface name. `listen` is a port number for Tailscale and
@@ -25,7 +17,7 @@ pub struct DoorPlan {
 /// `http://127.0.0.1:PORT` or an `http://` address in `10.0.0.0/8`,
 /// `192.168.0.0/16`, or `172.16.0.0/12` for cloudflared and tailscale.
 /// Whitespace in either string is refused for every kind.
-pub fn plan(kind: DoorKind, id: &str, listen: &str, upstream: &str) -> Result<DoorPlan, ApiError> {
+pub fn plan(kind: DoorKind, id: &str, listen: &str, upstream: &str) -> ApiResult<DoorPlan> {
     if listen.chars().any(|c| c.is_whitespace()) {
         return Err(ApiError::bad_request("listen must not contain whitespace"));
     }

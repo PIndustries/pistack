@@ -1,25 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The `upstream` argument: which `http://` addresses a door may be told
-//! to publish.
+//! Which `http://` addresses a door may be told to publish.
 
-use pistack_types::ApiError;
 use std::net::Ipv4Addr;
 
-/// `http://127.0.0.1:PORT` (port required) or `http://` plus an address in
-/// 10/8, 192.168/16, or 172.16/12. No path, query, userinfo, or other host.
-pub(super) fn check_upstream(upstream: &str) -> Result<(), ApiError> {
-    if allowed_upstream(upstream) {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(
-            "upstream must be http://127.0.0.1:PORT or http://10.*, http://192.168.*, or http://172.16-31.*",
-        ))
-    }
-}
-
-pub(super) fn allowed_upstream(upstream: &str) -> bool {
+pub(crate) fn allowed_upstream(upstream: &str) -> bool {
     let Some(rest) = upstream.strip_prefix("http://") else {
         return false;
     };

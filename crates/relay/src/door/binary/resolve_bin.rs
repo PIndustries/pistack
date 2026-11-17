@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Finding the publisher's binary. An override environment variable wins
-//! over `PATH`; a missing binary is unavailable, never a silent skip.
+//! Resolving the publisher binary for a kind: an override env var wins over
+//! `PATH`; a missing binary is unavailable, never a silent skip.
 
-use super::kind::DoorKind;
-use pistack_types::ApiError;
+use super::super::kind::DoorKind;
+use super::which::which;
+use pistack_types::{ApiError, ApiResult};
 use std::path::PathBuf;
 
-pub(super) fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
-pub(super) fn resolve_bin(kind: DoorKind, fallback: &str) -> Result<PathBuf, ApiError> {
+pub(crate) fn resolve_bin(kind: DoorKind, fallback: &str) -> ApiResult<PathBuf> {
     let key = match kind {
         DoorKind::Cloudflared => "PISTACK_CLOUDFLARED",
         DoorKind::Tailscale => "PISTACK_TAILSCALE",
