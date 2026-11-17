@@ -32,19 +32,35 @@ Every module is a crate in `crates/` and a prefix on the one API port. Names fol
 | `gauge` | metrics, alarms, metering |
 | `bench` | the `pi` CLI and the web console |
 
-Shared crates: `pistack-types` (resource model, errors, the `Module` contract), `pistack-store` (embedded redb store behind a trait; Raft later), `pistack-policy`, `pistack-config`, `pistack-rpc`.
+Shared crates: `pistack-types` (resource model, errors, the `Module` contract), `pistack-store` (embedded redb store behind a trait, with three-voter consensus in `pistack-cluster`), `pistack-policy`, `pistack-config`, `pistack-rpc`, `power`.
 
 ## Status
 
-The binary mounts every module on one API. The shape of the system is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The phase list is in [docs/ROADMAP.md](docs/ROADMAP.md).
+One binary mounts every module on one API. What works and what does not, area by area, is in [docs/STATUS.md](docs/STATUS.md). What comes next is in [docs/ROADMAP.md](docs/ROADMAP.md). The shape of the system is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+The wiki is the operator's manual:
+
+- [Quick start](wiki/Quick-start.md)
+- [Install](wiki/Install.md)
+- [Upgrading](wiki/Upgrading.md)
+- [Running a cluster](wiki/Running-a-cluster.md)
+- [Agents and hosts](wiki/Agents-and-hosts.md)
+- [Networking](wiki/Networking.md)
+- [Storage](wiki/Storage.md)
+- [Identity and access](wiki/Identity-and-access.md)
+- [Metrics and alarms](wiki/Metrics-and-alarms.md)
+- [Configuration reference](wiki/Configuration-reference.md)
+- [CLI reference](wiki/CLI-reference.md)
+- [Concepts](wiki/Concepts.md)
+- [Known limits](wiki/Known-limits.md)
 
 ## Installing
 
 Releases for Linux x86_64 and aarch64 are on the [releases page](https://github.com/PIndustries/pistack/releases). Each tarball holds `pistack`, `pi`, the host helpers, the systemd units and an install script.
 
 ```sh
-tar -xzf pistack-26.11.12.1-linux-x86_64.tar.gz
-cd pistack-26.11.12.1-linux-x86_64
+tar -xzf pistack-26.11.13.1-linux-x86_64.tar.gz
+cd pistack-26.11.13.1-linux-x86_64
 sudo ./install.sh
 ```
 
