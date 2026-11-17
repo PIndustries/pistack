@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! A series is a metric name and a set of labels, written the way
-//! Prometheus writes it: `pistack_machine_memory_bytes{host="h1",machine="mach-1"}`.
-//! That text is the key samples are stored under.
-
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+use super::escape::escape;
+use super::sanitize::{sanitize_label, sanitize_name};
 
 /// A metric name and its labels.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,116 +118,5 @@ impl Series {
                 .labels
                 .iter()
                 .all(|(key, value)| other.labels.get(key) == Some(value))
-    }
-}
-
-/// The key for `name` with `labels`.
-pub fn series(name: &str, labels: &[(&str, &str)]) -> String {
-    let mut s = Series::new(name);
-    for (key, value) in labels {
-        s.labels.insert((*key).to_owned(), (*value).to_owned());
-    }
-    s.key()
-}
-
-fn escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            c if c.is_control() => out.push('_'),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Prometheus metric names are `[a-zA-Z_:][a-zA-Z0-9_:]*`. Any other
-/// character becomes `_`, and a leading digit gets one in front.
-pub fn sanitize_name(name: &str) -> String {
-    sanitize(name, true)
-}
-
-/// Label names are the same without the colon.
-fn sanitize_label(name: &str) -> String {
-    sanitize(name, false)
-}
-
-fn sanitize(name: &str, colon: bool) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || (colon && c == ':') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if out.is_empty() {
-        return "_".into();
-    }
-    if out.as_bytes()[0].is_ascii_digit() {
-        out.insert(0, '_');
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_key_reads_back_as_the_series_it_was_made_from() {
-        let key = series(
-            "pistack_machine_memory_bytes",
-            &[
-                ("name", "we\"b\\1\n"),
-                ("host", "h1"),
-                ("machine", "mach-1"),
-            ],
-        );
-        assert_eq!(
-            key,
-            "pistack_machine_memory_bytes{host=\"h1\",machine=\"mach-1\",name=\"we\\\"b\\\\1\\n\"}"
-        );
-        let back = Series::parse(&key);
-        assert_eq!(back.name, "pistack_machine_memory_bytes");
-        assert_eq!(back.labels["name"], "we\"b\\1\n");
-        assert_eq!(back.labels.len(), 3);
-        assert_eq!(back.key(), key);
-    }
-
-    #[test]
-    fn odd_text_is_read_as_far_as_it_goes() {
-        assert_eq!(Series::parse(" cpu.usage "), Series::new("cpu.usage"));
-        assert_eq!(Series::parse("m{}"), Series::new("m"));
-        let s = Series::parse("m{a=\"1\", b=\"2\"");
-        assert_eq!(s.labels.len(), 2);
-        let s = Series::parse("m{a=\"1\",b=oops}");
-        assert_eq!(s.labels.len(), 1);
-        let s = Series::parse("m{a=\"never closed}");
-        assert!(s.labels.is_empty());
-    }
-
-    #[test]
-    fn a_selector_matches_on_the_labels_it_names() {
-        let stored = Series::parse("m{host=\"h1\",machine=\"mach-1\"}");
-        assert!(Series::parse("m").selects(&stored));
-        assert!(Series::parse("m{machine=\"mach-1\"}").selects(&stored));
-        assert!(!Series::parse("m{machine=\"mach-2\"}").selects(&stored));
-        assert!(!Series::parse("m{zone=\"a\"}").selects(&stored));
-        assert!(!Series::parse("other").selects(&stored));
-    }
-
-    #[test]
-    fn names_are_made_legal_for_the_text_format() {
-        let s = Series::new("cpu.usage").label("data-dir", "/var");
-        assert_eq!(s.exposition(), "cpu_usage{data_dir=\"/var\"}");
-        assert_eq!(sanitize_name("9lives"), "_9lives");
-        assert_eq!(sanitize_name(""), "_");
-        assert_eq!(sanitize_name("a:b"), "a:b");
     }
 }

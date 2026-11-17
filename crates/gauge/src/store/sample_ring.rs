@@ -1,47 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The samples a server holds: a short window per series, in memory.
-//!
-//! This is not a time-series database. It keeps enough for the API, for
-//! `pi machine stats` and for alarms: the last [`WINDOW_POINTS`] points of
-//! each series, none older than [`WINDOW_AGE`], for at most [`MAX_SERIES`]
-//! series. Nothing is written to disk and nothing is replicated; a server
-//! that restarts or takes over as leader starts with an empty window.
-//! History is what Prometheus scrapes from `/metrics`.
-
 use crate::types::{Sample, MAX_SERIES, WINDOW_AGE, WINDOW_POINTS};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Point {
-    at: DateTime<Utc>,
-    value: f64,
-}
-
-/// The latest point of one series, and the one before it when there is one.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Reading {
-    /// The series key, as [`crate::Series::key`] writes it.
-    pub metric: String,
-    pub value: f64,
-    pub timestamp: DateTime<Utc>,
-    pub previous: Option<(DateTime<Utc>, f64)>,
-}
-
-impl Reading {
-    /// How fast the value rose between the last two points, per second.
-    /// `None` with one point, or when the value went down (a counter that
-    /// started again).
-    pub fn rate(&self) -> Option<f64> {
-        let (at, value) = self.previous?;
-        let secs = (self.timestamp - at).num_milliseconds() as f64 / 1000.0;
-        (secs > 0.0 && self.value >= value).then(|| (self.value - value) / secs)
-    }
-}
+use super::point::Point;
+use super::reading::Reading;
 
 /// Per-series windows of samples. The name is from when this was one ring.
 #[derive(Debug, Default)]
@@ -53,7 +20,7 @@ pub struct SampleRing {
 }
 
 /// How often a push also drops what has aged out of the window.
-const PRUNE_EVERY: chrono::Duration = chrono::Duration::seconds(60);
+pub(crate) const PRUNE_EVERY: chrono::Duration = chrono::Duration::seconds(60);
 
 impl SampleRing {
     pub fn memory() -> Self {
@@ -184,92 +151,5 @@ impl SampleRing {
                 })
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Duration;
-
-    fn sample(metric: &str, value: f64, at: DateTime<Utc>) -> Sample {
-        Sample {
-            metric: metric.into(),
-            value,
-            timestamp: at,
-        }
-    }
-
-    #[test]
-    fn a_series_keeps_its_last_points_only() {
-        let ring = SampleRing::memory();
-        let now = Utc::now();
-        for i in 0..(WINDOW_POINTS + 5) {
-            ring.push(sample("m", i as f64, now));
-        }
-        ring.push(sample("other", 1.0, now));
-        let points = ring.list(Some("m"));
-        assert_eq!(points.len(), WINDOW_POINTS);
-        assert_eq!(points[0].value, 5.0);
-        assert_eq!(ring.latest("m").unwrap().value, (WINDOW_POINTS + 4) as f64);
-        assert_eq!(ring.list(None).len(), WINDOW_POINTS + 1);
-        assert_eq!(ring.series_count(), 2);
-    }
-
-    #[test]
-    fn a_late_sample_lands_where_its_stamp_belongs_and_alarms_read_the_newest() {
-        let ring = SampleRing::memory();
-        let now = Utc::now();
-        ring.push(sample("m", 1.0, now));
-        // A report carrying a reading it took two minutes ago.
-        ring.push(sample("m", 2.0, now - Duration::minutes(2)));
-        assert_eq!(ring.latest("m").unwrap().value, 1.0);
-        assert_eq!(
-            ring.list(Some("m"))
-                .iter()
-                .map(|s| s.value)
-                .collect::<Vec<_>>(),
-            vec![2.0, 1.0]
-        );
-    }
-
-    #[test]
-    fn old_points_and_empty_series_are_pruned() {
-        let ring = SampleRing::memory();
-        let now = Utc::now();
-        ring.push(sample("old", 1.0, now - WINDOW_AGE - Duration::seconds(1)));
-        ring.push(sample("both", 1.0, now - WINDOW_AGE - Duration::seconds(1)));
-        ring.push(sample("both", 2.0, now));
-        ring.prune(now);
-        assert!(ring.latest("old").is_none());
-        assert_eq!(ring.list(Some("both")).len(), 1);
-        assert_eq!(ring.series_count(), 1);
-    }
-
-    #[test]
-    fn new_series_are_refused_past_the_cap_and_old_ones_still_take_points() {
-        let ring = SampleRing::memory();
-        let now = Utc::now();
-        ring.push_all((0..MAX_SERIES).map(|i| sample(&format!("m{i}"), 0.0, now)));
-        ring.push(sample("one-too-many", 1.0, now));
-        ring.push(sample("m0", 7.0, now));
-        assert_eq!(ring.series_count(), MAX_SERIES);
-        assert!(ring.latest("one-too-many").is_none());
-        assert_eq!(ring.latest("m0").unwrap().value, 7.0);
-    }
-
-    #[test]
-    fn a_reading_gives_the_rate_between_the_last_two_points() {
-        let ring = SampleRing::memory();
-        let now = Utc::now();
-        ring.push(sample("c", 100.0, now - Duration::seconds(10)));
-        assert_eq!(ring.readings(|_| true)[0].rate(), None);
-        ring.push(sample("c", 150.0, now));
-        let reading = &ring.readings(|key| key == "c")[0];
-        assert_eq!(reading.value, 150.0);
-        assert_eq!(reading.rate(), Some(5.0));
-        // A counter that went back to zero has no rate until the next point.
-        ring.push(sample("c", 3.0, now + Duration::seconds(10)));
-        assert_eq!(ring.readings(|_| true)[0].rate(), None);
     }
 }
