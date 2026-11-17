@@ -99,6 +99,7 @@ async fn serve_without_nfs_tooling() -> Harness {
     // to do and lasts exactly as long as this server.
     let h = serve().await;
     set_var("PISTACK_SHELF_EUID", "1000");
+    set_var("PISTACK_SHELF_SQUASH_UID", "65534");
     set_var("PISTACK_EXPORTFS", "definitely-not-here");
     h
 }
@@ -242,6 +243,10 @@ async fn serve() -> Harness {
     }
     set_env("PISTACK_EXPORTFS", &exportfs);
     set_var("PISTACK_SHELF_EUID", "0");
+    // Squash to nobody/nogroup is what a root server does, and this server
+    // is one. Off root the process cannot chown to nobody; the share keeps
+    // its own uid and the suite asserts against what the process reaches.
+    set_var("PISTACK_SHELF_SQUASH_UID", "65534");
     unset_env("PISTACK_SHELF_HELPER");
 
     // One store per harness — one server's worth of rows, as every module of
@@ -258,6 +263,11 @@ async fn serve() -> Harness {
         node_name: "test".into(),
         leadership: pistack_types::Leadership::always(),
     };
+    // `Shelf::start` is never called here — the routes are mounted straight
+    // onto the router — so the address a ready share reports is pinned the
+    // way a server boot would pin it from the public URL. The host `test` is
+    // what the CLI then prints before the path.
+    module.set_export_address(&ctx.public_url);
     let seen = Seen {
         store: store.clone(),
         project: project.clone(),
@@ -691,13 +701,34 @@ async fn share_list_prints_protocol_size_and_access() {
         .expect("media row");
     assert!(media.contains("cephfs"), "{media}");
 
-    // wide adds the client count and the message
+    // wide adds the client count, the mount address and the message
     let r = pi(&h, "", &["share", "list", "-o", "wide", "--no-headers"]).await;
     assert_eq!(r.code, 0, "{r:?}");
     let home = r.out.lines().find(|l| l.contains("home")).unwrap();
     // An exported NFS share reports the directory it is exported from.
     assert!(home.contains("/shares/"), "{home}");
+    // A ready NFS share also says where to mount it. The address comes from
+    // the server: the harness starts its shelf with the public URL
+    // `http://test`, so its host — not the ephemeral listener, which the
+    // module never saw — stands before the path.
+    assert!(home.contains("test:/"), "{home}");
+    let media = r.out.lines().find(|l| l.contains("media")).unwrap();
+    // A cephfs share is not mounted over NFS and shows nothing there.
+    assert!(!media.contains(":/"), "{media}");
     assert_eq!(h.seen.queries.lock().unwrap()[0], "");
+
+    // The plain table has no EXPORT column; `show` prints the field whole.
+    let r = pi(&h, "", &["share", "list"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!r.out.contains("EXPORT"), "{}", r.out);
+    let r = pi(&h, "", &["share", "show", "home", "-o", "json"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let v: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(
+        v["status"]["export"].as_str(),
+        Some(format!("test:{}", v["status"]["message"].as_str().unwrap()).as_str()),
+        "{v}"
+    );
 }
 
 #[tokio::test]
