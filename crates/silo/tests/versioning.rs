@@ -117,12 +117,53 @@ fn tag_value(xml: &[u8], tag: &str) -> Option<String> {
 
 /// The contents of each `<Version>` element, in the order listed.
 fn versions(xml: &[u8]) -> Vec<String> {
+    elements(xml, "Version")
+}
+
+/// The contents of each `<DeleteMarker>` element, in the order listed.
+fn markers(xml: &[u8]) -> Vec<String> {
+    elements(xml, "DeleteMarker")
+}
+
+/// Each `<Version>` and `<DeleteMarker>` row in document order, as
+/// `(tag, VersionId)` — the shape of a ListObjectVersions page.
+fn version_rows(xml: &[u8]) -> Vec<(String, String)> {
     let xml = body_text(xml);
+    let mut rows: Vec<(usize, String, String)> = Vec::new();
+    for tag in ["Version", "DeleteMarker"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut at = 0;
+        while let Some(start) = xml[at..].find(&open) {
+            let start = at + start + open.len();
+            let Some(rel) = xml[start..].find(&close) else {
+                break;
+            };
+            let row = &xml[start..start + rel];
+            let id = row
+                .find("<VersionId>")
+                .map(|i| {
+                    let s = &row[i + "<VersionId>".len()..];
+                    s[..s.find("</VersionId>").unwrap_or(s.len())].to_owned()
+                })
+                .unwrap_or_default();
+            rows.push((start, tag.to_owned(), id));
+            at = start + rel;
+        }
+    }
+    rows.sort_by_key(|(pos, _, _)| *pos);
+    rows.into_iter().map(|(_, t, id)| (t, id)).collect()
+}
+
+fn elements(xml: &[u8], tag: &str) -> Vec<String> {
+    let xml = body_text(xml);
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
     let mut out = Vec::new();
     let mut rest = xml.as_str();
-    while let Some(start) = rest.find("<Version>") {
-        rest = &rest[start + "<Version>".len()..];
-        match rest.find("</Version>") {
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        match rest.find(&close) {
             Some(end) => {
                 out.push(rest[..end].to_owned());
                 rest = &rest[end..];
@@ -802,24 +843,371 @@ async fn delete_a_version_that_is_not_there_is_no_such_version() {
 }
 
 #[tokio::test]
-async fn plain_delete_on_a_versioned_bucket_removes_the_key_as_before() {
-    // The store keeps no delete marker, so a plain delete is unchanged: the
-    // whole key goes and no marker is listed in its place.
+async fn plain_delete_on_a_versioned_bucket_leaves_a_delete_marker() {
+    // Point 1: on a versioned bucket a delete with no `versionId` hides the
+    // key behind a marker — the next generation, size 0, no bytes touched —
+    // and says so in the headers.
     let w = world("v-plaindel").await;
     w.put_versioning("v-plaindel", "Enabled").await;
     w.put("v-plaindel", "k", b"one").await;
     w.put("v-plaindel", "k", b"two").await;
+    let (status, _, headers) = w.call("DELETE", "/v-plaindel/k", "", b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
-        w.delete("v-plaindel", "k", None).await,
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+    assert_eq!(
+        headers.get("x-amz-version-id").map(|v| v.to_str().unwrap()),
+        Some("3"),
+        "the marker is the key's next generation"
+    );
+    // The marker holds no bytes and is the only new thing the call wrote.
+    let (_, listed) = w.list_versions("v-plaindel", "").await;
+    let xml = body_text(&listed);
+    let rows = versions(&listed);
+    assert_eq!(rows.len(), 2, "the two generations are untouched: {xml}");
+    // Both generations still carry their own 3 bytes.
+    for row in &rows {
+        assert_eq!(
+            tag_value(row.as_bytes(), "Size").as_deref(),
+            Some("3"),
+            "{xml}"
+        );
+    }
+    let found = markers(&listed);
+    assert_eq!(found.len(), 1, "{xml}");
+    assert!(
+        found[0].contains("<VersionId>3</VersionId>"),
+        "{}",
+        found[0]
+    );
+    assert!(found[0].contains("<IsLatest>true</IsLatest>"));
+    assert!(
+        !found[0].contains("<Size>"),
+        "a marker has no size: {}",
+        found[0]
+    );
+}
+
+#[tokio::test]
+async fn a_key_under_a_marker_is_not_there_to_read() {
+    // Point 2: GET and HEAD without a `versionId` answer 404 NoSuchKey with
+    // the marker headers, and the key is gone from the listings.
+    let w = world("v-hidden").await;
+    w.put_versioning("v-hidden", "Enabled").await;
+    w.put("v-hidden", "k", b"body").await;
+    w.delete("v-hidden", "k", None).await;
+
+    let (status, body, headers) = w.call("GET", "/v-hidden/k", "", b"").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{}", body_text(&body));
+    assert_eq!(error_code(&body), "NoSuchKey");
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+    assert_eq!(
+        headers.get("x-amz-version-id").map(|v| v.to_str().unwrap()),
+        Some("2")
+    );
+
+    let (status, headers, version_id, _) = w.head("v-hidden", "k", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+    assert_eq!(version_id.as_deref(), Some("2"));
+
+    // Hidden from ListObjectsV2, though ListObjectVersions still tells the
+    // whole story.
+    let (status, listed, _) = w.call("GET", "/v-hidden", "list-type=2", b"").await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&listed));
+    assert!(
+        !body_text(&listed).contains("<Key>k</Key>"),
+        "a hidden key must not be listed: {}",
+        body_text(&listed)
+    );
+}
+
+#[tokio::test]
+async fn an_older_generation_reads_under_a_marker() {
+    // Point 3: the bytes are all still there — the marker hides the key from
+    // the plain path only.
+    let w = world("v-older").await;
+    w.put_versioning("v-older", "Enabled").await;
+    w.put("v-older", "k", b"one").await;
+    w.put("v-older", "k", b"two").await;
+    w.delete("v-older", "k", None).await;
+    let (status, body) = w.get("v-older", "k", Some("2")).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&body));
+    assert_eq!(body, b"two");
+    let (status, body) = w.get("v-older", "k", Some("1")).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&body));
+    assert_eq!(body, b"one");
+    // Head by version answers the generation's own ETag, as ever.
+    let (status, _, version_id, etag) = w.head("v-older", "k", Some("1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(version_id.as_deref(), Some("1"));
+    assert_eq!(
+        etag.as_deref(),
+        Some(&format!("\"{}\"", md5_hex(b"one"))[..])
+    );
+}
+
+#[tokio::test]
+async fn reading_the_marker_itself_is_method_not_allowed() {
+    // Point 4: a marker is not an object. Naming it as a `versionId` is 405
+    // MethodNotAllowed, with the marker headers on the answer.
+    let w = world("v-markread").await;
+    w.put_versioning("v-markread", "Enabled").await;
+    w.put("v-markread", "k", b"body").await;
+    w.delete("v-markread", "k", None).await;
+    let (status, body, headers) = w.call("GET", "/v-markread/k", "versionId=2", b"").await;
+    assert_eq!(
+        status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "{}",
+        body_text(&body)
+    );
+    assert_eq!(body, b"", "S3 sends no body with a 405");
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+    assert_eq!(
+        headers.get("x-amz-version-id").map(|v| v.to_str().unwrap()),
+        Some("2")
+    );
+    let (status, _, headers) = w.call("HEAD", "/v-markread/k", "versionId=2", b"").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_marker_brings_the_key_back() {
+    // Point 5: a marker removed by `versionId` promotes the generation under
+    // it, and the key reads on the plain path again.
+    let w = world("v-unhide").await;
+    w.put_versioning("v-unhide", "Enabled").await;
+    w.put("v-unhide", "k", b"came back").await;
+    w.delete("v-unhide", "k", None).await;
+    let (status, _, _) = w.call("GET", "/v-unhide/k", "", b"").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        w.delete("v-unhide", "k", Some("2")).await,
         StatusCode::NO_CONTENT
     );
-    let (status, _) = w.get("v-plaindel", "k", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = w.get("v-plaindel", "k", Some("1")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (_, listed) = w.list_versions("v-plaindel", "").await;
+    let (status, body) = w.get("v-unhide", "k", None).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&body));
+    assert_eq!(body, b"came back");
+    let (_, listed) = w.list_versions("v-unhide", "").await;
+    assert!(markers(&listed).is_empty(), "{}", body_text(&listed));
+    // The key path holds the bytes again on disk, not only in the record.
+    assert_eq!(w.get("v-unhide", "k", None).await.1, b"came back");
+}
+
+#[tokio::test]
+async fn a_put_under_a_marker_restores_the_key_at_the_next_generation() {
+    let w = world("v-rewrite").await;
+    w.put_versioning("v-rewrite", "Enabled").await;
+    w.put("v-rewrite", "k", b"one").await;
+    w.delete("v-rewrite", "k", None).await;
+    let version = w.put("v-rewrite", "k", b"three").await;
+    assert_eq!(version.as_deref(), Some("3"), "the marker counted");
+    let (status, body) = w.get("v-rewrite", "k", None).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&body));
+    assert_eq!(body, b"three");
+    // The marker is still history, but no longer current.
+    let (_, listed) = w.list_versions("v-rewrite", "").await;
+    let markers = markers(&listed);
+    assert_eq!(markers.len(), 1);
+    assert!(
+        !markers[0].contains("<IsLatest>true</IsLatest>"),
+        "{}",
+        markers[0]
+    );
+}
+
+#[tokio::test]
+async fn a_second_plain_delete_takes_the_key_whole() {
+    // A key already hidden has nothing left to hide: the delete removes the
+    // key and every generation under it, and answers no marker.
+    let w = world("v-twice").await;
+    w.put_versioning("v-twice", "Enabled").await;
+    w.put("v-twice", "k", b"one").await;
+    w.delete("v-twice", "k", None).await;
+    let (status, _, headers) = w.call("DELETE", "/v-twice/k", "", b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        None,
+        "the key went, it was not marked: {headers:?}"
+    );
+    assert_eq!(
+        headers.get("x-amz-version-id").map(|v| v.to_str().unwrap()),
+        Some("2"),
+        "the generation the call acted on was the marker"
+    );
+    let (_, listed) = w.list_versions("v-twice", "").await;
     assert!(versions(&listed).is_empty(), "{}", body_text(&listed));
-    assert!(!body_text(&listed).contains("DeleteMarker"));
+    assert!(markers(&listed).is_empty(), "{}", body_text(&listed));
+    let (status, body, _) = w.call("DELETE", "/v-twice/k", "", b"").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{}", body_text(&body));
+    assert_eq!(error_code(&body), "NoSuchKey");
+}
+
+#[tokio::test]
+async fn deleting_a_marker_by_version_says_nothing_of_a_marker() {
+    // Taking the marker away is a delete of a generation: it names the marker
+    // it removed and does not claim the key is hidden, because the key is not.
+    let w = world("v-delmark").await;
+    w.put_versioning("v-delmark", "Enabled").await;
+    w.put("v-delmark", "k", b"body").await;
+    w.delete("v-delmark", "k", None).await;
+    let (status, _, headers) = w.call("DELETE", "/v-delmark/k", "versionId=2", b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        headers.get("x-amz-version-id").map(|v| v.to_str().unwrap()),
+        Some("2")
+    );
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        None,
+        "the key came back: {headers:?}"
+    );
+    let (status, body) = w.get("v-delmark", "k", None).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&body));
+    assert_eq!(body, b"body");
+}
+
+#[tokio::test]
+async fn a_versioned_bucket_under_a_marker_is_not_empty() {
+    // Point: a hidden key still holds the bucket. Delete it through both
+    // doors and both refuse while the generation under the marker is there.
+    let w = world("v-notempty").await;
+    w.put_versioning("v-notempty", "Enabled").await;
+    w.put("v-notempty", "k", b"body").await;
+    w.delete("v-notempty", "k", None).await;
+    let (status, body, _) = w.call("DELETE", "/v-notempty", "", b"").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body_text(&body));
+    assert_eq!(error_code(&body), "BucketNotEmpty");
+    // Taking the marker, then the generation, empties it.
+    w.delete("v-notempty", "k", Some("2")).await;
+    let (status, body, _) = w.call("DELETE", "/v-notempty", "", b"").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body_text(&body));
+    w.delete("v-notempty", "k", Some("1")).await;
+    let (status, body, _) = w.call("DELETE", "/v-notempty", "", b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{}", body_text(&body));
+}
+
+#[tokio::test]
+async fn a_plain_bucket_delete_is_unchanged() {
+    // Versioning off: the delete takes the whole key, answers no marker, and
+    // leaves nothing in any listing.
+    let w = world("v-plainoff").await;
+    w.put("v-plainoff", "k", b"one").await;
+    w.put("v-plainoff", "k", b"two").await;
+    let (status, _, headers) = w.call("DELETE", "/v-plainoff/k", "", b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        headers
+            .get("x-amz-delete-marker")
+            .map(|v| v.to_str().unwrap()),
+        None
+    );
+    let (status, _) = w.get("v-plainoff", "k", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, listed) = w.list_versions("v-plainoff", "").await;
+    assert!(versions(&listed).is_empty(), "{}", body_text(&listed));
+    assert!(markers(&listed).is_empty(), "{}", body_text(&listed));
+}
+
+#[tokio::test]
+async fn a_batch_delete_marks_keys_on_a_versioned_bucket() {
+    // DeleteObjects with no VersionId on a versioned bucket: each key gets a
+    // marker and its `<Deleted>` row says so.
+    let w = world("v-batch").await;
+    w.put_versioning("v-batch", "Enabled").await;
+    w.put("v-batch", "a", b"1").await;
+    w.put("v-batch", "b", b"2").await;
+    let body = br#"<?xml version="1.0" encoding="UTF-8"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>a</Key></Object><Object><Key>b</Key></Object><Quiet>false</Quiet></Delete>"#;
+    let (status, xml, _) = w.call("POST", "/v-batch", "delete", body).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_text(&xml));
+    let xml = body_text(&xml);
+    assert_eq!(
+        xml.matches("<DeleteMarker>true</DeleteMarker>").count(),
+        2,
+        "{xml}"
+    );
+    assert!(xml.contains("<Key>a</Key>"), "{xml}");
+    assert!(xml.contains("<Key>b</Key>"), "{xml}");
+    // Both keys are hidden, and both markers are listed.
+    let (_, listed) = w.list_versions("v-batch", "").await;
+    assert_eq!(markers(&listed).len(), 2, "{}", body_text(&listed));
+}
+
+#[tokio::test]
+async fn list_versions_orders_markers_with_generations() {
+    // A marker is a generation and is listed among them, newest first within
+    // the key, and a rolled-up prefix page counts it.
+    let w = world("v-order").await;
+    w.put_versioning("v-order", "Enabled").await;
+    w.put("v-order", "a/one", b"1").await;
+    w.put("v-order", "a/one", b"2").await;
+    w.delete("v-order", "a/one", None).await;
+    w.put("v-order", "a/two", b"x").await;
+    let (_, listed) = w.list_versions("v-order", "").await;
+    let xml = body_text(&listed);
+    // Row order as listed: a/one marker (3), a/one gen 2, a/one gen 1, a/two gen 1.
+    let rows = version_rows(&listed);
+    assert_eq!(
+        rows,
+        vec![
+            ("DeleteMarker".to_owned(), "3".to_owned()),
+            ("Version".to_owned(), "2".to_owned()),
+            ("Version".to_owned(), "1".to_owned()),
+            ("Version".to_owned(), "1".to_owned()),
+        ],
+        "{xml}"
+    );
+}
+
+#[tokio::test]
+async fn marker_rows_carry_their_own_latest_flag() {
+    // IsLatest belongs to the newest generation of the key, marker included:
+    // the marker leads as latest, and once a put lands over it the marker is
+    // no longer latest.
+    let w = world("v-latest").await;
+    w.put_versioning("v-latest", "Enabled").await;
+    w.put("v-latest", "k", b"1").await;
+    w.delete("v-latest", "k", None).await;
+    let (_, listed) = w.list_versions("v-latest", "").await;
+    let xml = body_text(&listed);
+    let m = markers(&listed);
+    assert_eq!(m.len(), 1, "{xml}");
+    assert!(m[0].contains("<IsLatest>true</IsLatest>"), "{}", m[0]);
+    // The generation under it is not latest.
+    let v = versions(&listed);
+    assert_eq!(v.len(), 1, "{xml}");
+    assert!(v[0].contains("<IsLatest>false</IsLatest>"), "{}", v[0]);
 }
 
 #[tokio::test]

@@ -49,13 +49,18 @@ async fn delete_bucket_inner(
         // An object-path abort carries a key; there is none here.
         return Err(s3_err("NoSuchKey", "no object key on this request"));
     }
-    if !c.list_objects(&bucket.meta.id)?.is_empty() || c.has_staged_uploads(&bucket.meta.id).await?
+    if c.list_objects(&bucket.meta.id)?.is_empty() && !c.has_staged_uploads(&bucket.meta.id).await?
     {
-        return Err(s3_err(
-            "BucketNotEmpty",
-            "The bucket you tried to delete is not empty",
-        ));
+        // Nothing a listing shows. `delete_bucket` has the last word: a
+        // versioned bucket can still be held open by a generation under a
+        // delete marker, which no listing shows.
+        return c
+            .delete_bucket(&bucket.meta.id)
+            .await
+            .map(|_| StatusCode::NO_CONTENT);
     }
-    c.delete_bucket(&bucket.meta.id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Err(s3_err(
+        "BucketNotEmpty",
+        "The bucket you tried to delete is not empty",
+    ))
 }

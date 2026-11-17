@@ -28,6 +28,37 @@ pub(crate) fn no_such_version(raw: &str) -> ApiError {
     )
 }
 
+/// The record standing at `key`'s newest generation, marker or not, or `None`
+/// when the key holds no record.
+///
+/// The current generation of a key is its newest one, and a plain delete on a
+/// versioned bucket leaves a delete marker as that generation, so this is the
+/// record an S3 answer is taken from — unlike the record `put_here` replaces,
+/// which is the newest one that holds bytes.
+pub(crate) fn head(all: &[Object], key: &str) -> Option<Object> {
+    all.iter()
+        .filter(|o| o.spec.key == key)
+        .max_by_key(|o| (o.status.version, o.meta.revision))
+        .cloned()
+}
+
+/// The newest generation of `key` that holds bytes, ignoring delete markers —
+/// the record a put builds on, and the one the key path's file belongs to.
+pub(crate) fn newest_data(all: &[Object], key: &str) -> Option<Object> {
+    all.iter()
+        .filter(|o| o.spec.key == key && !o.status.delete_marker)
+        .max_by_key(|o| (o.status.version, o.meta.revision))
+        .cloned()
+}
+
+/// The next generation number at `key`, counting markers: a key whose three
+/// generations ended in a plain delete is written at 4, not 3.
+pub(crate) fn next_version(all: &[Object], key: &str) -> u64 {
+    head(all, key)
+        .map(|o| o.status.version.saturating_add(1))
+        .unwrap_or(1)
+}
+
 /// The record of `key` at generation `version` among `all`, or
 /// `NoSuchVersion`.
 pub(crate) fn generation(all: &[Object], key: &str, version: u64) -> ApiResult<Object> {
@@ -48,13 +79,24 @@ pub(crate) fn generation(all: &[Object], key: &str, version: u64) -> ApiResult<O
     found.ok_or_else(|| no_such_version(&version.to_string()))
 }
 
-/// One row of a ListObjectVersions page: a kept generation, or a prefix
-/// rolled up by the delimiter.
+/// True when `obj` is the newest generation of its key — the row ListObjectVersions
+/// answers `IsLatest` for. Taken from the history rather than `status.latest`,
+/// because a marker left on top of a key makes that key's newest generation
+/// while the record under it still carries the flag.
+pub(crate) fn is_latest(all: &[Object], obj: &Object) -> bool {
+    head(all, &obj.spec.key).is_some_and(|cur| cur.status.version == obj.status.version)
+}
+
+/// One row of a ListObjectVersions page: a kept generation, a prefix rolled up
+/// by the delimiter, or a delete marker.
 pub type VersionPage = (Vec<ListObjectEntry>, bool);
 
 /// Generations of each key in the bucket, newest generation first within a
 /// key, optionally filtered by `prefix` and resumed after a
 /// `(key-marker, version-id-marker)` pair (exclusive), capped at `limit`.
+///
+/// A delete marker is a generation like any other and is listed among them, so
+/// the caller can see why a key is missing and name the marker on a delete.
 ///
 /// `limit + 1` rows are collected so `truncated` can be answered exactly;
 /// the page itself holds `limit`.
@@ -104,7 +146,9 @@ pub(crate) fn list_generations(
 }
 
 /// Every generation of every key in the bucket, key order first and newest
-/// generation first within a key — the order S3 lists versions in.
+/// generation first within a key — the order S3 lists versions in. The current
+/// generation of a key is its newest one, marker included, so `latest` is
+/// answered off the version rather than the flag a put leaves behind.
 fn generations_in(c: &Client, bucket_id: &Id) -> ApiResult<Vec<Object>> {
     let mut all = c.list_all_objects(bucket_id)?;
     all.sort_by(|a, b| {

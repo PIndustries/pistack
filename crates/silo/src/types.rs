@@ -200,6 +200,10 @@ pub struct ObjectStatus {
     /// False for a generation kept only because the bucket has versioning on.
     #[serde(default = "default_latest")]
     pub latest: bool,
+    /// True for the generation a plain delete left in place of the bytes: no
+    /// bytes on disk, size 0, and the key is hidden until it is removed.
+    #[serde(default)]
+    pub delete_marker: bool,
 }
 
 impl Default for ObjectStatus {
@@ -210,6 +214,7 @@ impl Default for ObjectStatus {
             size_bytes: 0,
             version: default_version(),
             latest: default_latest(),
+            delete_marker: false,
         }
     }
 }
@@ -283,6 +288,28 @@ pub fn content_type_or_default(value: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_record_reads_as_no_delete_marker() {
+        // Records written before this field existed must keep reading.
+        let old = r#"{"bucket":"bkt-1","key":"k","sha256":"aa","md5":"bb","size_bytes":2,"version":3,"latest":false}"#;
+        let status: ObjectStatus = serde_json::from_str(old).unwrap();
+        assert!(!status.delete_marker);
+        assert_eq!(status.version, 3);
+        assert!(!status.latest);
+        // A record with no version at all is still generation 1 and current.
+        let bare: ObjectStatus = serde_json::from_str("{}").unwrap();
+        assert_eq!(bare.version, 1);
+        assert!(bare.latest);
+        assert!(!bare.delete_marker);
+        let marker = ObjectStatus {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(serde_json::to_string(&marker)
+            .unwrap()
+            .contains("\"delete_marker\":true"));
+    }
 
     #[test]
     fn key_rules() {
