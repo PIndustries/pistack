@@ -15,110 +15,22 @@
 //! (in-process HTTP, and TLS when `keep` already holds the certificate),
 //! and [`OvnProvider`] (unimplemented).
 
-use crate::types::{Balancer, Listener, Member, Pool, Provider, Route};
-use async_trait::async_trait;
-use pistack_types::{ApiResult, Id};
-use std::net::IpAddr;
-use std::sync::Arc;
-
 pub mod forward;
+pub mod lb_provider;
+pub mod listener_view;
 pub mod mock;
 pub mod ovn;
+pub mod providers;
+pub mod realized;
 pub mod relay_l7;
+pub mod route_view;
 
 pub use forward::ForwardProvider;
+pub use lb_provider::LbProvider;
+pub use listener_view::ListenerView;
 pub use mock::{Call, MockProvider};
 pub use ovn::OvnProvider;
+pub use providers::Providers;
+pub use realized::Realized;
 pub use relay_l7::RelayL7Provider;
-
-/// What the provider reports once a balancer exists.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Realized {
-    pub vip: IpAddr,
-    /// Provider-side handle, stored in `status.provider_ref`.
-    pub provider_ref: String,
-}
-
-/// A listener with everything the provider needs to program it.
-#[derive(Clone, Debug)]
-pub struct ListenerView {
-    pub balancer: Balancer,
-    pub listener: Listener,
-    /// Default pool and its members, when the listener has one. Members
-    /// that are administratively down or `Offline` are already filtered
-    /// out; what remains is what should take traffic.
-    pub pool: Option<(Pool, Vec<Member>)>,
-    /// Set for [`crate::types::ListenerProtocol::Terminated`] when `keep`
-    /// already has that listener's certificate. Absent means TLS stays
-    /// unavailable. The proxy does not generate one.
-    pub tls: Option<crate::tls::TlsMaterial>,
-    /// The listener's routes in spec order, each with its pool's active
-    /// members filtered the same way as `pool`.
-    pub routes: Vec<RouteView>,
-}
-
-/// One listener route with its pool already resolved.
-#[derive(Clone, Debug)]
-pub struct RouteView {
-    pub route: Route,
-    pub pool: Pool,
-    pub members: Vec<Member>,
-}
-
-#[async_trait]
-pub trait LbProvider: Send + Sync + 'static {
-    /// Human name, for logs and `GET /balancers/`.
-    fn name(&self) -> &'static str;
-
-    /// Which `spec.provider` values this implementation serves.
-    fn serves(&self, provider: Provider) -> bool;
-
-    /// Create or update the balancer's VIP. `requested` is the spec's
-    /// explicit address, if any.
-    async fn ensure_balancer(&self, lb: &Balancer) -> ApiResult<Realized>;
-    async fn delete_balancer(&self, id: &Id) -> ApiResult<()>;
-
-    /// Program one listener with its pool and members. Returns the
-    /// provider-side handle for the listener.
-    async fn ensure_listener(&self, view: &ListenerView) -> ApiResult<String>;
-    async fn delete_listener(&self, balancer: &Id, listener: &Id) -> ApiResult<()>;
-}
-
-/// Route each balancer to the provider that serves its `spec.provider`.
-#[derive(Clone, Default)]
-pub struct Providers {
-    inner: Vec<Arc<dyn LbProvider>>,
-}
-
-impl Providers {
-    pub fn new(list: Vec<Arc<dyn LbProvider>>) -> Self {
-        Self { inner: list }
-    }
-
-    pub fn for_balancer(&self, lb: &Balancer) -> ApiResult<Arc<dyn LbProvider>> {
-        self.inner
-            .iter()
-            .find(|p| p.serves(lb.spec.provider))
-            .cloned()
-            .ok_or_else(|| {
-                pistack_types::ApiError::unavailable(format!(
-                    "no provider for {:?} balancers",
-                    lb.spec.provider
-                ))
-            })
-    }
-
-    /// Stop whatever any provider runs for balancer `id`, without touching
-    /// the store. A provider with nothing for `id` does nothing.
-    pub async fn stop_everywhere(&self, id: &Id) {
-        for p in &self.inner {
-            if let Err(e) = p.delete_balancer(id).await {
-                tracing::warn!(balancer = %id, provider = p.name(), error = %e, "relay: local stop failed");
-            }
-        }
-    }
-
-    pub fn names(&self) -> Vec<&'static str> {
-        self.inner.iter().map(|p| p.name()).collect()
-    }
-}
+pub use route_view::RouteView;
