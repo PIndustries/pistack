@@ -30,6 +30,7 @@ mod ovnmeta;
 mod probe;
 pub mod renew;
 pub mod runtime;
+pub(crate) mod spawn_retry;
 pub mod usage;
 
 pub use agent::{run_agent, run_agent_with, run_agent_with_facts, AgentOpts};

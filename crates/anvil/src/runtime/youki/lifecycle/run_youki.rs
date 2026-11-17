@@ -27,8 +27,8 @@ pub(in crate::runtime::youki) async fn run_youki(
         .stderr(Stdio::piped());
     arm_user_ns_join(&mut cmd, join_user_ns);
     let program = command_program(bin, mode);
-    let child = cmd
-        .spawn()
+    let child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
         .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
     let timeout = youki_timeout();
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {

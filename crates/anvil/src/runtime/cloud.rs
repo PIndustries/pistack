@@ -206,7 +206,7 @@ impl MachineRuntime for CloudRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = match cmd.spawn() {
+        let mut child = match crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn()).await {
             Ok(child) => child,
             Err(e) => {
                 release_taps(&ports).await;
@@ -979,15 +979,15 @@ async fn remove_net_device(remote: &Path, socket: &Path, net: &SavedNet) -> ApiR
 }
 
 async fn run_tool(bin: &Path, args: &[&str]) -> ApiResult<String> {
-    let child = Command::new(bin)
-        .args(args)
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+        .stderr(Stdio::piped());
     let name = bin.file_name().and_then(|s| s.to_str()).unwrap_or("helper");
-    match tokio::time::timeout(TOOL_WAIT, child).await {
+    let run = crate::spawn_retry::output_retrying_busy(&mut cmd);
+    match tokio::time::timeout(TOOL_WAIT, run).await {
         Ok(Ok(out)) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         }

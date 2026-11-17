@@ -297,13 +297,15 @@ async fn run(bin: &Path, args: &[String], elevate: bool) -> ApiResult<std::proce
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = cmd.spawn().map_err(|err| {
-        ApiError::unavailable(format!(
-            "rbd is not installed ({}: {err}){}",
-            program.display(),
-            privilege_hint()
-        ))
-    })?;
+    let child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
+        .map_err(|err| {
+            ApiError::unavailable(format!(
+                "rbd is not installed ({}: {err}){}",
+                program.display(),
+                privilege_hint()
+            ))
+        })?;
     let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {

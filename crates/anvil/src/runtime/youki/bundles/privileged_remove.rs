@@ -39,22 +39,21 @@ pub(in crate::runtime::youki) fn privileged_remove(
             path.display()
         )));
     };
-    let output = std::process::Command::new(sudo)
-        .arg("-n")
+    let mut cmd = std::process::Command::new(sudo);
+    cmd.arg("-n")
         .arg(&helper)
         .arg("delete")
         .arg("--path")
         .arg(&path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| {
-            ApiError::unavailable(format!(
-                "youki runtime: cannot run cleanup helper {}: {e}",
-                helper.display()
-            ))
-        })?;
+        .stderr(std::process::Stdio::piped());
+    let output = crate::spawn_retry::spawn_sync_retrying_busy(|| cmd.output()).map_err(|e| {
+        ApiError::unavailable(format!(
+            "youki runtime: cannot run cleanup helper {}: {e}",
+            helper.display()
+        ))
+    })?;
     if output.status.success() && !path_exists(&path) {
         return Ok(());
     }

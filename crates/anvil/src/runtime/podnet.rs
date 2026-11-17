@@ -677,7 +677,8 @@ async fn run_argv(argv: &[String]) -> ApiResult<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("ovs-vsctl");
-    match tokio::time::timeout(TOOL_WAIT, cmd.output()).await {
+    let run = crate::spawn_retry::output_retrying_busy(&mut cmd);
+    match tokio::time::timeout(TOOL_WAIT, run).await {
         Ok(Ok(out)) if out.status.success() => Ok(()),
         Ok(Ok(out)) => {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -791,7 +792,8 @@ async fn run_ip(privilege: &IpPrivilege, args: &[String]) -> ApiResult<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let name = program.file_name().and_then(|s| s.to_str()).unwrap_or("ip");
-    match tokio::time::timeout(TOOL_WAIT, cmd.output()).await {
+    let run = crate::spawn_retry::output_retrying_busy(&mut cmd);
+    match tokio::time::timeout(TOOL_WAIT, run).await {
         Ok(Ok(out)) if out.status.success() => Ok(()),
         Ok(Ok(out)) => {
             let err = String::from_utf8_lossy(&out.stderr);
