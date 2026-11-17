@@ -12,10 +12,10 @@ use crate::bucket_name::validate_bucket_name;
 use crate::client::Client;
 use crate::http::create_project;
 use crate::multipart::s3_err;
-use crate::s3::{bucket_exists, caller, ensure_body_hash, s3_error};
+use crate::s3::{bucket_exists, caller, ensure_body_hash, s3_error, BucketQuery};
 use crate::types::BucketSpec;
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Extension,
@@ -28,8 +28,12 @@ pub async fn create_bucket(
     State(c): State<Client>,
     ext: Option<Extension<Caller>>,
     Path(bucket): Path<String>,
+    Query(q): Query<BucketQuery>,
     req: Request,
 ) -> Response {
+    if q.versioning.is_some() {
+        return crate::s3_bucket_versioning::put_handler(c, ext, bucket, req).await;
+    }
     match create_bucket_inner(c, ext, bucket, req).await {
         Ok(resp) => resp,
         Err(err) => s3_error(err),

@@ -10,6 +10,9 @@
 //! GET                         /{bucket}?list-type=2&prefix=&delimiter=&continuation-token=&start-after=&max-keys=
 //! GET                         /{bucket}?uploads&prefix=&delimiter=&key-marker=&upload-id-marker=&max-uploads=
 //!                                     ListMultipartUploads
+//! GET                         /{bucket}?versions&prefix=&max-keys=&key-marker=&version-id-marker=
+//!                                     ListObjectVersions
+//! GET|PUT                     /{bucket}?versioning   Get/PutBucketVersioning
 //! POST                        /{bucket}?delete (XML body)   DeleteObjects
 //! PUT|GET|HEAD|DELETE|POST    /{bucket}/{*key}
 //!
@@ -65,6 +68,19 @@
 //! on one object, drops that `<Deleted>` entry. Anything else that fails
 //! becomes one `<Error>` naming the key, and the answer is still 200: a batch
 //! does not fail as a whole over one key.
+//!
+//! **Versioning.** A `versionId` on the wire is the record's generation
+//! number as a decimal string — all the store keeps. `PUT`/`GET
+//! /{bucket}?versioning` sets and reads [`BucketSpec::versioning`]
+//! ([`crate::s3_bucket_versioning`]); `GET /{bucket}?versions` is
+//! ListObjectVersions over every generation ([`crate::s3_list_versions`]).
+//! PutObject on a versioned bucket answers `x-amz-version-id`, and
+//! GetObject/HeadObject accept `?versionId=` — answering that generation with
+//! `x-amz-version-id`, or `NoSuchVersion` with 404 when it is not there.
+//! `DELETE ?versionId=` removes exactly that generation, promoting the newest
+//! survivor to current when the current one goes. A plain DeleteObject still
+//! removes the whole key: the store has no delete marker, so none is listed
+//! and none is created.
 
 use crate::chunked::{self, StreamingAuth};
 use crate::client::Client;
@@ -76,7 +92,7 @@ use crate::types::*;
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Extension,
 };
@@ -105,6 +121,9 @@ pub struct ObjectQuery {
     pub upload_id: Option<String>,
     #[serde(rename = "partNumber")]
     pub part_number: Option<String>,
+    /// One generation of the key, as its decimal record version.
+    #[serde(rename = "versionId")]
+    pub version_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -120,15 +139,31 @@ pub struct ListQuery {
     pub start_after: Option<String>,
     /// Presence of `uploads` (even empty) means ListMultipartUploads.
     pub uploads: Option<String>,
+    /// Presence of `versions` (even empty) means ListObjectVersions.
+    pub versions: Option<String>,
+    /// Presence of `versioning` (even empty) means the bucket's versioning
+    /// configuration.
+    pub versioning: Option<String>,
     #[serde(rename = "key-marker")]
     pub key_marker: Option<String>,
     #[serde(rename = "upload-id-marker")]
     pub upload_id_marker: Option<String>,
+    #[serde(rename = "version-id-marker")]
+    pub version_id_marker: Option<String>,
     #[serde(rename = "max-uploads")]
     pub max_uploads: Option<String>,
     pub delimiter: Option<String>,
     #[serde(rename = "encoding-type")]
     pub encoding_type: Option<String>,
+}
+
+/// Query fields of the bucket path that choose a subresource rather than a
+/// list. `ListQuery` carries them too, for `GET /{bucket}`.
+#[derive(Debug, Deserialize, Default)]
+pub struct BucketQuery {
+    /// Presence of `versioning` (even empty) means the bucket's versioning
+    /// configuration.
+    pub versioning: Option<String>,
 }
 
 pub async fn put_object(
@@ -260,6 +295,9 @@ async fn put_object_inner(
     let mut resp = StatusCode::OK.into_response();
     if let Some(v) = etag {
         resp.headers_mut().insert(header::ETAG, v);
+    }
+    if bucket.spec.versioning {
+        set_version_id(resp.headers_mut(), obj.status.version);
     }
     resp.headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
@@ -544,7 +582,14 @@ pub async fn get_object(
             Err(err) => s3_error(err),
         };
     }
-    match get_object_inner(c, ext, bucket, key, headers, true).await {
+    let version = match q.version_id.as_deref() {
+        Some(raw) => match crate::versions::parse_version_id(raw) {
+            Ok(v) => Some(v),
+            Err(err) => return s3_error(err),
+        },
+        None => None,
+    };
+    match get_object_inner(c, ext, bucket, key, headers, true, version).await {
         Ok(resp) => resp,
         Err(err) => s3_error(err),
     }
@@ -554,9 +599,17 @@ pub async fn head_object(
     State(c): State<Client>,
     ext: Option<Extension<Caller>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<ObjectQuery>,
     headers: HeaderMap,
 ) -> Response {
-    match get_object_inner(c, ext, bucket, key, headers, false).await {
+    let version = match q.version_id.as_deref() {
+        Some(raw) => match crate::versions::parse_version_id(raw) {
+            Ok(v) => Some(v),
+            Err(err) => return s3_error(err),
+        },
+        None => None,
+    };
+    match get_object_inner(c, ext, bucket, key, headers, false, version).await {
         Ok(resp) => resp,
         Err(err) => s3_error(err),
     }
@@ -569,21 +622,30 @@ async fn get_object_inner(
     key: String,
     headers: HeaderMap,
     with_body: bool,
+    version: Option<u64>,
 ) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
     if !with_body {
-        let obj = c.head_object(&bucket.meta.id, &key)?;
+        let obj = match version {
+            Some(v) => c.head_version(&bucket.meta.id, &key, v)?,
+            None => c.head_object(&bucket.meta.id, &key)?,
+        };
         let mut resp = StatusCode::OK.into_response();
         apply_object_headers(resp.headers_mut(), &obj)?;
+        set_version_id(resp.headers_mut(), obj.status.version);
         *resp.body_mut() = Body::empty();
         return Ok(resp);
     }
-    let (obj, mut file) = c.open_object(&bucket.meta.id, &key).await?;
+    let (obj, mut file) = match version {
+        Some(v) => c.open_version(&bucket.meta.id, &key, v).await?,
+        None => c.open_object(&bucket.meta.id, &key).await?,
+    };
     let Some(range) = header_str(&headers, "range").and_then(copy::parse_get_range) else {
         let mut resp =
             Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
         apply_object_headers(resp.headers_mut(), &obj)?;
+        set_version_id(resp.headers_mut(), obj.status.version);
         return Ok(resp);
     };
     let size = obj.status.size_bytes;
@@ -605,6 +667,7 @@ async fn get_object_inner(
         let mut resp =
             Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)).into_response();
         apply_object_headers(resp.headers_mut(), &obj)?;
+        set_version_id(resp.headers_mut(), obj.status.version);
         return Ok(resp);
     }
     let len = end - start + 1;
@@ -616,6 +679,7 @@ async fn get_object_inner(
     let mut resp =
         Body::from_stream(ReaderStream::with_capacity(file.take(len), 256 * 1024)).into_response();
     apply_object_headers(resp.headers_mut(), &obj)?;
+    set_version_id(resp.headers_mut(), obj.status.version);
     *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
     if let Ok(v) = HeaderValue::from_str(&len.to_string()) {
         resp.headers_mut().insert(header::CONTENT_LENGTH, v);
@@ -634,7 +698,7 @@ pub async fn delete_object(
     req: Request,
 ) -> Response {
     match delete_object_inner(c, ext, bucket, key, q, req).await {
-        Ok(status) => status.into_response(),
+        Ok(resp) => resp.into_response(),
         Err(err) => s3_error(err),
     }
 }
@@ -646,7 +710,7 @@ async fn delete_object_inner(
     key: String,
     q: ObjectQuery,
     req: Request,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Response> {
     let who = caller(ext)?;
     let bucket = load_bucket(&c, &who, &bucket)?;
     let expected = req.extensions().get::<ExpectedPayloadSha256>().cloned();
@@ -659,10 +723,23 @@ async fn delete_object_inner(
     if let Some(upload_id) = q.upload_id.as_deref() {
         c.abort_multipart_upload(&bucket.meta.id, &key, upload_id)
             .await?;
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    c.delete_object(&bucket.meta.id, &key).await?;
-    Ok(StatusCode::NO_CONTENT)
+    // A named generation is taken on its own; the key path then belongs to
+    // the newest survivor, or the key is gone. Without a `versionId` the whole
+    // key goes as it always has — the store keeps no delete marker to leave
+    // behind, so nothing is recorded in its place.
+    let obj = match q.version_id.as_deref() {
+        Some(raw) => {
+            let version = crate::versions::parse_version_id(raw)?;
+            c.delete_version(&bucket.meta.id, &key, version).await?
+        }
+        None => c.delete_object(&bucket.meta.id, &key).await?,
+    };
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    // `x-amz-version-id` names the generation this call acted on.
+    set_version_id(resp.headers_mut(), obj.status.version);
+    Ok(resp)
 }
 
 pub async fn post_object(
@@ -841,6 +918,12 @@ async fn list_or_bucket_inner(
 ) -> ApiResult<Response> {
     if q.uploads.is_some() {
         return list_uploads_inner(c, ext, bucket_name, q).await;
+    }
+    if q.versioning.is_some() {
+        return crate::s3_bucket_versioning::get_versioning(c, ext, bucket_name).await;
+    }
+    if q.versions.is_some() {
+        return crate::s3_list_versions::list_versions(c, ext, bucket_name, q).await;
     }
     if q.list_type.as_deref() != Some("2") {
         return Err(ApiError::bad_request(
@@ -1184,7 +1267,7 @@ fn list_uploads_xml(page: &ListUploadsPage<'_>) -> String {
     body
 }
 
-fn parse_max_keys(raw: Option<&str>) -> ApiResult<usize> {
+pub(crate) fn parse_max_keys(raw: Option<&str>) -> ApiResult<usize> {
     parse_limit(raw, "max-keys", S3_MAX_KEYS)
 }
 
@@ -1223,7 +1306,16 @@ fn apply_object_headers(headers: &mut HeaderMap, obj: &Object) -> ApiResult<()> 
     Ok(())
 }
 
-fn etag_value(obj: &Object) -> Option<HeaderValue> {
+/// `x-amz-version-id`: the record's generation number as a decimal string.
+pub(crate) fn set_version_id(headers: &mut HeaderMap, version: u64) {
+    if let Ok(v) = HeaderValue::from_str(&version.to_string()) {
+        headers.insert(VERSION_ID, v);
+    }
+}
+
+const VERSION_ID: HeaderName = HeaderName::from_static("x-amz-version-id");
+
+pub(crate) fn etag_value(obj: &Object) -> Option<HeaderValue> {
     let hex = if !obj.status.md5.is_empty() {
         &obj.status.md5
     } else if !obj.status.sha256.is_empty() {
@@ -1293,7 +1385,7 @@ pub(crate) fn bucket_exists(err: &ApiError) -> bool {
         && err.message.contains("already exists")
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1317,12 +1409,12 @@ const S3_URL_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
-fn s3_url_encode(s: &str) -> String {
+pub(crate) fn s3_url_encode(s: &str) -> String {
     utf8_percent_encode(s, S3_URL_ENCODE).to_string()
 }
 
 /// XML-escape a list key-name field, optionally after `encoding-type=url`.
-fn xml_list_value(s: &str, encode_url: bool) -> String {
+pub(crate) fn xml_list_value(s: &str, encode_url: bool) -> String {
     if encode_url {
         xml_escape(&s3_url_encode(s))
     } else {
@@ -1344,7 +1436,7 @@ fn decode_continuation_token(raw: &str) -> ApiResult<String> {
 }
 
 /// `None`/empty → no encoding; `url` → encode; anything else → 400.
-fn parse_encoding_type(raw: Option<&str>) -> ApiResult<bool> {
+pub(crate) fn parse_encoding_type(raw: Option<&str>) -> ApiResult<bool> {
     match raw {
         None | Some("") => Ok(false),
         Some("url") => Ok(true),

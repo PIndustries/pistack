@@ -569,6 +569,176 @@ impl Client {
         Ok(current)
     }
 
+    /// Remove exactly one generation of `key`, named by its version number.
+    ///
+    /// The key path always holds the current generation, so the file comes
+    /// away only when the named generation is the current one; an older
+    /// generation loses its `.blobs` copy. When a generation survives at the
+    /// key, the newest of them becomes the current one if the named row was.
+    pub async fn delete_version(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+        version: u64,
+    ) -> ApiResult<Object> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let all = self.objects_for_bucket(&bucket)?;
+        let same_key: Vec<Object> = all.iter().filter(|o| o.spec.key == key).cloned().collect();
+        let doomed = same_key
+            .iter()
+            .find(|o| o.status.version == version)
+            .cloned()
+            .ok_or_else(|| crate::versions::no_such_version(&version.to_string()))?;
+        self.store.collection::<Object>().delete(&doomed.meta.id)?;
+        let survivors: Vec<Object> = same_key
+            .into_iter()
+            .filter(|o| o.meta.id != doomed.meta.id)
+            .collect();
+        if doomed.status.latest {
+            match survivors.iter().max_by_key(|o| o.status.version) {
+                Some(newest) => {
+                    self.promote(&bucket, newest).await?;
+                }
+                // Nothing is left at the key: the file and its marker go.
+                None => {
+                    remove_file(&self.key_path(&bucket.meta.id, key)?).await?;
+                    crate::replica::remove_marker(&self.root, &bucket.meta.id, key).await;
+                }
+            }
+        }
+        // A checksum still named by a surviving record keeps its blob.
+        let keep: BTreeSet<String> = all
+            .iter()
+            .filter(|o| o.meta.id != doomed.meta.id)
+            .map(|o| o.status.sha256.clone())
+            .collect();
+        if !keep.contains(&doomed.status.sha256) {
+            if let Some(blob) = blob_file(&self.root, &bucket.meta.id, &doomed.status.sha256) {
+                remove_file(&blob).await?;
+            }
+        }
+        Ok(doomed)
+    }
+
+    /// Every generation of `key`, newest first. `NoSuchVersion` when the key
+    /// holds no record at all, which is what an S3 caller is owed for a
+    /// version of a key it never wrote.
+    pub fn list_object_versions_of_key(&self, bucket_id: &Id, key: &str) -> ApiResult<Vec<Object>> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let mut same: Vec<Object> = self
+            .objects_for_bucket(&bucket)?
+            .into_iter()
+            .filter(|o| o.spec.key == key)
+            .collect();
+        if same.is_empty() {
+            return Err(crate::versions::no_such_version(""));
+        }
+        same.sort_by_key(|o| std::cmp::Reverse(o.status.version));
+        Ok(same)
+    }
+
+    /// Metadata of one generation of `key`, named by its version number.
+    pub fn head_version(&self, bucket_id: &Id, key: &str, version: u64) -> ApiResult<Object> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        crate::versions::generation(&self.objects_for_bucket(&bucket)?, key, version)
+    }
+
+    /// Open one generation of `key` for reading, named by its version number.
+    pub async fn open_version(
+        &self,
+        bucket_id: &Id,
+        key: &str,
+        version: u64,
+    ) -> ApiResult<(Object, tokio::fs::File)> {
+        validate_key(key)?;
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        let obj = crate::versions::generation(&self.objects_for_bucket(&bucket)?, key, version)?;
+        let path = self.generation_path(&obj).await?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| crate::versions::no_such_version(&version.to_string()))?;
+        Ok((obj, file))
+    }
+
+    /// Turn versioning off, or on, for the bucket.
+    ///
+    /// `Suspended` is the store's `versioning = false`: a put then replaces
+    /// the record in place and no new generation is kept.
+    pub fn set_versioning(&self, bucket_id: &Id, enabled: bool) -> ApiResult<Bucket> {
+        let col = self.store.collection::<Bucket>();
+        let mut bucket = col.get(bucket_id)?;
+        bucket.spec.versioning = enabled;
+        col.update(bucket, None).map_err(Into::into)
+    }
+
+    /// Generations of every key in the bucket: the current one of each key,
+    /// plus every older generation the bucket has kept. Returns
+    /// `(page, truncated)`.
+    pub fn list_object_versions(
+        &self,
+        bucket_id: &Id,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        after: Option<(&str, Option<&str>)>,
+        limit: usize,
+    ) -> ApiResult<(Vec<ListObjectEntry>, bool)> {
+        crate::versions::list_generations(self, bucket_id, prefix, delimiter, after, limit)
+    }
+
+    /// The file holding `obj`'s bytes on this server, fetching them from a
+    /// peer when it does not hold them. The key path when the generation is
+    /// current, its `.blobs` copy otherwise.
+    pub(crate) async fn generation_path(&self, obj: &Object) -> ApiResult<PathBuf> {
+        if !obj.status.latest {
+            let Some(path) = blob_file(&self.root, &obj.spec.bucket, &obj.status.sha256) else {
+                return Err(ApiError::not_found(format!(
+                    "object '{}' has no bytes",
+                    obj.spec.key
+                )));
+            };
+            if !tokio::fs::try_exists(&path).await.map_err(io_err)? {
+                self.ensure_bytes(obj).await?;
+            }
+            return Ok(path);
+        }
+        let path = self.key_path(&obj.spec.bucket, &obj.spec.key)?;
+        if !tokio::fs::try_exists(&path).await.map_err(io_err)? {
+            self.ensure_bytes(obj).await?;
+        }
+        Ok(path)
+    }
+
+    /// Make `obj` the current generation of its key: its bytes are placed at
+    /// the key path, the key's marker is rewritten, and the record is marked
+    /// current.
+    async fn promote(&self, bucket: &Bucket, obj: &Object) -> ApiResult<Object> {
+        let path = self.key_path(&bucket.meta.id, &obj.spec.key)?;
+        let src = self.generation_path(obj).await?;
+        if src != path {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
+            }
+            tokio::fs::copy(&src, &path).await.map_err(io_err)?;
+        }
+        crate::replica::write_marker(
+            &self.root,
+            &bucket.meta.id,
+            &obj.spec.key,
+            &obj.status.sha256,
+        )
+        .await
+        .map_err(io_err)?;
+        let mut next = obj.clone();
+        next.status.latest = true;
+        self.store
+            .collection::<Object>()
+            .update(next, None)
+            .map_err(Into::into)
+    }
+
     /// True when this server still stages an unfinished multipart upload in
     /// the bucket. A `.uploads/` entry that is neither recorded done nor
     /// complete is one; an empty or unreadable staging tree is not.
@@ -646,6 +816,13 @@ impl Client {
         let truncated = entries.len() > limit;
         let page = entries.into_iter().take(limit).collect();
         Ok((page, truncated))
+    }
+
+    /// Every object record of the bucket, current generations and the older
+    /// generations a versioned bucket has kept.
+    pub(crate) fn list_all_objects(&self, bucket_id: &Id) -> ApiResult<Vec<Object>> {
+        let bucket = self.store.collection::<Bucket>().get(bucket_id)?;
+        self.objects_for_bucket(&bucket)
     }
 
     #[allow(clippy::too_many_arguments)]

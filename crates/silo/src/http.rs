@@ -14,6 +14,8 @@
 //! PUT|GET|HEAD|DELETE|POST  /{bucket}/{*key}  (POST: multipart create/complete)
 //! GET                       /{bucket}?list-type=2&…
 //! GET                       /{bucket}?uploads&…  (ListMultipartUploads)
+//! GET                       /{bucket}?versions&…  (ListObjectVersions)
+//! GET|PUT                   /{bucket}?versioning  (Get/PutBucketVersioning)
 //! POST                      /{bucket}?delete     (DeleteObjects)
 //!
 //! Between control-plane servers (join token instead of a caller):

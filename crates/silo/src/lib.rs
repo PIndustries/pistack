@@ -58,13 +58,16 @@ pub mod http;
 pub mod multipart;
 pub mod replica;
 pub mod s3;
+mod s3_bucket_versioning;
 mod s3_create_bucket;
 mod s3_delete_bucket;
+mod s3_list_versions;
 pub mod sigv4;
 pub mod staging;
 mod staging_fetch;
 pub mod types;
 pub mod usage;
+mod versions;
 
 pub use client::Client;
 pub use replica::Peers;
