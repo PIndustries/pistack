@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use pistack_types::{ApiError, ApiResult};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod spawn_retry;
+
 /// Where the BMC password comes from for one control.
 #[derive(Clone, Debug)]
 pub enum Secret {
@@ -180,12 +182,12 @@ fn bmc_user(raw: &str) -> ApiResult<String> {
 }
 
 async fn run(bin: &Path, args: &[String], what: &str) -> ApiResult<String> {
-    let output = tokio::process::Command::new(bin)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stderr(std::process::Stdio::piped());
+    let output = spawn_retry::output_retrying_busy(&mut cmd)
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
