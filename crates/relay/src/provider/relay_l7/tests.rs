@@ -4,9 +4,10 @@
 //! Proxy tests: the bind rules, the route table, the algorithms seen
 //! through HTTP, and the request the member receives.
 
-use super::http::route_key;
+use super::choice::Choice;
 use super::provider::RelayL7Provider;
-use super::table::{Choice, RouteTarget, Table};
+use super::route_key::route_key;
+use super::table::{RouteTarget, Table};
 
 use crate::picker::{Backend, Picker};
 use crate::provider::{LbProvider, ListenerView};

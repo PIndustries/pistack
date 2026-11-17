@@ -4,11 +4,12 @@
 //! The `LbProvider` surface: what a caller asks the proxy to bind, serve,
 //! and release.
 
-use super::accept::{accept_loop, Served};
+use super::accept_loop::accept_loop;
 use super::bind::bind_target;
 use super::provider::RelayL7Provider;
+use super::served::Served;
 use super::slot::{Serve, Slot};
-use super::table::table_for;
+use super::table_for::table_for;
 use crate::provider::{LbProvider, ListenerView, Realized};
 use crate::types::{Balancer, ListenerProtocol, Provider};
 use async_trait::async_trait;

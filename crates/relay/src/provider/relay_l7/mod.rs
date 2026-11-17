@@ -19,20 +19,49 @@
 //! forwarder, and the connections this proxy holds count towards
 //! `least_conn`.
 //!
-//! One concern per file: the public [`provider`] and its
-//! [`LbProvider`][super::LbProvider] wiring in [`lb`], the per-balancer
-//! [`slot`], the bind rules in [`bind`], the route table and member
-//! selection in [`table`], the request line and header rewriting in
-//! [`http`], and the accept loop and the copy loops over TLS or plain
-//! bytes in [`accept`]. Callers see only [`RelayL7Provider`], as before.
+//! One file per thing the proxy does. The public [`provider`] and its
+//! [`LbProvider`][super::LbProvider] wiring in [`lb`]; the per-balancer
+//! [`slot`] and the bind rules in [`bind`]. Member selection, which used to
+//! share one file, is now its own set: [`table`] is what requests match
+//! against, [`table_for`] builds it, [`choose`] runs a lookup, [`choice`]
+//! is its result, [`host_rank`] and [`path_len`] the two comparisons a
+//! lookup scores, [`live_backends`] the members a pool offers, [`weighed`]
+//! the backends as the picker sees them, [`opened`]/[`closed`] the
+//! connection counts `least_conn` reads, and [`held`] one counted
+//! connection. The request line and header rewriting in [`http`], and the
+//! accept loop in [`accept_loop`], the byte copy in [`splice`], the HTTP
+//! proxy in [`proxy_http`], what one listener serves from in [`served`],
+//! and the two replies in [`refuse`] and [`not_found`]. Callers see only
+//! [`RelayL7Provider`], as before.
 
-mod accept;
+mod accept_loop;
 mod bind;
-mod http;
+mod choice;
+mod choose;
+mod closed;
+mod content_length;
+mod find_header_end;
+mod header_has;
+mod held;
+mod host_rank;
 mod lb;
+mod live_backends;
+mod normalize_host;
+mod not_found;
+mod opened;
+mod path_len;
 mod provider;
+mod proxy_http;
+mod read_headers;
+mod refuse;
+mod rewrite_request;
+mod route_key;
+mod served;
 mod slot;
+mod splice;
 mod table;
+mod table_for;
+mod weighed;
 
 #[cfg(test)]
 mod tests;
