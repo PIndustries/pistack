@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
+//! `ApiError`: the single error shape returned by every PiStack API.
+
 use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -8,6 +10,8 @@ use axum::{
 };
 use chrono::TimeDelta as Duration;
 use serde::{Deserialize, Serialize};
+
+use super::error_code::ErrorCode;
 
 /// The single error shape returned by every PiStack API.
 ///
@@ -22,55 +26,6 @@ pub struct ApiError {
     pub message: String,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub details: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    BadRequest,
-    Unauthorized,
-    Forbidden,
-    NotFound,
-    Conflict,
-    /// The resource is there but this method is not allowed on it. S3 answers
-    /// a read of a delete marker this way.
-    MethodNotAllowed,
-    QuotaExceeded,
-    /// Too many requests; the message says what to wait for.
-    RateLimited,
-    Unprocessable,
-    Internal,
-    Unavailable,
-    NotImplemented,
-}
-
-impl std::fmt::Display for ErrorCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = serde_json::to_value(self)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "internal".into());
-        f.write_str(&s)
-    }
-}
-
-impl ErrorCode {
-    pub fn status(self) -> StatusCode {
-        match self {
-            ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
-            ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
-            ErrorCode::Forbidden => StatusCode::FORBIDDEN,
-            ErrorCode::NotFound => StatusCode::NOT_FOUND,
-            ErrorCode::Conflict => StatusCode::CONFLICT,
-            ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            ErrorCode::QuotaExceeded => StatusCode::FORBIDDEN,
-            ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-            ErrorCode::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,
-            ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::NotImplemented => StatusCode::NOT_IMPLEMENTED,
-        }
-    }
 }
 
 impl ApiError {
@@ -152,48 +107,5 @@ impl IntoResponse for ApiError {
 impl From<serde_json::Error> for ApiError {
     fn from(e: serde_json::Error) -> Self {
         ApiError::bad_request(format!("invalid json: {e}"))
-    }
-}
-
-pub type ApiResult<T> = Result<T, ApiError>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn retry_after(e: ApiError) -> Option<String> {
-        e.into_response()
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-    }
-
-    #[test]
-    fn a_rate_limit_counts_the_seconds_to_wait() {
-        let e = ApiError::rate_limited("try again later", Duration::milliseconds(899_400));
-        assert_eq!(e.code, ErrorCode::RateLimited);
-        assert_eq!(e.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(e.details["retry_after_secs"], 900);
-        // A refusal with no time left is still a refusal that says wait.
-        assert_eq!(
-            ApiError::rate_limited("x", Duration::zero()).details["retry_after_secs"],
-            1
-        );
-    }
-
-    #[test]
-    fn a_rate_limit_reply_carries_the_header() {
-        let e = ApiError::rate_limited("too many failed sign-ins", Duration::seconds(120));
-        assert_eq!(retry_after(e.clone()), Some("120".to_owned()));
-        assert_eq!(e.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(e.details["retry_after_secs"], 120);
-        assert_eq!(e.to_string(), "rate_limited: too many failed sign-ins");
-    }
-
-    #[test]
-    fn another_error_has_no_retry_header() {
-        let e = ApiError::unauthorized("invalid credentials");
-        assert_eq!(retry_after(e), None);
     }
 }
