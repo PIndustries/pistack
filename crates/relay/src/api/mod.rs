@@ -32,9 +32,15 @@ mod visible;
 // before them.
 #[macro_use]
 mod crud;
+mod create_member;
+mod delete_member;
+mod get_member;
 mod info;
-mod member;
+mod list_members;
+mod list_pool_members;
+mod member_scope;
 mod require_caller;
 mod router;
+mod update_member;
 
 pub use router::router;

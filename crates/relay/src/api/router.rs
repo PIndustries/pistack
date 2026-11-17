@@ -4,9 +4,14 @@
 //! The routes, and the three kinds that get them from [`crud`]. Members are
 //! wired by hand because a member is reached through its pool.
 
+use super::create_member::create_member;
+use super::delete_member::delete_member;
+use super::get_member::get_member;
 use super::info::info;
-use super::member;
+use super::list_members::list_members;
+use super::list_pool_members::list_pool_members;
 use super::require_caller::require_caller;
+use super::update_member::update_member;
 use crate::client::Client;
 use crate::types::{kinds, Balancer, BalancerSpec, Listener, ListenerSpec, Pool, PoolSpec};
 use axum::extract::{Extension, Path, Query, State};
@@ -66,15 +71,13 @@ pub fn router(client: Client) -> axum::Router {
         )
         .route(
             "/pools/{id}/members",
-            get(member::list_pool_members).post(member::create_member),
+            get(list_pool_members).post(create_member),
         )
         .route(
             "/pools/{id}/members/{member}",
-            get(member::get_member)
-                .put(member::update_member)
-                .delete(member::delete_member),
+            get(get_member).put(update_member).delete(delete_member),
         )
-        .route("/members", get(member::list_members))
+        .route("/members", get(list_members))
         .layer(middleware::from_fn(require_caller))
         .with_state(client)
 }
