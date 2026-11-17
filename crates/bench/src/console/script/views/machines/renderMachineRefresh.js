@@ -18,5 +18,14 @@
     feed(hist.tx, "pistack_machine_network_transmit_bytes_total", "rate");
     drawCharts();
   }, 10000);
+  // A soft pass built the whole page into a detached element. Now that every
+  // read has answered and this build is still the newest, move its children
+  // into the live view in a single swap and put the scroll back where it was.
+  if (soft) {
+    if (gen !== renderGen) return;
+    const y = window.scrollY;
+    live.replaceChildren(...root.childNodes);
+    window.scrollTo(0, y);
+  }
 }
 

@@ -115,6 +115,7 @@ vnc/openConsolePointer.js
 vnc/openConsoleKeys.js
 vnc/openConsoleOpen.js
 views/machines/machineTab.js
+views/machines/machineHeld.js
 views/machines/renderMachineHead.js
 views/machines/machineRebuild.js
 views/machines/machineResize.js

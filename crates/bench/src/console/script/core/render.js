@@ -5,7 +5,7 @@ async function render(soft) {
   const live = document.getElementById("view");
   if (current === "machines" && openMachine) {
     setErr("");
-    await renderMachine(openMachine, gen);
+    await renderMachine(openMachine, gen, soft);
     return;
   }
   if (current === "hosts" && openHost) {

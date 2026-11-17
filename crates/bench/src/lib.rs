@@ -257,6 +257,129 @@ mod tests {
         assert!(text.contains("Everything on its root disk is lost."));
     }
 
+    /// The Live timer used to bail out whenever a single machine page was
+    /// open (`if (openMachine || openHost ...) return;`), so only the list
+    /// pages refreshed and the machine header, details and conditions froze
+    /// until you left and came back. The timer must let the machine page
+    /// through to a soft reload. A soft pass must not blank the open page: it
+    /// builds into a detached element and swaps it into #view only once every
+    /// read has answered and the build is still the newest, restores the scroll
+    /// position, and on a failed machine read leaves the page alone (a 404 is
+    /// the exception: the machine is gone, so drop it and show the list). Text
+    /// checks pin both ends of that contract.
+    #[test]
+    fn live_timer_refreshes_an_open_machine_page() {
+        let text = CONSOLE_HTML;
+
+        // The old blanket hold on any open machine is gone from the timer.
+        assert!(
+            !text.contains("if (openMachine || openHost ||"),
+            "the Live timer still holds every open machine page"
+        );
+        // The timer still reloads, softly, once a machine is open: it calls
+        // `render(true)` and is not gated on `openMachine` anymore.
+        assert!(
+            text.contains("render(true);"),
+            "the Live timer no longer issues a soft reload"
+        );
+        assert!(
+            !text.contains("if (openMachine"),
+            "the Live timer still gates on openMachine"
+        );
+
+        // The machine page takes the soft pass, and a soft pass is a Live
+        // reload that keeps the selected tab (only a fresh draw resets it).
+        assert!(
+            text.contains("await renderMachine(openMachine, gen, soft);"),
+            "render does not carry the soft flag into the machine page"
+        );
+        assert!(
+            text.contains("async function renderMachine(id, gen, soft)"),
+            "renderMachine does not take a soft flag"
+        );
+        assert!(
+            text.contains("if (!soft) machineTab = \"details\";"),
+            "a soft Live reload must not reset the selected tab"
+        );
+
+        // A soft pass must not blank the open page while the reads are in
+        // flight: it builds into a detached element and swaps it into #view in
+        // one call only after every read has answered and the build is still
+        // the newest. A fresh draw keeps building straight into the live view.
+        assert!(
+            text.contains("const root = soft ? document.createElement(\"div\") : live;"),
+            "a soft pass does not build the machine page into a detached element"
+        );
+        assert!(
+            text.contains("live.replaceChildren(...root.childNodes);"),
+            "the soft pass does not swap the built machine page into #view in one call"
+        );
+        assert!(
+            text.contains("const y = window.scrollY;"),
+            "the soft swap does not remember the scroll position to restore"
+        );
+        assert!(
+            text.contains("window.scrollTo(0, y);"),
+            "the soft swap does not restore the scroll position"
+        );
+
+        // A soft pass leaves the page already on screen alone when the machine
+        // read fails, except a 404 (the machine is gone): drop it and show the
+        // list. setErr is only reached on a fresh draw.
+        assert!(
+            text.contains("if (e.status === 404) { openMachine = null; render(); }"),
+            "a soft pass does not drop to the list when the machine read is a 404"
+        );
+
+        // The live tab pane and the machine id are still stamped for the page.
+        assert!(
+            text.contains("el(\"div\", null, \"tabpane\")"),
+            "the machine tab pane is not stamped"
+        );
+        assert!(
+            text.contains("live.dataset.machineId = String(machine.id);"),
+            "the machine page does not stamp the machine id on the live view"
+        );
+
+        // The console-held guard lives in the machine view and is what the
+        // soft pass consults before it replaces anything. The soft pass reads
+        // the live view (not the detached build) for focus.
+        assert!(
+            text.contains("function machineHeld()"),
+            "the machine console-held guard is missing"
+        );
+        assert!(
+            text.contains("live.contains(document.activeElement) || machineHeld()"),
+            "the soft pass does not consult the console-held guard on the live view"
+        );
+
+        // The dead keep/oldPane/wasConsole hand-off is gone: a soft pass never
+        // reaches a console pane because an open console holds the reload, so
+        // the Console pane opens afresh instead of reusing an old node.
+        assert!(
+            !text.contains("wasConsole"),
+            "the Console pane still carries dead keep/wasConsole hand-off code"
+        );
+        assert!(
+            !text.contains("const keep = wasConsole"),
+            "the Console pane still carries dead keep/oldPane hand-off code"
+        );
+    }
+
+    /// The Live timer must hold a reload while a host page is open: the host
+    /// page has no soft pass, so a tick would fully redraw it out from under
+    /// the user. A previous change dropped `openHost` from the hold because an
+    /// open *machine* page learned to reload soft; the host page has no such
+    /// path, so it must stay held.
+    #[test]
+    fn live_timer_holds_an_open_host_page() {
+        let text = CONSOLE_HTML;
+        assert!(
+            text.contains("if (openHost || openProject || openUser || formOpen[current]) return;"),
+            "the Live timer no longer holds a reload while a host page is open"
+        );
+    }
+
     /// A folder of console pieces read straight off disk.
     fn console_dir() -> std::path::PathBuf {
         format!("{}/src/console", env!("CARGO_MANIFEST_DIR")).into()
