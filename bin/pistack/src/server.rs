@@ -190,6 +190,18 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.trim_matches(|c| c == '[' || c == ']').to_owned())
 }
 
+/// What an NFS client of this server mounts a share at: the host of the
+/// public URL. Shelf keeps `PISTACK_EXPORT_ADDRESS` at it so a ready share's
+/// status can say `<address>:<path>`; an address the operator set stays.
+fn set_export_address(public_url: &str) {
+    if std::env::var_os("PISTACK_EXPORT_ADDRESS").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    if let Some(host) = host_of(public_url) {
+        std::env::set_var("PISTACK_EXPORT_ADDRESS", host);
+    }
+}
+
 /// After a join over https: the store that came down holds the root CA
 /// whose fingerprint the operator gave. Nothing to check without one.
 fn joined_the_pinned_cloud(store: &Store, pin: Option<&str>) -> anyhow::Result<()> {
@@ -230,6 +242,7 @@ pub async fn run(opts: ServerOpts) -> anyhow::Result<Stopped> {
         format!("{scheme}://{}", opts.listen.replace("0.0.0.0", "127.0.0.1"))
     });
     let agent_api = agent_api(opts.tls_listen.as_deref(), opts.agent_url.as_deref())?;
+    set_export_address(&public_url);
     let tls_mode =
         keep::peer::tls_mode_value(std::env::var(keep::peer::CLUSTER_TLS_ENV).ok().as_deref())
             .map_err(anyhow::Error::msg)?;
@@ -541,7 +554,7 @@ pub fn dump(data_dir: PathBuf) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_api, host_of, joined_the_pinned_cloud, ovn_host_config};
+    use super::{agent_api, host_of, joined_the_pinned_cloud, ovn_host_config, set_export_address};
 
     #[test]
     fn the_certificate_host_is_read_from_the_agent_url() {
@@ -558,6 +571,36 @@ mod tests {
             Some("fd00::11")
         );
         assert_eq!(host_of("cloud.example"), None);
+    }
+
+    #[test]
+    fn the_export_address_follows_the_public_url_host() {
+        let prev = std::env::var_os("PISTACK_EXPORT_ADDRESS");
+        std::env::remove_var("PISTACK_EXPORT_ADDRESS");
+        set_export_address("https://10.97.0.11:8443");
+        assert_eq!(
+            std::env::var("PISTACK_EXPORT_ADDRESS").unwrap(),
+            "10.97.0.11"
+        );
+        set_export_address("https://elsewhere.example");
+        assert_eq!(
+            std::env::var("PISTACK_EXPORT_ADDRESS").unwrap(),
+            "10.97.0.11",
+            "an address already set is kept"
+        );
+        std::env::set_var("PISTACK_EXPORT_ADDRESS", "cloud.example");
+        set_export_address("https://10.97.0.12:8443");
+        assert_eq!(
+            std::env::var("PISTACK_EXPORT_ADDRESS").unwrap(),
+            "cloud.example"
+        );
+        std::env::remove_var("PISTACK_EXPORT_ADDRESS");
+        set_export_address("not a url");
+        assert!(std::env::var_os("PISTACK_EXPORT_ADDRESS").is_none());
+        match prev {
+            Some(v) => std::env::set_var("PISTACK_EXPORT_ADDRESS", v),
+            None => std::env::remove_var("PISTACK_EXPORT_ADDRESS"),
+        }
     }
 
     #[test]

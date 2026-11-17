@@ -19,6 +19,12 @@
 //! Root writes the file and runs `exportfs -ra` in this process.
 //! `PISTACK_EXPORTFS` overrides the `exportfs` binary.
 //!
+//! Every managed line squashes its clients
+//! (`all_squash,anonuid=65534,anongid=65534`, see [`crate::export_opts`])
+//! and each share directory is owned by that uid with mode `0770` plus
+//! setgid (see [`crate::share_dir`]), so a `write` share is writable by any
+//! client user and a `read` share is not.
+//!
 //! Any other user runs both steps through one helper named by
 //! `PISTACK_SHELF_HELPER`. The program in this repo is
 //! `scripts/pistack-shelf-helper`. Install it as
@@ -47,6 +53,8 @@
 //!
 //! A failed export is [`Phase::Error`] with the helper or `exportfs` text in
 //! `status.message`. The reconcile loop retries it with exponential backoff.
+//! A ready NFS share's `status.export` carries `<address>:<path>`, the
+//! address being this server's API host (see [`crate::export_address`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -58,6 +66,9 @@ use pistack_types::{ApiError, ApiResult, Id, Phase};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::export_address;
+use crate::export_opts::export_line;
+use crate::share_dir;
 use crate::types::{AccessMode, Share, ShareStatus, PROTOCOL_CEPHFS, PROTOCOL_NFS};
 
 const DEFAULT_EXPORTS: &str = "/etc/exports.d/pistack.exports";
@@ -249,6 +260,7 @@ fn persist(store: &Store, shares: &[Share], skip: Option<&Id>) -> ApiResult<()> 
 fn status_changed(current: &ShareStatus, next: &ShareStatus) -> bool {
     current.phase != next.phase
         || current.message != next.message
+        || current.export != next.export
         || current.failures != next.failures
         || current.retry_at != next.retry_at
 }
@@ -647,6 +659,7 @@ fn mark_failure(share: &mut Share, message: String) {
     share.status = ShareStatus {
         phase: Phase::Error,
         message,
+        export: None,
         failures,
         retry_at: Some(Utc::now() + chrono::Duration::milliseconds(backoff_ms(failures))),
         observed_revision: observed,
@@ -655,9 +668,11 @@ fn mark_failure(share: &mut Share, message: String) {
 
 fn mark_ready(share: &mut Share, dir: String) {
     let observed = share.status.observed_revision;
+    let export = export_address::get().map(|addr| format!("{addr}:{dir}"));
     share.status = ShareStatus {
         phase: Phase::Ready,
         message: dir,
+        export,
         failures: 0,
         retry_at: None,
         observed_revision: observed,
@@ -669,6 +684,7 @@ fn mark_pending(share: &mut Share, message: &str) {
     share.status = ShareStatus {
         phase: Phase::Pending,
         message: message.to_owned(),
+        export: None,
         failures: 0,
         retry_at: None,
         observed_revision: observed,
@@ -705,6 +721,19 @@ async fn create_share_dir(root: &Path, id: &str) -> Result<String, String> {
         .map_err(|e| format!("cannot open share directory {}: {e}", dir.display()))?;
     if !canon.starts_with(root) || canon == root {
         return Err("share path escapes the shelf directory".into());
+    }
+    // Every pass, not only the first: a share directory made before the
+    // squashed owner existed is fixed here, on the next reconcile. The
+    // export line squashes every client to that owner, so a directory it
+    // cannot write is the fault this closes. A server that cannot take
+    // ownership — no root, and chowning to nobody needs it — still exports:
+    // a refusal here would hold back shares that work.
+    if let Err(e) = share_dir::apply(&canon).await {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "shelf: share directory keeps the owner it has; nfs clients may not write it",
+        );
     }
     Ok(canon.to_string_lossy().into_owned())
 }
@@ -794,6 +823,7 @@ async fn realize_ceph(share: &mut Share, id: &str) -> Result<(), String> {
     share.status = ShareStatus {
         phase: Phase::Ready,
         message: format!("{fs}/{id}"),
+        export: None,
         failures: 0,
         retry_at: None,
         observed_revision: observed,
@@ -877,14 +907,6 @@ fn clip(s: &str) -> String {
         out.push('…');
     }
     out
-}
-
-fn export_line(dir: &str, cidr: &str, mode: AccessMode) -> String {
-    let flag = match mode {
-        AccessMode::Read => "ro",
-        AccessMode::Write => "rw",
-    };
-    format!("{dir} {cidr}({flag},sync,no_subtree_check)\n")
 }
 
 #[cfg(test)]
@@ -1049,18 +1071,178 @@ mod tests {
 
     #[test]
     fn export_line_marks_read_and_write() {
-        assert_eq!(
-            export_line("/srv/share-1", "10.0.0.0/24", AccessMode::Read),
-            "/srv/share-1 10.0.0.0/24(ro,sync,no_subtree_check)\n"
-        );
-        assert_eq!(
-            export_line("/srv/share-1", "10.1.0.0/24", AccessMode::Write),
-            "/srv/share-1 10.1.0.0/24(rw,sync,no_subtree_check)\n"
-        );
+        let _guard = share_dir::test_env_lock().lock().unwrap();
+        let prev = std::env::var_os("PISTACK_SHELF_SQUASH_UID");
+        std::env::remove_var("PISTACK_SHELF_SQUASH_UID");
+        let rw = export_line("/srv/share-1", "10.1.0.0/24", AccessMode::Write);
+        assert!(rw.starts_with("/srv/share-1 10.1.0.0/24(rw,"), "{rw}");
+        let ro = export_line("/srv/share-1", "10.0.0.0/24", AccessMode::Read);
+        assert!(ro.starts_with("/srv/share-1 10.0.0.0/24(ro,"), "{ro}");
         assert!(!cidr_ok("../x"));
         assert!(!cidr_ok("10.0.0.0/33"));
         assert!(cidr_ok("10.0.0.0/24"));
         assert!(safe_id("..").is_err());
+        match prev {
+            Some(v) => std::env::set_var("PISTACK_SHELF_SQUASH_UID", v),
+            None => std::env::remove_var("PISTACK_SHELF_SQUASH_UID"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_share_is_exported_rw_and_a_read_share_ro() {
+        // The export line is what a client is handed. These are its own
+        // tests: unit tests run side by side and one process cannot hold
+        // two shelf roots, so the managed-file assertions live with the
+        // end-to-end suites in `tests/shares.rs`.
+        let _guard = share_dir::test_env_lock().lock().unwrap();
+        let prev = std::env::var_os("PISTACK_SHELF_SQUASH_UID");
+        std::env::remove_var("PISTACK_SHELF_SQUASH_UID");
+        let ro = export_line("/srv/share-1", "10.0.0.0/24", AccessMode::Read);
+        assert_eq!(
+            ro,
+            "/srv/share-1 10.0.0.0/24(ro,sync,no_subtree_check,\
+             all_squash,anonuid=65534,anongid=65534)\n"
+        );
+        let rw = export_line("/srv/share-1", "10.1.0.0/24", AccessMode::Write);
+        assert_eq!(
+            rw,
+            "/srv/share-1 10.1.0.0/24(rw,sync,no_subtree_check,\
+             all_squash,anonuid=65534,anongid=65534)\n"
+        );
+        match prev {
+            Some(v) => std::env::set_var("PISTACK_SHELF_SQUASH_UID", v),
+            None => std::env::remove_var("PISTACK_SHELF_SQUASH_UID"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_share_directory_is_owned_by_the_squashed_uid_and_setgid() {
+        let _guard = env_lock().lock().await;
+        let dir = scratch();
+        let shelf = dir.join("shares");
+        let exports = dir.join("pistack.exports");
+        let ok = script(&dir, "exportfs", "#!/bin/sh\nexit 0\n");
+        let _shelf = Env::set("PISTACK_SHELF_DIR", &shelf);
+        let _file = Env::set("PISTACK_EXPORTS_FILE", &exports);
+        let _euid = Env::set("PISTACK_SHELF_EUID", "0");
+        let _helper = Env::unset("PISTACK_SHELF_HELPER");
+        let _bin = Env::set("PISTACK_EXPORTFS", &ok);
+        // The uid this process certainly owns: chowning to it needs no root,
+        // so the owner and mode assertions run in an unprivileged test run.
+        let me = share_dir::euid();
+        let _uid = Env::set("PISTACK_SHELF_SQUASH_UID", me.to_string());
+
+        let mut share = sample_mode(PROTOCOL_NFS, Some("10.2.0.0/24"), AccessMode::Write);
+        share.meta.name = "owned".into();
+        apply(&mut share).await.unwrap();
+        assert_eq!(share.status.phase, Phase::Ready);
+        let path = PathBuf::from(&share.status.message);
+        let (uid, mode) = share_dir::probe(&path).expect("probe share dir");
+        assert_eq!(uid, me, "share dir uid {uid}");
+        assert_eq!(mode, share_dir::SHARE_DIR_MODE, "{mode:#o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_share_directory_is_fixed_on_the_next_reconcile() {
+        let _guard = env_lock().lock().await;
+        let dir = scratch();
+        let shelf = dir.join("shares");
+        let exports = dir.join("pistack.exports");
+        let ok = script(&dir, "exportfs", "#!/bin/sh\nexit 0\n");
+        let _shelf = Env::set("PISTACK_SHELF_DIR", &shelf);
+        let _file = Env::set("PISTACK_EXPORTS_FILE", &exports);
+        let _euid = Env::set("PISTACK_SHELF_EUID", "0");
+        let _helper = Env::unset("PISTACK_SHELF_HELPER");
+        let _bin = Env::set("PISTACK_EXPORTFS", &ok);
+        let me = share_dir::euid();
+        let _uid = Env::set("PISTACK_SHELF_SQUASH_UID", me.to_string());
+
+        let mut share = sample_mode(PROTOCOL_NFS, Some("10.3.0.0/24"), AccessMode::Write);
+        share.meta.name = "fixed".into();
+        apply(&mut share).await.unwrap();
+        assert_eq!(share.status.phase, Phase::Ready);
+        let path = PathBuf::from(&share.status.message);
+
+        // An older pass left it this process's own, mode 0700, setgid gone:
+        // the shape of the fault.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (uid, mode) = share_dir::probe(&path).expect("probe");
+        assert_eq!(uid, me);
+        assert_eq!(mode, 0o700, "{mode:#o}");
+
+        // A pass that finds nothing else due — and a Ready share whose
+        // revision is observed is nothing else due.
+        reconcile_one(&share).await;
+        let (uid, mode) = share_dir::probe(&path).expect("probe");
+        assert_eq!(uid, me, "share dir uid {uid}");
+        assert_eq!(mode, share_dir::SHARE_DIR_MODE, "{mode:#o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One pass of the test-only reconciler over `share` as it stands in the
+    /// shelf directory, through the same `drive` the server loops on.
+    #[cfg(unix)]
+    async fn reconcile_one(share: &Share) {
+        let _guard = export_lock().lock().await;
+        let mut all = vec![share.clone()];
+        // `due_now` false: what a Ready share at its observed revision is on
+        // a quiet tick. The pass must still walk the directory it exports.
+        let _ = drive(&mut all, Utc::now(), None, false).await;
+    }
+
+    #[tokio::test]
+    async fn a_ready_nfs_share_reports_the_address_to_mount() {
+        let _guard = env_lock().lock().await;
+        let dir = scratch();
+        let shelf = dir.join("shares");
+        let exports = dir.join("pistack.exports");
+        let ok = script(&dir, "exportfs", "#!/bin/sh\nexit 0\n");
+        let _shelf = Env::set("PISTACK_SHELF_DIR", &shelf);
+        let _file = Env::set("PISTACK_EXPORTS_FILE", &exports);
+        let _euid = Env::set("PISTACK_SHELF_EUID", "0");
+        let _helper = Env::unset("PISTACK_SHELF_HELPER");
+        let _bin = Env::set("PISTACK_EXPORTFS", &ok);
+        let _uid = Env::unset("PISTACK_SHELF_SQUASH_UID");
+        export_address::clear();
+        std::env::set_var("PISTACK_EXPORT_ADDRESS", "10.97.0.11");
+        // A unit test is not a module start: pretend the server started with
+        // this address, the way `bin/pistack` starts one that has it set.
+        export_address::set("10.97.0.11");
+
+        let mut share = sample_mode(PROTOCOL_NFS, Some("10.4.0.0/24"), AccessMode::Write);
+        share.meta.name = "mounted".into();
+        apply(&mut share).await.unwrap();
+        assert_eq!(share.status.phase, Phase::Ready);
+        assert_eq!(
+            share.status.export.as_deref(),
+            Some(format!("10.97.0.11:{}", share.status.message).as_str())
+        );
+        // The local path stays where it always was.
+        assert!(share.status.message.contains(&share.meta.id.to_string()));
+
+        // Without an address the field is simply absent, as before: a start
+        // that names no host, and no variable either.
+        export_address::set("");
+        let mut plain = sample_mode(PROTOCOL_NFS, Some("10.6.0.0/24"), AccessMode::Write);
+        plain.meta.name = "plain".into();
+        apply(&mut plain).await.unwrap();
+        assert_eq!(plain.status.phase, Phase::Ready);
+        assert_eq!(plain.status.export, None);
+
+        // A cephfs share has no NFS address to give.
+        let _fs = Env::unset("PISTACK_CEPH_FS");
+        let mut ceph = sample(PROTOCOL_CEPHFS, None);
+        apply(&mut ceph).await.unwrap();
+        assert_eq!(ceph.status.phase, Phase::Pending);
+        assert_eq!(ceph.status.export, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1128,6 +1310,10 @@ mod tests {
     }
 
     fn sample(protocol: &str, cidr: Option<&str>) -> Share {
+        sample_mode(protocol, cidr, AccessMode::Read)
+    }
+
+    fn sample_mode(protocol: &str, cidr: Option<&str>, mode: AccessMode) -> Share {
         use crate::types::ShareSpec;
         use pistack_types::{kind, Meta};
         let mut access = Vec::new();
@@ -1135,7 +1321,7 @@ mod tests {
             access.push(crate::types::ShareAccess {
                 principal: None,
                 cidr: Some(cidr.to_owned()),
-                mode: AccessMode::Read,
+                mode,
             });
         }
         Share {
@@ -1192,6 +1378,7 @@ mod tests {
         let _file = Env::set("PISTACK_EXPORTS_FILE", &exports);
         let _euid = Env::set("PISTACK_SHELF_EUID", "0");
         let _helper = Env::unset("PISTACK_SHELF_HELPER");
+        let _uid = Env::set("PISTACK_SHELF_SQUASH_UID", "65534");
         let _bin = Env::set("PISTACK_EXPORTFS", dir.join("missing-exportfs"));
 
         let mut pending = sample(PROTOCOL_NFS, Some("10.0.0.0/24"));
@@ -1201,7 +1388,8 @@ mod tests {
         assert!(pending.status.retry_at.is_some());
 
         std::env::set_var("PISTACK_EXPORTFS", &fail);
-        let mut failed = sample(PROTOCOL_NFS, Some("10.0.0.0/24"));
+        let mut failed = sample(PROTOCOL_NFS, Some("10.0.1.0/24"));
+        failed.meta.name = "home-fail".into();
         apply(&mut failed).await.unwrap();
         assert_eq!(failed.status.phase, Phase::Error);
         assert!(
@@ -1212,6 +1400,7 @@ mod tests {
 
         std::env::set_var("PISTACK_EXPORTFS", &ok);
         let mut ready = sample(PROTOCOL_NFS, Some("10.4.0.0/24"));
+        ready.meta.name = "home-ok".into();
         apply(&mut ready).await.unwrap();
         assert_eq!(ready.status.phase, Phase::Ready);
         assert!(ready.status.message.contains(&ready.meta.id.to_string()));
@@ -1219,7 +1408,9 @@ mod tests {
         assert!(text.contains("-ra"), "{text}");
         let file = std::fs::read_to_string(&exports).unwrap();
         assert!(
-            file.contains("10.4.0.0/24(ro,sync,no_subtree_check)"),
+            file.contains(
+                "10.4.0.0/24(ro,sync,no_subtree_check,all_squash,anonuid=65534,anongid=65534)"
+            ),
             "{file}"
         );
         assert!(file.starts_with("# Managed by pistack shelf"), "{file}");

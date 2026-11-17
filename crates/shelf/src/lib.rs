@@ -12,8 +12,11 @@
 //!
 //! HTTP is mounted at `/shelf`: `GET|POST /shares`, `GET|PUT|DELETE /shares/{id}`.
 
+mod export_address;
+mod export_opts;
 mod http;
 mod realize;
+mod share_dir;
 pub(crate) mod spawn_retry;
 mod types;
 
@@ -34,6 +37,16 @@ impl Shelf {
         let store = ctx.store::<Store>();
         (*store).clone()
     }
+
+    /// A ready share reports `<address>:<path>`; the address is the host of
+    /// this server's public URL. `bin/pistack` keeps
+    /// PISTACK_EXPORT_ADDRESS at the same host for anything that runs shelf
+    /// outside this process. A URL with no host is an empty set: this server
+    /// has no address, and does not borrow one from the environment.
+    pub fn set_export_address(&self, public_url: &str) {
+        let host = export_opts::address_of(public_url);
+        export_address::set(host.as_deref().unwrap_or(""));
+    }
 }
 
 #[async_trait]
@@ -52,6 +65,7 @@ impl Module for Shelf {
     }
 
     async fn start(&self, ctx: ModuleContext) -> anyhow::Result<()> {
+        self.set_export_address(&ctx.public_url);
         let store = Self::store(&ctx);
         match realize::ensure_share_root().await {
             Ok(root) => tracing::info!(root = %root.display(), "shelf share root ready"),

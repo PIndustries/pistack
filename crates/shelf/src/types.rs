@@ -98,6 +98,12 @@ pub struct ShareStatus {
     pub phase: Phase,
     #[serde(default)]
     pub message: String,
+    /// Where a client mounts a ready NFS share: `<address>:<path>`, the
+    /// address being the API host of the server that exports it. Absent
+    /// until the share is ready, and when no address for this server is
+    /// known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<String>,
     /// Failures since the last `Ready`. Drives retry backoff.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub failures: u32,
@@ -119,6 +125,7 @@ impl Default for ShareStatus {
         Self {
             phase: Phase::Pending,
             message: PENDING_MESSAGE.to_owned(),
+            export: None,
             failures: 0,
             retry_at: None,
             observed_revision: 0,

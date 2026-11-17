@@ -888,6 +888,7 @@ pub static KINDS: &[KindDef] = &[
         ],
         wide: &[
             col!("CLIENTS", count "/spec/access"),
+            col!("EXPORT", "/status/export"),
             col!("MESSAGE", "/status/message"),
             col!("FULL-ID", full_id),
             col!("PROJECT", project),
@@ -1018,6 +1019,33 @@ mod tests {
             let last = k.columns.last().unwrap().header;
             assert!(last == "AGE" || last == "LAST-SEEN", "{}: {last}", k.noun);
         }
+    }
+
+    #[test]
+    fn share_wide_shows_the_mount_address_of_a_ready_share() {
+        let kind = by_noun("share").unwrap();
+        let column = kind
+            .wide
+            .iter()
+            .find(|c| c.header == "EXPORT")
+            .expect("EXPORT column");
+        let now = Utc::now();
+        let ready = serde_json::json!({
+            "status": {
+                "phase": "ready",
+                "message": "/var/lib/pistack/shares/share-0199",
+                "export": "10.97.0.11:/var/lib/pistack/shares/share-0199"
+            }
+        });
+        assert_eq!(
+            (column.get)(&ready, now),
+            "10.97.0.11:/var/lib/pistack/shares/share-0199"
+        );
+        // Not exported yet: no address to show, and the path is not one.
+        let pending = serde_json::json!({
+            "status": { "phase": "pending", "message": "/var/lib/pistack/shares/share-0199" }
+        });
+        assert_eq!((column.get)(&pending, now), "");
     }
 
     #[test]
