@@ -64,8 +64,12 @@ pub fn build(
 ) -> Router {
     let mut app = Router::new();
     let mut entries = Vec::new();
+    let mut s3_prefix: Option<&str> = None;
     for m in &asm.modules {
         let info = m.info();
+        if info.name == "silo" {
+            s3_prefix = Some(info.prefix);
+        }
         entries.push(ModuleEntry {
             name: info.name,
             prefix: info.prefix,
@@ -75,6 +79,14 @@ pub fn build(
         });
         app = app.nest(&format!("/{}", info.prefix), m.router(ctx.clone()));
     }
+    // Where the write gate carries a client's object writes to, without being
+    // asked: the prefix this assembly mounts the S3 API on. The limit is the
+    // forwarding limit, not the object store's own — what a follower can hold
+    // to pass on is not how large an object the leader is willing to keep.
+    let s3_carry = match s3_prefix {
+        Some(prefix) => crate::cluster::S3Carry::new(prefix, crate::cluster::FORWARD_LIMIT),
+        None => crate::cluster::S3Carry::default(),
+    };
     // Agent transport (anvil <-> control plane). `pistack agent --join URL`
     // talks to URL/rpc/agents/... Strict by default: `/rpc` requires a
     // cloud-CA client certificate (escape hatch `PISTACK_RPC_INSECURE=1`).
@@ -166,7 +178,7 @@ pub fn build(
             reads_at_leader,
         ));
         app = app.layer(middleware::from_fn_with_state(
-            handle.clone(),
+            (handle.clone(), s3_carry.clone()),
             crate::cluster::reject_follower_writes,
         ));
         app = app.layer(middleware::from_fn_with_state(
@@ -884,7 +896,7 @@ mod tests {
             .route("/healthz", get(|| async { "ok" }))
             .fallback(|| async { "ok" })
             .layer(middleware::from_fn_with_state(
-                handle.clone(),
+                (handle.clone(), crate::cluster::S3Carry::default()),
                 crate::cluster::reject_follower_writes,
             ))
             .layer(middleware::from_fn_with_state(

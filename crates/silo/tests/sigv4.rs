@@ -2498,3 +2498,199 @@ async fn presigned_get_serves_a_range() {
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(&body[..], b"def");
 }
+
+/// What a follower sends on is what the signature has to cover.
+///
+/// A client that cannot reach the leader signs the address it was told to use
+/// and reaches a follower instead. The follower has to hand the leader the
+/// same method, path, query, `Host` and signed headers, and put nothing of
+/// its own in front of them, or the leader refuses a request the client
+/// signed correctly. This is the carrying code in `bin/pistack`
+/// (`forward_to_leader`) applied to a request, then the request verified the
+/// way a leader verifies it.
+#[tokio::test]
+async fn a_signature_holds_after_a_follower_carries_the_request_on() {
+    let w = world().await;
+    let body = b"carried body".to_vec();
+    let payload = sha256_hex(&body);
+    let date = amz_now();
+    // The address the client was told to use. Nothing listens there: that is
+    // the whole reason the request is being carried.
+    let host = "s3.example:8443";
+    let path = format!("/{}/carried-through.txt", w.bucket);
+    let query = "x-amz-foo=a%20b&tag=carry";
+    let mut signed: Vec<(String, String)> = vec![
+        ("host".into(), host.into()),
+        ("x-amz-content-sha256".into(), payload.clone()),
+        ("x-amz-date".into(), date.clone()),
+        ("content-type".into(), "text/plain".into()),
+        ("x-amz-meta-purpose".into(), "carry".into()),
+    ];
+    signed.sort_by(|a, b| a.0.cmp(&b.0));
+    let signed_names: Vec<String> = signed.iter().map(|k| k.0.clone()).collect();
+    let signature = sigv4::sign_request(
+        "PUT",
+        &path,
+        query,
+        &signed,
+        &payload,
+        &w.access_key_id,
+        &w.secret,
+        &w.region,
+        &date,
+    );
+    let stamp: String = date.chars().take(8).collect();
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{stamp}/{}/s3/aws4_request, SignedHeaders={}, Signature={signature}",
+        w.access_key_id,
+        w.region,
+        signed_names.join(";"),
+    );
+
+    // The request as it arrives at the follower: the client's own headers, the
+    // header that asked to be carried, and the three a follower puts on a
+    // request it carries for someone else.
+    let arrived = Request::builder()
+        .method("PUT")
+        .uri(format!("{path}?{query}"))
+        .header(header::HOST, host)
+        .header(header::AUTHORIZATION, &authorization)
+        .header("x-amz-content-sha256", &payload)
+        .header("x-amz-date", &date)
+        .header("content-type", "text/plain")
+        .header("x-amz-meta-purpose", "carry")
+        .header(header::CONTENT_LENGTH, body.len().to_string())
+        .header("connection", "keep-alive, x-hold")
+        .header("keep-alive", "timeout=5")
+        .header("x-hold", "dropped by the Connection line")
+        .header("x-pistack-forward", "leader")
+        .header("x-pistack-cluster", "the carrier's peer key")
+        .header("x-pistack-node", "sim2")
+        .header("x-pistack-client-addr", "203.0.113.7")
+        .body(Body::from(body.clone()))
+        .unwrap();
+
+    // Where the follower reaches the leader. A request that signed no host
+    // would be answered under this address instead of the client's.
+    let leader_api = "http://127.0.0.1:11443";
+    let carried = carry_as_a_follower_sends(arrived, leader_api);
+
+    // Answered by the route, not refused before it: a `SignatureDoesNotMatch`
+    // here is the carry having changed something the signature covers.
+    let response = w.app.clone().oneshot(carried).await.unwrap();
+    // PutObject answers 200 with no body of its own; what matters here is
+    // that the leader got past the signature at all.
+    let status = response.status();
+    let text = String::from_utf8_lossy(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+        .into_owned();
+    assert_eq!(status, StatusCode::OK, "{status}: {text}");
+
+    // The same signature does not hold for the address the request arrived
+    // on. Without this, a pass above would prove nothing about `Host`.
+    let misfiled = Request::builder()
+        .method("PUT")
+        .uri(format!("{path}?{query}"))
+        .header(header::HOST, leader_api.trim_start_matches("http://"))
+        .header(header::AUTHORIZATION, &authorization)
+        .header("x-amz-content-sha256", &payload)
+        .header("x-amz-date", &date)
+        .header("content-type", "text/plain")
+        .header("x-amz-meta-purpose", "carry")
+        .header(header::CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap();
+    let response = w.app.clone().oneshot(misfiled).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+        .into_owned();
+    assert_eq!(extract_error_code(&text), "SignatureDoesNotMatch", "{text}");
+}
+
+/// What `forward_to_leader` in `bin/pistack/src/cluster.rs` does to a request
+/// before it goes on the wire, kept in step with it by hand: the hop-by-hop
+/// names and the ones the carrier claims for itself are taken off, the client's
+/// `Host` is kept only for a request the client signed itself, and everything
+/// else goes on in order with repeats kept.
+fn carry_as_a_follower_sends(req: Request<Body>, leader_api: &str) -> Request<Body> {
+    const STOPPED: [&str; 7] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+    ];
+    const CARRIED: [&str; 3] = [
+        "x-pistack-cluster",
+        "x-pistack-node",
+        "x-pistack-client-addr",
+    ];
+    let (mut parts, body) = req.into_parts();
+    let mut dropped: Vec<header::HeaderName> = STOPPED
+        .iter()
+        .chain(CARRIED.iter())
+        .map(|name| header::HeaderName::from_lowercase(name.as_bytes()).unwrap())
+        .collect();
+    dropped.extend(
+        parts
+            .headers
+            .get_all(header::CONNECTION)
+            .iter()
+            .flat_map(|value| value.to_str().unwrap_or_default().split(','))
+            .filter_map(|word| header::HeaderName::from_lowercase(word.trim().as_bytes()).ok())
+            .filter(|name| *name != header::CONNECTION),
+    );
+    // A request the client signed for its own `host` keeps it; anything else
+    // is answered under the address it arrived on.
+    let signed_host = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_uppercase().starts_with("AWS4-HMAC-SHA256 "))
+        && parts.headers.contains_key(header::HOST);
+    if !signed_host {
+        dropped.push(header::HOST);
+    }
+    // Dropped names are applied in order, repeats kept, exactly as the carrier
+    // rebuilds the header list.
+    let kept: Vec<(header::HeaderName, header::HeaderValue)> = parts
+        .headers
+        .keys()
+        .filter(|name| !dropped.contains(name))
+        .flat_map(|name| {
+            parts
+                .headers
+                .get_all(name)
+                .iter()
+                .map(move |value| (name.clone(), value.clone()))
+        })
+        .collect();
+    let mut headers = header::HeaderMap::new();
+    for (name, value) in kept {
+        headers.append(name, value);
+    }
+    // The header that asked for the carry does not go on, and the carrier's
+    // own node is named again as it leaves.
+    headers.remove("x-pistack-forward");
+    headers.append(
+        header::HeaderName::from_static("x-pistack-node"),
+        header::HeaderValue::from_static("sim2"),
+    );
+    if !headers.contains_key(header::HOST) {
+        headers.insert(
+            header::HOST,
+            header::HeaderValue::from_str(leader_api.trim_start_matches("http://")).unwrap(),
+        );
+    }
+    parts.headers = headers;
+    // The request line the leader reads: the carrier rebuilds the path and
+    // query onto the leader's own address.
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .to_owned();
+    parts.uri = format!("{leader_api}{path_and_query}").parse().unwrap();
+    Request::from_parts(parts, body)
+}
