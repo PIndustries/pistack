@@ -317,8 +317,8 @@ pub async fn apply(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
         .map_err(|e| ApiError::unavailable(format!("{} failed to start: {e}", plan.bin)))?;
     match kind {
         DoorKind::Tailscale | DoorKind::Wireguard => {
@@ -413,13 +413,12 @@ async fn try_create_pw(iface: &str) {
     }) {
         return;
     }
-    let _ = tokio::process::Command::new(bin)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+        .stderr(std::process::Stdio::null());
+    let _ = crate::spawn_retry::status_retrying_busy(&mut cmd).await;
 }
 
 struct EdgePublish {

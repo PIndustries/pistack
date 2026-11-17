@@ -27,6 +27,7 @@ pub mod health;
 pub mod picker;
 pub mod provider;
 mod reconcile;
+pub(crate) mod spawn_retry;
 mod tls;
 pub mod types;
 mod udp;
