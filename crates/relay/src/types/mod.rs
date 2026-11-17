@@ -8,25 +8,27 @@
 //! point at a default pool. A pool holds members and a health monitor.
 //! `spec` is the request. `status` is what the provider reported.
 //!
-//! One file per resource and per shape, so the file names are the map:
-//! `kinds` the id kinds and constants relay owns, `resource` the macro that
-//! gives each of them its wire shape, then the four resources in
-//! `balancer`, `listener`, `pool`, `member`. Each of those holds its spec,
-//! its status, and the `resource!` call that binds them, because a spec
-//! apart from its resource does not read. `route` is the HTTP rule a
-//! listener carries and `health_monitor` the check a pool carries, each
-//! named for the thing it describes.
+//! A module is a directory and each file inside it is one item, named for
+//! the item alone. `balancer/` holds `spec`, `status`, `provider` and the
+//! `resource!` call in `mod.rs`; `listener/`, `pool/` and `member/` the
+//! same. `route/` and `health_monitor/` hold the rule and the check a
+//! resource carries. `kinds` the id constants, `resource` the macro, and
+//! the bare `default_*` / `root_path` files the serde defaults shared
+//! across more than one resource.
 
-// Declares the `resource!` macro every resource below expands.
+// Declares the `resource!` macro every resource expands.
 #[macro_use]
 mod resource;
 
 mod balancer;
+mod default_true;
+mod default_weight;
 mod health_monitor;
 pub mod kinds;
 mod listener;
 mod member;
 mod pool;
+mod root_path;
 mod route;
 
 pub use balancer::Balancer;
@@ -37,7 +39,6 @@ pub use health_monitor::HealthMonitor;
 pub use health_monitor::MonitorType;
 pub use kinds::KINDS;
 pub use kinds::MANAGED_LABEL;
-
 pub use listener::Listener;
 pub use listener::ListenerProtocol;
 pub use listener::ListenerSpec;

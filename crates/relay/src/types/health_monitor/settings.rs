@@ -4,16 +4,8 @@
 //! The active health check a pool runs. Absent on a pool means its members
 //! are `NoMonitor`.
 
+use super::monitor_type::MonitorType;
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MonitorType {
-    #[default]
-    Tcp,
-    Http,
-    Https,
-}
 
 /// Active health check settings; absent means members are `NoMonitor`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
