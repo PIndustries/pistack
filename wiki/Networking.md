@@ -44,7 +44,18 @@ pi machine create web --image ubuntu-24.04 --size m.2x4 --network app
 
 A VPC is a routed private address space inside one project. It holds one or more blocks, and the subnets cut from them reach each other without anyone making a router: the VPC owns one, made with it and gone when it goes. That router is shown as owned and cannot be changed or deleted on its own.
 
-The API sits beside the network routes: `POST /network/vpcs` with one or more `cidrs`, and `POST /network/vpcs/{id}/subnets` with a `name` and a `cidr` — the short road that makes a network and its one subnet together. A `cidr` of `/24` alone takes the next free `/24` from the VPC. The long road still works: make a network with `vpc` set, then a subnet on it.
+```sh
+pi vpc create core --cidr 10.20.0.0/16 --external-network public
+pi vpc subnet create core web4 --cidr 10.20.1.0/24
+pi vpc subnet create core db4 --cidr 24        # the next free /24 in the VPC
+pi vpc list
+pi vpc show core
+pi vpc subnet list core
+pi vpc subnet delete core web4
+pi vpc delete core
+```
+
+The API sits beside the network routes: `POST /network/vpcs` with one or more `cidrs`, and `POST /network/vpcs/{id}/subnets` with a `name` and a `cidr`: the short road that makes a network and its one subnet together. A `cidr` of `/24` alone takes the next free `/24` from the VPC. The long road still works: make a network with `vpc` set, then a subnet on it. `pi vpc create` takes the blocks, an `--external-network` and a `--dns-domain`; `pi vpc subnet create` takes the VPC, a name and a `--cidr`, and leaves the gateway, DNS servers and DHCP to the module's defaults. A VPC is deleted only once its subnets are gone.
 
 - A network set `vpc` on at create belongs to that VPC and never leaves it. A network in a VPC is private: it cannot be external or a provider network. Networks with no VPC work exactly as before, with routers made by hand.
 - A subnet on a VPC network sits inside one of the VPC's blocks and overlaps no other subnet in it. It gets its router interface as part of its own create and loses it with its own delete.

@@ -80,7 +80,7 @@ The routes servers call on each other, under `/cluster`, hand out the whole stor
 
 ## TLS between servers
 
-Servers call each other for the replication log, the status, votes, joins and snapshots (`/cluster`), and for object bytes (`/silo/peer`). The routes are on both listeners.
+Servers call each other for the replication log, the status, votes, joins and snapshots (`/cluster`), and for object bytes and multipart staging (`/silo/peer`). The routes are on both listeners. A server that does not lead answers the `/silo/peer/` routes itself: they serve what that server holds, and a follower is asked for bytes precisely because it holds them.
 
 A call to a server whose member record has an HTTPS address goes there. The caller checks the certificate against the cloud CA in its own store, not against the system's certificates, and checks that it is valid for the address called. The member key is sent as before, inside the TLS connection. A call to a server with no HTTPS address goes to its API address over plain HTTP.
 
@@ -171,9 +171,13 @@ Any server answers reads. A write sent to a server that is not the leader is ref
 http://10.0.0.11:8443 is not the leader; sending the request to http://10.0.0.12:8443
 ```
 
-It does this only when the leader's address has the same scheme as the one `pi` was given, so a token sent over `https` is never repeated over `http`; otherwise it prints the refusal. Within one command `pi` remembers that address and sends the rest of its requests there, so a `--wait` that follows a write reads from the server that took it. It does not remember it into the next command. To save the extra request, point `pi` at the leader (`pi cluster status` shows which server that is). Other clients have to follow the address themselves, or go through a proxy that sends traffic to whichever server reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
+It does this only when the leader's address has the same scheme as the one `pi` was given, so a token sent over `https` is never repeated over `http`; otherwise it prints the refusal. Within one command `pi` remembers that address and sends the rest of its requests there, so a `--wait` that follows a write reads from the server that took it. It does not remember it into the next command. The same rule covers the answer that says a body is too large to carry: `pi` opens the file again and sends it to the leader whole. To save the extra request, point `pi` at the leader (`pi cluster status` shows which server that is). Other clients have to follow the address themselves, or go through a proxy that sends traffic to whichever server reports `"leader": true` on `/cluster`. The proxy's check needs an admin token.
+
+Every answer of a server that does not lead names the leader in an `x-pistack-leader` response header, the unauthenticated `GET /healthz` included; the leader's own answers and those of a single server carry none, and a follower that does not know the leader yet sends none. `pi` puts an address through the same checks a refusal's address must pass, so it never follows a token from `https` to `http`. It uses that before a long upload: for a file over 8 MiB it asks the server it was given who leads and sends the upload straight there, rather than streaming a body the follower cannot hold. A follower's own copy of the store can trail a write for a moment. A write's answer carries `x-pistack-commit`, and before it exits `pi` asks the server it was given once to hold a request until its store has applied that entry, so a read through that server sees the write. The wait is a favour, not a promise: a server that will not catch up within three seconds answers normally and the command is none the worse.
 
 A client that cannot go to another address asks the server to do it. With the header `X-PiStack-Forward: leader`, a server that does not lead carries the request to the leader over the same link the servers use between themselves, and hands back the leader's answer. The token goes with the request and the leader checks it as usual. After a write the server waits, up to two seconds, for its own copy to reach that write, so a read sent to it next already shows the change. The console sends this header on every request, so it works the same on any server. A body over 8 MiB is not carried: the answer names the leader instead. The leader's audit record of a carried request shows the client's address, the one the carrier saw, and names the server that carried it beside it. The client's address travels in a header only the carrier's peer key makes count: a server takes these headers off anything that is not another server of the cluster, so a client cannot put an address of its own into a record.
+
+An S3 client has no header it can put on a request, and a JSON refusal tells a client that reads XML nothing. A write that lands under `/silo` on a follower is therefore carried whether or not anyone asked. What the follower cannot hold is refused in the object store's own shape: `503` with `<Code>SlowDown</Code>`, naming the server that would take it. The limit is the same 8 MiB, and a default multipart part fits under it.
 
 A carried request keeps the headers the client sent. Only the ones belonging to the connection it leaves are taken off — the hop-by-hop headers, and any name a `Connection` line asks to drop — and the carrier's own three. Everything else arrives as it was sent, repeats and all, because a client that signed a header checks it on the far side. `Host` follows that rule with one twist. An S3 request signed under `/silo`, by header or by presigned query, is signed over the address the client meant, and the leader is the server that checks it. A client that had that address would have gone to the leader itself, so the leader cannot work it out; the carrier passes on the one the client sent. Nothing else carries a `Host`: a bearer token says who the caller is without help from the name, and a caller must not be able to choose the address the leader answers under. So `curl --aws-sigv4` works against any server of the cluster with that header, whether the request has a body or not, while a signed request sent without it is still refused with the leader's address to try.
 
@@ -181,7 +185,9 @@ Agents do follow. An agent that loses its server tries the other servers it know
 
 ### Durability of a write
 
-Today the leader commits a write to its own store and answers the client. Followers pull the entry afterwards, normally within a fraction of a second. If the leader's disk is lost before a follower has pulled, that write is gone. Pull request [PIndustries/pistack#103](https://github.com/PIndustries/pistack/pull/103) changes this so that a write in a cluster with more than one voter waits for a majority of voters. It is not merged yet.
+In a cluster with more than one voter the leader answers a write only once a majority of voters holds it. The leader applies and logs the entry, then holds the response until enough followers have pulled past it; a follower's pull names the index it has applied, so an acknowledgement follows a write in milliseconds. A candidate needs a log at least as current as a majority's to win, so the next leader holds every write that was answered. A write no majority confirms within five seconds is answered `503`: it is in the leader's log and may still take effect, so read before retrying. A cluster of one voter confirms alone.
+
+Object bytes are held to the same shape and not the same rule: a put is answered once one other server says it has fetched and checked them. See [Storage](Storage#object-storage).
 
 ## Failover
 
@@ -197,6 +203,7 @@ During failover:
 - Reads keep working on any server that is up.
 - Running machines are not touched. Hosts keep running what they have.
 - Reconcilers stop on the old leader and start on the new one.
+- A volume on `local` or `lvm` stops working: its bytes are on the disk of the server that made it, and the new leader does not hold them. See [Storage](Storage#which-server-holds-a-volume). Object bytes and multipart staging are on the other servers and carry on.
 
 A restarted server finds its existing store and comes back as a follower. It asks the other voters who leads and catches up from the log. No flags are needed beyond the usual `--listen`.
 

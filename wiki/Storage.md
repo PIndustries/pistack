@@ -2,7 +2,7 @@
 
 Four modules deal with storage: `slab` for block volumes, `mold` for images, `silo` for objects, and `shelf` for shared filesystems.
 
-One fact shapes all of them today. Image files, local volume files, object data and share directories live on the control-plane server's local disk, under its data directory. They are not replicated between servers and not copied to hosts. The replicated store holds only the records. Until distribution is built, a setup that works end to end is one machine running both the server and the agent, or hosts that mount the server's data directory at the same path, or Ceph for volumes.
+One fact shapes all of them today. Image files, local volume files, object data and share directories live on the control-plane server's local disk, under its data directory. They are not replicated between servers and not copied to hosts. The replicated store holds only the records. Object bytes are the exception: every server keeps a copy of what it lacks, and a put is confirmed only once another server holds the bytes. Until distribution is built for the rest, a setup that works end to end is one machine running both the server and the agent, or hosts that mount the server's data directory at the same path, or Ceph for volumes.
 
 ## Volumes
 
@@ -31,7 +31,21 @@ pi volume create db --type fast --size 100
 
 Any backend also accepts `fs_type` (default `ext4`), the filesystem made on a blank volume when it is attached to a pod.
 
-The backend commands run in the server process, not on the host. For `local` and `lvm` the server then gives the agent a path on the server's own filesystem. That only works when the agent is on the same machine or sees the same path. `rbd` volumes are network disks and do not have this restriction. The server does not use `sudo` for LVM, so it needs permission to run the LVM tools itself.
+The backend commands run in the server process, not on the host. For `local` and `lvm` the volume is on the disk of the one server that made it, and the server then gives the agent a path on that server's own filesystem. That only works when the agent is on the same machine or sees the same path. `rbd` volumes are network disks and do not have this restriction. The server does not use `sudo` for LVM, so it needs permission to run the LVM tools itself.
+
+### Which server holds a volume
+
+A `local` or `lvm` volume records the node whose disk holds it as `status.home_node`. It attaches there and nowhere else: an attach asked for on another node is refused before anything is recorded, and the error names both nodes. An `rbd` volume has no home node.
+
+A machine is placed where its volumes can attach by naming them at create:
+
+```sh
+pi machine create db --image ubuntu-24.04 --size m.2x4 --near-volume data
+```
+
+`--near-volume` is repeatable and attaches nothing. It only steers placement: the machine goes to the home node of every volume it names, and stays `pending` with a message naming the volume and the node when that node is not a usable host or the volumes sit on different nodes. A name that matches no volume, and an `rbd` volume, do not limit placement. Attach afterwards with `pi volume attach`.
+
+A server that does not hold the bytes, a new leader after a failover, fails a snapshot, extend, backup or restore of such a volume and names the node that does. A delete there removes the record and leaves the file, so the volume can still be deleted once that node is gone. A volume made before the node was recorded is adopted by the server that finds its file.
 
 ### Attaching
 
@@ -59,11 +73,11 @@ pi volume create data3 --size 20 --source-volume data
 
 Snapshots are real on all three backends: a file copy, an LVM snapshot, or a protected RBD snapshot. A volume with snapshots cannot be deleted until they are.
 
-Creating a volume from a snapshot or from another volume copies the data on the `local` backend only. On `lvm` and `rbd` the new volume comes out blank. Do not rely on restore-from-snapshot or clone on those backends yet.
+A volume made from a snapshot or from another volume carries the source's data on all three backends: a file copy on `local`, a thin snapshot of the origin on `lvm`, and `rbd clone` or `rbd cp` on `rbd`.
 
 `pi volume create --image NAME` fills a new volume from an image. It needs `qemu-img` on the server, and the image must be a disk image, not a container image.
 
-Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check. Restoring a backup works for `local` and `lvm` volumes and not for `rbd`.
+Backups stream a volume into a `silo` bucket as one object, with a SHA-256 check. Restoring writes the bytes back: onto the file or the LVM device from byte 0, and on `rbd` through `rbd import` into a second image that replaces the volume's image only once the import has finished cleanly. A volume with snapshots is not restored over; restore into a new volume instead.
 
 ```sh
 pi backup create nightly --volume data --bucket backups
@@ -73,7 +87,7 @@ pi backup restore nightly --volume data2
 pi backup delete nightly --yes
 ```
 
-The bucket has to exist already: `pi api POST /silo/buckets -d '{"name":"backups"}'`. A new backup is `pending` while its bytes are uploaded and `ready` once they are stored; `--wait` holds until then. A restore needs a `ready` backup and returns only when the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
+The bucket has to exist already: `pi bucket create backups`, or `pi api POST /silo/buckets -d '{"name":"backups"}'`. A new backup is `pending` while its bytes are uploaded and `ready` once they are stored; `--wait` holds until then. A restore needs a `ready` backup and returns only when the volume's bytes match the stored checksum. Without `--volume` it makes a new volume named after the backup, in the source volume's type and size.
 
 Volumes can grow and cannot shrink. The `--encrypted` flag is stored on the volume and has no effect.
 
@@ -134,32 +148,63 @@ There is no image distribution yet. When a machine starts, the server sends the 
 
 `silo` serves an S3-compatible API at `/silo` on the API port. Addressing is path-style only: `http://server:8443/silo/<bucket>/<key>`. The region is `pistack`.
 
-Objects are files on the server's disk under `<data_dir>/silo`. There is one copy. Nothing is replicated to other servers.
+Objects are files under `<data_dir>/silo` on the server that took the put. Every other control-plane server copies them: it pulls what it lacks in the background, and a read that finds the record without the bytes fetches them from a peer and checks size and SHA-256 before serving. A put is not answered until one other server says it holds the bytes.
+
+That wait is `[modules.silo] put_copies`, default 2 servers. With `1` a put is answered as soon as this server has the bytes. A put whose bytes no other server takes is answered `503` and says the object is stored on this server only; it is kept and copied later, so read before retrying. A cluster of one server waits for nobody.
+
+Multipart staging is copied the same way. CreateMultipartUpload and UploadPart are answered only once another server holds the upload's metadata or the part, after checking the part's length and MD5, and every server pulls the uploads it lacks in the background. An upload in flight therefore survives a change of leader: the new leader has the parts and completes it. A part sent twice under the same number is settled by the copy written later.
 
 Requests are authenticated with a bearer token, or with AWS Signature Version 4 using an access key from `pi access-key create`. See [Identity and access](Identity-and-access).
 
 Buckets and objects also have native API and CLI commands: `pi bucket` for the buckets, `pi object` for the keys inside one. A get without `--out` streams the bytes to stdout, and a put streams the file up.
 
+An S3 client can write through any server of the cluster. There is no header an S3 client can put on a request to ask to be carried, so a write that lands under `/silo` on a server that does not lead is taken to the leader by that server and the leader's answer handed back. The signature is checked at the leader against the address the client signed for. What a follower cannot hold in memory is refused in S3's own shape: `503` with `<Code>SlowDown</Code>`, naming the server that would take it, and the limit is 8 MiB. `pi` avoids the detour: before streaming a file over 8 MiB it asks the server it was given who leads, and sends the upload there.
+
+### Buckets
+
+A bucket belongs to the project that made it and names one region, `pistack`. `pi bucket create NAME` makes one, and `--versioning` makes it keep generations. Names share one namespace across the cloud: a name already taken in another project is refused. Through S3, `CreateBucket` answers `200` with a `Location` of `/<bucket>`, answers the same again for a name the caller already holds, and answers `409 BucketAlreadyExists` for one held elsewhere. A `CreateBucketConfiguration` body is checked against the payload hash the caller declared and then ignored; no location is applied.
+
+A bucket can be deleted only when nothing is left in it: no key, no unfinished multipart upload, and no older generation or delete marker under any key. `pi bucket delete`, `DELETE /silo/buckets/{id}` and S3 `DeleteBucket` all refuse a bucket that still holds something with `BucketNotEmpty`.
+
+`spec.versioning` is a flag. On a bucket with it, writing a key again keeps the previous bytes under `.blobs`, addressed by their SHA-256, and keeps the older record as one more generation of the key. A `versionId` on the wire is that record's generation number as a decimal string; there is no separate version identity.
+
+A plain delete on a versioned bucket hides the key rather than taking it. It writes a delete marker as the key's newest generation: a record at the next number, size 0, no checksum, no bytes on disk. Everything under the marker stays where it is.
+
+- A read of the key answers `404` with `x-amz-delete-marker` and the marker's version.
+- An older generation still reads with `?versionId=`.
+- Deleting the marker by its `versionId` brings the key back.
+- A put under a marker restores the key at the next generation.
+- A second plain delete, with a marker already current, takes the key and everything under it whole.
+- `ListObjectVersions` lists markers among the versions, newest first within a key.
+
+On a bucket without versioning a delete takes the key whole, as it always did. The same rule holds for the native `DELETE /silo/buckets/{id}/objects/{key}`, since both reach the key through one door. Volume backups and image storage write into buckets they make with versioning off, so their deletes are unaffected. The native surface reads a key's current generation only: generations, markers and the versioning flag are read and set on the S3 surface.
+
+Usage is counted in buckets per project. There is no limit on object bytes: silo keeps no running total per bucket or project, so a project can be limited in buckets and not in what it stores in them.
+
 ### What is implemented
 
 - `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects`
 - `CopyObject`
+- `CreateBucket`, `DeleteBucket`, `HeadBucket`
 - `ListObjectsV2`, with prefix and delimiter
+- `ListObjectVersions`: every generation of every key, with prefix, `max-keys`, and `key-marker` with `version-id-marker` to page inside a key
+- `GetBucketVersioning` and `PutBucketVersioning` (`?versioning`). `Enabled` turns generations on, `Suspended` turns them off. The store has one flag, so a suspended bucket is answered as one that never had versioning: no `Status` element.
 - Range reads on `GetObject`: `bytes=a-b`, `bytes=a-` and `bytes=-n`, answered with 206 and `Content-Range`. A range past the end is 416 `InvalidRange`; a multi-range or malformed header is ignored and the whole object is returned.
 - Multipart upload: create, upload part, upload part copy, complete, abort, list parts, list uploads
 - SigV4 in the header, presigned URLs (up to seven days), and chunked uploads
 
 ### What is not
 
-- Bucket operations through S3. `CreateBucket`, `DeleteBucket` and `ListBuckets` are not there. Create buckets with `pi bucket create`, or through the native API: `pi api POST /silo/buckets -d '{"name":"backups"}'`.
+- `ListBuckets`. List buckets with `pi bucket list`, or `pi api GET /silo/buckets`.
 - `ListObjects` version 1.
 - ACLs, bucket policies, lifecycle rules, tagging, CORS, server-side encryption.
-- Reading old versions. A bucket can keep earlier generations of an object, but there is no call to fetch one.
+- A `versionId` on a copy source. `CopyObject` and `UploadPartCopy` take the current generation only.
+- Reading a delete marker as an object: a `GET` or `HEAD` naming a marker by `versionId` is `405 MethodNotAllowed`.
 - SigV4A.
 
-Limits: 5 GiB per single `PutObject`, parts of at least 5 MiB, 10,000 parts per upload, 1,000 keys per list page and per `DeleteObjects` request. Unfinished multipart uploads are removed after seven days. The object size limit, the multipart lifetime and the region can be changed in `[modules.silo]`; see the [Configuration reference](Configuration-reference).
+Limits: 5 GiB per single `PutObject`, parts of at least 5 MiB, 10,000 parts per upload, 1,000 keys per list page and per `DeleteObjects` request, and 8 MiB for a body carried by a server that does not lead. Unfinished multipart uploads are removed after seven days, counted from the upload's creation, by the leader. The object size limit, the multipart lifetime and the region can be changed in `[modules.silo]`; see the [Configuration reference](Configuration-reference).
 
-An S3 client has to be set to path-style addressing, given `http://<server>/silo` as its endpoint and `pistack` as its region, and must not try to create the bucket itself.
+An S3 client has to be set to path-style addressing, given `http://<server>/silo` as its endpoint and `pistack` as its region. It can create and remove buckets.
 
 ## Shared filesystems
 
@@ -176,9 +221,15 @@ pi share access allow home --cidr 10.0.1.0/24 --mode write
 | NFS | A directory under `<data_dir>/shares` is created and exported to the share's CIDR. The server rewrites `/etc/exports.d/pistack.exports` and runs `exportfs -ra`. | An NFS server and `exportfs` on the control-plane machine. |
 | CephFS | `ceph fs subvolume create` on the filesystem named in `PISTACK_CEPH_FS`. | The `ceph` command and that variable. |
 
+Only the server that leads touches a share. A follower makes no directory, writes no export line and records no status; when it is promoted it reconciles every share on the next pass.
+
+An export line carries the client CIDR and these options: `ro` or `rw`, `sync`, `no_subtree_check`, `all_squash`, and `anonuid`/`anongid` at one pair. `rw` is given only where the share allows that CIDR in mode write. Every client is squashed to that pair, so the share directory is owned by it and is mode `0770` with setgid: `rws` so a file one client writes is still writable by the next. The pair is nobody/nogroup, `65534`, unless `PISTACK_SHELF_SQUASH_UID` names another. Owner and mode are applied on every pass, so a directory that drifted is corrected without recreating the share. A server that cannot `chown` keeps exporting and says so in the log.
+
 A server that is not root runs the export step through `sudo -n` and the helper named in `PISTACK_SHELF_HELPER`. Install `scripts/pistack-shelf-helper` as `/usr/local/sbin/pistack-shelf-helper`; its header has the sudoers line.
 
-An NFS share with no CIDR, or a CephFS share when `ceph` or `PISTACK_CEPH_FS` is missing, stays `pending`. The size of an NFS share is recorded and not enforced.
+An NFS share with no CIDR, or a CephFS share when `ceph` or `PISTACK_CEPH_FS` is missing, stays `pending`. The size of a share is recorded and not enforced: an NFS share is a plain directory with no quota on it.
+
+A ready NFS share says where to mount. `status.export` holds `<address>:<path>`, the address being the API host of the server that exports it. `pi share show` prints the record, with that field in it, and `pi share list -o wide` has an `EXPORT` column; the plain table has none. A share lives on that one server: its directory and its export line are local to it, and a change of leader does not move either. `PISTACK_EXPORT_ADDRESS` overrides the address for anything that runs `shelf` outside the server process.
 
 `pi share access allow` and `deny` change one client rule. The API takes the whole spec, so the commands read the share, edit its list and write it back with `If-Match` on the revision they read; a share that moved in between is refused rather than overwritten.
 
