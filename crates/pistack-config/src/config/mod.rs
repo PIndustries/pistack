@@ -4,8 +4,8 @@
 //! The `Config` tree and the loader that builds it from a TOML file and
 //! `PISTACK__*` environment overrides.
 
-mod config_load;
 mod config_error;
+mod config_load;
 mod constants;
 mod example_toml;
 mod log_config;
@@ -16,8 +16,8 @@ mod tests;
 mod tls_config;
 mod tls_paths;
 
-pub use config_load::Config;
 pub use config_error::ConfigError;
+pub use config_load::Config;
 pub use constants::DEFAULT_PATHS;
 pub use constants::ENV_CONFIG_PATH;
 pub use constants::ENV_PREFIX;
