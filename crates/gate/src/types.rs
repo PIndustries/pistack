@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 pub const KIND_BINDING: &str = "rb";
 /// Id kind for API keys.
 pub const KIND_KEY: &str = "key";
+/// Id kind for stored identity providers (gate-private).
+pub const KIND_PROVIDER: &str = "idp";
 
 /// Built-in role names. `authorize` in `policy.rs` knows these three.
 pub const ROLE_ADMIN: &str = "admin";
@@ -123,10 +125,34 @@ pub enum PrincipalKind {
     ServiceAccount,
 }
 
+/// The one account a single identity provider vouches for.
+///
+/// The pair is the whole of it: the provider that signed the token, and the
+/// `sub` claim inside it. Nothing else identifies an external user — not a
+/// name, which an account may already hold for some other reason, and not an
+/// email address, which a provider does not own and an administrator may have
+/// typed into any account.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalIdentity {
+    /// The provider's id, not its name: a provider renamed keeps the accounts
+    /// already bound to it.
+    pub provider: Id,
+    /// The token's `sub`, exactly as the token carries it.
+    pub subject: String,
+}
+
+impl ExternalIdentity {
+    /// Does this pair name the same external account as `other`?
+    pub fn is(&self, provider: &Id, subject: &str) -> bool {
+        self.provider == *provider && self.subject == subject
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrincipalSpec {
     #[serde(default)]
     pub kind: PrincipalKind,
+    /// Display only. Never used to find an account for a sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     /// Argon2id PHC string. Never returned by the API; handlers redact it.
@@ -137,6 +163,16 @@ pub struct PrincipalSpec {
     /// Project a token is scoped to when the login does not name one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_project: Option<Id>,
+    /// How the account was created. `None` is a local account with its own
+    /// password. A name set here belongs to an identity provider: the user
+    /// has no password of their own and password login is refused for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
+    /// The external account this one is. `Some` when a provider created the
+    /// account or an administrator linked it to one; sign-in from a provider
+    /// finds the account by this and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalIdentity>,
 }
 
 impl Default for PrincipalSpec {
@@ -147,6 +183,8 @@ impl Default for PrincipalSpec {
             password_hash: None,
             enabled: true,
             default_project: None,
+            auth_source: None,
+            external: None,
         }
     }
 }
@@ -266,6 +304,68 @@ impl ApiKey {
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.spec.expires_at.is_some_and(|t| t <= now)
     }
+}
+
+// ---- IdentityProvider ------------------------------------------------------
+
+/// One `(role, project)` pair a group can be mapped to. `project` is a
+/// project name; a binding made from it is scoped to that project. A `None`
+/// project grants the role at system scope.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupBinding {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentityProviderSpec {
+    /// The issuer URL, exactly as it appears in the token's `iss` and as the
+    /// base for `/.well-known/openid-configuration`.
+    pub issuer: String,
+    /// Client id: the value the token's `aud` must contain.
+    pub client_id: String,
+    /// The claim that names the user. Defaults to `email`.
+    #[serde(default = "default_name_claim")]
+    pub name_claim: String,
+    /// The claim holding group names, when groups are mapped to roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_claim: Option<String>,
+    /// Group name -> bindings to apply on sign-in. Absent means no mapping.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub group_map: BTreeMap<String, Vec<GroupBinding>>,
+    /// Create a principal on first sign-in when no account matches the name.
+    #[serde(default)]
+    pub create_unknown: bool,
+}
+
+impl Default for IdentityProviderSpec {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            client_id: String::new(),
+            name_claim: default_name_claim(),
+            groups_claim: None,
+            group_map: BTreeMap::new(),
+            create_unknown: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IdentityProviderStatus {}
+
+resource!(
+    /// An OpenID Connect provider a client already holds an ID token from.
+    /// Managed by cloud admins only.
+    IdentityProvider,
+    IdentityProviderSpec,
+    IdentityProviderStatus,
+    KIND_PROVIDER
+);
+
+fn default_name_claim() -> String {
+    "email".to_owned()
 }
 
 fn default_true() -> bool {

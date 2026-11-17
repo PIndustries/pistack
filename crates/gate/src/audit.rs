@@ -151,6 +151,10 @@ pub struct Subject {
     pub principal_id: Option<Id>,
     pub api_key: Option<Id>,
     pub project: Option<Id>,
+    /// A login's outcome note: the provider an OIDC sign-in named, and the
+    /// reason a refusal was made. The API answer never carries the reason;
+    /// only this record does.
+    pub notes: BTreeMap<String, String>,
 }
 
 /// A read that is recorded like a write, because it returns a secret or
@@ -208,6 +212,7 @@ pub fn describe(method: &str, path: &str) -> (String, String, String) {
         ["identity", "tokens", "self", "switch"] => {
             ("switch_project".into(), "tokens".into(), String::new())
         }
+        ["identity", "oidc", "login"] => ("login".into(), "oidc".into(), String::new()),
         ["rpc", "agents", "enroll"] => ("enroll".into(), "agents".into(), String::new()),
         [_, kind] => (verb.into(), (*kind).into(), String::new()),
         [_, kind, id] => (verb.into(), (*kind).into(), (*id).into()),
@@ -259,7 +264,7 @@ pub fn record(store: &Store, e: Entry) {
         .caller
         .as_ref()
         .and_then(|c| c.project.clone())
-        .or(subject.project);
+        .or(subject.project.clone());
     if let Some((id, created_project)) = e.created {
         if resource.is_empty() {
             resource = id;
@@ -294,7 +299,7 @@ pub fn record(store: &Store, e: Entry) {
             carried_by: e.carried_by,
             status: e.status,
             request_id: e.request_id,
-            notes: BTreeMap::new(),
+            notes: subject.notes,
         },
         status: AuditStatus {},
     };
@@ -714,6 +719,7 @@ mod tests {
             format!("{a} {k} {r}")
         };
         assert_eq!(d("POST", "/identity/tokens"), "login tokens ");
+        assert_eq!(d("POST", "/identity/oidc/login"), "login oidc ");
         assert_eq!(d("POST", "/compute/machines"), "create machines ");
         assert_eq!(d("DELETE", "/compute/machines/web"), "delete machines web");
         assert_eq!(d("POST", "/compute/hosts/rack1/drain"), "drain hosts rack1");
