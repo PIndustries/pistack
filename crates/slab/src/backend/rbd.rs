@@ -401,7 +401,7 @@ impl BlockBackend for RbdBackend {
         let id = vol_id(vol)?;
         let spec = format!("{pool}/{id}");
         let bin = super::configured_bin(ENV_BIN, "rbd");
-        BackupStream::spawn(&bin, &["export".into(), spec, "-".into()], "rbd export")
+        BackupStream::spawn(&bin, &["export".into(), spec, "-".into()], "rbd export").await
     }
 
     async fn open_restore(&self, vol: &Volume) -> ApiResult<RestoreStream> {
@@ -471,6 +471,7 @@ impl BlockBackend for RbdBackend {
             "rbd import",
             after,
         )
+        .await
     }
 }
 
@@ -543,7 +544,11 @@ async fn run_out(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<Stri
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let finished = tokio::time::timeout(TIMEOUT, cmd.output()).await;
+    let finished = tokio::time::timeout(
+        TIMEOUT,
+        super::spawn_retry::spawn_retrying_busy_async(|| cmd.output()),
+    )
+    .await;
     let output = match finished {
         Err(_) => return Err(ApiError::unavailable(format!("{bin} timed out after 30s"))),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -590,7 +595,11 @@ async fn run_copy(bin: &str, args: &[String]) -> ApiResult<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let finished = tokio::time::timeout(COPY_TIMEOUT, cmd.output()).await;
+    let finished = tokio::time::timeout(
+        COPY_TIMEOUT,
+        super::spawn_retry::spawn_retrying_busy_async(|| cmd.output()),
+    )
+    .await;
     let output = match finished {
         Err(_) => {
             return Err(ApiError::unavailable(format!(

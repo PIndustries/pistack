@@ -414,7 +414,11 @@ async fn run(bin: &str, args: &[String], missing_ok: bool) -> ApiResult<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let finished = tokio::time::timeout(TIMEOUT, cmd.output()).await;
+    let finished = tokio::time::timeout(
+        TIMEOUT,
+        super::spawn_retry::spawn_retrying_busy_async(|| cmd.output()),
+    )
+    .await;
     let output = match finished {
         Err(_) => return Err(ApiError::unavailable(format!("{bin} timed out after 30s"))),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
