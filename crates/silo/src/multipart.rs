@@ -772,7 +772,9 @@ pub(crate) fn validate_upload_id(id: &str) -> ApiResult<()> {
 pub fn s3_err(code: &str, message: impl Into<String>) -> ApiError {
     let message = message.into();
     let status_code = match code {
-        "NoSuchUpload" | "NoSuchKey" | "NoSuchBucket" => ApiError::not_found(message),
+        "NoSuchUpload" | "NoSuchKey" | "NoSuchBucket" | "NoSuchVersion" => {
+            ApiError::not_found(message)
+        }
         "EntityTooLarge"
         | "EntityTooSmall"
         | "InvalidPart"
