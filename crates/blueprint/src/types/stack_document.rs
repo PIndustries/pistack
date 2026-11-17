@@ -5,9 +5,7 @@
 use pistack_types::{ApiError, ApiResult};
 use std::collections::BTreeMap;
 
-use super::kit_spec::KitSpec;
 use super::parameter_decl::ParameterDecl;
-use super::stack_spec::StackSpec;
 use super::template::{declared_uses, given, names, push, substitute, PARAM_PREFIX};
 
 /// A stack spec: the document, the parameters it declares, and the values
@@ -111,35 +109,5 @@ pub trait StackDocument {
         self.check_refs()?;
         Ok(substitute(self.document(), self.declared(), self.values())?
             .unwrap_or_else(|| self.document().to_owned()))
-    }
-}
-
-impl StackDocument for StackSpec {
-    fn document(&self) -> &str {
-        &self.document
-    }
-    fn declared(&self) -> &[ParameterDecl] {
-        &self.declared
-    }
-    fn values(&self) -> &BTreeMap<String, String> {
-        &self.parameters
-    }
-    fn declared_mut(&mut self) -> &mut Vec<ParameterDecl> {
-        &mut self.declared
-    }
-}
-
-impl StackDocument for KitSpec {
-    fn document(&self) -> &str {
-        &self.document
-    }
-    fn declared(&self) -> &[ParameterDecl] {
-        &self.declared
-    }
-    fn values(&self) -> &BTreeMap<String, String> {
-        &self.parameters
-    }
-    fn declared_mut(&mut self) -> &mut Vec<ParameterDecl> {
-        &mut self.declared
     }
 }

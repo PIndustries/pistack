@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use super::kit_kind::KIT_KIND;
 use super::parameter_decl::ParameterDecl;
+use super::stack_document::StackDocument;
 use super::stack_status::StackStatus;
 use pistack_types::Resource;
 
@@ -28,6 +29,21 @@ pub struct KitSpec {
 
 impl Spec for KitSpec {
     const KIND: &'static str = KIT_KIND;
+}
+
+impl StackDocument for KitSpec {
+    fn document(&self) -> &str {
+        &self.document
+    }
+    fn declared(&self) -> &[ParameterDecl] {
+        &self.declared
+    }
+    fn values(&self) -> &BTreeMap<String, String> {
+        &self.parameters
+    }
+    fn declared_mut(&mut self) -> &mut Vec<ParameterDecl> {
+        &mut self.declared
+    }
 }
 
 /// Observed phase for a kit. Same phases as a stack; a kit keeps no

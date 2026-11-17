@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::parameter_decl::ParameterDecl;
+use super::stack_document::StackDocument;
 
 /// What the user asked to apply.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,4 +26,19 @@ pub struct StackSpec {
 
 impl Spec for StackSpec {
     const KIND: &'static str = kind::STACK;
+}
+
+impl StackDocument for StackSpec {
+    fn document(&self) -> &str {
+        &self.document
+    }
+    fn declared(&self) -> &[ParameterDecl] {
+        &self.declared
+    }
+    fn values(&self) -> &BTreeMap<String, String> {
+        &self.parameters
+    }
+    fn declared_mut(&mut self) -> &mut Vec<ParameterDecl> {
+        &mut self.declared
+    }
 }
