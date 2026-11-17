@@ -18,7 +18,7 @@ These work on every command.
 | `--profile <NAME>` | `PI_PROFILE` | Profile to use. Default: the one `pi profile use` picked. |
 | `--url <URL>` | `PI_URL` | API URL. Overrides the profile. |
 | `--token <TOKEN>` | `PI_TOKEN` | Bearer token. Overrides the profile. |
-| `--project <PROJECT>` | `PI_PROJECT` | Project scope for `pi login`. Overrides the profile. |
+| `--project <PROJECT>` | `PI_PROJECT` | Project scope; overrides the profile. It sets the scope a command runs in; `pi login` takes the token's project from `--scope-project`, and `pi binding create` wants `--in-project` or `--system`. |
 | `--insecure` | | Skip TLS certificate verification. |
 | `-o, --output <OUTPUT>` | | `table` (default), `wide`, `json`, `yaml` or `name`. |
 | `--no-headers` | | Omit the header row in table output. |
@@ -32,7 +32,7 @@ These work on every command.
 | `list` | `--all`, `-l, --selector <K=V>` | List. `--all` asks for every project (admin). `-l` filters by label and can be repeated. |
 | `show <NAME>` | | Show one resource. Use `-o yaml` or `-o json` for the full record. |
 | `create <NAME>` | per noun, below | Create. |
-| `delete <NAME>` | `-y, --yes`, `--wait` | Delete. Asks for confirmation unless `--yes`. `--wait` returns when the resource is gone. |
+| `delete <NAME>` | `-y, --yes`, `--wait` | Delete. Asks for confirmation unless `--yes`. `--wait` returns when the resource is gone. Not every noun's `delete` takes both; the tables below name the ones that differ. |
 
 The tables below list only the arguments and options that are specific to a command. An empty meaning is an option the tool prints no help text for.
 
@@ -62,7 +62,7 @@ pi completion <SHELL>
 | --- | --- | --- |
 | `login` | `<URL>` | API URL, e.g. https://cloud.example:8443 |
 | `login` | `--name <NAME>` | Principal name |
-| `login` | `--password-stdin` | Read the password from stdin instead of prompting |
+| `login` | `--password-stdin` | Read the password from stdin instead of prompting. Without a terminal this is the only way: the command stops and says so |
 | `login` | `--scope-project <PROJECT>` | Project to scope the token to (name or id) |
 | `login` | `--ttl <TTL>` | Token lifetime in seconds |
 | `api` | `<METHOD>` | HTTP method |
@@ -517,6 +517,37 @@ pi network set <NAME> --auto-floating-ip <BOOL>
 | `network set` | `<NAME>` | Name or id |
 | `network set` | `--auto-floating-ip <BOOL>` | Turn automatic floating IPs from this external network on or off. Turning it off leaves the floating IPs already given in place [possible values: true, false] |
 
+## pi vpc
+
+VPCs and the subnets cut from them. A VPC is a set of address blocks with a router of its own; networks live inside it and subnets are cut from its blocks. See [Networking](Networking).
+
+```text
+pi vpc list
+pi vpc show <NAME>
+pi vpc create --cidr <CIDR> <NAME>
+pi vpc delete <NAME>
+pi vpc subnet list <VPC>
+pi vpc subnet create --cidr <CIDR> <VPC> <NAME>
+pi vpc subnet delete <VPC> <SUBNET>
+```
+
+| Command | Argument or option | Meaning |
+| --- | --- | --- |
+| `vpc create` | `<NAME>` | Name the VPC is filed under |
+| `vpc create` | `--description <DESCRIPTION>` |  |
+| `vpc create` | `--label <K=V>` | Label `key=value` (repeatable) |
+| `vpc create` | `--cidr <CIDR>` | Address block the space is made of (repeatable, at least one), e.g. 10.0.0.0/16. Subnets are cut from these |
+| `vpc create` | `--external-network <NET>` | External network: where traffic leaves and floating IPs are drawn from (name or id) |
+| `vpc create` | `--dns-domain <DOMAIN>` | DNS domain handed to a subnet on this VPC's networks that sets none |
+| `vpc subnet list` | `<VPC>` | The VPC (name or id) |
+| `vpc subnet create` | `<VPC>` | The VPC (name or id) |
+| `vpc subnet create` | `<NAME>` | Name the subnet is filed under |
+| `vpc subnet create` | `--cidr <CIDR>` | A full CIDR (e.g. 10.0.1.0/24), or a prefix length (`24` or `/24`) for the next free block of that size in the VPC |
+| `vpc subnet delete` | `<VPC>` | The VPC (name or id) |
+| `vpc subnet delete` | `<SUBNET>` | The subnet (name or id) |
+
+`vpc delete` takes the VPC and everything under it. A subnet made through `pi vpc subnet` lives on a network of its own inside the VPC, and `pi vpc subnet delete` removes both. A project has five VPCs by default; see [Concepts](Concepts#quotas).
+
 ## pi subnet
 
 Subnets.
@@ -751,6 +782,7 @@ pi object delete <BUCKET> <KEY>
 | `object get` | `--out <FILE>` | Write to this file instead of stdout |
 | `object delete` | `-y, --yes` | Do not ask for confirmation |
 
+A put of more than 8 MiB to a server that does not lead goes to the leader: `pi` asks the server it was given who leads and sends the file there. A write a follower carries comes back with the log entry it was held at, and `pi` then asks that server once to catch its copy up, for at most three seconds, before the command exits.
 
 ## pi image
 
