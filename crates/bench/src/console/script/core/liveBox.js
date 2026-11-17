@@ -8,9 +8,11 @@ liveBox.addEventListener("change", () => {
 setInterval(() => {
   if (!liveBox.checked || document.hidden || !token()) return;
   if (document.getElementById("shell").hidden) return;
-  // What is open stays open: a machine, a host, an open limits or roles
-  // panel, a form being filled in.
-  if (openMachine || openHost || openProject || openUser || formOpen[current]) return;
+  // A form being filled in, or a one-time secret on screen, holds the reload.
+  // An open machine page no longer does: it is reloaded soft, keeping its tab
+  // and leaving an open console pane (and its websocket) in place. An open host
+  // page still holds: it has no soft pass, so a tick would fully redraw it.
+  if (openHost || openProject || openUser || formOpen[current]) return;
   // A panel is held open by what is on screen, not only by what the state
   // remembers: a click that has not finished drawing still counts.
   if (panelHeld()) return;
