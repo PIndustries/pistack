@@ -26,6 +26,8 @@ use crate::types::{Snapshot, Volume};
 pub(crate) const ENV_QEMU_IMG: &str = "PISTACK_QEMU_IMG_BIN";
 const QEMU_IMG_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+mod spawn_retry;
+
 pub mod local;
 pub mod lvm;
 pub mod rbd;
@@ -222,20 +224,22 @@ impl BackupStream {
 
     /// Spawn `bin args…` and read its stdout. Stderr is drained so a noisy
     /// command cannot fill the pipe and stall the export.
-    pub(crate) fn spawn(bin: &str, args: &[String], label: &'static str) -> ApiResult<Self> {
+    pub(crate) async fn spawn(bin: &str, args: &[String], label: &'static str) -> ApiResult<Self> {
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ApiError::unavailable(format!("{label} is not available"))
-            } else {
-                ApiError::internal(format!("{label}: {e}"))
-            }
-        })?;
+        let mut child = spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ApiError::unavailable(format!("{label} is not available"))
+                } else {
+                    ApiError::internal(format!("{label}: {e}"))
+                }
+            })?;
         let stdout = child
             .stdout
             .take()
@@ -360,7 +364,7 @@ impl RestoreStream {
 
     /// Spawn `bin args…` and write the restore to its stdin. `after` runs
     /// once the command has exited with success.
-    pub(crate) fn spawn(
+    pub(crate) async fn spawn(
         bin: &str,
         args: &[String],
         label: &'static str,
@@ -372,13 +376,15 @@ impl RestoreStream {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ApiError::unavailable(format!("{label} is not available"))
-            } else {
-                ApiError::internal(format!("{label}: {e}"))
-            }
-        })?;
+        let mut child = spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ApiError::unavailable(format!("{label} is not available"))
+                } else {
+                    ApiError::internal(format!("{label}: {e}"))
+                }
+            })?;
         let stdin = child
             .stdin
             .take()
@@ -540,7 +546,11 @@ pub(crate) async fn run_qemu_img(src: &Path, args: &[String]) -> ApiResult<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let finished = tokio::time::timeout(QEMU_IMG_TIMEOUT, cmd.output()).await;
+    let finished = tokio::time::timeout(
+        QEMU_IMG_TIMEOUT,
+        spawn_retry::spawn_retrying_busy_async(|| cmd.output()),
+    )
+    .await;
     let output = match finished {
         Err(_) => {
             return Err(ApiError::unavailable(format!(
