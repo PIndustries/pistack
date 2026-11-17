@@ -337,15 +337,15 @@ async fn clean_remote(id: &Id, address: &str, user: &str, pass: &Path) -> ApiRes
     let Some(bin) = clean_bin() else {
         return Ok(());
     };
-    let output = tokio::process::Command::new(&bin)
-        .arg(id.to_string())
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg(id.to_string())
         .arg(address)
         .arg(user)
         .arg(pass.as_os_str())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stderr(std::process::Stdio::piped());
+    let output = crate::spawn_retry::output_retrying_busy(&mut cmd)
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

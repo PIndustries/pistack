@@ -779,9 +779,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let out = Command::new(bin)
-        .args(args)
-        .output()
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    let out = crate::spawn_retry::output_retrying_busy(&mut cmd)
         .await
         .map_err(|e| ApiError::unavailable(format!("{bin} is not installed ({e})")))?;
     if !out.status.success() {
@@ -1101,8 +1101,10 @@ fn rbd_info_args(disk: &RbdDisk) -> Vec<String> {
 async fn probe_rbd(disk: &RbdDisk) -> ApiResult<()> {
     let bin = rbd_bin();
     let args = rbd_info_args(disk);
-    let child = Command::new(&bin).args(&args).kill_on_drop(true).output();
-    match tokio::time::timeout(Duration::from_secs(30), child).await {
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args).kill_on_drop(true);
+    let run = crate::spawn_retry::output_retrying_busy(&mut cmd);
+    match tokio::time::timeout(Duration::from_secs(30), run).await {
         Ok(Ok(out)) if out.status.success() => Ok(()),
         Ok(Ok(out)) => {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -1389,18 +1391,18 @@ pub async fn migrate(domain: &str, dest_uri: &str) -> ApiResult<()> {
     let bin =
         std::env::var_os("PISTACK_VIRSH").unwrap_or_else(|| std::ffi::OsString::from("virsh"));
     let shown = bin.to_string_lossy();
-    let child = Command::new(&bin)
-        .args([
-            "migrate",
-            "--live",
-            "--p2p",
-            "--tunnelled",
-            domain,
-            dest_uri,
-        ])
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(Duration::from_secs(60), child).await {
+    let mut cmd = Command::new(&bin);
+    cmd.args([
+        "migrate",
+        "--live",
+        "--p2p",
+        "--tunnelled",
+        domain,
+        dest_uri,
+    ])
+    .kill_on_drop(true);
+    let run = crate::spawn_retry::output_retrying_busy(&mut cmd);
+    match tokio::time::timeout(Duration::from_secs(60), run).await {
         Ok(Ok(out)) if out.status.success() => Ok(()),
         Ok(Ok(out)) => {
             let err = String::from_utf8_lossy(&out.stderr);

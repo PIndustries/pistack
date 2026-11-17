@@ -48,8 +48,8 @@ pub(in crate::runtime::youki) async fn run_detach(
     cmd.process_group(0);
     arm_user_ns_join(&mut cmd, join_user_ns);
     let program = command_program(bin, mode);
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
         .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
     let mut group = GroupKill::arm(child.id());
     let timeout = youki_timeout();

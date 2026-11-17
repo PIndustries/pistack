@@ -39,8 +39,8 @@ pub(in crate::runtime::youki) async fn run_exec(
         Privilege::Sudo { sudo } => sudo.display().to_string(),
         Privilege::Root | Privilege::Rootless { .. } => bin.display().to_string(),
     };
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
         .map_err(|e| ApiError::unavailable(format!("youki runtime: cannot run {program}: {e}")))?;
     let mut group = GroupKill::arm(child.id());
     let stdout = spawn_reader(child.stdout.take(), output_cap);

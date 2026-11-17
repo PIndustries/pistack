@@ -30,14 +30,16 @@ pub(in crate::runtime::volfs) async fn exec(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = cmd.spawn().map_err(|err| {
-        ApiError::unavailable(format!(
-            "{} is not installed ({}: {err}){}",
-            bin.display(),
-            program.display(),
-            privilege_hint()
-        ))
-    })?;
+    let child = crate::spawn_retry::spawn_retrying_busy(|| cmd.spawn())
+        .await
+        .map_err(|err| {
+            ApiError::unavailable(format!(
+                "{} is not installed ({}: {err}){}",
+                bin.display(),
+                program.display(),
+                privilege_hint()
+            ))
+        })?;
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(err)) => Err(ApiError::unavailable(format!(
