@@ -22,7 +22,8 @@ Running real workloads across several hosts is still being built. Images and loc
 - [Agents and hosts](Agents-and-hosts): joining a host, runtimes.
 - [Networking](Networking): the fabric backends and what each needs.
 - [Storage](Storage): volumes, images, object storage, shares.
-- [Identity and access](Identity-and-access): principals, tokens, keys.
+- [Stacks and parameters](Stacks-and-parameters): one document for a whole service, with values you fill in.
+- [Identity and access](Identity-and-access): principals, tokens, keys, OpenID Connect sign-in.
 - [Metrics and alarms](Metrics-and-alarms): usage of hosts and machines, the Prometheus endpoint, alarms.
 - [CLI reference](CLI-reference): every `pi` command.
 - [Configuration reference](Configuration-reference): flags and environment variables.

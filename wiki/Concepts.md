@@ -65,7 +65,7 @@ Some resources are cloud-wide and have no project: hosts, sizes, roles, principa
 
 ### Quotas
 
-A project's quotas are a map of resource name to limit. A name with no entry is unlimited. A request that would take the project over a limit is refused with `403` and the code `quota_exceeded`. The message names the resource, what is used, what was asked for and the limit, and `details` carries the same four values:
+A project's quotas are a map of resource name to limit. A name with no entry is unlimited, except `vpcs`: a project with no limit set for it gets five. A request that would take the project over a limit is refused with `403` and the code `quota_exceeded`. The message names the resource, what is used, what was asked for and the limit, and `details` carries the same four values:
 
 ```json
 {"error": {"code": "quota_exceeded",
@@ -82,7 +82,9 @@ A project's quotas are a map of resource name to limit. A name with no entry is 
 | `snapshots` | Volume snapshots | A snapshot is created |
 | `backups` | Volume backups | A backup is created |
 | `backups_gib` | For every backup, the size of the volume it was taken from | A backup is created |
-| `networks`, `subnets`, `routers` | Networks, subnets, routers | One is created |
+| `networks` | Networks | One is created |
+| `vpcs` | VPCs | One is created |
+| `subnets`, `routers` | Subnets, routers | One is created |
 | `security_groups` | Security groups, without the project's `default` group | A group is created |
 | `ports` | Ports, without the ports a router makes for itself | A port is created |
 | `floating_ips` | Floating IPs | One is allocated |
@@ -91,7 +93,7 @@ A project's quotas are a map of resource name to limit. A name with no entry is 
 | `buckets` | Buckets | A bucket is created |
 | `secrets`, `certificates`, `access_keys` | Secrets, certificates, access keys | One is created |
 
-`secrets`, `certificates` and `access_keys` are the only ones with a limit when the project sets none. Their defaults are in `[modules.keep]`; see the [Configuration reference](Configuration-reference).
+`vpcs` has a limit when the project sets none: five. An admin raises it or clears it. `secrets`, `certificates` and `access_keys` have defaults too; theirs are in `[modules.keep]`; see the [Configuration reference](Configuration-reference).
 
 A system admin sets limits. Anyone with a role in the project can read its limits and usage.
 
@@ -136,7 +138,7 @@ The server is built from modules. Each one owns its resource kinds and is the on
 | `gate` | `/identity` | Principals, projects, roles, role bindings, tokens, API keys, quotas |
 | `forge` | `/compute` | Machines (virtual machines, containers, bare metal), sizes, hosts, the scheduler |
 | `loom` | `/loom` | Pods, deployments, services, jobs, ingresses, stateful sets, daemon sets, autoscalers |
-| `fabric` | `/network` | Networks, subnets, ports, routers, security groups, floating IPs |
+| `fabric` | `/network` | Networks, subnets, ports, routers, security groups, floating IPs, VPCs |
 | `slab` | `/volume` | Block volumes, snapshots, backups, volume types |
 | `mold` | `/image` | Images |
 | `silo` | `/silo` | Object storage with an S3 API |
@@ -149,7 +151,7 @@ The server is built from modules. Each one owns its resource kinds and is the on
 | `bench` | `/console` | The `pi` CLI and the web console |
 | `anvil` | none | The host agent. It runs inside `pistack agent`, not the server. |
 
-`pi modules` prints the first fourteen rows from a running server.
+`pi modules` prints the rows from a running server. `anvil` has no prefix and is not one of them.
 
 Two other path groups are not modules: `/rpc` is the agent transport, and `/cluster` is used between control-plane servers.
 

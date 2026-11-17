@@ -1,6 +1,6 @@
 # Identity and access
 
-The `gate` module owns principals, projects, roles, role bindings, tokens and API keys. The `keep` module owns access keys and join tokens. Identity is built in; there is no external identity provider to connect.
+The `gate` module owns principals, projects, roles, role bindings, tokens and API keys. The `keep` module owns access keys and join tokens. Identity is built in; a cloud can also sign users in with OpenID Connect, through external identity providers registered by an admin.
 
 ## How a request is authenticated
 
@@ -37,6 +37,8 @@ pi user list
 Only an admin can create, list or delete principals. A principal can change its own password and email. Passwords are stored as argon2id hashes.
 
 A password being set is measured then, not later: at least 12 characters, and not the principal's name in any case. A password already stored is verified as it was stored, so a password set before the rule keeps working at sign-in. A refusal says which of the two the password failed. `PISTACK_ADMIN_PASSWORD` is measured the same way, and a server told to found itself with a password too short to keep says so and does not start.
+
+An account that belongs to an identity provider has no password of its own. A password login for it is answered exactly as a wrong password is: counted, and refused with `invalid credentials`. The account is signed in through its provider instead.
 
 A service account is a principal for a program. It is meant to authenticate with an API key instead of a password.
 
@@ -156,6 +158,8 @@ Both counts are in one server's memory, not in the store: every server keeps its
 
 Both counts are bounded in memory, so a caller inventing names or addresses cannot grow a server's tables past `MAX_NAMES` and `MAX_COUNTS`; a name or address that is tried again after its table has been walked past is simply counted afresh.
 
+An OIDC sign-in is not counted against these walls. An ID token is not a guessable secret, as an API key is not.
+
 A single token cannot be cancelled. The server keeps no list of the tokens it has issued, so there is nothing to mark. What you can do is refuse every token one user holds:
 
 ```sh
@@ -222,6 +226,98 @@ curl -s -X POST http://10.0.0.11:8443/identity/tokens \
 ```
 
 Pass the token to `pi` with `--token` or `PI_TOKEN`. `pi key delete` revokes the key and every token exchanged from it.
+
+## Signing in with OpenID Connect
+
+A cloud admin can register an external identity provider and sign its users in with an OpenID Connect ID token. This is the token check only: the web console has no sign-in through a provider, and `pi` has no command for it. Everything below is the API, with a cloud admin's token.
+
+### Registering a provider
+
+```sh
+curl -s -X POST http://10.0.0.11:8443/identity/providers \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{
+    "name": "corp",
+    "description": "corporate SSO",
+    "issuer": "https://id.corp.example",
+    "client_id": "pistack",
+    "name_claim": "email",
+    "groups_claim": "groups",
+    "group_map": {"devs": [{"role": "member", "project": "research"}]},
+    "create_unknown": false,
+    "labels": {"tier": "prod"}
+  }'
+```
+
+`issuer` and `client_id` are required. The issuer must be an HTTPS URL; plain HTTP is accepted only to `127.0.0.1` or `localhost`, for a test issuer. A provider stored with an issuer gate could never reach is refused at create. `name_claim` names the claim that labels a user and defaults to `email`. `groups_claim` holds group names, and `group_map` maps a group name to a list of `{role, project}` bindings; a binding with no project is system-wide. `create_unknown`, off by default, lets an unknown subject get a new account at sign-in. A name already taken is a `409`.
+
+Providers are read with `GET /identity/providers` and `GET /identity/providers/{id}`, by name or id. Every provider action is a cloud-admin permission. There is no update: delete the provider and register it again.
+
+`DELETE /identity/providers/{id}` is refused while any account is linked to it:
+
+```text
+provider 'corp' still has 2 account(s) linked to it; unlink them first
+```
+
+Unlink the accounts first, while the provider is still there to be named. The delete clears the provider's cached keys with the row.
+
+### Signing in
+
+`POST /identity/oidc/login` takes a provider and an ID token the client already holds, and answers exactly what a password login answers: a token, its type, its expiry and the caller.
+
+```sh
+curl -s -X POST http://10.0.0.11:8443/identity/oidc/login \
+  -H 'content-type: application/json' \
+  -d '{"provider": "corp", "id_token": "eyJhbGciOiJSUzI1..."}'
+```
+
+The login is unauthenticated: the ID token is the credential. Nothing is counted against the password walls.
+
+Gate finds the provider's keys through its discovery document, fetched over HTTPS and cached per provider for ten minutes. If a token names a key the cache does not hold, the key set is refetched once and verification is tried again, which is what carries a provider's key rotation.
+
+What is checked on the token, in order:
+
+- The algorithm is `RS256` or `ES256`. `none`, every HMAC algorithm and every other algorithm fail before a key is consulted.
+- The signature verifies against the key the token's `kid` names, out of the provider's key set.
+- `iss` matches the provider's issuer and `aud` its client id. `exp` and, when present, `nbf` are checked against the clock with 60 seconds of leeway. `iss`, `aud`, `exp` and `sub` are required claims.
+- When the name claim is `email` and the token carries `email_verified`, it must be true. A token that leaves the claim out is accepted.
+
+### Which account a token signs in to
+
+An outside identity is the provider and the token's `sub`, and nothing else. A token is never matched to an account by a name or an email address: a provider that vouches for `admin@anywhere` does not hand out the local `admin`, because a name is a label an account may hold for any reason and an address is something the provider does not own.
+
+- An account bound to the pair is the account. A bound service account and a disabled user are refused.
+- With `create_unknown` off, a subject no account is bound to is refused.
+- With it on, the subject gets a new account: a user with no roles and no password, marked as belonging to the provider. Its name is the name claim's value cleaned to a legal resource name, or the subject when the claim carries nothing; when that name is held, `name-2`, `name-3` and so on follow. The name is a label and picks nothing.
+- The token's name-claim value, when the provider names users by email, is stored on a new account for display only.
+
+Every refusal is the same answer, `401` with `the identity token was not accepted`, whether the provider is unknown, the token will not verify, the subject matches nobody or the account is disabled. Only the audit record says which check failed.
+
+### The group map
+
+When a provider sets `groups_claim`, the groups named in the token are read at sign-in and each one in `group_map` adds its bindings, before the token is minted, so a newly granted role is in the token the user leaves with.
+
+Only bindings the account does not already hold are added, and a sign-in never removes a binding. A group that maps to a role or a project the cloud does not have is skipped rather than failing the sign-in, so a provider renaming a group cannot lock a user out.
+
+### Linking an existing account
+
+Linking is the only way an existing account becomes reachable by an OIDC sign-in, and it is always an admin's explicit act. Both directions are audited.
+
+```sh
+curl -s -X POST http://10.0.0.11:8443/identity/identities \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"user": "alice", "provider": "corp", "subject": "1084"}'
+```
+
+`user` is a principal name or id, `provider` a provider name or id, `subject` the `sub` the provider's tokens carry for the person. An account carries at most one pair and a pair belongs to at most one account; both halves are checked, and a conflict names what is already linked. Linking a pair the account already carries answers as it stands.
+
+```sh
+curl -s -X POST http://10.0.0.11:8443/identity/identities/remove \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"provider": "corp", "subject": "1084"}'
+```
+
+The unlink names the pair being let go of, not the user; the account is found from the pair. A pair nobody holds answers `{"external": null, "unlinked": false}`, so a retried unlink is not a failure.
 
 ## Access keys
 
@@ -343,7 +439,7 @@ The server keeps an audit log in the store. It replicates with everything else a
 
 One record is written after the response for:
 
-- every request that changes something: `POST`, `PUT`, `PATCH` and `DELETE` on any module, a login (`POST /identity/tokens`), and removing a control-plane server;
+- every request that changes something: `POST`, `PUT`, `PATCH` and `DELETE` on any module, a login (`POST /identity/tokens`, or an OIDC sign-in at `POST /identity/oidc/login`), and removing a control-plane server;
 - three reads that hand out a secret or control of a resource: a secret's payload, a certificate's private key and a machine console ticket;
 - an agent enrolling with a join token.
 
@@ -364,6 +460,7 @@ Each record holds:
 | `kind`, `resource` | The collection in the path (`machines`, `bindings`, `hosts`) and the resource as the request named it, by id or by name. For a create, the id of what was made. |
 | `status` | The HTTP status of the answer. |
 | `request_id` | The `x-request-id` of the request, the same one the server log shows. |
+| `notes` | What a module adds beyond the outcome: for a sign-in refused through a provider, the provider and the reason; for a link or unlink, the action, the provider, the subject and the user. Never a payload or a credential. |
 
 Request bodies, query strings and headers are never stored, so a record cannot hold a password, a token or a secret value.
 

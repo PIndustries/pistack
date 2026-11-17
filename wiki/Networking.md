@@ -280,7 +280,7 @@ A pool spreads new connections by its `algorithm`, on TCP and HTTP alike.
 
 Anything else is refused when the pool is created or updated. A member that is down, draining or weighted zero is never picked under any algorithm. `session_persistence` is stored and ignored; `source_ip` is the algorithm, not persistence.
 
-`pi lb` covers balancers, and the listeners, pools and members under them; see the [CLI reference](CLI-reference.md#pi-lb). Services and ingresses in `loom` create balancers for you.
+`pi lb` covers balancers, and the listeners, pools and members under them; see the [CLI reference](CLI-reference#pi-lb). Services and ingresses in `loom` create balancers for you.
 
 ## DNS
 

@@ -149,7 +149,7 @@ See [Metrics and alarms](Metrics-and-alarms).
 | --- | --- | --- |
 | `PISTACK_FABRIC_BACKEND` | saved choice, else `mock` | `mock`, `hostnat`, `overlay` or `ovn`. See [Networking](Networking). |
 | `PISTACK_OVN_NB` | `unix:/var/run/ovn/ovnnb_db.sock` | OVN northbound database, `unix:` or `tcp:`. |
-| `PISTACK_OVN_GATEWAY_CHASSIS` | empty | Comma-separated gateway chassis names, in priority order. |
+| `PISTACK_OVN_GATEWAY_CHASSIS` | empty | Comma-separated gateway chassis names, in priority order. Without it, gateway ports go to the ready hosts that report a bridge mapping. |
 | `PISTACK_RELAY_BACKEND` | follows the fabric | `mock` or `forward`. Any other value stops the server. |
 | `PISTACK_DNS_LISTEN` | `<private listen address>:5353`, else `127.0.0.1:5353` | DNS listener. `host:port`, or several separated by commas. |
 | `PISTACK_METADATA_LISTEN` | `127.0.0.1:18880` | Instance metadata listener. `0.0.0.0` is refused. |
@@ -187,6 +187,8 @@ Setting any `PISTACK_KEEP_VAULT_*` variable without `PISTACK_KEEP_BACKEND=vault`
 | `PISTACK_EXPORTS_FILE` | `/etc/exports.d/pistack.exports` | The NFS exports file the server manages. |
 | `PISTACK_EXPORTFS` | `exportfs` on `PATH` | `exportfs` binary. |
 | `PISTACK_SHELF_HELPER` | none | Privileged helper for a server that is not root. |
+| `PISTACK_SHELF_SQUASH_UID` | `65534` | The uid and gid every NFS client arrives at, root included. The share directory is owned by it. Set it when the machine calls `nobody` something else. |
+| `PISTACK_EXPORT_ADDRESS` | the host of the server's public URL | The address a ready share reports in `status.export`, as `pi share show` prints it. Set it when clients reach the exporting server under another address. |
 | `PISTACK_SHELF_RETRY_MS` | `5000` | Share reconcile interval. |
 | `PISTACK_SHELF_BACKOFF_MS` | `5000` | Base retry delay after a failed export, capped at 300 seconds. |
 | `PISTACK_CEPH_BIN` | `ceph` on `PATH` | `ceph` binary for CephFS shares. |
@@ -212,6 +214,8 @@ Setting any `PISTACK_KEEP_VAULT_*` variable without `PISTACK_KEEP_BACKEND=vault`
 | `PISTACK_VIRSH` | `virsh` | `virsh` binary. |
 | `PISTACK_LIBVIRT_DIR` | `/var/lib/libvirt/images/pistack` | Where virtual machine disks are kept. |
 | `PISTACK_FIP_BIN` | `/usr/local/sbin/pistack-fip` | Helper used to turn on metadata redirection for the libvirt bridge. |
+| `PISTACK_QEMU_IMG` | `qemu-img` | `qemu-img` binary, on the host, for filling and checking guest disks. |
+| `PISTACK_CLOUD_LOCALDS` | `cloud-localds` | `cloud-localds` binary, for the cloud-init seed. |
 | `PISTACK_RBD_BIN` | `rbd` | `rbd` binary used to check RBD disks. |
 
 ### Containers
@@ -249,6 +253,17 @@ Setting any `PISTACK_KEEP_VAULT_*` variable without `PISTACK_KEEP_BACKEND=vault`
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PISTACK_OVERLAY_BIN` | `/usr/local/sbin/pistack-overlay` | The overlay helper. |
+
+### OVN on a host
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PISTACK_OVN_BRIDGE_MAPPINGS` | none | `physnet:bridge` pairs, for example `physnet1:br-ex`, written to the host's Open vSwitch database as `ovn-bridge-mappings`. A host with the uplink needs it to host a router's gateway port. The bridge itself is the operator's to create. |
+| `PISTACK_OVN_SUDO` | off | `1`, `true` or `yes`: an agent that is not root runs `ovs-vsctl` and `ovn-appctl` through `sudo -n`. |
+| `PISTACK_OVN_APPCTL_BIN` | `ovn-appctl` | `ovn-appctl` binary. |
+| `PISTACK_OVS_VSCTL_BIN` | `ovs-vsctl` | `ovs-vsctl` binary. |
+
+The server hands the southbound address (`PISTACK_OVN_SB`, `tcp:` or `ssl:`) and the tunnel type (`PISTACK_OVN_ENCAP_TYPE`, `geneve` unless set) to every agent in the hello answer; with no southbound address set an agent changes nothing and the operator sets the host up by hand. See [Networking](Networking).
 
 ## Environment variables: helper scripts
 
