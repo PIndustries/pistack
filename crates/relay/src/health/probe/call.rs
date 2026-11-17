@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! One probe and its result, bounded by the monitor's timeout.
+//! One probe, bounded by the monitor's timeout.
 
-use super::probe_inner::probe_inner;
+use super::super::probe_inner::probe_inner;
+use super::result::Probe;
 use crate::types::HealthMonitor;
 use std::net::SocketAddr;
 use std::time::Duration;
-
-/// Result of one probe.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Probe {
-    Up,
-    Down(String),
-}
 
 /// Probe one member with the monitor's settings.
 pub async fn probe(addr: SocketAddr, hm: &HealthMonitor) -> Probe {

@@ -4,14 +4,15 @@
 //! The routes, and the three kinds that get them from [`crud`]. Members are
 //! wired by hand because a member is reached through its pool.
 
-use super::create_member::create_member;
-use super::delete_member::delete_member;
-use super::get_member::get_member;
-use super::info::info;
-use super::list_members::list_members;
-use super::list_pool_members::list_pool_members;
-use super::require_caller::require_caller;
-use super::update_member::update_member;
+use super::super::create_member::create_member;
+use super::super::delete_member::delete_member;
+use super::super::get_member::get_member;
+use super::super::info::info;
+use super::super::list_members::list_members;
+use super::super::list_pool_members::list_pool_members;
+use super::super::require_caller::require_caller;
+use super::super::update_member::update_member;
+use super::by_balancer::by_balancer;
 use crate::client::Client;
 use crate::types::{kinds, Balancer, BalancerSpec, Listener, ListenerSpec, Pool, PoolSpec};
 use axum::extract::{Extension, Path, Query, State};
@@ -20,31 +21,16 @@ use axum::middleware;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Json;
-use pistack_types::{ApiResult, Caller, Id, Kind, ListQuery, Page};
+use pistack_types::{ApiResult, Caller, Id, ListQuery, Page};
 
-use super::body::{Create, ScopeQuery, Update};
-use super::created::created;
-use super::if_match::if_match;
-use super::meta::{apply_meta, new_meta};
-use super::page::page;
-use super::scope::{create_project, scope};
-use super::visible::visible;
+use super::super::body::{Create, ScopeQuery, Update};
+use super::super::created::created;
+use super::super::if_match::if_match;
+use super::super::meta::{apply_meta, new_meta};
+use super::super::page::page;
+use super::super::scope::{create_project, scope};
+use super::super::visible::visible;
 
-/// Listeners and pools both belong to a balancer, so both can be listed
-/// through one of them by name or id.
-fn by_balancer<K: Kind>(
-    c: &Client,
-    project: Option<&Id>,
-    sq: &ScopeQuery,
-    items: &mut Vec<K>,
-    balancer_of: fn(&K) -> &Id,
-) -> ApiResult<()> {
-    if let Some(b) = &sq.balancer {
-        let lb = c.balancers().resolve(project, b)?;
-        items.retain(|k| balancer_of(k) == &lb.meta.id);
-    }
-    Ok(())
-}
 use pistack_types::kind;
 
 pub fn router(client: Client) -> axum::Router {

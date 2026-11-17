@@ -1,46 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! In-memory provider: records every call, allocates VIPs from a private
-//! range, serves every `spec.provider`. Tests assert on [`MockProvider::calls`].
+//! The in-memory provider: records every call, allocates VIPs from a
+//! private range, serves every `spec.provider`.
 
-use super::{LbProvider, ListenerView, Realized};
+use super::super::{LbProvider, ListenerView, Realized};
+use super::call::Call;
+use super::state::State;
 use crate::types::{Balancer, Provider};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use pistack_types::{ApiError, ApiResult, Id};
-use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Call {
-    EnsureBalancer {
-        balancer: Id,
-        vip: IpAddr,
-    },
-    DeleteBalancer(Id),
-    EnsureListener {
-        balancer: Id,
-        listener: Id,
-        port: u16,
-        pool: Option<Id>,
-        /// `address:port` of every member that should take traffic.
-        members: Vec<String>,
-    },
-    DeleteListener {
-        balancer: Id,
-        listener: Id,
-    },
-}
-
-#[derive(Default)]
-struct State {
-    calls: Vec<Call>,
-    vips: BTreeMap<Id, IpAddr>,
-    next: u32,
-    /// When set, every call fails with this message.
-    fail: Option<String>,
-}
 
 #[derive(Default)]
 pub struct MockProvider {
