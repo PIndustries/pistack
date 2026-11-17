@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-pub(super) static RECONCILE_FAILURES: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+pub(super) static RECONCILE_FAILURES: Mutex<BTreeMap<&'static str, u64>> =
+    Mutex::new(BTreeMap::new());
 
 /// Failures counted so far, by module. A module that has had none is not
 /// listed.
