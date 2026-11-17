@@ -24,8 +24,8 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 ## Control plane
 
-- **A write is durable on the leader only.** The leader answers before any follower has the entry. Losing the leader's disk at the wrong moment loses the write. Also addressed by #103.
-- **Only `pi` follows the leader.** A write sent to a follower is refused with `409` and the leader's address. `pi` sends it again to that address, once. Any other client has to do the same itself, and `pi` does not follow an address on a different scheme than the one it was given.
+- **A write is confirmed before it is answered, but the answer can still say no.** In a cluster with more than one voter the leader holds the answer until a majority of voters holds the entry, and a write no majority confirms within five seconds is answered `503`. The entry is in the leader's log by then and may still take effect, so a retry can apply it twice. There is no way to ask whether a write that was refused took. See [Running a cluster](Running-a-cluster#durability-of-a-write).
+- **Only `pi` asks to be carried to the leader.** A write sent to a follower is refused with `409` and the leader's address. `pi` sends it again to that address, once, and can ask a follower to carry the request for it. Any other client has to do the same itself, and `pi` does not follow an address on a different scheme than the one it was given. A body over 8 MiB is not carried: the answer names the leader instead. An S3 write is the exception; it is carried without being asked, to the same 8 MiB.
 - **At most three voters.** Further servers are learners. Two servers give one voter and one learner, with no failover.
 - **Removing a server needs a leader.** When the majority of voters is gone there is no leader, and the dead servers cannot be removed.
 - **Removal does not revoke secrets.** A removed server's store still holds the member key. The others refuse it by the id it states.
@@ -39,7 +39,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Restore rolls back the store only.** Machines and volumes made after the backup are unknown to the restored store, and deleted ones are back in it. What the control plane does about the difference with the hosts has not been tested.
 - **Servers do not compare schema versions.** Each store checks its own. A release that raises the version needs every server stopped and upgraded together.
 - **Discovery is IPv4 and one /24.** It only runs when `--listen` is a private IPv4 address.
-- **Only the store is replicated.** Images, local volumes, objects and shares are files on one server's disk.
+- **Only the store and object bytes are replicated.** Images, local volume files and share directories are files on one server's disk. Object bytes are copied to the other servers, and a volume on `local` or `lvm` stays on the one server that holds it.
 - **The config file is mostly not applied.** Only `[modules.silo]` and `[modules.keep]` are read.
 - **No watch API.** Clients poll.
 - **Metrics have no history.** A server keeps the last 240 points of each series in memory, for at most an hour, and loses them when it restarts. History needs a Prometheus server scraping `/metrics`. See [Metrics and alarms](Metrics-and-alarms).
@@ -55,13 +55,12 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 - **Cloud Hypervisor and bare metal are not selectable.** The runtimes are in the source, and the agent never picks them. A machine of kind `metal` is only placed on a mock host.
 - **Hosts cannot be removed.** A host that is gone for good stays in the list.
 - **Drain only moves running virtual machines on libvirt hosts whose machine disks are shared.** Containers, pods, bare metal, stopped machines and machines whose disks are on the host itself are reported and left where they are.
-- **Live migration does not copy disks.** It only works when the destination host already sees the machine's disk at the same path. A failed migration leaves the machine in phase `error` on the old host, still running.
-- **A machine whose disks are local to its host is not drained or migrated.** The agent says whether its machine disk directory is on an NFS or SMB mount, and the answer is `local` unless it says otherwise. A machine on such a host is listed by `pi host drain` with that reason, and a migrate call for it is refused. Mount the disk directory where every host can see it and the host reports `shared` at its next hello. See [Agents and hosts](Agents-and-hosts#host-maintenance).
+- **Live migration does not copy disks.** It only works when the destination host already sees the machine's disk at the same path. A migration that the host refuses, or that never answers, leaves the machine `ready` where it was with `migrate did not happen:` and the host's words as its message. Another drain tries it again.
+- **A machine whose disks are local to its host is not drained or migrated.** The agent says whether its machine disk directory is on an NFS or SMB mount, and the answer is `local` unless it says otherwise. A machine on such a host is listed by `pi host drain` with that reason, and a migrate call for it is refused. A machine with a volume on a backend the hosts do not share is listed the same way. Mount the disk directory where every host can see it and the host reports `shared` at its next hello. See [Agents and hosts](Agents-and-hosts#host-maintenance).
 - **Evacuating a host loses root disks.** A root disk is a file on its host. An evacuated machine starts from its image, and `pi host evacuate` moves nothing without `--rebuild-from-image`.
 - **Fencing needs power control.** An evacuation only proves a host is off through its BMC when a cloud admin has set `pi host power set` on it. Without power control, evacuation relies on `--confirm-dead`, and a host that is only cut off from the control plane runs its machines twice until its agent reports again.
 - **A machine with a local or LVM volume is not evacuated.** The volume was on the dead host.
 - **Pods pinned to a host by a volume are not drained or evacuated.**
-- **The web console has no host controls.** Label, disable, drain and evacuate are in `pi` and the API only.
 - **Free capacity is bookkeeping.** It is the reported total minus what was placed, not a measurement. What a host really uses is reported as metrics and does not feed the scheduler.
 - **Only libvirt machines report usage.** Containers, cloud-hypervisor guests and bare metal have no CPU, memory, disk or network series.
 - **Container images are not pulled from registries.** An OCI image has to be uploaded as a tarball.
@@ -69,14 +68,17 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 ## Storage
 
 - **No image distribution.** The agent is given a file path on the server. It works when the agent runs on the server machine, when the path is a shared mount, or when images are staged on each host by hand.
-- **Local and LVM volumes are tied to the server machine** for the same reason. RBD volumes are not.
-- **Snapshot restore and clone are blank on LVM and RBD.** A volume created from a snapshot or from another volume only contains the data on the `local` backend.
-- **Backups of RBD volumes cannot be restored.**
+- **Local and LVM volumes work only while the server that holds them leads.** Such a volume records the node whose disk holds it and attaches there and nowhere else. After a failover the new leader has the record but not the bytes: a snapshot, extend, backup or restore of the volume fails and names the node that holds it, and a delete there drops the record and leaves the file behind. Nothing moves the bytes to the new leader. `pi machine create --near-volume` places a machine on the node that holds the volumes it names; an `rbd` volume has no home node and is not affected. See [Storage](Storage#which-server-holds-a-volume).
+- **A volume cannot be resized below its size or below its source.** A volume made from a snapshot or another volume has to be at least as large as the source, and extend only grows.
 - **Volume encryption does nothing.** The flag is stored.
-- **Volumes cannot shrink.**
-- **Object storage keeps one copy on one server.** No replication, no erasure coding.
-- **The S3 API is partial.** No bucket operations through S3, no `ListObjects` v1, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption. Path-style addressing only.
-- **NFS share sizes are not enforced.**
+- **The LVM and RBD backends have not been run against real storage.** The commands they issue are checked against scripts that log their arguments. Nothing here has been run against a Ceph cluster or a thin pool.
+- **Object bytes are copied, not spread.** Another server has to hold a copy before a put is answered, and the rest catch up in the background. There is no erasure coding and no second storage system behind the bytes; the copies are files on control-plane servers.
+- **The S3 API is partial.** No `ListBuckets`, no `ListObjects` v1, no ACLs, policies, lifecycle, tagging, CORS or server-side encryption, and no `versionId` on a copy source. Path-style addressing only. See [Storage](Storage#object-storage).
+- **A versioned bucket has no way back to off.** `Suspended` is answered as a bucket that never had versioning: generations already kept are still listed and still read by `versionId`, and a plain delete stops writing markers. The store keeps one flag, not a third state.
+- **A versioned bucket cannot be emptied in one call.** A plain delete leaves a marker, so the generations under it stay until each is deleted by its `versionId`, and until they are gone the bucket refuses `DeleteBucket`.
+- **Share sizes are not enforced.** An NFS share is a plain directory with no quota on it. A CephFS subvolume is created at the size asked for and nothing in PiStack checks a write against it.
+- **A share lives on the server that leads.** Its directory and its export line are local to that server and do not move on a failover; `status.export` names the address to mount. Followers neither export nor record status. See [Storage](Storage#shared-filesystems).
+- **Every NFS client is squashed.** Every managed export line carries `all_squash`, with `anonuid` and `anongid` at one pair. A client is never seen as its own user or as root. The share directory is owned by that pair with mode `0770` and setgid, so it is not readable by any other account on the server itself.
 - **No quota on object bytes.** A project can be limited in buckets and not in what it stores in them.
 - **An image upload is checked against `images_bytes` after it is received.** The size is not known before, so an upload that does not fit is stored and then deleted.
 
@@ -101,7 +103,7 @@ What does not work yet, as of `main`. Each item was read in the source or seen o
 
 ## CLI
 
-- **No commands for** certificate authorities, access keys, or join tokens. Use `pi api`.
+- **No commands for** certificate authorities. Use `pi api`.
 - **`--project` does not re-scope a token.** A token's project is fixed at login.
 - **`pi machine list --all` does not cross projects** for a token scoped to a project.
 - **Dev mode creates resources with no project** when no token is sent. They are invisible after you log in.

@@ -193,17 +193,19 @@ Drain never stops a machine. A machine it cannot move stays where it is, running
 
 - containers, pods and bare metal
 - a machine that is powered off or not `ready`
+- a machine that is being deleted, or a pod pinned to the host by its volumes
 - any machine when the host has no libvirt runtime
 - a machine whose root disk is a file on this host
+- a machine with a volume on a backend the hosts do not share
 - a machine no other host can take
 
 A migration takes time. The machine leaves the list when its new host reports it. Run the command again to see what is still on the host. Running it again is always safe: it does not start a second migration for a machine that is already moving.
 
-When a migration fails, the machine goes to phase `error` with the message from libvirt. It is still running on the old host.
+When a migration does not happen, the machine is `ready` where it was. Its message is `migrate did not happen:` and the host's reason, or that the host never answered. The guest was never proved to have stopped, so it is left on the host the control plane last heard from, reachable, and a later drain tries it again. A report from either host settles which one it is on.
 
 Live migration does not copy disks. The destination host must already see the machine's disk at the same path.
 
-The agent says whether the directory it writes machine disks into is on an NFS or SMB mount, and the host keeps that answer as the label `pistack.io/disk`. A host without that label set to `shared` is read as keeping its machine disks to itself, so nothing on it is asked to move. Mount the disk directory where every host can see it and the host reports `shared` at its next hello.
+The agent says whether the directory it writes machine disks into is on an NFS or SMB mount, and the host keeps that answer as the label `pistack.io/disk`. A host without that label set to `shared` is read as keeping its machine disks to itself, so nothing on it is asked to move. Only NFS and SMB read as shared; another shared filesystem reports `local` and its machines stay put. Mount the disk directory where every host can see it and the host reports `shared` at its next hello.
 
 When the work is done, `pi host enable agent1` puts the host back.
 
@@ -229,7 +231,7 @@ Because of that, no machine is evacuated unless you pass `--rebuild-from-image`.
 What happens to volumes:
 
 - A volume on shared storage (an `rbd` volume type) follows the machine. It is plugged into the machine again once the machine runs on its new host.
-- A volume on `local` or `lvm` storage lived on the dead host. A machine with one is skipped and named.
+- A volume on `local` or `lvm` storage lived on the dead host. A machine with one is skipped and named. A volume whose type the server cannot look up is treated as local: nothing says its data is anywhere but on the dead host.
 
 These are also skipped: bare metal machines, pods that are pinned to the host by their volumes, and machines that are being deleted or live-migrated.
 
