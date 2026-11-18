@@ -64,12 +64,9 @@ def parse_items(src):
             macro_rules_defs.append('\n'.join(lines[i:k+1]))
             i = k + 1
             continue
-        # type-defining macro calls: `resource!(...)`, `resource!{...}` etc.
+        # type-defining macro calls: `resource!(...)`, `resource_kind!(...)`, etc.
         mm = re.match(r'^(?:pub )?(\w+)\s*!\s*[\(\{\[]', lines[i])
-        if mm and mm.group(1) in ('resource', 'resources', 'spec_status',
-                                  'resource_with'):
-            kind = 'macro'
-            # the first identifier argument is the type name
+        if mm and mm.group(1) != 'macro_rules':
             block = []
             k = i; depth = 0; started = False
             while k < N:
@@ -83,13 +80,13 @@ def parse_items(src):
                     break
                 k += 1
             body = '\n'.join(block)
-            nm = re.search(r'!\s*\(?\s*(?://![^\n]*\n\s*)*(?:///[^\n]*\n\s*)*(\w+)', body)
-            name = nm.group(1) if nm else mm.group(1)
-            s = doc_back(i); e = k
-            items.append({'kind': 'macro', 'name': name, 'target': name,
-                          'start': s, 'end': e})
-            i = e + 1
-            continue
+            nm = re.search(r'!\s*\(?\s*((?://[/!][^\n]*\n\s*)*)\b([A-Z]\w*)', body)
+            typename = nm.group(2) if nm else None
+            if typename:
+                items.append({'kind': 'macro', 'name': typename, 'target': typename,
+                              'start': doc_back(i), 'end': k})
+                i = k + 1
+                continue
         m = re.match(r'^((?:pub(?:\([a-z]+\))? )?(?:pub )?(?:const |static )?(?:async )?)'
                      r'(fn|struct|enum|impl|trait|type|const|static|union|macro)\b(.*)',
                      lines[i])
@@ -220,17 +217,33 @@ def main():
         k = ub
         depth = 0
         block = []
+        # Collect every top-level `use`/`pub use` statement from the import
+        # header, allowing blank/comment lines to separate groups, until the
+        # first line that is not part of a use statement.
         while k < len(lines):
             l = lines[k]
+            s = l.strip()
+            if depth == 0:
+                # only start/continue the block on use lines (plus blanks/plain
+                # comments between groups), until the first item doc or decl.
+                if s == '' or s.startswith('//'):
+                    # an item doc comment (///) ends the import header
+                    if s.startswith('///'):
+                        break
+                    if block:
+                        block.append(l)
+                    k += 1
+                    continue
+                if not (s.startswith('use ') or s.startswith('pub use ')):
+                    break
             block.append(l)
             depth += l.count('{') - l.count('}') + l.count('(') - l.count(')')
             if depth <= 0 and l.rstrip().endswith(';'):
-                # peek: keep going only if next line still a use continuation
-                nxt = lines[k+1] if k+1 < len(lines) else ''
-                if nxt.startswith('use ') or nxt.startswith('pub use '):
-                    k += 1; continue
-                break
+                depth = 0
             k += 1
+        # drop trailing blanks
+        while block and block[-1].strip() == '':
+            block.pop()
         use_block = '\n'.join(block).strip('\n')
 
     # module doc comment: //! lines at top
@@ -285,6 +298,15 @@ def main():
         grp_sorted = sorted(grp, key=lambda x: x['start'])
         body = '\n\n'.join(body_of(i) for i in grp_sorted)
         written[fn] = body
+
+    # A child file must not share its directory's name (`client/client.rs`):
+    # rustc/clippy reject "module has the same name as its containing module".
+    dirname = os.path.basename(moddir.rstrip('/'))
+    if dirname in written and dirname != 'mod':
+        renamed = written.pop(dirname)
+        written[dirname + '_type'] = renamed
+        # remap the owning group so imports/re-exports follow.
+        groups[dirname + '_type'] = groups.pop(dirname)
 
     # imports for a file: references to other files' owned names
     file_names = {}  # filename -> set of public names it defines

@@ -1,120 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! `Client` is mold's core and the only writer of image `status`. HTTP
-//! handlers call it; `forge` and `slab` use [`Client::open`] and
-//! [`Client::resolve`] to boot from and populate volumes with images.
-
 use pistack_store::{Collection, Store, StoreError};
 use pistack_types::{ApiError, ApiResult, Caller, Id, Meta, Phase};
-use serde::Deserialize;
-use std::collections::BTreeMap;
-use std::io;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio_util::io::StreamReader;
 
 use crate::inspect;
 use crate::store::{ImageData, ImageStore, LocalDirStore};
 use crate::types::*;
 
-/// Body of `POST /images`.
-#[derive(Clone, Debug, Deserialize)]
-pub struct CreateImage {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub labels: BTreeMap<String, String>,
-    #[serde(default)]
-    pub annotations: BTreeMap<String, String>,
-    /// Admins may create on behalf of a project (or cloud-wide with `None`).
-    #[serde(default)]
-    pub project: Option<Id>,
-    pub spec: ImageSpec,
-}
-
-/// Body of `PUT /images/{id}`: metadata and the mutable spec fields.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct UpdateImage {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub labels: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    pub annotations: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    pub os: Option<String>,
-    #[serde(default)]
-    pub min_disk_gib: Option<u64>,
-    #[serde(default)]
-    pub min_ram_mib: Option<u64>,
-    #[serde(default)]
-    pub visibility: Option<Visibility>,
-}
+use super::create_image::CreateImage;
+use super::fetch_source::fetch_source;
+use super::not_found_to_none::not_found_to_none;
+use super::update_image::UpdateImage;
+use super::validate_name::validate_name;
+use super::validate_source_url::validate_source_url;
 
 #[derive(Clone)]
 pub struct Client {
-    store: Store,
-    blobs: Arc<dyn ImageStore>,
-}
-
-fn validate_name(name: &str) -> ApiResult<()> {
-    if name.is_empty() || name.len() > 128 {
-        return Err(ApiError::bad_request("name must be 1-128 characters"));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-    {
-        return Err(ApiError::bad_request(
-            "name may contain only letters, digits, '-', '_', '.' and ':'",
-        ));
-    }
-    Ok(())
-}
-
-/// `http(s)://host[:port]/path` with nothing clever.
-pub fn validate_source_url(url: &str) -> ApiResult<()> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| ApiError::bad_request("url must start with http:// or https://"))?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(ApiError::bad_request("url has no host"));
-    }
-    if authority.contains('@') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(ApiError::bad_request(
-            "url may not contain credentials or whitespace",
-        ));
-    }
-    // Bracketed IPv6 (`[::1]`, `[::1]:443`) must not be split on ':'.
-    // A bare `::1` has more than one colon, so it is the host, not host:port.
-    let host = if let Some(inner) = authority.strip_prefix('[') {
-        inner.split_once(']').map(|(h, _)| h).unwrap_or(inner)
-    } else if authority.matches(':').count() > 1 {
-        authority
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    if host.is_empty() {
-        return Err(ApiError::bad_request("url has no host"));
-    }
-    if matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "169.254.169.254"
-    ) {
-        return Err(ApiError::bad_request(
-            "url may not point at the server itself",
-        ));
-    }
-    Ok(())
+    pub(crate) store: Store,
+    pub(crate) blobs: Arc<dyn ImageStore>,
 }
 
 impl Client {
@@ -170,7 +75,7 @@ impl Client {
         caller.is_admin() || (caller.project.is_some() && caller.project == img.meta.project)
     }
 
-    fn is_member(&self, image: &Id, project: &Id) -> ApiResult<bool> {
+    pub(crate) fn is_member(&self, image: &Id, project: &Id) -> ApiResult<bool> {
         Ok(self
             .members()
             .list(None)?
@@ -337,7 +242,7 @@ impl Client {
         Ok(())
     }
 
-    async fn release_blob(&self, reference: &str) -> ApiResult<()> {
+    pub(crate) async fn release_blob(&self, reference: &str) -> ApiResult<()> {
         let shared = self
             .images()
             .list(None)?
@@ -473,7 +378,7 @@ impl Client {
         }
     }
 
-    async fn fail(&self, id: &Id, op: &str, e: ApiError) -> ApiResult<Image> {
+    pub(crate) async fn fail(&self, id: &Id, op: &str, e: ApiError) -> ApiResult<Image> {
         tracing::warn!(image = %id, op, error = %e, "image upload failed");
         self.images().modify(id, |i| {
             i.status.phase = Phase::Error;
@@ -569,104 +474,5 @@ impl Client {
             })?;
         self.members().delete(&m.meta.id)?;
         Ok(())
-    }
-}
-
-const MAX_IMPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_REDIRECTS: usize = 5;
-
-fn redirect_action(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
-    if attempt.previous().len() >= MAX_REDIRECTS {
-        return attempt.error(io::Error::other("image import: too many redirects"));
-    }
-    match validate_source_url(attempt.url().as_str()) {
-        Ok(()) => attempt.follow(),
-        Err(e) => attempt.error(io::Error::other(format!("image import: {e}"))),
-    }
-}
-
-fn fetch_err(e: reqwest::Error) -> ApiError {
-    if e.is_timeout() || e.is_connect() {
-        ApiError::unavailable(format!("image import: {e}"))
-    } else {
-        ApiError::bad_request(format!("image import: {e}"))
-    }
-}
-
-/// GET `url`, following at most five redirects when every hop passes
-/// [`validate_source_url`]. The body is capped at 8 GiB.
-async fn fetch_source(url: &str) -> ApiResult<ImageData> {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(redirect_action))
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(120))
-        .timeout(Duration::from_secs(2 * 60 * 60))
-        .build()
-        .map_err(|e| ApiError::internal(format!("image import: {e}")))?;
-    let resp = http
-        .get(url)
-        .send()
-        .await
-        .map_err(fetch_err)?
-        .error_for_status()
-        .map_err(fetch_err)?;
-    if resp.content_length().is_some_and(|n| n > MAX_IMPORT_BYTES) {
-        return Err(ApiError::bad_request("image import exceeds 8 GiB"));
-    }
-    let stream = futures::stream::unfold((resp, 0u64), |(mut resp, read)| async move {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let next = read.saturating_add(chunk.len() as u64);
-                if next > MAX_IMPORT_BYTES {
-                    Some((
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "image import exceeds 8 GiB",
-                        )),
-                        (resp, next),
-                    ))
-                } else {
-                    Some((Ok(chunk), (resp, next)))
-                }
-            }
-            Ok(None) => None,
-            Err(e) => Some((Err(io::Error::other(e)), (resp, read))),
-        }
-    });
-    Ok(Box::pin(StreamReader::new(stream)))
-}
-
-fn not_found_to_none<T>(r: pistack_store::Result<T>) -> ApiResult<Option<T>> {
-    match r {
-        Ok(v) => Ok(Some(v)),
-        Err(StoreError::NotFound(_)) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_source_url;
-
-    #[test]
-    fn source_url_allows_public_http_and_rejects_ssrf() {
-        assert!(validate_source_url("https://cloud-images.example/x.img").is_ok());
-        assert!(validate_source_url("http://example.com:8080/a").is_ok());
-        for bad in [
-            "ftp://x/y",
-            "http://localhost/x",
-            "http://127.0.0.1/x",
-            "http://127.0.0.1:9/latest",
-            "http://[::1]/x",
-            "http://[::1]:80/x",
-            "http://::1/",
-            "http://169.254.169.254/latest",
-            "http://user:pass@example.com/x",
-            "http://example.com/a b",
-            "/etc/passwd",
-            "https://",
-        ] {
-            assert!(validate_source_url(bad).is_err(), "{bad}");
-        }
     }
 }
