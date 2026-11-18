@@ -1,147 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! The reconciler: turns `spec` into backend state and writes `status`.
-//!
-//! Driven by store events (`handle_event`), a full pass at start
-//! (`reconcile_all`) and a periodic retry of anything not `Ready`
-//! (`reconcile_pending`). Every status write records
-//! `observed_revision = revision + 1`, the revision the write itself
-//! produces, so the event that write emits is recognised and skipped.
-//!
-//! Dependencies are pulled, not scheduled: realising a port first makes
-//! sure its network is realised, a router makes sure its ports are. That
-//! keeps ordering correct whatever order events arrive in.
-
 use crate::backend::{FipView, RouterView};
 use crate::client::{Client, PortRef};
 use crate::types::*;
-use pistack_store::{Collection, StoreError};
-use pistack_types::{kind, ApiError, ApiResult, Event, EventAction, Id, Kind, Phase};
+use pistack_store::Collection;
+use pistack_types::{kind, ApiError, ApiResult, Event, EventAction, Id, Phase};
 use std::net::IpAddr;
 
-/// Common status surface, so the event loop can ask "is this stale?" for
-/// any of our kinds.
-pub trait Observed: Kind {
-    fn phase(&self) -> Phase;
-    fn observed_revision(&self) -> u64;
-    fn message(&self) -> &str;
-    fn set_result(&mut self, phase: Phase, message: String, observed: u64);
-    /// Written since the reconciler last looked. An event acts on this.
-    fn unseen(&self) -> bool {
-        self.observed_revision() != self.meta().revision
-    }
-    /// Due on the periodic pass: unseen, or failed last time. A failure is
-    /// not retried on events. The status write that records it is itself an
-    /// event, so retrying there never stops.
-    fn stale(&self) -> bool {
-        self.unseen() || self.phase() == Phase::Error
-    }
-}
-
-macro_rules! observed {
-    ($t:ty) => {
-        impl Observed for $t {
-            fn phase(&self) -> Phase {
-                self.status.phase
-            }
-            fn observed_revision(&self) -> u64 {
-                self.status.observed_revision
-            }
-            fn message(&self) -> &str {
-                &self.status.message
-            }
-            fn set_result(&mut self, phase: Phase, message: String, observed: u64) {
-                self.status.phase = phase;
-                self.status.message = message;
-                self.status.observed_revision = observed;
-            }
-        }
-    };
-}
-observed!(Vpc);
-observed!(Network);
-observed!(Subnet);
-observed!(Port);
-observed!(Router);
-observed!(SecurityGroup);
-observed!(FloatingIp);
-
-/// Write a status outcome. `extra` runs before the phase is set and may
-/// fill kind-specific status fields.
-///
-/// `acted` is the revision this pass read. A spec write during the backend
-/// call must stay stale: the event loop handles one event at a time, so
-/// that write's event is still queued, and claiming it here would skip the
-/// backend work for the new spec.
-fn finish<K: Observed>(
-    col: &Collection<K>,
-    id: &Id,
-    acted: u64,
-    outcome: ApiResult<()>,
-    mut extra: impl FnMut(&mut K),
-) -> Phase {
-    if matches!(&outcome, Err(e) if e.message == "not the leader") {
-        tracing::debug!(kind = K::KIND, %id, "reconcile stopped; not the leader");
-        return Phase::Updating;
-    }
-    let (phase, msg) = match &outcome {
-        Ok(()) => (Phase::Ready, String::new()),
-        Err(e) => (Phase::Error, e.to_string()),
-    };
-    // A retry that fails the same way has nothing new to say. Writing it
-    // again would add a log entry per failed resource on every pass.
-    if phase == Phase::Error {
-        if let Ok(cur) = col.get(id) {
-            if cur.meta().revision == acted
-                && !cur.unseen()
-                && cur.phase() == Phase::Error
-                && cur.message() == msg
-            {
-                tracing::debug!(kind = K::KIND, %id, error = %msg, "reconcile still failing");
-                return phase;
-            }
-        }
-    }
-    let res = col.modify(id, |cur| {
-        if cur.meta().revision != acted {
-            return Err(StoreError::Conflict("reconcile superseded".into()));
-        }
-        extra(cur);
-        let next = cur.meta().revision + 1;
-        cur.set_result(phase, msg.clone(), next);
-        Ok(())
-    });
-    match res {
-        Ok(_) => {
-            if phase == Phase::Error {
-                pistack_types::tally::reconcile_failed("fabric");
-                tracing::warn!(kind = K::KIND, %id, error = %msg, "reconcile failed");
-            } else {
-                tracing::debug!(kind = K::KIND, %id, "reconciled");
-            }
-            phase
-        }
-        // Deleted while we worked; the Deleted event cleans up.
-        Err(StoreError::NotFound(_)) => phase,
-        Err(StoreError::NotLeader) => {
-            tracing::debug!(kind = K::KIND, %id, "status write skipped; not the leader");
-            Phase::Updating
-        }
-        Err(StoreError::Conflict(reason)) if reason == "reconcile superseded" => {
-            tracing::debug!(kind = K::KIND, %id, "spec changed during reconcile");
-            Phase::Updating
-        }
-        Err(e) => {
-            tracing::error!(kind = K::KIND, %id, error = %e, "status write failed");
-            phase
-        }
-    }
-}
-
-fn api(e: StoreError) -> ApiError {
-    e.into()
-}
+use super::api::api;
+use super::finish::finish;
+use super::observed::Observed;
+use crate::types::Network;
+use crate::types::Port;
 
 impl Client {
     /// React to one store event. Ignores kinds fabric does not own and
@@ -194,14 +65,14 @@ impl Client {
         }
     }
 
-    fn is_unseen<K: Observed>(&self, col: &Collection<K>, id: &Id) -> bool {
+    pub(crate) fn is_unseen<K: Observed>(&self, col: &Collection<K>, id: &Id) -> bool {
         match col.get(id) {
             Ok(r) => r.unseen(),
             Err(_) => false,
         }
     }
 
-    async fn handle_deleted(&self, k: &str, id: &Id) {
+    pub(crate) async fn handle_deleted(&self, k: &str, id: &Id) {
         let b = self.backend();
         let res = match k {
             kind::VPC => Ok(()),
@@ -240,7 +111,7 @@ impl Client {
         self.pass(false).await;
     }
 
-    async fn pass(&self, force: bool) {
+    pub(crate) async fn pass(&self, force: bool) {
         macro_rules! each {
             ($col:expr, $f:ident) => {
                 match $col.list(None) {
@@ -269,7 +140,7 @@ impl Client {
     /// A vpc has nothing of its own to realise. The router it owns is
     /// reconciled as a router; a vpc is ready when that router is, and its
     /// subnet count is kept current on the way.
-    async fn count_vpc_pass(&self, id: &Id) {
+    pub(crate) async fn count_vpc_pass(&self, id: &Id) {
         self.reconcile_vpc(id).await;
     }
 
@@ -326,7 +197,7 @@ impl Client {
     /// First realisation wins. A guest port already bound `hostnat`, the
     /// shared 10.88.0.0/24 network, or a host-NAT backend stays on that
     /// bridge. The choice is not rewritten when the backend flag changes.
-    fn stick_datapath(&self, net: &Network) -> Option<String> {
+    pub(crate) fn stick_datapath(&self, net: &Network) -> Option<String> {
         if net.status.datapath.is_some() {
             return None;
         }
@@ -358,7 +229,7 @@ impl Client {
 
     /// Overlay segment ids are VXLAN VNIs from a store counter. The backend
     /// is given the segment before ensure.
-    fn next_segment(&self) -> ApiResult<u32> {
+    pub(crate) fn next_segment(&self) -> ApiResult<u32> {
         const KEY: &str = "fabric/next_segment";
         let cur: u32 = self.store().get_meta(KEY).map_err(api)?.unwrap_or(1);
         self.store().put_meta(KEY, &(cur + 1)).map_err(api)?;
@@ -366,7 +237,7 @@ impl Client {
     }
 
     /// Make sure a network is realised; returns it when Ready.
-    async fn ready_network(&self, id: &Id) -> ApiResult<Network> {
+    pub(crate) async fn ready_network(&self, id: &Id) -> ApiResult<Network> {
         let net = self.networks().get(id).map_err(api)?;
         if net.status.phase == Phase::Ready && !net.stale() {
             return Ok(net);
@@ -598,187 +469,5 @@ impl Client {
             f.status.fixed_ip = fixed_ip;
             f.status.router = router_id.clone();
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::{FipView, NetBackend, RouterView};
-    use crate::Client;
-    use async_trait::async_trait;
-    use pistack_store::Store;
-    use pistack_types::Meta;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use tokio::sync::Notify;
-
-    /// Holds the first floating-IP call so a spec write can land underneath it.
-    struct Gate {
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
-        held: AtomicBool,
-        calls: parking_lot::Mutex<Vec<Option<Id>>>,
-    }
-
-    #[async_trait]
-    impl NetBackend for Gate {
-        fn name(&self) -> &'static str {
-            "gate"
-        }
-        async fn ensure_network(&self, _: &Network) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn delete_network(&self, _: &Id) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn ensure_subnet(&self, _: &Network, _: &Subnet) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn delete_subnet(&self, _: &Id) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn ensure_port(
-            &self,
-            _: &Network,
-            _: &Port,
-            _: &[SecurityGroup],
-        ) -> ApiResult<PortBinding> {
-            Ok(PortBinding::default())
-        }
-        async fn delete_port(&self, _: &Id) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn ensure_router(&self, _: &RouterView) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn delete_router(&self, _: &Id) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn apply_security_group(&self, _: &SecurityGroup, _: &[Port]) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn delete_security_group(&self, _: &Id) -> ApiResult<()> {
-            Ok(())
-        }
-        async fn associate_fip(&self, view: &FipView) -> ApiResult<()> {
-            self.calls.lock().push(view.fip.spec.port.clone());
-            if !self.held.swap(true, Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
-            }
-            Ok(())
-        }
-        async fn delete_fip(&self, _: &Id) -> ApiResult<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn spec_change_during_reconcile_stays_stale() {
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let gate = Arc::new(Gate {
-            entered: entered.clone(),
-            release: release.clone(),
-            held: AtomicBool::new(false),
-            calls: parking_lot::Mutex::new(Vec::new()),
-        });
-        let store = Store::in_memory().unwrap();
-        let client = Client::new(store, gate.clone());
-        client.ensure_default_template().unwrap();
-        let project = Id::new(kind::PROJECT);
-        let ext = NetworkSpec {
-            external: true,
-            ..Default::default()
-        };
-        let net = client
-            .create_network(
-                Meta::new(kind::NETWORK, "fleet", Some(project.clone())),
-                ext,
-            )
-            .unwrap();
-        let sub = client
-            .create_subnet(
-                Meta::new(kind::SUBNET, "pool", Some(project.clone())),
-                SubnetSpec {
-                    network: net.meta.id.clone(),
-                    cidr: "10.66.66.80/28".parse().unwrap(),
-                    gateway: Some("10.66.66.81".parse().unwrap()),
-                    allocation_pools: vec![],
-                    dns_nameservers: vec![],
-                    enable_dhcp: false,
-                    host_routes: vec![],
-                },
-            )
-            .unwrap();
-        let guest = client
-            .create_network(
-                Meta::new(kind::NETWORK, "guest", Some(project.clone())),
-                NetworkSpec::default(),
-            )
-            .unwrap();
-        client
-            .create_subnet(
-                Meta::new(kind::SUBNET, "guest", Some(project.clone())),
-                SubnetSpec {
-                    network: guest.meta.id.clone(),
-                    cidr: "10.88.0.0/24".parse().unwrap(),
-                    gateway: Some("10.88.0.1".parse().unwrap()),
-                    allocation_pools: vec![],
-                    dns_nameservers: vec![],
-                    enable_dhcp: true,
-                    host_routes: vec![],
-                },
-            )
-            .unwrap();
-        let port = client
-            .create_port(
-                Meta::new(kind::PORT, "demo", Some(project.clone())),
-                PortSpec {
-                    network: guest.meta.id,
-                    fixed_ips: vec!["10.88.0.187".parse().unwrap()],
-                    ..PortSpec::default()
-                },
-            )
-            .unwrap();
-        let fip = client
-            .create_floating_ip(
-                Meta::new(kind::FLOATING_IP, "demo", Some(project)),
-                FloatingIpSpec {
-                    network: net.meta.id,
-                    address: None,
-                    port: None,
-                },
-            )
-            .unwrap();
-        let _ = sub;
-
-        let waiting = entered.notified();
-        tokio::pin!(waiting);
-        let id = fip.meta.id.clone();
-        let worker = client.clone();
-        let task = tokio::spawn(async move { worker.reconcile_floating_ip(&id).await });
-        waiting.await;
-        client
-            .associate_floating_ip(&fip.meta.id, Some(port.meta.id.clone()))
-            .unwrap();
-        release.notify_one();
-        let _ = task.await.unwrap();
-
-        let mid = client.floating_ips().get(&fip.meta.id).unwrap();
-        assert!(
-            mid.stale(),
-            "the in-flight pass must not mark the new port observed"
-        );
-        assert_eq!(mid.spec.port, Some(port.meta.id.clone()));
-
-        client.reconcile_floating_ip(&fip.meta.id).await;
-        let done = client.floating_ips().get(&fip.meta.id).unwrap();
-        assert_eq!(done.status.phase, Phase::Ready);
-        assert_eq!(done.status.fixed_ip, Some("10.88.0.187".parse().unwrap()));
-        assert!(!done.stale());
-        let calls = gate.calls.lock().clone();
-        assert_eq!(calls, vec![None, Some(port.meta.id)]);
     }
 }
