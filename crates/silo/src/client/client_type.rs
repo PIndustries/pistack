@@ -1,45 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! Bucket and object writes.
-//!
-//! Bytes for the current generation of a key live at
-//! `{root}/{bucket-id}/{key}`, where `root` is `$PISTACK_DATA_DIR/silo` in
-//! the module. `status.sha256` is the content address of those bytes;
-//! `status.md5` is the S3 single-PUT ETag. With bucket versioning, the
-//! previous generation's bytes are kept at
-//! `{root}/{bucket-id}/.blobs/{sha256}` and the old record stays with
-//! `status.latest = false`.
-//!
-//! Puts stream the request body to a temp file (hashing as they go), then
-//! rename into place. Gets can stream the file back without buffering it.
-//!
-//! A put lands on one server's disk. With [`Client::with_peers`], a read
-//! on a server that has the record but not the bytes fetches them from
-//! another server first; see [`crate::replica`].
-
+use super::into_body_read_err::IntoBodyReadErr;
 use crate::types::*;
 use bytes::Bytes;
 use futures::Stream;
-use md5::Md5;
 use pistack_store::Store;
 use pistack_types::{ApiError, ApiResult, Id, Meta, Phase, Spec};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use subtle::ConstantTimeEq;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+
+use super::blob_file::blob_file;
+use super::clean_name::clean_name;
+use super::current_to_read::current_to_read;
+use super::io_err::io_err;
+use super::list_object_entry::ListObjectEntry;
+use super::map_stream_err::map_stream_err;
+use super::pick_current::pick_current;
+use super::remove_file::remove_file;
+use super::sha256_hex::sha256_hex;
+use super::write_stream_atomic::write_stream_atomic;
 
 #[derive(Clone)]
 pub struct Client {
-    store: Store,
-    root: PathBuf,
-    max_object_bytes: usize,
-    min_part_bytes: usize,
+    pub(crate) store: Store,
+    pub(crate) root: PathBuf,
+    pub(crate) max_object_bytes: usize,
+    pub(crate) min_part_bytes: usize,
     /// Other servers to ask for bytes this one lacks.
-    peers: Option<crate::replica::Peers>,
+    pub(crate) peers: Option<crate::replica::Peers>,
     /// Servers that must hold an object's bytes before a put is answered.
-    put_copies: u32,
+    pub(crate) put_copies: u32,
 }
 
 impl Client {
@@ -298,7 +290,7 @@ impl Client {
     }
 
     /// Wait until enough other servers hold `obj`'s bytes.
-    async fn second_copy(&self, obj: &Object) -> ApiResult<()> {
+    pub(crate) async fn second_copy(&self, obj: &Object) -> ApiResult<()> {
         let Some(peers) = &self.peers else {
             return Ok(());
         };
@@ -310,7 +302,7 @@ impl Client {
     }
 
     /// Write the object on this server and record it.
-    async fn put_here<S, E>(
+    pub(crate) async fn put_here<S, E>(
         &self,
         bucket_id: &Id,
         key: &str,
@@ -811,7 +803,7 @@ impl Client {
     /// Make `obj` the current generation of its key: its bytes are placed at
     /// the key path, the key's marker is rewritten, and the record is marked
     /// current.
-    async fn promote(&self, bucket: &Bucket, obj: &Object) -> ApiResult<Object> {
+    pub(crate) async fn promote(&self, bucket: &Bucket, obj: &Object) -> ApiResult<Object> {
         let path = self.key_path(&bucket.meta.id, &obj.spec.key)?;
         let src = self.generation_path(obj).await?;
         if src != path {
@@ -928,7 +920,7 @@ impl Client {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn insert_object(
+    pub(crate) fn insert_object(
         &self,
         bucket: &Bucket,
         key: &str,
@@ -959,11 +951,11 @@ impl Client {
             .map_err(Into::into)
     }
 
-    fn bucket_dir(&self, id: &Id) -> PathBuf {
+    pub(crate) fn bucket_dir(&self, id: &Id) -> PathBuf {
         self.root.join(id.to_string())
     }
 
-    fn objects_for_bucket(&self, bucket: &Bucket) -> ApiResult<Vec<Object>> {
+    pub(crate) fn objects_for_bucket(&self, bucket: &Bucket) -> ApiResult<Vec<Object>> {
         let items = self
             .store
             .collection::<Object>()
@@ -974,7 +966,12 @@ impl Client {
             .collect())
     }
 
-    async fn preserve_previous(&self, bucket: &Id, sha: &str, src: &Path) -> ApiResult<()> {
+    pub(crate) async fn preserve_previous(
+        &self,
+        bucket: &Id,
+        sha: &str,
+        src: &Path,
+    ) -> ApiResult<()> {
         let Some(dest) = blob_file(&self.root, bucket, sha) else {
             return Ok(());
         };
@@ -989,266 +986,5 @@ impl Client {
         }
         tokio::fs::copy(src, &dest).await.map_err(io_err)?;
         Ok(())
-    }
-}
-
-/// One row in a ListObjectsV2 page (object or rolled-up prefix).
-#[derive(Clone, Debug, PartialEq)]
-pub enum ListObjectEntry {
-    Object(Box<Object>),
-    CommonPrefix(String),
-}
-
-impl ListObjectEntry {
-    pub fn sort_key(&self) -> &str {
-        match self {
-            Self::Object(o) => o.spec.key.as_str(),
-            Self::CommonPrefix(p) => p.as_str(),
-        }
-    }
-}
-
-fn pick_current(matches: Vec<Object>) -> Option<Object> {
-    // Newest generation wins — that is the key's current record, marker
-    // included. `latest` only breaks a tie between two records written at the
-    // same generation, which a racing writer can leave behind.
-    matches
-        .into_iter()
-        .max_by_key(|o| (o.status.version, o.status.latest, o.meta.revision))
-}
-
-/// The current record of `key`, or the error a read of the key is owed.
-///
-/// A key whose current generation is a delete marker is not there: 404, with
-/// the marker's version in `details` so the S3 route can answer
-/// `x-amz-delete-marker: true` and name it.
-fn current_to_read(all: &[Object], key: &str) -> ApiResult<Object> {
-    match pick_current(all.iter().filter(|o| o.spec.key == key).cloned().collect()) {
-        None => Err(ApiError::not_found(format!("object '{key}' not found"))),
-        Some(obj) if obj.status.delete_marker => Err(crate::delete_marker::hidden(key, &obj)),
-        Some(obj) => Ok(obj),
-    }
-}
-
-fn blob_file(root: &Path, bucket: &Id, sha: &str) -> Option<PathBuf> {
-    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(
-        root.join(bucket.to_string())
-            .join(".blobs")
-            .join(sha.to_ascii_lowercase()),
-    )
-}
-
-fn clean_name(name: &str) -> ApiResult<String> {
-    let name = name.trim();
-    if name.is_empty() || name.len() > 128 || name.contains('/') {
-        return Err(ApiError::bad_request(
-            "name must be 1-128 characters without '/'",
-        ));
-    }
-    Ok(name.to_owned())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex_encode(Sha256::digest(bytes).as_slice())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0xf) as usize] as char);
-    }
-    s
-}
-
-fn io_err(e: std::io::Error) -> ApiError {
-    ApiError::internal(format!("silo: {e}"))
-}
-
-async fn remove_file(path: &Path) -> ApiResult<()> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err(e)),
-    }
-}
-
-struct Written {
-    sha256: String,
-    md5: String,
-    size: u64,
-}
-
-/// Preserve [`ApiError`] stream errors (including `details.s3_code`); wrap others.
-pub(crate) fn map_stream_err<S, E>(body: S) -> impl Stream<Item = Result<Bytes, ApiError>> + Send
-where
-    S: Stream<Item = Result<Bytes, E>> + Send,
-    E: IntoBodyReadErr + Send,
-{
-    use futures::StreamExt;
-    body.map(|item| item.map_err(IntoBodyReadErr::into_body_read_err))
-}
-
-pub trait IntoBodyReadErr {
-    fn into_body_read_err(self) -> ApiError;
-}
-
-impl IntoBodyReadErr for ApiError {
-    fn into_body_read_err(self) -> ApiError {
-        self
-    }
-}
-
-impl IntoBodyReadErr for std::io::Error {
-    fn into_body_read_err(self) -> ApiError {
-        ApiError::bad_request(format!("reading body: {self}"))
-    }
-}
-
-impl IntoBodyReadErr for String {
-    fn into_body_read_err(self) -> ApiError {
-        ApiError::bad_request(format!("reading body: {self}"))
-    }
-}
-
-impl IntoBodyReadErr for &str {
-    fn into_body_read_err(self) -> ApiError {
-        ApiError::bad_request(format!("reading body: {self}"))
-    }
-}
-
-impl IntoBodyReadErr for axum::Error {
-    fn into_body_read_err(self) -> ApiError {
-        ApiError::bad_request(format!("reading body: {self}"))
-    }
-}
-
-/// Best-effort cleanup of a staging path if the future is cancelled or errors
-/// before rename. Call [`TmpGuard::disarm`] after a successful rename so Drop
-/// does not attempt another delete of the (now gone) temp path.
-pub(crate) struct TmpGuard(Option<std::path::PathBuf>);
-
-impl TmpGuard {
-    pub(crate) fn new(path: std::path::PathBuf) -> Self {
-        Self(Some(path))
-    }
-
-    /// Stop Drop from deleting the path (use after a successful rename).
-    pub(crate) fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for TmpGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-async fn write_stream_atomic<S>(
-    dest: &Path,
-    body: S,
-    max: usize,
-    content_length: Option<u64>,
-    expected_sha256: Option<&str>,
-) -> ApiResult<Written>
-where
-    S: Stream<Item = Result<Bytes, ApiError>> + Send,
-{
-    use futures::StreamExt;
-
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
-    }
-    let tmp = dest.with_file_name(format!(".tmp-{}", uuid::Uuid::now_v7()));
-    let mut tmp_guard = TmpGuard::new(tmp.clone());
-    let result = async {
-        let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
-        let mut sha = Sha256::new();
-        let mut md5 = Md5::new();
-        let mut size: u64 = 0;
-        let mut body = std::pin::pin!(body);
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk?;
-            let next = size.saturating_add(chunk.len() as u64);
-            if next > max as u64 {
-                return Err(ApiError::bad_request(object_too_large_message(max)));
-            }
-            if let Some(len) = content_length {
-                if next > len {
-                    return Err(ApiError::bad_request(
-                        "body longer than Content-Length".to_owned(),
-                    ));
-                }
-            }
-            sha.update(&chunk);
-            md5.update(&chunk);
-            file.write_all(&chunk).await.map_err(io_err)?;
-            size = next;
-        }
-        if let Some(len) = content_length {
-            if size != len {
-                return Err(ApiError::bad_request(format!(
-                    "body length {size} does not match Content-Length {len}"
-                )));
-            }
-        }
-        file.flush().await.map_err(io_err)?;
-        file.sync_all().await.map_err(io_err)?;
-        drop(file);
-        let sha256 = hex_encode(sha.finalize().as_slice());
-        if let Some(want) = expected_sha256 {
-            let want = want.to_ascii_lowercase();
-            if !bool::from(sha256.as_bytes().ct_eq(want.as_bytes())) {
-                return Err(crate::multipart::s3_err(
-                    "XAmzContentSHA256Mismatch",
-                    "The provided 'x-amz-content-sha256' header does not match what was computed.",
-                ));
-            }
-        }
-        tokio::fs::rename(&tmp, dest).await.map_err(io_err)?;
-        Ok(Written {
-            sha256,
-            md5: hex_encode(md5.finalize().as_slice()),
-            size,
-        })
-    }
-    .await;
-    if result.is_ok() {
-        tmp_guard.disarm();
-    } else {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    result
-}
-
-#[cfg(test)]
-mod tmp_guard_tests {
-    use super::TmpGuard;
-
-    #[test]
-    fn disarm_skips_delete() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keep-me");
-        std::fs::write(&path, b"hi").unwrap();
-        let mut g = TmpGuard::new(path.clone());
-        g.disarm();
-        drop(g);
-        assert!(path.exists(), "disarmed guard must not delete the path");
-    }
-
-    #[test]
-    fn drop_deletes_when_armed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("remove-me");
-        std::fs::write(&path, b"hi").unwrap();
-        drop(TmpGuard::new(path.clone()));
-        assert!(!path.exists(), "armed guard must delete on drop");
     }
 }
