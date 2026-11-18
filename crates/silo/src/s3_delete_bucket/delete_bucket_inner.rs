@@ -1,41 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! S3 DeleteBucket: `DELETE /{bucket}` (no `uploadId`) on the path-style
-//! surface.
-//!
-//! Removes the same record the native `DELETE /buckets/{id}` removes, through
-//! the same visibility check (`load_bucket`) and the same
-//! `Client::delete_bucket`. The S3 difference is that a bucket holding
-//! objects or unfinished multipart uploads is refused (`BucketNotEmpty`)
-//! instead of taken down with its contents.
-
 use crate::client::Client;
 use crate::http::load_bucket;
 use crate::multipart::s3_err;
-use crate::s3::{caller, ensure_body_hash, s3_error, ObjectQuery};
-use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Extension,
-};
+use crate::s3::{caller, ensure_body_hash, ObjectQuery};
+use axum::{extract::Request, http::StatusCode, Extension};
 use pistack_types::{ApiResult, Caller};
 
-pub async fn delete_bucket(
-    State(c): State<Client>,
-    ext: Option<Extension<Caller>>,
-    Path(bucket): Path<String>,
-    Query(q): Query<ObjectQuery>,
-    req: Request,
-) -> Response {
-    match delete_bucket_inner(c, ext, bucket, q, req).await {
-        Ok(status) => status.into_response(),
-        Err(err) => s3_error(err),
-    }
-}
-
-async fn delete_bucket_inner(
+pub(crate) async fn delete_bucket_inner(
     c: Client,
     ext: Option<Extension<Caller>>,
     bucket: String,
