@@ -9,9 +9,9 @@
 //! are members, the leader promotes caught-up learners until there are
 //! three voters. Further machines stay learners.
 
-mod discover;
-mod group;
-mod replicate;
+pub mod discover;
+pub mod group;
+pub mod replicate;
 
 pub use discover::{
     check_advertise, collect_announcements, scan_targets, sweep, Announce, DiscoverError,
