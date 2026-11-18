@@ -1,271 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 P. Industries LLC and PiStack contributors
 
-//! VPCs: a routed private address space inside one project.
-//!
-//! A VPC holds one or more address blocks and owns one router, made with it
-//! and deleted with it. A network that names a VPC belongs to it; a subnet on
-//! such a network sits inside one of the VPC's blocks, overlaps no other
-//! subnet of that VPC, and is joined to the VPC's router as part of its own
-//! create. A network with no `vpc` is untouched by any of this.
-//!
-//! Two counts matter here. A VPC is counted against its own `vpcs` limit and
-//! never against `routers`, which is why its router is written outside the
-//! quota path; and the VPC's subnet count lives in its status, kept current
-//! whenever one of them appears or goes.
-
 use crate::client::Client;
 use crate::types::{Network, NetworkSpec, PortSpec, Router, RouterSpec, Subnet, Vpc, VpcSpec};
 use crate::usage;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use pistack_store::StoreError;
 use pistack_types::{kind, ApiError, ApiResult, Id, Meta};
-use std::net::IpAddr;
-use std::str::FromStr;
 
-fn store_err(e: StoreError) -> ApiError {
-    e.into()
-}
-
-/// How many addresses a block holds.
-fn span(cidr: IpNet) -> u128 {
-    let free = match cidr {
-        IpNet::V4(n) => u128::from(32 - n.prefix_len()),
-        IpNet::V6(n) => u128::from(128 - n.prefix_len()),
-    };
-    if free >= 128 {
-        u128::MAX
-    } else {
-        1u128 << free
-    }
-}
-
-fn index(addr: IpAddr) -> u128 {
-    match addr {
-        IpAddr::V4(v4) => u32::from(v4) as u128,
-        IpAddr::V6(v6) => u128::from(v6),
-    }
-}
-
-/// The block of `prefix` addresses starting at `at`, in the family of `cidr`.
-fn block_at(cidr: IpNet, at: u128, prefix: u16) -> Option<IpNet> {
-    match cidr {
-        IpNet::V4(_) => {
-            let v4 = u32::try_from(at).ok()?;
-            Ipv4Net::new(v4.into(), prefix as u8).ok().map(IpNet::V4)
-        }
-        IpNet::V6(_) => Ipv6Net::new(at.into(), prefix as u8).ok().map(IpNet::V6),
-    }
-}
-
-/// `at` with the low bits of a `prefix`-sized block cleared, so it starts on a
-/// boundary a router would agree with.
-fn align(at: u128, width: u16, prefix: u16) -> Option<u128> {
-    let bits = width.saturating_sub(prefix);
-    if bits >= 128 {
-        return Some(0);
-    }
-    Some(at & !((1u128 << bits) - 1))
-}
-
-/// Two blocks meet when they are of one family: only then can they share an
-/// address, or one hold the other.
-fn meets(a: IpNet, b: IpNet) -> bool {
-    a.addr().is_ipv4() == b.addr().is_ipv4()
-}
-
-/// Do two blocks of the same family share an address?
-pub(crate) fn overlaps(a: IpNet, b: IpNet) -> bool {
-    meets(a, b) && (a.contains(&b.addr()) || b.contains(&a.addr()))
-}
-
-/// Is `small` wholly inside `big`?
-fn inside(big: IpNet, small: IpNet) -> bool {
-    if !meets(big, small) {
-        return false;
-    }
-    let base = index(big.network());
-    let start = index(small.network());
-    start >= base
-        && start
-            .saturating_sub(base)
-            .saturating_add(span(small).saturating_sub(1))
-            <= span(big).saturating_sub(1)
-}
-
-/// Addresses no host may hold: the network address, and the broadcast address
-/// of an IPv4 block with room for one.
-fn unusable(cidr: IpNet, addr: IpAddr) -> bool {
-    match cidr {
-        IpNet::V4(n) => n.network() == addr || (n.prefix_len() < 31 && n.broadcast() == addr),
-        IpNet::V6(n) => n.network() == addr,
-    }
-}
-
-/// The address a router takes on a subnet: the gateway it was given, otherwise
-/// the first address of the block that a host could hold.
-pub(crate) fn router_address(cidr: IpNet, gateway: Option<IpAddr>) -> Option<IpAddr> {
-    if let Some(g) = gateway {
-        return Some(g);
-    }
-    let mut cur = Some(cidr.network());
-    while let Some(a) = cur {
-        if !unusable(cidr, a) {
-            return Some(a);
-        }
-        cur = crate::ipam::next_ip(a);
-    }
-    None
-}
-
-/// The next free block of `prefix` addresses: the first block of that size,
-/// aligned as a router would want it, that lies wholly inside one of `cidrs`
-/// and shares no address with `used`. Blocks are tried in the order given, and
-/// a free block never straddles two of them.
-pub(crate) fn next_block(cidrs: &[IpNet], used: &[IpNet], prefix: u8) -> ApiResult<IpNet> {
-    let prefix = u16::from(prefix);
-    if cidrs.is_empty() {
-        return Err(ApiError::bad_request(
-            "the vpc has no cidr to take a block from",
-        ));
-    }
-    for b in cidrs {
-        let max = match b {
-            IpNet::V4(_) => 32u16,
-            IpNet::V6(_) => 128,
-        };
-        if prefix > max {
-            return Err(ApiError::bad_request(format!(
-                "/{prefix} does not fit the family of {b}"
-            )));
-        }
-        if prefix < u16::from(b.prefix_len()) {
-            return Err(ApiError::bad_request(format!(
-                "/{prefix} is larger than {b}"
-            )));
-        }
-        if !used.iter().all(|u| inside(*b, *u) || !meets(*b, *u)) {
-            return Err(ApiError::internal(format!(
-                "subnet {used:?} is partly inside {b}"
-            )));
-        }
-    }
-    // A sub-block of a block that starts on its own boundary is aligned to the
-    // size asked for as well, so the walk starts at the block itself.
-    let used: Vec<IpNet> = used.to_vec();
-    for b in cidrs {
-        let held: Vec<IpNet> = used.iter().copied().filter(|u| meets(*b, *u)).collect();
-        if let Some(cand) = first_free(*b, &held, prefix) {
-            return Ok(cand);
-        }
-    }
-    Err(ApiError::conflict(format!(
-        "the vpc has no free /{prefix} in {}",
-        joined(cidrs)
-    )))
-}
-
-/// The first `prefix` block inside `big` that no member of `held` — each of
-/// them wholly inside `big` — touches. Candidates step from the lowest
-/// boundary at or above `big`'s base to the last block that still fits.
-fn first_free(big: IpNet, held: &[IpNet], prefix: u16) -> Option<IpNet> {
-    let width = match big {
-        IpNet::V4(_) => 32u16,
-        IpNet::V6(_) => 128,
-    };
-    let size = 1u128 << (width - prefix);
-    let base = index(big.network());
-    let top = base.checked_add(span(big))?;
-    let mut at = align(base, width, prefix)?;
-    if at < base {
-        at = at.checked_add(size)?;
-    }
-    while at.checked_add(size)? <= top {
-        if let Some(cand) = block_at(big, at, prefix) {
-            if !held.iter().any(|u| overlaps(cand, *u)) {
-                return Some(cand);
-            }
-        }
-        at = at.checked_add(size)?;
-    }
-    None
-}
-
-/// One cidr from a short-road request: a block as it stands, or the next free
-/// block of the prefix asked for.
-pub(crate) fn carve(vpc: &Vpc, taken: &[Subnet], raw: &str) -> ApiResult<IpNet> {
-    let used: Vec<IpNet> = taken.iter().map(|s| s.spec.cidr).collect();
-    match Cidr::from_str(raw).map_err(ApiError::bad_request)? {
-        Cidr::Block(b) => Ok(b),
-        Cidr::Prefix(p) => next_block(&vpc.spec.cidrs, &used, p),
-    }
-}
-
-fn joined(cidrs: &[IpNet]) -> String {
-    cidrs
-        .iter()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Blocks are given, and none of them overlaps another.
-pub(crate) fn validate_cidrs(cidrs: &[IpNet]) -> ApiResult<()> {
-    if cidrs.is_empty() {
-        return Err(ApiError::bad_request("a vpc needs at least one cidr"));
-    }
-    for c in cidrs {
-        if c.addr().is_unspecified() {
-            return Err(ApiError::bad_request(format!("{c} is not a block")));
-        }
-    }
-    for (i, a) in cidrs.iter().enumerate() {
-        for b in &cidrs[i + 1..] {
-            if overlaps(*a, *b) {
-                return Err(ApiError::bad_request(format!("cidrs {a} and {b} overlap")));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One project for the VPC, its networks and its subnets.
-fn same_project(mine: &Option<Id>, theirs: &Option<Id>, what: &str) -> ApiResult<()> {
-    match (mine, theirs) {
-        (_, None) => Ok(()),
-        (Some(a), Some(b)) if a == b => Ok(()),
-        _ => Err(ApiError::forbidden(format!(
-            "the {what} belongs to another project"
-        ))),
-    }
-}
-
-/// A cidr as sent on the wire: a block, or a prefix length alone.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Cidr {
-    Block(IpNet),
-    Prefix(u8),
-}
-
-impl std::str::FromStr for Cidr {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        if let Some(digits) = s.strip_prefix('/') {
-            return digits
-                .parse::<u8>()
-                .map(Cidr::Prefix)
-                .map_err(|_| format!("'{s}' is not a prefix length"));
-        }
-        if let Ok(b) = s.parse::<IpNet>() {
-            return Ok(Cidr::Block(b));
-        }
-        // A bare number is a prefix length too; the slash is easy to lose.
-        s.parse::<u8>()
-            .map(Cidr::Prefix)
-            .map_err(|_| format!("'{s}' is neither a cidr nor a prefix length"))
-    }
-}
+use super::inside::inside;
+use super::joined::joined;
+use super::overlaps::overlaps;
+use super::router_address::router_address;
+use super::same_project::same_project;
+use super::store_err::store_err;
+use super::validate_cidrs::validate_cidrs;
 
 impl Client {
     // ---- the vpc -----------------------------------------------------------
@@ -437,7 +184,7 @@ impl Client {
         self.routers().delete(id).map_err(store_err)
     }
 
-    fn vpc_external_clearable(&self, id: &Id) -> ApiResult<()> {
+    pub(crate) fn vpc_external_clearable(&self, id: &Id) -> ApiResult<()> {
         let ext = self.vpc_router(id)?.spec.external_network.clone();
         for f in self.floating_ips().list(None).map_err(store_err)? {
             let depends = f.spec.port.is_some()
@@ -687,17 +434,4 @@ impl Client {
             tracing::debug!(%vpc, error = %e, "fabric: vpc subnet count not recorded");
         }
     }
-}
-
-/// The vpc's name, as the router it owns was told when it was made.
-pub(crate) fn owner_name(r: &Router) -> Option<String> {
-    r.meta.annotations.get("vpc").cloned()
-}
-
-/// A VPC spec is never sent without blocks.
-pub(crate) fn cidrs_required(spec: &VpcSpec) -> ApiResult<()> {
-    if spec.cidrs.is_empty() {
-        return Err(ApiError::bad_request("spec.cidrs needs at least one block"));
-    }
-    Ok(())
 }
