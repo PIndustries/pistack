@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 P. Industries LLC and PiStack contributors
+
+//! The resources `loom` owns.
+//!
+//! Every one is a plain `Resource<Spec, Status>` from `pistack-types` with
+//! the spec type implementing [`Spec`], so the store's `Collection` API
+//! works unchanged. The shapes follow Kubernetes field for field where that
+//! costs nothing (metadata + spec + status, labels, selectors, conditions,
+//! `pod-template-hash`) so a k8s-API facade can be bolted on later without
+//! a translation layer.
+//!
+//! `spec` is the user's; `status` is written only by the controllers in
+//! [`crate::controllers`].
+
+/// Id prefixes / store tables.
+pub mod kinds {
+    pub const POD: &str = pistack_types::kind::POD;
+    pub const REPLICA_SET: &str = "rs";
+    pub const DEPLOYMENT: &str = "deploy";
+    pub const STATEFUL_SET: &str = "sts";
+    pub const DAEMON_SET: &str = "ds";
+    pub const SERVICE: &str = "svc";
+    pub const CONFIG_MAP: &str = "cm";
+    pub const JOB: &str = "job";
+    pub const CRON_JOB: &str = "cron";
+    pub const INGRESS: &str = "ing";
+    pub const AUTOSCALER: &str = "scaler";
+}
+
+mod autoscaler;
+mod autoscaler_spec;
+mod autoscaler_status;
+mod concurrency_policy;
+mod config_map;
+mod config_map_spec;
+mod config_map_status;
+mod container;
+mod container_port;
+mod container_state;
+mod container_status;
+mod cron_job;
+mod cron_job_spec;
+mod cron_job_status;
+mod daemon_set;
+mod daemon_set_spec;
+mod daemon_set_status;
+mod default_failure;
+mod default_period;
+mod default_probe_path;
+mod default_success;
+mod default_timeout;
+mod default_volume_type;
+mod delete_annotation;
+mod delete_requested;
+mod deployment;
+mod deployment_spec;
+mod deployment_status;
+mod deployment_strategy;
+mod desired_replicas;
+mod endpoint;
+mod env_var;
+mod env_var_source;
+mod exec_probe;
+mod hostname_label;
+mod http_get_probe;
+mod ingress;
+mod ingress_backend;
+mod ingress_path;
+mod ingress_rule;
+mod ingress_spec;
+mod ingress_status;
+mod ingress_tls;
+mod int_or_name;
+mod int_or_percent;
+mod job;
+mod job_spec;
+mod job_status;
+mod machine_pod_label;
+mod node_port_range;
+mod nonzero;
+mod one;
+mod owner_label;
+mod path_type;
+mod pod;
+mod pod_management_policy;
+mod pod_name_label;
+mod pod_ordinal_label;
+mod pod_phase;
+mod pod_ready;
+mod pod_spec;
+mod pod_status;
+mod pod_template;
+mod pod_template_hash;
+mod pod_volume;
+mod probe;
+mod probe_handler_kind;
+mod probe_scheme;
+mod protocol;
+mod quarter;
+mod replica_set;
+mod replica_set_spec;
+mod replica_set_status;
+mod restart_policy;
+mod revision_annotation;
+mod root;
+mod scale_target_kind;
+mod selector;
+mod selector_operator;
+mod selector_requirement;
+mod service;
+mod service_kind;
+mod service_port;
+mod service_spec;
+mod service_status;
+mod set_condition;
+mod six;
+mod stateful_set;
+mod stateful_set_spec;
+mod stateful_set_status;
+mod stateful_set_update_strategy;
+mod target_host_annotation;
+mod tcp_socket_probe;
+#[cfg(test)]
+mod tests;
+mod three;
+mod volume_claim_template;
+mod volume_mount;
+mod volume_source;
+pub use autoscaler::Autoscaler;
+pub use autoscaler_spec::AutoscalerSpec;
+pub use autoscaler_status::AutoscalerStatus;
+pub use concurrency_policy::ConcurrencyPolicy;
+pub use config_map::ConfigMap;
+pub use config_map_spec::ConfigMapSpec;
+pub use config_map_status::ConfigMapStatus;
+pub use container::Container;
+pub use container_port::ContainerPort;
+pub use container_state::ContainerState;
+pub use container_status::ContainerStatus;
+pub use cron_job::CronJob;
+pub use cron_job_spec::CronJobSpec;
+pub use cron_job_status::CronJobStatus;
+pub use daemon_set::DaemonSet;
+pub use daemon_set_spec::DaemonSetSpec;
+pub use daemon_set_status::DaemonSetStatus;
+pub use delete_annotation::DELETE_ANNOTATION;
+pub use delete_requested::delete_requested;
+pub use deployment::Deployment;
+pub use deployment_spec::DeploymentSpec;
+pub use deployment_status::DeploymentStatus;
+pub use deployment_strategy::DeploymentStrategy;
+pub use desired_replicas::desired_replicas;
+pub use endpoint::Endpoint;
+pub use env_var::EnvVar;
+pub use env_var_source::EnvVarSource;
+pub use exec_probe::ExecProbe;
+pub use hostname_label::HOSTNAME_LABEL;
+pub use http_get_probe::HttpGetProbe;
+pub use ingress::Ingress;
+pub use ingress_backend::IngressBackend;
+pub use ingress_path::IngressPath;
+pub use ingress_rule::IngressRule;
+pub use ingress_spec::IngressSpec;
+pub use ingress_status::IngressStatus;
+pub use ingress_tls::IngressTls;
+pub use int_or_name::IntOrName;
+pub use int_or_percent::IntOrPercent;
+pub use job::Job;
+pub use job_spec::JobSpec;
+pub use job_status::JobStatus;
+pub use machine_pod_label::MACHINE_POD_LABEL;
+pub use node_port_range::NODE_PORT_RANGE;
+pub use owner_label::OWNER_LABEL;
+pub use path_type::PathType;
+pub use pod::Pod;
+pub use pod_management_policy::PodManagementPolicy;
+pub use pod_name_label::POD_NAME_LABEL;
+pub use pod_ordinal_label::POD_ORDINAL_LABEL;
+pub use pod_phase::PodPhase;
+pub use pod_ready::POD_READY;
+pub use pod_spec::PodSpec;
+pub use pod_status::PodStatus;
+pub use pod_template::PodTemplate;
+pub use pod_template_hash::POD_TEMPLATE_HASH;
+pub use pod_volume::PodVolume;
+pub use probe::Probe;
+pub use probe_handler_kind::ProbeHandlerKind;
+pub use probe_scheme::ProbeScheme;
+pub use protocol::Protocol;
+pub use replica_set::ReplicaSet;
+pub use replica_set_spec::ReplicaSetSpec;
+pub use replica_set_status::ReplicaSetStatus;
+pub use restart_policy::RestartPolicy;
+pub use revision_annotation::REVISION_ANNOTATION;
+pub use scale_target_kind::ScaleTargetKind;
+pub use selector::Selector;
+pub use selector_operator::SelectorOperator;
+pub use selector_requirement::SelectorRequirement;
+pub use service::Service;
+pub use service_kind::ServiceKind;
+pub use service_port::ServicePort;
+pub use service_spec::ServiceSpec;
+pub use service_status::ServiceStatus;
+pub use set_condition::set_condition;
+pub use stateful_set::StatefulSet;
+pub use stateful_set_spec::StatefulSetSpec;
+pub use stateful_set_status::StatefulSetStatus;
+pub use stateful_set_update_strategy::StatefulSetUpdateStrategy;
+pub use target_host_annotation::TARGET_HOST_ANNOTATION;
+pub use tcp_socket_probe::TcpSocketProbe;
+pub use volume_claim_template::VolumeClaimTemplate;
+pub use volume_mount::VolumeMount;
+pub use volume_source::VolumeSource;
